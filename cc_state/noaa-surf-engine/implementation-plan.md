@@ -90,7 +90,7 @@ outputs after scoring exists.
 | 3 | T-3.3: Backtest harness | Public-history physical calibration path | L | DONE | T-3.1 |
 | 4 | T-4.1: Dashboard v1 | Usable NorCal forecast console | M | DONE | T-3.2 |
 | 4 | T-4.2: Daily report layer | Disabled/enabled report path with guardrails | M | DONE | T-3.2 |
-| 4 | T-4.3: Self-host docs and smoke | One-command local/deploy smoke path | M | PARTIAL | T-4.1, T-4.2 |
+| 4 | T-4.3: Self-host docs and smoke | One-command local/deploy smoke path | M | DONE | T-4.1, T-4.2 |
 
 ## Phase 1: Foundation And Mapping
 
@@ -320,3 +320,8 @@ credentials are present.
   contact-gated/uncertain; the app surfaces caveats and lowers confidence.
 - **Next:** Apply remote D1 migration/seed, deploy Worker, run manual remote
   ingest and `pnpm smoke:cloudflare`, then push and open PR.
+- **Completed:** Applied remote D1 migration/seed, deployed Worker version
+  `ef8f2465-ca8c-4c0d-8c87-c1533bfa2873`, reran remote manual ingest after
+  batching D1 writes, and verified `pnpm smoke:cloudflare` against
+  `https://surf.alex-1ca.workers.dev`.
+- **Next:** Commit deployment fixes/state, push branch, open ready PR.

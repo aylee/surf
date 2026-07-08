@@ -45,7 +45,10 @@ and caveats are visible.
 Local manual ingest succeeded on 2026-07-08 for OBSF Central and the other v1
 spots: CO-OPS wrote 438 tide rows, NWS wrote 936 wind rows and 10 hazards, and
 `GET /api/forecast/obsf-central` returned 25 windows with live source-run IDs.
-Remote D1 migration/seed, deploy, remote ingest, and Cloudflare smoke are next.
+Remote D1 migration/seed, deploy, manual ingest, and Cloudflare smoke completed
+on 2026-07-08. The deployed Worker version is
+`ef8f2465-ca8c-4c0d-8c87-c1533bfa2873` at
+`https://surf.alex-1ca.workers.dev`.
 
 ## Open Items & Decisions Ledger
 
@@ -88,7 +91,7 @@ Remote D1 migration/seed, deploy, remote ingest, and Cloudflare smoke are next.
 | Bootstrap deploy | DONE | `https://surf.alex-1ca.workers.dev` | Use for remote smoke. |
 | Public-data extraction | PARTIAL | `services/extractor/`, `apps/web/worker/adapters/` | Add GRIB point parser/runtime and CDIP/MOP direct model pulls. |
 | Forecast scoring | DONE | `packages/forecast-core/`, `apps/web/worker/forecast.ts` | Tune confidence once wave rows exist. |
-| Product UI/API | DONE | `apps/web/` | Deploy and smoke against Cloudflare. |
+| Product UI/API | DONE | `apps/web/` | Push branch and open ready PR. |
 
 ## Verification
 
@@ -112,11 +115,18 @@ Local verification on 2026-07-08:
 - Local D1 migration + seed applied with Wrangler.
 - `pnpm ingest:once` succeeded against live public CO-OPS/NWS feeds.
 - `pnpm smoke:local` passed after ingest.
+- Remote D1 migration + seed succeeded.
+- Cloudflare deploy succeeded:
+  `ef8f2465-ca8c-4c0d-8c87-c1533bfa2873`.
+- Remote manual ingest succeeded: 438 tide rows, 936 wind rows, 10 hazards, no
+  errors.
+- `pnpm smoke:cloudflare` passed against
+  `https://surf.alex-1ca.workers.dev`.
 
 ## Next Action
 
-**Apply remote D1 migration/seed, deploy the Worker, run remote manual ingest,
-run `pnpm smoke:cloudflare`, then push and open the ready PR.**
+**Push `aylee/v1-noaa-surf-engine` and open the ready PR with verification
+results and the remaining GFSwave/CDIP caveats.**
 
 ## Closeout Path
 
@@ -138,3 +148,8 @@ CO-OPS/NWS source-run/read-model persistence, guarded report generation, smoke
 coverage, and the NDBC public-history backtest harness. Local ingest produced
 live source-run IDs for OBSF Central; GFSwave numeric GRIB extraction and
 CDIP/MOP direct model access remain explicit confidence-lowering caveats.
+
+_2026-07-08_ - **Deployed v1.** Applied remote D1 migration and seed, deployed
+Worker version `ef8f2465-ca8c-4c0d-8c87-c1533bfa2873`, fixed remote D1
+persistence by batching writes, reran manual ingest successfully in production,
+and passed `pnpm smoke:cloudflare`.

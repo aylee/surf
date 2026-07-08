@@ -31,6 +31,11 @@ type PersistenceResult = {
   errors: string[];
 };
 
+type PendingStatement = {
+  label: string;
+  statement: D1PreparedStatement;
+};
+
 export type IngestSummary = {
   kind: IngestKind;
   region: string;
@@ -182,6 +187,38 @@ function ktToMs(value: number | null): number | null {
   return value === null ? null : Math.round(value * 0.514444 * 1000) / 1000;
 }
 
+async function runPendingStatements(db: D1Database, pending: PendingStatement[]): Promise<PersistenceResult> {
+  if (pending.length === 0) return { rowsWritten: 0, errors: [] };
+
+  if (typeof db.batch === "function") {
+    const chunkSize = 50;
+    let rowsWritten = 0;
+    const errors: string[] = [];
+    for (let start = 0; start < pending.length; start += chunkSize) {
+      const chunk = pending.slice(start, start + chunkSize);
+      try {
+        await db.batch(chunk.map((item) => item.statement));
+        rowsWritten += chunk.length;
+      } catch (error) {
+        errors.push(`${chunk[0]?.label ?? "D1"} batch starting at ${start}: ${errorMessage(error)}`);
+      }
+    }
+    return { rowsWritten, errors };
+  }
+
+  let rowsWritten = 0;
+  const errors: string[] = [];
+  for (const item of pending) {
+    try {
+      await item.statement.run();
+      rowsWritten += 1;
+    } catch (error) {
+      errors.push(`${item.label}: ${errorMessage(error)}`);
+    }
+  }
+  return { rowsWritten, errors };
+}
+
 async function persistTideForecasts(
   db: D1Database,
   sourceRunId: string,
@@ -192,8 +229,6 @@ async function persistTideForecasts(
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for tide_forecasts."] };
   }
 
-  let rowsWritten = 0;
-  const errors: string[] = [];
   const statement = db.prepare(
     `insert into tide_forecasts (
       spot_id,
@@ -218,10 +253,9 @@ async function persistTideForecasts(
       created_at = excluded.created_at`
   );
 
-  for (const row of rows) {
-    try {
-      await statement
-        .bind(
+  const pending = rows.map((row) => ({
+    label: `tide_forecasts ${row.spotId} ${row.forecastAt}`,
+    statement: statement.bind(
           row.spotId,
           "coops:tide-predictions",
           sourceRunId,
@@ -234,14 +268,9 @@ async function persistTideForecasts(
           JSON.stringify(row),
           createdAt
         )
-        .run();
-      rowsWritten += 1;
-    } catch (error) {
-      errors.push(`tide_forecasts ${row.spotId} ${row.forecastAt}: ${errorMessage(error)}`);
-    }
-  }
+  }));
 
-  return { rowsWritten, errors };
+  return runPendingStatements(db, pending);
 }
 
 async function persistNwsRows(
@@ -254,8 +283,6 @@ async function persistNwsRows(
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for NWS rows."] };
   }
 
-  let rowsWritten = 0;
-  const errors: string[] = [];
   const windStatement = db.prepare(
     `insert into wind_forecasts (
       spot_id,
@@ -310,11 +337,12 @@ async function persistNwsRows(
       updated_at = excluded.updated_at`
   );
 
+  const pending: PendingStatement[] = [];
   for (const context of rows) {
     for (const wind of context.windForecasts) {
-      try {
-        await windStatement
-          .bind(
+      pending.push({
+        label: `wind_forecasts ${wind.spotId} ${wind.forecastAt}`,
+        statement: windStatement.bind(
             wind.spotId,
             "nws:point-forecast-alerts",
             sourceRunId,
@@ -328,18 +356,14 @@ async function persistNwsRows(
             JSON.stringify(wind),
             createdAt
           )
-          .run();
-        rowsWritten += 1;
-      } catch (error) {
-        errors.push(`wind_forecasts ${wind.spotId} ${wind.forecastAt}: ${errorMessage(error)}`);
-      }
+      });
     }
 
     for (const hazard of context.hazards) {
       const eventId = `${hazard.spotId}:${hazard.event}:${hazard.effectiveAt ?? "unknown"}:${hazard.expiresAt ?? "unknown"}`;
-      try {
-        await hazardStatement
-          .bind(
+      pending.push({
+        label: `hazard_events ${hazard.spotId} ${hazard.event}`,
+        statement: hazardStatement.bind(
             hazard.spotId,
             "nws:point-forecast-alerts",
             sourceRunId,
@@ -356,15 +380,11 @@ async function persistNwsRows(
             JSON.stringify(hazard),
             createdAt
           )
-          .run();
-        rowsWritten += 1;
-      } catch (error) {
-        errors.push(`hazard_events ${hazard.spotId} ${hazard.event}: ${errorMessage(error)}`);
-      }
+      });
     }
   }
 
-  return { rowsWritten, errors };
+  return runPendingStatements(db, pending);
 }
 
 function bodyString(value: unknown): string | null {
