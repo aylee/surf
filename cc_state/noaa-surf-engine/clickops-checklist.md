@@ -19,6 +19,8 @@ last_updated: 2026-07-08
 - [x] Provisioned Queue `surf-ingest-dlq`
   - ID: `5e1876faf4d14f5a84b23bcea315a2eb`
 - [x] Wrote Cloudflare bindings into `apps/web/wrangler.jsonc`
+- [x] Deployed bootstrap Worker/UI
+  - URL: `https://surf.alex-1ca.workers.dev`
 
 ## Needs Alex Or A Later Authenticated Browser/API Pass
 
@@ -37,4 +39,3 @@ last_updated: 2026-07-08
 - Surfline/Magicseaweed/Surf Captain credential.
 - Camera feed credential.
 - Custom bathymetry/SWAN infrastructure.
-

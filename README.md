@@ -67,6 +67,10 @@ Cloudflare resources are already provisioned in Alex's account:
 - KV namespace: `surf-cache`
 - Queues: `surf-ingest`, `surf-ingest-dlq`
 
+Bootstrap deployment:
+
+- `https://surf.alex-1ca.workers.dev`
+
 To reconcile or recreate resources from a local machine, set
 `CLOUDFLARE_API_TOKEN` and run:
 
@@ -105,4 +109,3 @@ Deployment/smoke checks after Cloudflare auth is available:
 pnpm cf:provision
 pnpm smoke:cloudflare
 ```
-

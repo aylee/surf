@@ -21,6 +21,12 @@ Provisioned in Alex's Cloudflare account on 2026-07-08:
 - Report generation is gated by `REPORT_AGENT_ENABLED=true` and provider key
   availability.
 
+## Deployment
+
+Bootstrap Worker URL:
+
+- `https://surf.alex-1ca.workers.dev`
+
 ## Checks
 
 ```bash
@@ -49,4 +55,3 @@ secrets should be set with Cloudflare Worker secrets.
 - Configure Cloudflare Access if the app should be private behind identity.
 - Set `OPENAI_API_KEY` and `REPORT_AGENT_ENABLED=true` only when narrative
   report generation should run.
-

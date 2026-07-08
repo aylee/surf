@@ -30,9 +30,10 @@ PM context lives in alex-os. This repo owns implementation truth.
 
 Bootstrap is complete enough for implementation kickoff. Cloudflare D1, R2,
 KV, and Queues were provisioned on 2026-07-08 and encoded in
-`apps/web/wrangler.jsonc`. The repo has a Hono Worker/API shell, Vite React UI,
-Zod contracts, deterministic scoring fixtures, Drizzle/D1 schema shell, and
-Python extractor shell.
+`apps/web/wrangler.jsonc`. The bootstrap Worker is deployed at
+`https://surf.alex-1ca.workers.dev`. The repo has a Hono Worker/API shell,
+Vite React UI, Zod contracts, deterministic scoring fixtures, Drizzle/D1
+schema shell, and Python extractor shell.
 
 No live NOAA/CDIP extraction has been implemented yet. v1 starts from
 `brief-one-shot-v1.md`.
@@ -75,6 +76,7 @@ No live NOAA/CDIP extraction has been implemented yet. v1 starts from
 |---|---|---|---|
 | Repo bootstrap | DONE | root files, `cc_state/` | Commit initial repo state. |
 | Cloudflare resources | DONE | `apps/web/wrangler.jsonc` | Configure domain/Access later. |
+| Bootstrap deploy | DONE | `https://surf.alex-1ca.workers.dev` | Use for remote smoke. |
 | Public-data extraction | OPEN | `services/extractor/` | Implement live NOAA/CDIP adapters. |
 | Forecast scoring | OPEN | `packages/forecast-core/` | Replace fixtures with live normalized inputs. |
 | Product UI/API | OPEN | `apps/web/` | Build v1 dashboard and reports. |
@@ -109,5 +111,5 @@ Only cross-repo lessons should be distilled back to alex-os memory.
 
 _2026-07-08_ - **Bootstrap and handoff.** Created the public OSS repo scaffold,
 provisioned Cloudflare D1/R2/KV/Queues, handed off alex-os research/RFC, added
-PRD and DAG implementation plan, and minted `brief-one-shot-v1.md`.
-
+PRD and DAG implementation plan, deployed the bootstrap Worker, and minted
+`brief-one-shot-v1.md`.
