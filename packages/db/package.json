@@ -6,7 +6,8 @@
   "main": "./src/schema.ts",
   "types": "./src/schema.ts",
   "scripts": {
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
     "drizzle-orm": "latest"

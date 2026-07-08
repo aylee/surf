@@ -21,6 +21,27 @@ Provisioned in Alex's Cloudflare account on 2026-07-08:
 - Report generation is gated by `REPORT_AGENT_ENABLED=true` and provider key
   availability.
 
+## v1 Ingest Behavior
+
+`POST /api/ingest/once` runs the NorCal ingest coordinator immediately. It
+fetches live NOAA CO-OPS tide predictions and NWS point forecasts/alerts for all
+six v1 spots, writes `source_runs`, and persists normalized `tide_forecasts`,
+`wind_forecasts`, and `hazard_events` rows in D1.
+
+NOAA GFSwave is validated in the Python extractor today: it selects complete
+cycles, validates NOMADS `.idx` inventories, and plans deterministic R2 keys for
+raw GRIB2 subsets. Numeric GRIB point extraction remains blocked until the
+runtime includes `wgrib2` or `cfgrib` + `xarray`; forecast confidence is lowered
+and caveats are exposed while that layer falls back.
+
+Apply local D1 schema and seed before local ingest:
+
+```bash
+cd apps/web
+pnpm exec wrangler d1 execute surf --local --file ../../packages/db/migrations/0000_initial.sql
+pnpm exec wrangler d1 execute surf --local --file ../../packages/db/seeds/0000_v1_norcal.sql
+```
+
 ## Deployment
 
 Bootstrap Worker URL:
@@ -33,9 +54,19 @@ Bootstrap Worker URL:
 pnpm check
 pnpm test
 uv run --project services/extractor pytest
+pnpm ingest:once
 pnpm cf:provision
 pnpm smoke:local
 pnpm smoke:cloudflare
+```
+
+`pnpm smoke:local` and `pnpm smoke:cloudflare` verify `/api/health`,
+`/api/spots`, `/api/forecast/obsf-central`, and `/api/reports/today`.
+
+Run the public-observation calibration harness with:
+
+```bash
+uv run --project services/extractor surf-extractor backtest-ndbc-history --station-id 46026 --year 2025
 ```
 
 ## Secrets

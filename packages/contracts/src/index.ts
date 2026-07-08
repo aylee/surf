@@ -14,6 +14,35 @@ export const SourceCapabilitySchema = z.enum([
 
 export type SourceCapability = z.infer<typeof SourceCapabilitySchema>;
 
+export const SourceStatusSchema = z.enum([
+  "planned",
+  "live",
+  "stale",
+  "unavailable",
+  "blocked",
+  "failed"
+]);
+
+export type SourceStatus = z.infer<typeof SourceStatusSchema>;
+
+export const SourceMappingSchema = z.object({
+  sourceId: z.string(),
+  capability: SourceCapabilitySchema,
+  provider: z.string(),
+  name: z.string(),
+  url: z.string().url().optional(),
+  stationId: z.string().optional(),
+  modelPointId: z.string().optional(),
+  lat: z.number().optional(),
+  lon: z.number().optional(),
+  distanceKm: z.number().nonnegative().optional(),
+  weight: z.number().nonnegative().optional(),
+  status: SourceStatusSchema,
+  notes: z.string()
+});
+
+export type SourceMapping = z.infer<typeof SourceMappingSchema>;
+
 export const SpotIdSchema = z.enum([
   "obsf-north",
   "obsf-central",
@@ -53,6 +82,7 @@ export const SpotProfileSchema = z.object({
   referenceBuoys: z.array(z.string()),
   cdipStations: z.array(z.string()),
   tideStation: z.string(),
+  sourceMappings: z.array(SourceMappingSchema).optional(),
   notes: z.string()
 });
 
@@ -98,21 +128,67 @@ export const SurfScoreSchema = z.object({
 
 export type SurfScore = z.infer<typeof SurfScoreSchema>;
 
+export const ScoredForecastWindowSchema = SurfScoreSchema.extend({
+  waveHeightFt: z.number().nonnegative().nullable(),
+  peakPeriodSec: z.number().nonnegative().nullable(),
+  primaryDirectionDeg: z.number().min(0).max(360).nullable(),
+  tideFt: z.number().nullable(),
+  windSpeedKt: z.number().nonnegative().nullable(),
+  windDirectionDeg: z.number().min(0).max(360).nullable(),
+  sourceFreshnessMinutes: z.number().nonnegative(),
+  activeCapabilities: z.array(SourceCapabilitySchema),
+  sourceRunIds: z.array(z.string()),
+  caveats: z.array(z.string())
+});
+
+export type ScoredForecastWindow = z.infer<typeof ScoredForecastWindowSchema>;
+
 export const ForecastResponseSchema = z.object({
   spot: SpotProfileSchema,
-  windows: z.array(SurfScoreSchema),
+  windows: z.array(ScoredForecastWindowSchema),
   generatedAt: z.string(),
   sourceNote: z.string()
 });
 
 export type ForecastResponse = z.infer<typeof ForecastResponseSchema>;
 
+export const SourceRunSchema = z.object({
+  id: z.string(),
+  sourceId: z.string(),
+  capability: SourceCapabilitySchema,
+  provider: z.string(),
+  status: SourceStatusSchema,
+  startedAt: z.string(),
+  completedAt: z.string().nullable(),
+  cycleAt: z.string().nullable(),
+  forecastHour: z.number().int().nullable(),
+  rawR2Key: z.string().nullable(),
+  recordsWritten: z.number().int().nonnegative(),
+  error: z.string().nullable(),
+  metadata: z.record(z.string(), z.unknown()).optional()
+});
+
+export type SourceRun = z.infer<typeof SourceRunSchema>;
+
+export const IngestResponseSchema = z.object({
+  enqueued: z.boolean(),
+  processed: z.boolean(),
+  requestedAt: z.string(),
+  completedAt: z.string().nullable(),
+  region: z.literal("norcal"),
+  sourceRuns: z.array(SourceRunSchema),
+  caveats: z.array(z.string())
+});
+
+export type IngestResponse = z.infer<typeof IngestResponseSchema>;
+
 export const ReportResponseSchema = z.object({
   enabled: z.boolean(),
   generatedAt: z.string().nullable(),
   reportMarkdown: z.string().nullable(),
-  reason: z.string().nullable()
+  reason: z.string().nullable(),
+  sourceRunIds: z.array(z.string()).optional(),
+  caveats: z.array(z.string()).optional()
 });
 
 export type ReportResponse = z.infer<typeof ReportResponseSchema>;
-

@@ -79,18 +79,18 @@ outputs after scoring exists.
 
 | Phase | Task | Deliverable | Size | Status | Dependencies |
 |---|---|---|---|---|---|
-| 1 | T-1.1: Validate scaffold and contracts | Passing check/test baseline | S | - | - |
-| 1 | T-1.2: Spot/source mapping | v1 source map and CDIP coverage notes | M | - | T-1.1 |
-| 1 | T-1.3: D1 migrations and seed | Applied schema and spot/source seed | M | - | T-1.1 |
-| 2 | T-2.1: NOAA GFSwave extractor | Live GRIB subset/extract for OBSF | L | - | T-1.2 |
-| 2 | T-2.2: CDIP/NDBC observations | Live observed and modeled wave pulls | L | - | T-1.2 |
-| 2 | T-2.3: CO-OPS/NWS fetchers | Tide, wind, hazard normalized rows | M | - | T-1.2, T-1.3 |
-| 3 | T-3.1: Forecast normalization | Source runs and forecast rows in D1 | L | - | T-2.1, T-2.2, T-2.3 |
-| 3 | T-3.2: Scoring integration | API returns scored live windows | M | - | T-3.1 |
-| 3 | T-3.3: Backtest harness | Public-history physical calibration path | L | - | T-3.1 |
-| 4 | T-4.1: Dashboard v1 | Usable NorCal forecast console | M | - | T-3.2 |
-| 4 | T-4.2: Daily report layer | Disabled/enabled report path with guardrails | M | - | T-3.2 |
-| 4 | T-4.3: Self-host docs and smoke | One-command local/deploy smoke path | M | - | T-4.1, T-4.2 |
+| 1 | T-1.1: Validate scaffold and contracts | Passing check/test baseline | S | DONE | - |
+| 1 | T-1.2: Spot/source mapping | v1 source map and CDIP coverage notes | M | DONE | T-1.1 |
+| 1 | T-1.3: D1 migrations and seed | Applied schema and spot/source seed | M | DONE | T-1.1 |
+| 2 | T-2.1: NOAA GFSwave extractor | Live GRIB subset/extract for OBSF | L | PARTIAL | T-1.2 |
+| 2 | T-2.2: CDIP/NDBC observations | Live observed and modeled wave pulls | L | PARTIAL | T-1.2 |
+| 2 | T-2.3: CO-OPS/NWS fetchers | Tide, wind, hazard normalized rows | M | DONE | T-1.2, T-1.3 |
+| 3 | T-3.1: Forecast normalization | Source runs and forecast rows in D1 | L | PARTIAL | T-2.1, T-2.2, T-2.3 |
+| 3 | T-3.2: Scoring integration | API returns scored live windows | M | DONE | T-3.1 |
+| 3 | T-3.3: Backtest harness | Public-history physical calibration path | L | DONE | T-3.1 |
+| 4 | T-4.1: Dashboard v1 | Usable NorCal forecast console | M | DONE | T-3.2 |
+| 4 | T-4.2: Daily report layer | Disabled/enabled report path with guardrails | M | DONE | T-3.2 |
+| 4 | T-4.3: Self-host docs and smoke | One-command local/deploy smoke path | M | PARTIAL | T-4.1, T-4.2 |
 
 ## Phase 1: Foundation And Mapping
 
@@ -299,7 +299,8 @@ credentials are present.
 
 - [ ] Custom domain and Access posture.
 - [ ] LLM provider/model for daily reports.
-- [ ] Exact CDIP/MOP coverage by spot.
+- [x] Exact CDIP/MOP coverage by spot recorded with public evidence and
+  confidence-lowering access caveats.
 
 ## Log
 
@@ -308,4 +309,14 @@ credentials are present.
 - **Completed:** Bootstrap repo, Cloudflare resources, PRD/RFC/research handoff,
   and initial implementation DAG.
 - **Next:** Execute T-1.1, then close OI-3/OI-4.
-
+- **Completed:** Validated baseline, added v1 source mapping/tests, expanded D1
+  schema and seed, implemented live CO-OPS/NWS ingest with normalized rows,
+  added GFSwave live inventory validation/R2 key planning, built scored 72-hour
+  API windows, dashboard, guarded report path, smoke checks, and NDBC public
+  history backtest harness.
+- **Partial / caveated:** GFSwave numeric GRIB point extraction remains blocked
+  until `wgrib2` or `cfgrib` + `xarray` is available in the Python runtime.
+  CDIP/MOP nearshore access is mapped with public evidence but remains
+  contact-gated/uncertain; the app surfaces caveats and lowers confidence.
+- **Next:** Apply remote D1 migration/seed, deploy Worker, run manual remote
+  ingest and `pnpm smoke:cloudflare`, then push and open PR.

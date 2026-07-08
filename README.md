@@ -10,9 +10,12 @@ report layer.
 
 ## Current Status
 
-Bootstrap repo. The first active workstream is
+Working v1 implementation in progress. The app has live CO-OPS tide and NWS
+wind/hazard ingest, D1 source-run/read-model storage, deterministic 72-hour
+forecast windows for the six NorCal spots, an API-backed dashboard, guarded
+report output, and a Python GFSwave/backtest extractor shell. Read the active
+workstream before extending v1:
 [`cc_state/noaa-surf-engine/WORKSTREAM.md`](cc_state/noaa-surf-engine/WORKSTREAM.md).
-Read that before implementing v1.
 
 ## First Region
 
@@ -101,6 +104,7 @@ Honest starter checks:
 pnpm check
 pnpm test
 uv run --project services/extractor pytest
+pnpm smoke:local
 ```
 
 Deployment/smoke checks after Cloudflare auth is available:
