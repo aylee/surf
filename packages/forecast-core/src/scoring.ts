@@ -2,6 +2,7 @@ import type {
   ForecastResponse,
   ForecastWindowInput,
   QualityLabel,
+  ScoredForecastWindow,
   SourceCapability,
   SpotId,
   SpotProfile,
@@ -108,20 +109,33 @@ export function buildFixtureForecast(spotId: SpotId, now = new Date()): Forecast
     "wind"
   ];
 
-  const windows = [0, 6, 12, 18].map((hourOffset) => {
+  const windows: ScoredForecastWindow[] = Array.from({ length: 25 }, (_, index) => index * 3).map((hourOffset) => {
     const forecastAt = new Date(now.getTime() + hourOffset * 60 * 60 * 1000).toISOString();
-    return scoreSpotWindow(spot, {
+    const input: ForecastWindowInput = {
       spotId,
       forecastAt,
-      waveHeightFt: spot.id.startsWith("obsf") ? 4.5 + hourOffset / 12 : 2.8 + hourOffset / 18,
-      peakPeriodSec: 12 + hourOffset / 8,
+      waveHeightFt: spot.id.startsWith("obsf") ? 4.5 + Math.sin(hourOffset / 12) : 2.8 + Math.sin(hourOffset / 15) * 0.5,
+      peakPeriodSec: 12 + Math.cos(hourOffset / 18),
       primaryDirectionDeg: spot.bestSwellDeg.minDeg + 12,
-      tideFt: spot.bestTideFt.min + 1.5,
-      windSpeedKt: 7 + hourOffset / 8,
+      tideFt: spot.bestTideFt.min + 1.5 + Math.sin(hourOffset / 6),
+      windSpeedKt: 7 + Math.max(0, Math.sin(hourOffset / 9) * 5),
       windDirectionDeg: spot.offshoreWindFromDeg.minDeg + 20,
       sourceFreshnessMinutes: 45,
       activeCapabilities
-    });
+    };
+    return {
+      ...scoreSpotWindow(spot, input),
+      waveHeightFt: input.waveHeightFt,
+      peakPeriodSec: input.peakPeriodSec,
+      primaryDirectionDeg: input.primaryDirectionDeg,
+      tideFt: input.tideFt,
+      windSpeedKt: input.windSpeedKt,
+      windDirectionDeg: input.windDirectionDeg,
+      sourceFreshnessMinutes: input.sourceFreshnessMinutes,
+      activeCapabilities,
+      sourceRunIds: ["fixture"],
+      caveats: ["Fixture forecast. Live source rows have not been loaded for this window."]
+    };
   });
 
   return {
@@ -131,4 +145,3 @@ export function buildFixtureForecast(spotId: SpotId, now = new Date()): Forecast
     sourceNote: "Fixture forecast. Replace with live NOAA/CDIP/NDBC/CO-OPS/NWS ingest in v1."
   };
 }
-

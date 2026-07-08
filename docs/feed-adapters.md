@@ -40,3 +40,12 @@ needed for audit/backtesting.
 - Python extractor: GRIB2, netCDF, xarray, CDIP THREDDS, wgrib2/ecCodes, future
   bathymetry transforms.
 
+## v1 Adapter Status
+
+| Adapter | Runtime | Status | Notes |
+|---|---|---|---|
+| NOAA GFSwave inventory/artifact planning | Python | live inventory validation | Validates `wcoast.0p16` `.idx` inventories for f000-f072 and plans R2 keys. Numeric GRIB extraction waits on `wgrib2` or `cfgrib` + `xarray`. |
+| NOAA CO-OPS tide predictions | Worker | live ingest | Fetches hourly MLLW predictions for mapped v1 stations and writes `tide_forecasts`. |
+| NWS point forecast and alerts | Worker | live ingest | Resolves spot point forecasts, hourly wind periods, and active alerts; writes `wind_forecasts` and `hazard_events`. |
+| NDBC history backtest | Python | harness | Parses public historical stdmet files and reports observation-summary metrics for calibration. |
+| CDIP/MOP nearshore model | Python future | blocked/explicit caveat | Public model coverage is documented for the region, but direct MOP prediction access is contact-gated/uncertain; v1 keeps the coverage caveat visible. |

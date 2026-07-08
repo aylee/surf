@@ -1,3 +1,3 @@
-export { NORCAL_SPOTS, getSpotProfile } from "./spot-registry";
+export { NORCAL_SPOTS, getSpotProfile, getSpotSourceMap } from "./spot-registry";
 export { buildFixtureForecast, scoreSpotWindow } from "./scoring";
-
+export { buildDeterministicReport } from "./report";

@@ -23,8 +23,13 @@ describe("scoreSpotWindow", () => {
 
   it("builds fixture forecasts for the v1 spots", () => {
     const forecast = buildFixtureForecast("bolinas", new Date("2026-07-08T12:00:00.000Z"));
-    expect(forecast.windows).toHaveLength(4);
+    expect(forecast.windows).toHaveLength(25);
     expect(forecast.spot.id).toBe("bolinas");
+    expect(forecast.windows.at(-1)?.forecastAt).toBe("2026-07-11T12:00:00.000Z");
+    expect(forecast.windows[0]).toMatchObject({
+      activeCapabilities: ["forecast_wave_offshore", "observed_wave", "tide", "wind"],
+      sourceRunIds: ["fixture"]
+    });
+    expect(forecast.windows[0]?.caveats.length).toBeGreaterThan(0);
   });
 });
-
