@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+
+const baseUrl = process.env.SURF_BASE_URL || "http://127.0.0.1:8787";
+
+async function get(path) {
+  const response = await fetch(`${baseUrl}${path}`);
+  if (!response.ok) {
+    throw new Error(`${path} returned ${response.status}`);
+  }
+  return response.json();
+}
+
+const health = await get("/api/health");
+const spots = await get("/api/spots");
+
+if (health.status !== "ok") {
+  throw new Error(`Unexpected health status: ${JSON.stringify(health)}`);
+}
+
+if (!Array.isArray(spots.spots) || spots.spots.length < 6) {
+  throw new Error(`Expected v1 NorCal spots, got: ${JSON.stringify(spots)}`);
+}
+
+console.log(`Local smoke passed against ${baseUrl}`);
+

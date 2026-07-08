@@ -1,0 +1,24 @@
+{
+  "name": "surf",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Self-hosted public-data surf forecast engine.",
+  "license": "MIT",
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "check": "pnpm -r --if-present check",
+    "test": "pnpm -r --if-present test && uv run --project services/extractor pytest",
+    "dev": "pnpm --filter @surf/web dev",
+    "build": "pnpm -r --if-present build",
+    "ingest:once": "pnpm --filter @surf/web ingest:once && uv run --project services/extractor surf-extractor inspect-fixtures",
+    "report:today": "pnpm --filter @surf/web report:today",
+    "cf:provision": "node scripts/cf-provision.mjs",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "smoke:cloudflare": "pnpm --filter @surf/web smoke:cloudflare"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}

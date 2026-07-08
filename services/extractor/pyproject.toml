@@ -1,0 +1,34 @@
+[project]
+name = "surf-extractor"
+version = "0.0.0"
+description = "Python extraction shell for public surf forecast data feeds."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "click>=8.1",
+  "pydantic>=2.7",
+  "httpx>=0.27"
+]
+
+[project.optional-dependencies]
+grib = [
+  "xarray>=2025.1",
+  "cfgrib>=0.9",
+  "netCDF4>=1.7"
+]
+
+[project.scripts]
+surf-extractor = "surf_extractor.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.2"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

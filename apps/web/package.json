@@ -1,0 +1,37 @@
+{
+  "name": "@surf/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "dev:worker": "wrangler dev --local --port 8787",
+    "build": "vite build",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "deploy": "pnpm build && wrangler deploy",
+    "ingest:once": "node scripts/ingest-once.mjs",
+    "report:today": "node scripts/report-today.mjs",
+    "smoke:cloudflare": "node scripts/smoke-cloudflare.mjs"
+  },
+  "dependencies": {
+    "@hono/zod-validator": "latest",
+    "@surf/contracts": "workspace:*",
+    "@surf/forecast-core": "workspace:*",
+    "hono": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}

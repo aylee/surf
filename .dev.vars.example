@@ -1,0 +1,5 @@
+# Cloudflare Worker local dev secrets. Copy to apps/web/.dev.vars when needed.
+# Do not commit real secrets.
+OPENAI_API_KEY=
+REPORT_AGENT_ENABLED=false
+

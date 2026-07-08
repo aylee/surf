@@ -1,0 +1,18 @@
+{
+  "name": "@surf/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/schema.ts",
+  "types": "./src/schema.ts",
+  "scripts": {
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "drizzle-orm": "latest"
+  },
+  "devDependencies": {
+    "drizzle-kit": "latest",
+    "typescript": "latest"
+  }
+}
