@@ -31,20 +31,67 @@ coastal-grid wave guidance, plus current NDBC buoy observations for all six v1
 spots. It writes `source_runs` and persists normalized tide, wind, hazard, wave
 forecast, and buoy-observation rows in D1.
 
-Issued history is intentionally bounded for a personal D1 database:
+D1 retention is intentionally bounded for a personal database:
 
+- operational `tide_forecasts`, `wind_forecasts`, and `wave_forecasts` rows keep
+  a two-day past troubleshooting tail plus every row in the current future
+  forecast horizon. Removing older past rows also bounds overlapping wave rows
+  from successive model cycles;
 - only 6 AM–6 PM local forecast windows are snapshotted;
-- spot configurations are content-addressed once in `forecast_configs`;
-- shared issue context lives once in `forecast_issues`;
-- `forecast_snapshots` retains compact per-window numeric/product facts;
+- spot configurations are content-addressed once in `forecast_configs`, shared
+  issue context lives once in `forecast_issues`, and configs no longer
+  referenced by a retained issue are removed;
+- `forecast_snapshots`, `forecast_issues`, `wind_forecast_issues`, wave/tide/wind
+  observations, hazards, and D1 `source_runs`/`source_artifacts` metadata keep
+  400 days;
 - `wind_forecast_issues` retains compact daylight rows without duplicated raw
-  payload JSON (the original response remains checksum-linked in R2);
-- snapshots and wind issues older than 400 days are pruned after each sampled
-  capture.
+  payload JSON.
 
 This preserves a full annual seasonal comparison set without turning hourly
-ingest into unbounded D1 growth. Export older issue sets to R2 before changing
-the retention window.
+ingest or successive wave cycles into unbounded D1 growth. Export any D1 issue
+history needed beyond 400 days before changing the retention window.
+
+The D1 retention job does **not** delete raw objects from R2, even when their
+`source_artifacts` metadata ages out of D1. No R2 lifecycle is configured or
+implied here. R2 deletion or archival requires a separate, explicit lifecycle
+decision with its own recovery plan.
+
+After a successful retention pass, the three operational-table `stale_past`
+counts below should all be zero. Total counts may move with source horizons, but
+should stabilize rather than grow monotonically across successive weeks:
+
+```sql
+select 'tide_forecasts' as table_name, count(*) as total,
+  coalesce(sum(case when julianday(forecast_at) < julianday('now', '-2 days') then 1 else 0 end), 0) as stale_past
+from tide_forecasts
+union all
+select 'wind_forecasts', count(*),
+  coalesce(sum(case when julianday(forecast_at) < julianday('now', '-2 days') then 1 else 0 end), 0)
+from wind_forecasts
+union all
+select 'wave_forecasts', count(*),
+  coalesce(sum(case when julianday(forecast_at) < julianday('now', '-2 days') then 1 else 0 end), 0)
+from wave_forecasts;
+```
+
+The 400-day and config checks should likewise return zeros after retention:
+
+```sql
+select
+  (select count(*) from forecast_snapshots where julianday(captured_at) < julianday('now', '-400 days')) as snapshots_over_400d,
+  (select count(*) from forecast_issues where julianday(captured_at) < julianday('now', '-400 days')) as issues_over_400d,
+  (select count(*) from wind_forecast_issues where julianday(captured_at) < julianday('now', '-400 days')) as wind_issues_over_400d,
+  ((select count(*) from wave_observations where julianday(observed_at) < julianday('now', '-400 days')) +
+   (select count(*) from tide_observations where julianday(observed_at) < julianday('now', '-400 days')) +
+   (select count(*) from wind_observations where julianday(observed_at) < julianday('now', '-400 days'))) as observations_over_400d,
+  (select count(*) from hazard_events where julianday(updated_at) < julianday('now', '-400 days')) as hazards_over_400d,
+  (select count(*) from source_runs where julianday(started_at) < julianday('now', '-400 days')) as source_runs_over_400d,
+  (select count(*) from source_artifacts where julianday(created_at) < julianday('now', '-400 days')) as source_artifacts_over_400d,
+  (select count(*) from forecast_configs c where not exists (
+    select 1 from forecast_issues i
+    where i.spot_id = c.spot_id and i.spot_config_hash = c.config_hash
+  )) as unreferenced_configs;
+```
 
 The public dashboard prefers mapped CDIP MOP per-point forecasts for Ocean
 Beach, Linda Mar, and Stinson. Bolinas and any unavailable MOP window fall back
@@ -232,9 +279,10 @@ Do not read or print existing secret files in agent sessions. Deployed runtime
 secrets should be set with Cloudflare Worker secrets.
 
 Raw upstream responses are archived under `raw/<source>/<date>/<run>/` in R2.
-Each source run points to a checksum-bearing manifest and corresponding
-`source_artifacts` rows in D1; normalized writes finalize the run only after
-artifact persistence succeeds.
+While its D1 metadata is retained, each source run points to a checksum-bearing
+manifest and corresponding `source_artifacts` rows; normalized writes finalize
+the run only after artifact persistence succeeds. R2 objects remain after that
+D1 metadata ages out unless a separate R2 lifecycle is explicitly approved.
 
 ## Remaining Clickops
 

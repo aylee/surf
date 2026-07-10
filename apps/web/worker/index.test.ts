@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./index";
 import worker from "./index";
-import { shouldCaptureForecastHistory } from "./ingest";
+import {
+  FORECAST_HISTORY_RETENTION_DAYS,
+  OPERATIONAL_FORECAST_RETENTION_DAYS,
+  pruneRetainedData,
+  shouldCaptureForecastHistory
+} from "./ingest";
 
 function dbMock() {
   const runs: unknown[][] = [];
@@ -44,6 +49,49 @@ describe("worker api", () => {
     expect(shouldCaptureForecastHistory("queued-ingest", "2026-07-10T00:17:00Z")).toBe(true);
     expect(shouldCaptureForecastHistory("queued-ingest", "2026-07-10T01:17:00Z")).toBe(false);
     expect(shouldCaptureForecastHistory("manual-ingest", "2026-07-10T01:17:00Z")).toBe(true);
+  });
+
+  it("bounds operational rows separately from the evaluation dataset", async () => {
+    const { db, runs, sqls } = dbMock();
+    const now = new Date("2026-07-10T12:00:00.000Z");
+
+    const result = await pruneRetainedData(db, now);
+
+    expect(result.errors).toEqual([]);
+    expect(sqls).toHaveLength(14);
+    for (const table of ["wave_forecasts", "tide_forecasts", "wind_forecasts"]) {
+      const index = sqls.findIndex((sql) => sql.includes(`delete from ${table}`));
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(runs[index]?.[0]).toBe(
+        new Date(
+          now.getTime() - OPERATIONAL_FORECAST_RETENTION_DAYS * 24 * 60 * 60 * 1000
+        ).toISOString()
+      );
+    }
+    for (const table of [
+      "forecast_snapshots",
+      "forecast_issues",
+      "wind_forecast_issues",
+      "wave_observations",
+      "tide_observations",
+      "wind_observations",
+      "hazard_events",
+      "spot_scores",
+      "source_artifacts",
+      "source_runs"
+    ]) {
+      const index = sqls.findIndex((sql) => sql.includes(`delete from ${table}`));
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(runs[index]?.[0]).toBe(
+        new Date(
+          now.getTime() - FORECAST_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000
+        ).toISOString()
+      );
+    }
+    expect(sqls.some((sql) => sql.includes("delete from forecast_configs"))).toBe(true);
+    expect(sqls.find((sql) => sql.includes("delete from source_runs"))).toContain(
+      "not exists (select 1 from wave_forecasts"
+    );
   });
 
   afterEach(() => {
@@ -259,6 +307,7 @@ describe("worker api", () => {
     expect(sqls.filter((sql) => sql.includes("insert into forecast_issues"))).toHaveLength(6);
     expect(sqls.filter((sql) => sql.includes("insert into forecast_snapshots"))).toHaveLength(120);
     expect(sqls.filter((sql) => sql.includes("delete from forecast_snapshots"))).toHaveLength(1);
+    expect(sqls.filter((sql) => sql.includes("delete from wave_forecasts"))).toHaveLength(1);
     const bolinasWindWrite = runs.find(
       (values, index) =>
         sqls[index]?.includes("insert into wind_forecasts") &&

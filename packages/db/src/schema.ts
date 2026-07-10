@@ -82,7 +82,8 @@ export const sourceRuns = sqliteTable("source_runs", {
 }, (table) => ({
   runKeyIdx: uniqueIndex("source_runs_run_key_idx").on(table.runKey),
   sourceStatusIdx: index("source_runs_source_status_idx").on(table.sourceId, table.status),
-  cycleIdx: index("source_runs_cycle_idx").on(table.cycleAt)
+  cycleIdx: index("source_runs_cycle_idx").on(table.cycleAt),
+  startedAtIdx: index("source_runs_started_at_idx").on(table.startedAt)
 }));
 
 export const sourceArtifacts = sqliteTable(
@@ -105,7 +106,8 @@ export const sourceArtifacts = sqliteTable(
   },
   (table) => ({
     r2KeyIdx: uniqueIndex("source_artifacts_r2_key_idx").on(table.r2Key),
-    sourceRunIdx: index("source_artifacts_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("source_artifacts_source_run_idx").on(table.sourceRunId),
+    createdAtIdx: index("source_artifacts_created_at_idx").on(table.createdAt)
   })
 );
 
@@ -140,7 +142,8 @@ export const waveForecasts = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.spotId, table.sourceId, table.modelCycleAt, table.forecastAt] }),
     spotForecastAtIdx: index("wave_forecasts_spot_forecast_at_idx").on(table.spotId, table.forecastAt),
-    sourceRunIdx: index("wave_forecasts_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("wave_forecasts_source_run_idx").on(table.sourceRunId),
+    forecastAtIdx: index("wave_forecasts_forecast_at_idx").on(table.forecastAt)
   })
 );
 
@@ -166,7 +169,8 @@ export const tideForecasts = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.spotId, table.stationId, table.forecastAt] }),
     spotForecastAtIdx: index("tide_forecasts_spot_forecast_at_idx").on(table.spotId, table.forecastAt),
-    sourceRunIdx: index("tide_forecasts_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("tide_forecasts_source_run_idx").on(table.sourceRunId),
+    forecastAtIdx: index("tide_forecasts_forecast_at_idx").on(table.forecastAt)
   })
 );
 
@@ -193,7 +197,8 @@ export const windForecasts = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.spotId, table.sourceId, table.forecastAt] }),
     spotForecastAtIdx: index("wind_forecasts_spot_forecast_at_idx").on(table.spotId, table.forecastAt),
-    sourceRunIdx: index("wind_forecasts_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("wind_forecasts_source_run_idx").on(table.sourceRunId),
+    forecastAtIdx: index("wind_forecasts_forecast_at_idx").on(table.forecastAt)
   })
 );
 
@@ -264,7 +269,8 @@ export const waveObservations = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.spotId, table.sourceId, table.observedAt] }),
     spotObservedAtIdx: index("wave_observations_spot_observed_at_idx").on(table.spotId, table.observedAt),
-    sourceRunIdx: index("wave_observations_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("wave_observations_source_run_idx").on(table.sourceRunId),
+    observedAtIdx: index("wave_observations_observed_at_idx").on(table.observedAt)
   })
 );
 
@@ -289,7 +295,8 @@ export const tideObservations = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.spotId, table.stationId, table.observedAt] }),
     spotObservedAtIdx: index("tide_observations_spot_observed_at_idx").on(table.spotId, table.observedAt),
-    sourceRunIdx: index("tide_observations_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("tide_observations_source_run_idx").on(table.sourceRunId),
+    observedAtIdx: index("tide_observations_observed_at_idx").on(table.observedAt)
   })
 );
 
@@ -313,7 +320,8 @@ export const windObservations = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.spotId, table.sourceId, table.observedAt] }),
     spotObservedAtIdx: index("wind_observations_spot_observed_at_idx").on(table.spotId, table.observedAt),
-    sourceRunIdx: index("wind_observations_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("wind_observations_source_run_idx").on(table.sourceRunId),
+    observedAtIdx: index("wind_observations_observed_at_idx").on(table.observedAt)
   })
 );
 
@@ -343,7 +351,8 @@ export const hazardEvents = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.spotId, table.sourceId, table.eventId] }),
     spotStartsAtIdx: index("hazard_events_spot_starts_at_idx").on(table.spotId, table.startsAt),
-    sourceRunIdx: index("hazard_events_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("hazard_events_source_run_idx").on(table.sourceRunId),
+    updatedAtIdx: index("hazard_events_updated_at_idx").on(table.updatedAt)
   })
 );
 

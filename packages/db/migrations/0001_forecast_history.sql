@@ -2,6 +2,36 @@
 -- Keep the v1 latest-value tables unchanged so this migration is safe to
 -- apply to an already-running D1 database.
 
+-- Global time indexes keep the six-hour retention job from scanning the
+-- spot-prefixed operational indexes. The original per-spot read indexes stay
+-- intact for dashboard queries.
+create index if not exists source_runs_started_at_idx
+  on source_runs (started_at);
+
+create index if not exists source_artifacts_created_at_idx
+  on source_artifacts (created_at);
+
+create index if not exists wave_forecasts_forecast_at_idx
+  on wave_forecasts (forecast_at);
+
+create index if not exists tide_forecasts_forecast_at_idx
+  on tide_forecasts (forecast_at);
+
+create index if not exists wind_forecasts_forecast_at_idx
+  on wind_forecasts (forecast_at);
+
+create index if not exists wave_observations_observed_at_idx
+  on wave_observations (observed_at);
+
+create index if not exists tide_observations_observed_at_idx
+  on tide_observations (observed_at);
+
+create index if not exists wind_observations_observed_at_idx
+  on wind_observations (observed_at);
+
+create index if not exists hazard_events_updated_at_idx
+  on hazard_events (updated_at);
+
 create table if not exists wind_forecast_issues (
   spot_id text not null,
   source_id text not null,

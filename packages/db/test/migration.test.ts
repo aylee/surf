@@ -95,6 +95,15 @@ describe("D1 migration", () => {
     expect(normalizedSql).toContain("create index if not exists forecast_snapshots_spot_valid_at_idx on forecast_snapshots (spot_id, valid_at)");
     expect(normalizedSql).toContain("create index if not exists forecast_snapshots_captured_at_idx on forecast_snapshots (captured_at)");
     expect(normalizedSql).toContain("create index if not exists wind_forecast_issues_captured_at_idx on wind_forecast_issues (captured_at)");
+    expect(normalizedSql).toContain("create index if not exists source_runs_started_at_idx on source_runs (started_at)");
+    expect(normalizedSql).toContain("create index if not exists source_artifacts_created_at_idx on source_artifacts (created_at)");
+    expect(normalizedSql).toContain("create index if not exists wave_forecasts_forecast_at_idx on wave_forecasts (forecast_at)");
+    expect(normalizedSql).toContain("create index if not exists tide_forecasts_forecast_at_idx on tide_forecasts (forecast_at)");
+    expect(normalizedSql).toContain("create index if not exists wind_forecasts_forecast_at_idx on wind_forecasts (forecast_at)");
+    expect(normalizedSql).toContain("create index if not exists wave_observations_observed_at_idx on wave_observations (observed_at)");
+    expect(normalizedSql).toContain("create index if not exists tide_observations_observed_at_idx on tide_observations (observed_at)");
+    expect(normalizedSql).toContain("create index if not exists wind_observations_observed_at_idx on wind_observations (observed_at)");
+    expect(normalizedSql).toContain("create index if not exists hazard_events_updated_at_idx on hazard_events (updated_at)");
   });
 
   it("adds forecast history without altering or dropping the live read-model tables", () => {

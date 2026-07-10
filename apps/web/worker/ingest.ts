@@ -91,6 +91,7 @@ const NDBC_REALTIME_STATIONS = ["46237", "46026", "46013", "46012"];
 const DEFAULT_RAW_CAPTURE_LIMIT_BYTES = 2 * 1024 * 1024;
 const CDIP_RAW_CAPTURE_LIMIT_BYTES = 64 * 1024;
 export const FORECAST_HISTORY_RETENTION_DAYS = 400;
+export const OPERATIONAL_FORECAST_RETENTION_DAYS = 2;
 
 export function shouldCaptureForecastHistory(kind: IngestKind, requestedAt: string): boolean {
   if (kind === "manual-ingest") return true;
@@ -1009,25 +1010,121 @@ async function persistIssuedForecasts(
   return { rowsWritten, errors };
 }
 
-async function pruneForecastHistory(db: D1Database, now: Date): Promise<PersistenceResult> {
+export async function pruneRetainedData(
+  db: D1Database,
+  now: Date
+): Promise<PersistenceResult> {
   if (typeof db.prepare !== "function") {
-    return { rowsWritten: 0, errors: ["D1 binding does not expose prepare() for history retention."] };
+    return { rowsWritten: 0, errors: ["D1 binding does not expose prepare() for retention."] };
   }
-  const cutoff = new Date(
+  const historyCutoff = new Date(
     now.getTime() - FORECAST_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000
+  ).toISOString();
+  const operationalCutoff = new Date(
+    now.getTime() - OPERATIONAL_FORECAST_RETENTION_DAYS * 24 * 60 * 60 * 1000
   ).toISOString();
   return runPendingStatements(db, [
     {
       label: "prune forecast_snapshots",
-      statement: db.prepare("delete from forecast_snapshots where captured_at < ?").bind(cutoff)
+      statement: db
+        .prepare("delete from forecast_snapshots where captured_at < ?")
+        .bind(historyCutoff)
     },
     {
       label: "prune forecast_issues",
-      statement: db.prepare("delete from forecast_issues where captured_at < ?").bind(cutoff)
+      statement: db
+        .prepare("delete from forecast_issues where captured_at < ?")
+        .bind(historyCutoff)
     },
     {
       label: "prune wind_forecast_issues",
-      statement: db.prepare("delete from wind_forecast_issues where captured_at < ?").bind(cutoff)
+      statement: db
+        .prepare("delete from wind_forecast_issues where captured_at < ?")
+        .bind(historyCutoff)
+    },
+    {
+      label: "prune wave_forecasts",
+      statement: db
+        .prepare("delete from wave_forecasts where forecast_at < ?")
+        .bind(operationalCutoff)
+    },
+    {
+      label: "prune tide_forecasts",
+      statement: db
+        .prepare("delete from tide_forecasts where forecast_at < ?")
+        .bind(operationalCutoff)
+    },
+    {
+      label: "prune wind_forecasts",
+      statement: db
+        .prepare("delete from wind_forecasts where forecast_at < ?")
+        .bind(operationalCutoff)
+    },
+    {
+      label: "prune wave_observations",
+      statement: db
+        .prepare("delete from wave_observations where observed_at < ?")
+        .bind(historyCutoff)
+    },
+    {
+      label: "prune tide_observations",
+      statement: db
+        .prepare("delete from tide_observations where observed_at < ?")
+        .bind(historyCutoff)
+    },
+    {
+      label: "prune wind_observations",
+      statement: db
+        .prepare("delete from wind_observations where observed_at < ?")
+        .bind(historyCutoff)
+    },
+    {
+      label: "prune hazard_events",
+      statement: db
+        .prepare("delete from hazard_events where updated_at < ?")
+        .bind(historyCutoff)
+    },
+    {
+      label: "prune spot_scores",
+      statement: db
+        .prepare("delete from spot_scores where computed_at < ?")
+        .bind(historyCutoff)
+    },
+    {
+      label: "prune forecast_configs",
+      statement: db.prepare(
+        `delete from forecast_configs
+         where not exists (
+           select 1 from forecast_issues
+           where forecast_issues.spot_id = forecast_configs.spot_id
+             and forecast_issues.spot_config_hash = forecast_configs.config_hash
+         )`
+      ).bind()
+    },
+    {
+      label: "prune source_artifacts",
+      statement: db
+        .prepare("delete from source_artifacts where created_at < ?")
+        .bind(historyCutoff)
+    },
+    {
+      label: "prune source_runs",
+      statement: db
+        .prepare(
+          `delete from source_runs
+           where started_at < ?
+             and not exists (select 1 from source_artifacts where source_run_id = source_runs.id)
+             and not exists (select 1 from wave_forecasts where source_run_id = source_runs.id)
+             and not exists (select 1 from tide_forecasts where source_run_id = source_runs.id)
+             and not exists (select 1 from wind_forecasts where source_run_id = source_runs.id)
+             and not exists (select 1 from wind_forecast_issues where source_run_id = source_runs.id)
+             and not exists (select 1 from wave_observations where source_run_id = source_runs.id)
+             and not exists (select 1 from tide_observations where source_run_id = source_runs.id)
+             and not exists (select 1 from wind_observations where source_run_id = source_runs.id)
+             and not exists (select 1 from hazard_events where source_run_id = source_runs.id)
+             and not exists (select 1 from spot_scores where computed_from_run_id = source_runs.id)`
+        )
+        .bind(historyCutoff)
     }
   ]);
 }
@@ -1191,7 +1288,7 @@ export async function runNorcalIngest(
     ? await persistIssuedForecasts(env, now, completedAt, sourceIssueFingerprint)
     : { rowsWritten: 0, errors: [] };
   const retentionPersistence = captureHistory
-    ? await pruneForecastHistory(env.DB, now)
+    ? await pruneRetainedData(env.DB, now)
     : { rowsWritten: 0, errors: [] };
 
   const dbErrors = finalizedRuns.flatMap((run) => (run.recorded ? [] : [`${run.sourceId}: ${run.error}`]));
