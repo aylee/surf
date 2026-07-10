@@ -1,0 +1,272 @@
+{
+  "schemaVersion": 1,
+  "evaluatedDate": "2026-07-09",
+  "purpose": "Pin the object selections, mappings, options, and published summaries behind docs/accuracy-evaluation.md.",
+  "reproducibility": {
+    "status": "object-selection-pinned-not-byte-reproducible",
+    "limitations": [
+      "The original exploratory NDFD run used 06:00 UTC anchors and selected the nearest WMO object, so its YKUZ98 objects issued at 06:07 were not strict as-of selections at the anchor time.",
+      "The strictAsOf timestamp for each cycle is after both selected objects were available and selects the same pinned keys under the current no-lookahead archive selector.",
+      "NDFD keys, S3 ETags, and sizes are pinned here; S3 ETags are not asserted to be SHA-256 digests.",
+      "The exact CDIP MOP nowcast response bytes were not retained or checksummed, so the published metrics cannot be reproduced byte-for-byte from repository artifacts alone.",
+      "CDIP MOP nowcast is a buoy-driven modeled nearshore proxy, not an observed breaking-wave-face label."
+    ]
+  },
+  "ndfdToMop": {
+    "products": [
+      "YKUZ98_KWBN",
+      "YKUZ97_KWBN"
+    ],
+    "archive": "s3://noaa-ndfd-pds",
+    "waveVariable": "shww",
+    "gridSelection": "nearest finite coordinate within the per-mapping distance guard",
+    "options": {
+      "trainCutoff": "2025-07-01T00:00:00Z",
+      "matchToleranceMinutes": 31,
+      "allowFutureObservations": true,
+      "waveHeightToleranceM": 0.15,
+      "maxCycleAgeHours": 12,
+      "maxObjectBytes": 25000000,
+      "maxMopRecords": 50000,
+      "networkTimeoutSeconds": 30,
+      "fittedScalar": "dot(raw_height_m, mop_height_m) / dot(raw_height_m, raw_height_m)",
+      "bootstrap": {
+        "seed": 20260709,
+        "resamples": 2000,
+        "cluster": "issue date"
+      }
+    },
+    "mappings": [
+      {
+        "spotId": "obsf-north",
+        "targetLat": 37.782,
+        "targetLon": -122.514,
+        "mopPointId": "SF043",
+        "mopNowcastUrl": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SF043_nowcast.nc",
+        "evaluationScale": 1.0,
+        "maxGridDistanceKm": 5.0
+      },
+      {
+        "spotId": "obsf-central",
+        "targetLat": 37.759,
+        "targetLon": -122.53,
+        "mopPointId": "SF029",
+        "mopNowcastUrl": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SF029_nowcast.nc",
+        "evaluationScale": 1.0,
+        "maxGridDistanceKm": 5.0
+      },
+      {
+        "spotId": "obsf-south",
+        "targetLat": 37.735,
+        "targetLon": -122.53,
+        "mopPointId": "SF015",
+        "mopNowcastUrl": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SF015_nowcast.nc",
+        "evaluationScale": 1.0,
+        "maxGridDistanceKm": 5.0
+      },
+      {
+        "spotId": "linda-mar",
+        "targetLat": 37.594,
+        "targetLon": -122.53,
+        "mopPointId": "SM371",
+        "mopNowcastUrl": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SM371_nowcast.nc",
+        "evaluationScale": 0.6,
+        "maxGridDistanceKm": 5.0
+      },
+      {
+        "spotId": "stinson",
+        "targetLat": 37.899,
+        "targetLon": -122.644,
+        "mopPointId": "MA122",
+        "mopNowcastUrl": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/MA122_nowcast.nc",
+        "evaluationScale": 0.55,
+        "maxGridDistanceKm": 5.0
+      }
+    ],
+    "cycles": [
+      {
+        "anchor": "2025-04-01T06:00:00Z",
+        "strictAsOf": "2025-04-01T06:10:20Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-04-01T06:07:00Z","key":"wmo/waveh/2025/04/01/YKUZ98_KWBN_202504010607","etag":"f1daff1298ca80736af5fc4954e79b11","sizeBytes":11847768},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-04-01T05:33:00Z","key":"wmo/waveh/2025/04/01/YKUZ97_KWBN_202504010533","etag":"f7de514d571909d7146d2dc27b7f3cc4","sizeBytes":2962705}
+        ]
+      },
+      {
+        "anchor": "2025-04-15T06:00:00Z",
+        "strictAsOf": "2025-04-15T06:13:41Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-04-15T06:07:00Z","key":"wmo/waveh/2025/04/15/YKUZ98_KWBN_202504150607","etag":"af2948279e67cb26f2aa0afb68bab6d5","sizeBytes":11488046},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-04-15T05:33:00Z","key":"wmo/waveh/2025/04/15/YKUZ97_KWBN_202504150533","etag":"67edfc5673aab6246d6eb60d1b88ddf5","sizeBytes":2987591}
+        ]
+      },
+      {
+        "anchor": "2025-05-01T06:00:00Z",
+        "strictAsOf": "2025-05-01T06:09:08Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-05-01T06:07:00Z","key":"wmo/waveh/2025/05/01/YKUZ98_KWBN_202505010607","etag":"dee13c264b7dec575b42633f5f76ca64","sizeBytes":10682616},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-05-01T05:33:00Z","key":"wmo/waveh/2025/05/01/YKUZ97_KWBN_202505010533","etag":"2d6df2cc951eff03ad95d341b15258de","sizeBytes":2923269}
+        ]
+      },
+      {
+        "anchor": "2025-05-15T06:00:00Z",
+        "strictAsOf": "2025-05-15T06:12:36Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-05-15T06:07:00Z","key":"wmo/waveh/2025/05/15/YKUZ98_KWBN_202505150607","etag":"5f754f8b74f92dc94ccf275fdf9ae747","sizeBytes":10828464},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-05-15T05:33:00Z","key":"wmo/waveh/2025/05/15/YKUZ97_KWBN_202505150533","etag":"69f3a24f1e6f652fa097ef4a11498493","sizeBytes":2896942}
+        ]
+      },
+      {
+        "anchor": "2025-06-01T06:00:00Z",
+        "strictAsOf": "2025-06-01T06:12:48Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-06-01T06:07:00Z","key":"wmo/waveh/2025/06/01/YKUZ98_KWBN_202506010607","etag":"9e202edf8f19de1de08bc37f4e6011af","sizeBytes":11175999},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-06-01T05:33:00Z","key":"wmo/waveh/2025/06/01/YKUZ97_KWBN_202506010533","etag":"0f0a8105b39daf3480d80e8a71d82449","sizeBytes":2816648}
+        ]
+      },
+      {
+        "anchor": "2025-06-15T06:00:00Z",
+        "strictAsOf": "2025-06-15T06:08:38Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-06-15T06:07:00Z","key":"wmo/waveh/2025/06/15/YKUZ98_KWBN_202506150607","etag":"15ca535c1ddd132bedfd0fdc2923c80a","sizeBytes":10451378},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-06-15T05:33:00Z","key":"wmo/waveh/2025/06/15/YKUZ97_KWBN_202506150533","etag":"ab036b2ee1bef3b4fc714d5ac26f4fa0","sizeBytes":2847028}
+        ]
+      },
+      {
+        "anchor": "2025-07-01T06:00:00Z",
+        "strictAsOf": "2025-07-01T06:13:29Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-07-01T06:07:00Z","key":"wmo/waveh/2025/07/01/YKUZ98_KWBN_202507010607","etag":"ae2f7d8efe4be35325b8f8ecb0b8361d","sizeBytes":10899027},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-07-01T05:33:00Z","key":"wmo/waveh/2025/07/01/YKUZ97_KWBN_202507010533","etag":"10355f143701cd90baa4d839bffb174a","sizeBytes":2673955}
+        ]
+      },
+      {
+        "anchor": "2025-07-15T06:00:00Z",
+        "strictAsOf": "2025-07-15T06:11:18Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-07-15T06:07:00Z","key":"wmo/waveh/2025/07/15/YKUZ98_KWBN_202507150607","etag":"8dc64e1f5e7b96b87f31980c759d9f53","sizeBytes":10438274},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-07-15T05:33:00Z","key":"wmo/waveh/2025/07/15/YKUZ97_KWBN_202507150533","etag":"2fd79986f599221810228be11764ff05","sizeBytes":2601322}
+        ]
+      },
+      {
+        "anchor": "2025-08-01T06:00:00Z",
+        "strictAsOf": "2025-08-01T06:09:33Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-08-01T06:07:00Z","key":"wmo/waveh/2025/08/01/YKUZ98_KWBN_202508010607","etag":"5548174d5ca86a9827fd568a05deb90c","sizeBytes":10469518},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-08-01T05:33:00Z","key":"wmo/waveh/2025/08/01/YKUZ97_KWBN_202508010533","etag":"12a3c30c13be72793168e6427d737bce","sizeBytes":2656664}
+        ]
+      },
+      {
+        "anchor": "2025-08-15T06:00:00Z",
+        "strictAsOf": "2025-08-15T06:11:36Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-08-15T06:07:00Z","key":"wmo/waveh/2025/08/15/YKUZ98_KWBN_202508150607","etag":"99c694a576ff72810b3838f45847bd24","sizeBytes":10354034},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-08-15T05:33:00Z","key":"wmo/waveh/2025/08/15/YKUZ97_KWBN_202508150533","etag":"a82e67c6ee8cc1a830d28ab8bc6627fd","sizeBytes":2868125}
+        ]
+      },
+      {
+        "anchor": "2025-09-01T06:00:00Z",
+        "strictAsOf": "2025-09-01T06:09:49Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-09-01T06:07:00Z","key":"wmo/waveh/2025/09/01/YKUZ98_KWBN_202509010607","etag":"dd9550e778d86c5ec38c0b5833e280a9","sizeBytes":10454405},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-09-01T05:33:00Z","key":"wmo/waveh/2025/09/01/YKUZ97_KWBN_202509010533","etag":"c7bf4b4113072cf28f9aaf45f191ffcb","sizeBytes":2649024}
+        ]
+      },
+      {
+        "anchor": "2025-09-15T06:00:00Z",
+        "strictAsOf": "2025-09-15T06:13:20Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-09-15T06:07:00Z","key":"wmo/waveh/2025/09/15/YKUZ98_KWBN_202509150607","etag":"4cfd53af9661f5aab86f36f81ca7e809","sizeBytes":10546364},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-09-15T05:33:00Z","key":"wmo/waveh/2025/09/15/YKUZ97_KWBN_202509150533","etag":"9a0c869fa5fc7258522c9d572cfb28c4","sizeBytes":2622595}
+        ]
+      },
+      {
+        "anchor": "2025-10-01T06:00:00Z",
+        "strictAsOf": "2025-10-01T06:10:47Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-10-01T06:07:00Z","key":"wmo/waveh/2025/10/01/YKUZ98_KWBN_202510010607","etag":"d907e546d168db6bcc07437eac0e9304","sizeBytes":12486164},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-10-01T05:33:00Z","key":"wmo/waveh/2025/10/01/YKUZ97_KWBN_202510010533","etag":"bb5f2b64f9c0f40f261dd826195fb3bd","sizeBytes":2938630}
+        ]
+      },
+      {
+        "anchor": "2025-10-15T06:00:00Z",
+        "strictAsOf": "2025-10-15T06:14:24Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-10-15T06:07:00Z","key":"wmo/waveh/2025/10/15/YKUZ98_KWBN_202510150607","etag":"ca15bec91d4d7d862d07c70209db6367","sizeBytes":11296013},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-10-15T05:33:00Z","key":"wmo/waveh/2025/10/15/YKUZ97_KWBN_202510150533","etag":"b48ecd8c8173f34c4ba1cef22f2517a9","sizeBytes":3065722}
+        ]
+      },
+      {
+        "anchor": "2025-11-01T06:00:00Z",
+        "strictAsOf": "2025-11-01T06:10:17Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-11-01T06:07:00Z","key":"wmo/waveh/2025/11/01/YKUZ98_KWBN_202511010607","etag":"127f15032288080ded16f8e009861c09","sizeBytes":11970041},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-11-01T05:33:00Z","key":"wmo/waveh/2025/11/01/YKUZ97_KWBN_202511010533","etag":"60cbc1990d26581da1ca39faf5d189ff","sizeBytes":3130449}
+        ]
+      },
+      {
+        "anchor": "2025-11-15T06:00:00Z",
+        "strictAsOf": "2025-11-15T06:09:31Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-11-15T06:07:00Z","key":"wmo/waveh/2025/11/15/YKUZ98_KWBN_202511150607","etag":"27900d3ffa083e2dbc0ce659b0494baf","sizeBytes":11532363},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-11-15T05:34:00Z","key":"wmo/waveh/2025/11/15/YKUZ97_KWBN_202511150534","etag":"710364f3f9ac35706e1914f1f1a83630","sizeBytes":3007727}
+        ]
+      },
+      {
+        "anchor": "2025-12-01T06:00:00Z",
+        "strictAsOf": "2025-12-01T06:12:15Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-12-01T06:07:00Z","key":"wmo/waveh/2025/12/01/YKUZ98_KWBN_202512010607","etag":"eac047b98003b01725d38f4a6ab78b64","sizeBytes":11466463},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-12-01T05:34:00Z","key":"wmo/waveh/2025/12/01/YKUZ97_KWBN_202512010534","etag":"d0bc5e46a0afd0e00193c0c1cfb14ed1","sizeBytes":3020699}
+        ]
+      },
+      {
+        "anchor": "2025-12-15T06:00:00Z",
+        "strictAsOf": "2025-12-15T06:13:43Z",
+        "objects": [
+          {"product":"YKUZ98_KWBN","issuedAt":"2025-12-15T06:07:00Z","key":"wmo/waveh/2025/12/15/YKUZ98_KWBN_202512150607","etag":"4d9ea0d24d4bf81428812e61637518a4","sizeBytes":12540899},
+          {"product":"YKUZ97_KWBN","issuedAt":"2025-12-15T05:34:00Z","key":"wmo/waveh/2025/12/15/YKUZ97_KWBN_202512150534","etag":"41ec10a74dc32a9666fcb40c0c561f61","sizeBytes":3097217}
+        ]
+      }
+    ],
+    "publishedSummary": {
+      "pairs": 5195,
+      "issueCycles": 18,
+      "spots": 5,
+      "heightMaeM": 0.438,
+      "heightMaeFt": 1.44,
+      "heightBiasM": -0.402,
+      "within015MApproxFraction": 0.24,
+      "leadBuckets": [
+        {"minHours":0,"maxHours":24,"pairs":2160,"maeM":0.441,"maeFt":1.45,"biasM":-0.422},
+        {"minHours":24,"maxHours":48,"pairs":1440,"maeM":0.484,"maeFt":1.59,"biasM":-0.441},
+        {"minHours":48,"maxHours":72,"pairs":540,"maeM":0.429,"maeFt":1.41,"biasM":-0.365},
+        {"minHours":72,"maxHours":120,"pairs":705,"maeM":0.384,"maeFt":1.26,"biasM":-0.339},
+        {"minHours":120,"maxHours":145,"pairs":350,"maeM":0.364,"maeFt":1.19,"biasM":-0.309}
+      ]
+    }
+  },
+  "directMopForecastToNowcast": {
+    "modelCycle": "2026-07-07T00:00:00Z",
+    "lastVerifyingTime": "2026-07-10T03:00:00Z",
+    "matching": "exact valid-time join",
+    "forecastUrlTemplate": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/{point_id}_forecast.nc",
+    "nowcastUrlTemplate": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/{point_id}_nowcast.nc",
+    "variables": ["waveHs", "waveTp", "waveDp"],
+    "heightScale": 1.0,
+    "note": "All 130 comparisons used raw forecast Hs versus raw nowcast Hs. Production exposure scales were not applied to either side.",
+    "points": [
+      {"spotId":"obsf-north","pointId":"SF043","lat":37.7839,"lon":-122.51468,"waterDepthM":10.0,"shoreNormalDeg":305.41,"productionExposureScale":1.0,"pairs":26,"heightMaeM":0.055,"heightMaeFt":0.18,"heightBiasM":0.011,"periodMaeS":1.16,"directionMaeDeg":1.9},
+      {"spotId":"obsf-central","pointId":"SF029","lat":37.75892,"lon":-122.52074,"waterDepthM":10.01,"shoreNormalDeg":265.0,"productionExposureScale":1.0,"pairs":26,"heightMaeM":0.093,"heightMaeFt":0.31,"heightBiasM":-0.042,"periodMaeS":1.20,"directionMaeDeg":5.6},
+      {"spotId":"obsf-south","pointId":"SF015","lat":37.73442,"lon":-122.51637,"waterDepthM":10.01,"shoreNormalDeg":268.53,"productionExposureScale":1.0,"pairs":26,"heightMaeM":0.106,"heightMaeFt":0.35,"heightBiasM":-0.008,"periodMaeS":0.85,"directionMaeDeg":9.9},
+      {"spotId":"linda-mar","pointId":"SM371","lat":37.59555,"lon":-122.52342,"waterDepthM":15.01,"shoreNormalDeg":295.98,"productionExposureScale":0.6,"pairs":26,"heightMaeM":0.155,"heightMaeFt":0.51,"heightBiasM":-0.144,"periodMaeS":0.59,"directionMaeDeg":2.3},
+      {"spotId":"stinson","pointId":"MA122","lat":37.88907,"lon":-122.64715,"waterDepthM":15.0,"shoreNormalDeg":221.52,"productionExposureScale":1.0,"pairs":26,"heightMaeM":0.035,"heightMaeFt":0.11,"heightBiasM":-0.025,"periodMaeS":1.05,"directionMaeDeg":2.7}
+    ],
+    "publishedSummary": {
+      "pairs": 130,
+      "heightMaeM": 0.089,
+      "heightMaeFt": 0.29,
+      "heightBiasM": -0.042
+    }
+  }
+}

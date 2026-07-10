@@ -22,7 +22,7 @@ insert into spots (
     -122.514,
     'America/Los_Angeles',
     270,
-    '{"bestSwellDeg":{"minDeg":280,"maxDeg":310},"workableSwellDeg":{"minDeg":240,"maxDeg":330},"bestPeriodSec":{"min":11,"max":18},"bestTideFt":{"min":0.5,"max":4.5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":140},"maxGoodWindKt":8,"maxOkWindKt":15,"referenceBuoys":["46026","46013"],"tideStation":"9414290","notes":"Exposed SF beachbreak. Cold-start prior favors clean wind and moderate tides."}',
+    '{"bestSwellDeg":{"minDeg":280,"maxDeg":310},"workableSwellDeg":{"minDeg":240,"maxDeg":330},"bestPeriodSec":{"min":11,"max":18},"bestTideFt":{"min":0.5,"max":4.5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":140},"maxGoodWindKt":8,"maxOkWindKt":15,"referenceBuoys":["46237","46026","46013"],"tideStation":"9414290","notes":"Exposed SF beachbreak. Cold-start prior favors clean wind and moderate tides."}',
     1
   ),
   (
@@ -33,7 +33,7 @@ insert into spots (
     -122.51,
     'America/Los_Angeles',
     270,
-    '{"bestSwellDeg":{"minDeg":275,"maxDeg":310},"workableSwellDeg":{"minDeg":235,"maxDeg":330},"bestPeriodSec":{"min":10,"max":17},"bestTideFt":{"min":1,"max":5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":140},"maxGoodWindKt":8,"maxOkWindKt":15,"referenceBuoys":["46026","46013"],"tideStation":"9414290","notes":"Primary v1 OBSF reference spot."}',
+    '{"bestSwellDeg":{"minDeg":275,"maxDeg":310},"workableSwellDeg":{"minDeg":235,"maxDeg":330},"bestPeriodSec":{"min":10,"max":17},"bestTideFt":{"min":1,"max":5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":140},"maxGoodWindKt":8,"maxOkWindKt":15,"referenceBuoys":["46237","46026","46013"],"tideStation":"9414290","notes":"Primary v1 OBSF reference spot."}',
     1
   ),
   (
@@ -44,7 +44,7 @@ insert into spots (
     -122.506,
     'America/Los_Angeles',
     270,
-    '{"bestSwellDeg":{"minDeg":275,"maxDeg":315},"workableSwellDeg":{"minDeg":235,"maxDeg":335},"bestPeriodSec":{"min":10,"max":17},"bestTideFt":{"min":1,"max":5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":145},"maxGoodWindKt":8,"maxOkWindKt":15,"referenceBuoys":["46026","46013"],"tideStation":"9414290","notes":"Exposed beachbreak; needs local calibration for bars and tide sensitivity."}',
+    '{"bestSwellDeg":{"minDeg":275,"maxDeg":315},"workableSwellDeg":{"minDeg":235,"maxDeg":335},"bestPeriodSec":{"min":10,"max":17},"bestTideFt":{"min":1,"max":5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":145},"maxGoodWindKt":8,"maxOkWindKt":15,"referenceBuoys":["46237","46026","46013"],"tideStation":"9414290","notes":"Exposed beachbreak; needs local calibration for bars and tide sensitivity."}',
     1
   ),
   (
@@ -55,7 +55,7 @@ insert into spots (
     -122.506,
     'America/Los_Angeles',
     250,
-    '{"bestSwellDeg":{"minDeg":250,"maxDeg":295},"workableSwellDeg":{"minDeg":210,"maxDeg":320},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":0.5,"max":4},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":145},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46026","46012"],"tideStation":"9414131","notes":"Protected beginner-friendly beach; smaller swell windows matter."}',
+    '{"bestSwellDeg":{"minDeg":250,"maxDeg":295},"workableSwellDeg":{"minDeg":210,"maxDeg":320},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":0.5,"max":4},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":145},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46012","46237","46026"],"tideStation":"9414131","notes":"Protected beginner-friendly beach; smaller swell windows matter."}',
     1
   ),
   (
@@ -66,18 +66,18 @@ insert into spots (
     -122.644,
     'America/Los_Angeles',
     225,
-    '{"bestSwellDeg":{"minDeg":210,"maxDeg":285},"workableSwellDeg":{"minDeg":190,"maxDeg":310},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":1,"max":5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":135},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46026","46013"],"tideStation":"9414958","notes":"More sheltered than OBSF; local transform and tide calibration needed."}',
+    '{"bestSwellDeg":{"minDeg":210,"maxDeg":285},"workableSwellDeg":{"minDeg":190,"maxDeg":310},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":1,"max":5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":135},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46237","46013","46026"],"tideStation":"9414958","notes":"More sheltered than OBSF; local transform and tide calibration needed."}',
     1
   ),
   (
     'bolinas',
-    'Bolinas',
+    'Bolinas — Wharf/Brighton',
     'norcal',
     37.909,
     -122.687,
     'America/Los_Angeles',
     215,
-    '{"bestSwellDeg":{"minDeg":210,"maxDeg":285},"workableSwellDeg":{"minDeg":190,"maxDeg":310},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":0.5,"max":4.5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":135},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46026","46013"],"tideStation":"9414958","notes":"Sheltered longboard-friendly option; exact source mapping is a v1 task."}',
+    '{"bestSwellDeg":{"minDeg":210,"maxDeg":285},"workableSwellDeg":{"minDeg":190,"maxDeg":310},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":0.5,"max":4.5},"offshoreWindFromDeg":{"minDeg":270,"maxDeg":20},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46237","46013","46026"],"tideStation":"9414958","notes":"Regional Wharf/Brighton-facing Bolinas report; NW/WNW is offshore. Height remains low-confidence without a direct nearshore source."}',
     1
   )
 on conflict(id) do update set
@@ -134,6 +134,51 @@ insert into sources (
     360,
     0,
     '{"coverage_status":"unmapped","notes":"Placeholder source so every v1 spot records explicit nearshore coverage state."}'
+  ),
+  (
+    'cdip:mop-forecast',
+    'CDIP MOP public per-point nearshore forecast',
+    'forecast_wave_nearshore',
+    'CDIP/MOP',
+    'MOP_alongshore',
+    'https://thredds.cdip.ucsd.edu/thredds/catalog/cdip/model/MOP_alongshore/catalog.html',
+    'opendap_ascii',
+    'worker',
+    'Coastal Data Information Program MOP modeled wave forecasts',
+    'Public CDIP model output. Retain point ID, raw Hs, depth, Last-Modified source update, deterministic transform inputs, and the distinction from observed surf-face truth.',
+    180,
+    1,
+    '{"adapter":"fetchCdipMopForecastsForSpots","variables":["waveTime","waveHs","waveTp","waveDp","waveDm"],"sourceTimestampSemantics":"http_last_modified_source_update_not_model_cycle","heightSemantics":"modeled_significant_wave_height_not_breaking_face_height","experimentalTransform":"bulk-hs-linear-shoaling-v1","experimentalTransformAffectsDisplay":false,"breakerIndex":0.78}'
+  ),
+  (
+    'ndbc:realtime2-standard-meteorological',
+    'NDBC realtime wave observation adapter',
+    'observed_wave',
+    'NOAA/NDBC',
+    'realtime2',
+    'https://www.ndbc.noaa.gov/data/realtime2/',
+    'ndbc_text',
+    'worker',
+    'NOAA National Data Buoy Center realtime2 observations',
+    'Public NOAA/NDBC observations; retain station and observation time.',
+    30,
+    1,
+    '{"adapter":"fetchNdbcRealtimeObservationsForStations","stations":["46237","46026","46013","46012"]}'
+  ),
+  (
+    'ndbc-46237',
+    'NDBC 46237 San Francisco Bar buoy',
+    'observed_wave',
+    'NOAA/NDBC',
+    '46237',
+    'https://www.ndbc.noaa.gov/station_page.php?station=46237',
+    'ndbc_text',
+    'worker',
+    'NOAA/NDBC Station 46237 / CDIP 142',
+    'Public NOAA/NDBC observations; retain station attribution.',
+    30,
+    1,
+    '{"station":"46237","cdipStation":"142","notes":"Nearshore San Francisco Bar reference used by the v1 surf nowcast."}'
   ),
   (
     'ndbc-46026',
@@ -241,6 +286,21 @@ insert into sources (
     '{"adapter":"fetchCoopsTidePredictionsForSpots","stations":["9414290","9414131","9414958"]}'
   ),
   (
+    'nws:mtr-grid-wave',
+    'NWS MTR coastal marine grid wave forecast',
+    'forecast_wave_nearshore',
+    'NOAA/NWS MTR',
+    'MTR-grid-wave',
+    'https://api.weather.gov/gridpoints/MTR/',
+    'geojson',
+    'worker',
+    'NOAA/NWS MTR raw 2.5 km coastal marine grid forecast',
+    'Public National Weather Service forecast data; retain source grid, model update time, and derivation.',
+    60,
+    1,
+    '{"adapter":"fetchNwsGridWaveForSpots","fields":["waveHeight","wavePeriod","wavePeriod2","primarySwellHeight","primarySwellDirection","secondarySwellHeight","secondarySwellDirection","windWaveHeight"],"derivation":"raw significant height multiplied by explicit per-spot cold-start scale"}'
+  ),
+  (
     'nws-grid-norcal',
     'NWS NorCal grid forecast points',
     'wind',
@@ -311,52 +371,64 @@ insert into spot_source_map (
   metadata_json
 ) values
   ('obsf-north', 'noaa-gfswave-norcal', 'forecast_wave_offshore', null, 1.0, 10, 'active', 'Shared offshore model source for NorCal v1.', '{"mapping":"regional"}'),
-  ('obsf-north', 'cdip-mop-norcal-unmapped', 'forecast_wave_nearshore', null, 0.0, 90, 'unmapped', 'CDIP/MOP coverage still needs live verification.', '{"mapping":"pending"}'),
+  ('obsf-north', 'cdip:mop-forecast', 'forecast_wave_nearshore', 0.0, 1.0, 1, 'active', 'Direct SF043 modeled Hs at 10 m; not breaking-wave face height.', '{"pointId":"SF043","lat":37.7839,"lon":-122.51468,"waterDepthM":10.0,"shoreNormalDeg":305.41,"nearshoreHeightScale":1.0,"relationship":"direct_nearshore_point"}'),
+  ('obsf-north', 'ndbc-46237', 'observed_wave', null, 1.0, 5, 'active', 'San Francisco Bar nearshore reference.', '{"station":"46237","cdipStation":"142"}'),
   ('obsf-north', 'ndbc-46026', 'observed_wave', null, 1.0, 10, 'active', 'Primary buoy from current spot registry.', '{"station":"46026"}'),
   ('obsf-north', 'ndbc-46013', 'observed_wave', null, 0.5, 20, 'active', 'Secondary buoy from current spot registry.', '{"station":"46013"}'),
   ('obsf-north', 'coops-9414290', 'tide', null, 1.0, 10, 'active', 'Current v1 tide station.', '{"station":"9414290","datum":"MLLW"}'),
   ('obsf-north', 'nws-grid-norcal', 'wind', null, 1.0, 10, 'active', 'Resolve exact NWS grid point during adapter ingest.', '{"mapping":"point-resolution-required"}'),
   ('obsf-north', 'nws-alerts-norcal', 'hazard', null, 1.0, 10, 'active', 'Resolve exact NWS alert zones during adapter ingest.', '{"mapping":"zone-resolution-required"}'),
+  ('obsf-north', 'nws:mtr-grid-wave', 'forecast_wave_nearshore', null, 1.0, 5, 'active', 'Verified MTR 81,106 PZZ545 coastal grid; breaking-height scale 1.00.', '{"office":"MTR","gridX":81,"gridY":106,"lookup":{"lat":37.782,"lon":-122.514},"breakingHeightScale":1.0}'),
 
   ('obsf-central', 'noaa-gfswave-norcal', 'forecast_wave_offshore', null, 1.0, 10, 'active', 'Shared offshore model source for NorCal v1.', '{"mapping":"regional"}'),
-  ('obsf-central', 'cdip-mop-norcal-unmapped', 'forecast_wave_nearshore', null, 0.0, 90, 'unmapped', 'CDIP/MOP coverage still needs live verification.', '{"mapping":"pending"}'),
+  ('obsf-central', 'cdip:mop-forecast', 'forecast_wave_nearshore', 0.0, 1.0, 1, 'active', 'Direct SF029 modeled Hs at 10.01 m; not breaking-wave face height.', '{"pointId":"SF029","lat":37.75892,"lon":-122.52074,"waterDepthM":10.01,"shoreNormalDeg":265.0,"nearshoreHeightScale":1.0,"relationship":"direct_nearshore_point"}'),
+  ('obsf-central', 'ndbc-46237', 'observed_wave', null, 1.0, 5, 'active', 'San Francisco Bar nearshore reference.', '{"station":"46237","cdipStation":"142"}'),
   ('obsf-central', 'ndbc-46026', 'observed_wave', null, 1.0, 10, 'active', 'Primary buoy from current spot registry.', '{"station":"46026"}'),
   ('obsf-central', 'ndbc-46013', 'observed_wave', null, 0.5, 20, 'active', 'Secondary buoy from current spot registry.', '{"station":"46013"}'),
   ('obsf-central', 'coops-9414290', 'tide', null, 1.0, 10, 'active', 'Current v1 tide station.', '{"station":"9414290","datum":"MLLW"}'),
   ('obsf-central', 'nws-grid-norcal', 'wind', null, 1.0, 10, 'active', 'Resolve exact NWS grid point during adapter ingest.', '{"mapping":"point-resolution-required"}'),
   ('obsf-central', 'nws-alerts-norcal', 'hazard', null, 1.0, 10, 'active', 'Resolve exact NWS alert zones during adapter ingest.', '{"mapping":"zone-resolution-required"}'),
+  ('obsf-central', 'nws:mtr-grid-wave', 'forecast_wave_nearshore', null, 1.0, 5, 'active', 'Verified MTR 81,105 through adjacent PZZ545 lookup; breaking-height scale 1.00.', '{"office":"MTR","gridX":81,"gridY":105,"lookup":{"lat":37.759,"lon":-122.53},"breakingHeightScale":1.0}'),
 
   ('obsf-south', 'noaa-gfswave-norcal', 'forecast_wave_offshore', null, 1.0, 10, 'active', 'Shared offshore model source for NorCal v1.', '{"mapping":"regional"}'),
-  ('obsf-south', 'cdip-mop-norcal-unmapped', 'forecast_wave_nearshore', null, 0.0, 90, 'unmapped', 'CDIP/MOP coverage still needs live verification.', '{"mapping":"pending"}'),
+  ('obsf-south', 'cdip:mop-forecast', 'forecast_wave_nearshore', 0.0, 1.0, 1, 'active', 'Direct SF015 modeled Hs at 10.01 m; not breaking-wave face height.', '{"pointId":"SF015","lat":37.73442,"lon":-122.51637,"waterDepthM":10.01,"shoreNormalDeg":268.53,"nearshoreHeightScale":1.0,"relationship":"direct_nearshore_point"}'),
+  ('obsf-south', 'ndbc-46237', 'observed_wave', null, 1.0, 5, 'active', 'San Francisco Bar nearshore reference.', '{"station":"46237","cdipStation":"142"}'),
   ('obsf-south', 'ndbc-46026', 'observed_wave', null, 1.0, 10, 'active', 'Primary buoy from current spot registry.', '{"station":"46026"}'),
   ('obsf-south', 'ndbc-46013', 'observed_wave', null, 0.5, 20, 'active', 'Secondary buoy from current spot registry.', '{"station":"46013"}'),
   ('obsf-south', 'coops-9414290', 'tide', null, 1.0, 10, 'active', 'Current v1 tide station.', '{"station":"9414290","datum":"MLLW"}'),
   ('obsf-south', 'nws-grid-norcal', 'wind', null, 1.0, 10, 'active', 'Resolve exact NWS grid point during adapter ingest.', '{"mapping":"point-resolution-required"}'),
   ('obsf-south', 'nws-alerts-norcal', 'hazard', null, 1.0, 10, 'active', 'Resolve exact NWS alert zones during adapter ingest.', '{"mapping":"zone-resolution-required"}'),
+  ('obsf-south', 'nws:mtr-grid-wave', 'forecast_wave_nearshore', null, 1.0, 5, 'active', 'Verified adjacent MTR 80,104 PZZ545 marine grid; breaking-height scale 1.00.', '{"office":"MTR","gridX":80,"gridY":104,"lookup":{"lat":37.735,"lon":-122.53},"breakingHeightScale":1.0}'),
 
   ('linda-mar', 'noaa-gfswave-norcal', 'forecast_wave_offshore', null, 1.0, 10, 'active', 'Shared offshore model source for NorCal v1.', '{"mapping":"regional"}'),
-  ('linda-mar', 'cdip-mop-norcal-unmapped', 'forecast_wave_nearshore', null, 0.0, 90, 'unmapped', 'CDIP/MOP coverage still needs live verification.', '{"mapping":"pending"}'),
+  ('linda-mar', 'cdip:mop-forecast', 'forecast_wave_nearshore', null, 1.0, 1, 'active', 'SM371 is a 15.01 m approach proxy outside the cove; preserve the explicit 0.60 final cove scale and caveat.', '{"pointId":"SM371","lat":37.59555,"lon":-122.52342,"waterDepthM":15.01,"shoreNormalDeg":295.98,"nearshoreHeightScale":0.6,"relationship":"outside_cove_approach_proxy"}'),
+  ('linda-mar', 'ndbc-46237', 'observed_wave', null, 0.7, 15, 'active', 'San Francisco Bar secondary nearshore reference.', '{"station":"46237","cdipStation":"142"}'),
   ('linda-mar', 'ndbc-46026', 'observed_wave', null, 0.8, 10, 'active', 'Primary registry buoy for Linda Mar.', '{"station":"46026"}'),
   ('linda-mar', 'ndbc-46012', 'observed_wave', null, 0.6, 20, 'active', 'Secondary southern reference buoy for Linda Mar.', '{"station":"46012"}'),
   ('linda-mar', 'coops-9414131', 'tide', null, 1.0, 10, 'active', 'Current v1 tide station.', '{"station":"9414131","datum":"MLLW"}'),
   ('linda-mar', 'nws-grid-norcal', 'wind', null, 1.0, 10, 'active', 'Resolve exact NWS grid point during adapter ingest.', '{"mapping":"point-resolution-required"}'),
   ('linda-mar', 'nws-alerts-norcal', 'hazard', null, 1.0, 10, 'active', 'Resolve exact NWS alert zones during adapter ingest.', '{"mapping":"zone-resolution-required"}'),
+  ('linda-mar', 'nws:mtr-grid-wave', 'forecast_wave_nearshore', null, 1.0, 5, 'active', 'Verified adjacent MTR 79,98 PZZ545 marine grid; breaking-height scale 0.60.', '{"office":"MTR","gridX":79,"gridY":98,"lookup":{"lat":37.594,"lon":-122.53},"breakingHeightScale":0.6}'),
 
   ('stinson', 'noaa-gfswave-norcal', 'forecast_wave_offshore', null, 1.0, 10, 'active', 'Shared offshore model source for NorCal v1.', '{"mapping":"regional"}'),
-  ('stinson', 'cdip-mop-norcal-unmapped', 'forecast_wave_nearshore', null, 0.0, 90, 'unmapped', 'CDIP/MOP coverage still needs live verification.', '{"mapping":"pending"}'),
+  ('stinson', 'cdip:mop-forecast', 'forecast_wave_nearshore', null, 1.0, 1, 'active', 'Direct MA122 modeled Hs at 15 m; not breaking-wave face height.', '{"pointId":"MA122","lat":37.88907,"lon":-122.64715,"waterDepthM":15.0,"shoreNormalDeg":221.52,"nearshoreHeightScale":1.0,"relationship":"direct_nearshore_point"}'),
+  ('stinson', 'ndbc-46237', 'observed_wave', null, 1.0, 5, 'active', 'San Francisco Bar nearshore reference.', '{"station":"46237","cdipStation":"142"}'),
   ('stinson', 'ndbc-46026', 'observed_wave', null, 0.8, 10, 'active', 'Primary registry buoy for Stinson.', '{"station":"46026"}'),
   ('stinson', 'ndbc-46013', 'observed_wave', null, 0.6, 20, 'active', 'Secondary registry buoy for Stinson.', '{"station":"46013"}'),
   ('stinson', 'coops-9414958', 'tide', null, 1.0, 10, 'active', 'Current v1 tide station.', '{"station":"9414958","datum":"MLLW"}'),
   ('stinson', 'nws-grid-norcal', 'wind', null, 1.0, 10, 'active', 'Resolve exact NWS grid point during adapter ingest.', '{"mapping":"point-resolution-required"}'),
   ('stinson', 'nws-alerts-norcal', 'hazard', null, 1.0, 10, 'active', 'Resolve exact NWS alert zones during adapter ingest.', '{"mapping":"zone-resolution-required"}'),
+  ('stinson', 'nws:mtr-grid-wave', 'forecast_wave_nearshore', null, 1.0, 5, 'active', 'Verified MTR 78,112 PZZ545 coastal grid; breaking-height scale 0.55.', '{"office":"MTR","gridX":78,"gridY":112,"lookup":{"lat":37.899,"lon":-122.644},"breakingHeightScale":0.55}'),
 
   ('bolinas', 'noaa-gfswave-norcal', 'forecast_wave_offshore', null, 1.0, 10, 'active', 'Shared offshore model source for NorCal v1.', '{"mapping":"regional"}'),
-  ('bolinas', 'cdip-mop-norcal-unmapped', 'forecast_wave_nearshore', null, 0.0, 90, 'unmapped', 'CDIP/MOP coverage still needs live verification.', '{"mapping":"pending"}'),
+  ('bolinas', 'cdip-mop-norcal-unmapped', 'forecast_wave_nearshore', null, 0.0, 90, 'unmapped', 'No safe direct CDIP MOP point; keep Bolinas uncalibrated on the NWS fallback.', '{"mapping":"absent","reason":"no_safe_direct_mop_point"}'),
+  ('bolinas', 'ndbc-46237', 'observed_wave', null, 1.0, 5, 'active', 'San Francisco Bar nearshore reference.', '{"station":"46237","cdipStation":"142"}'),
   ('bolinas', 'ndbc-46026', 'observed_wave', null, 0.8, 10, 'active', 'Primary registry buoy for Bolinas.', '{"station":"46026"}'),
   ('bolinas', 'ndbc-46013', 'observed_wave', null, 0.6, 20, 'active', 'Secondary registry buoy for Bolinas.', '{"station":"46013"}'),
   ('bolinas', 'coops-9414958', 'tide', null, 1.0, 10, 'active', 'Current v1 tide station.', '{"station":"9414958","datum":"MLLW"}'),
   ('bolinas', 'nws-grid-norcal', 'wind', null, 1.0, 10, 'active', 'Resolve exact NWS grid point during adapter ingest.', '{"mapping":"point-resolution-required"}'),
-  ('bolinas', 'nws-alerts-norcal', 'hazard', null, 1.0, 10, 'active', 'Resolve exact NWS alert zones during adapter ingest.', '{"mapping":"zone-resolution-required"}')
+  ('bolinas', 'nws-alerts-norcal', 'hazard', null, 1.0, 10, 'active', 'Resolve exact NWS alert zones during adapter ingest.', '{"mapping":"zone-resolution-required"}'),
+  ('bolinas', 'nws:mtr-grid-wave', 'forecast_wave_nearshore', null, 1.0, 5, 'active', 'Verified MTR 75,113 PZZ545 marine grid; land cells returned all-zero wave layers. Breaking-height scale 0.65.', '{"office":"MTR","gridX":75,"gridY":113,"lookup":{"lat":37.909,"lon":-122.73},"breakingHeightScale":0.65}')
 on conflict(spot_id, source_id, role) do update set
   distance_km = excluded.distance_km,
   weight = excluded.weight,

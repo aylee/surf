@@ -2,10 +2,17 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
 const migrationSql = readFileSync(new URL("../migrations/0000_initial.sql", import.meta.url), "utf8");
+const historyMigrationSql = readFileSync(
+  new URL("../migrations/0001_forecast_history.sql", import.meta.url),
+  "utf8"
+);
+const allMigrationSql = `${migrationSql}\n${historyMigrationSql}`;
 const seedSql = readFileSync(new URL("../seeds/0000_v1_norcal.sql", import.meta.url), "utf8");
 
 function tableBody(tableName: string): string {
-  const match = migrationSql.match(new RegExp(`create table if not exists ${tableName}\\s*\\(([\\s\\S]*?)\\n\\);`, "i"));
+  const match = allMigrationSql.match(
+    new RegExp(`create table if not exists ${tableName}\\s*\\(([\\s\\S]*?)\\n\\);`, "i")
+  );
   if (!match?.[1]) {
     throw new Error(`Missing table ${tableName}`);
   }
@@ -30,6 +37,40 @@ describe("D1 migration", () => {
     session_feedback: ["occurred_at text not null", "rating integer", "source_snapshot_json text"],
     backtest_runs: ["valid_start_at text not null", "valid_end_at text not null", "metric_summary_json text"],
     backtest_metrics: ["metric text not null", "value real not null", "sample_count integer not null"],
+    wind_forecast_issues: [
+      "source_run_id text not null",
+      "issue_key text not null",
+      "issued_at text not null",
+      "forecast_at text not null",
+      "lead_hours real"
+    ],
+    forecast_snapshots: [
+      "issue_id text not null",
+      "captured_at text not null",
+      "issued_at text not null",
+      "valid_at text not null",
+      "lead_hours real not null",
+      "surface_condition text not null",
+      "displayed_height_label text not null",
+      "source_run_ids_json text not null",
+      "raw_facts_json text not null",
+      "spot_config_hash text not null",
+      "forecast_engine_version text not null"
+    ],
+    forecast_configs: [
+      "config_hash text not null",
+      "config_json text not null",
+      "created_at text not null"
+    ],
+    forecast_issues: [
+      "issue_id text not null",
+      "captured_at text not null",
+      "issued_at text not null",
+      "source_issue_fingerprint text not null",
+      "spot_config_hash text not null",
+      "issue_context_json text not null",
+      "expected_window_count integer not null"
+    ],
     forecast_reports: ["status text not null", "model_summary_json text not null", "report_markdown text", "disabled_reason text"]
   };
 
@@ -43,13 +84,42 @@ describe("D1 migration", () => {
   });
 
   it("keeps idempotency and read-path indexes for source runs and core forecast rows", () => {
-    const normalizedSql = migrationSql.replace(/\s+/g, " ").toLowerCase();
+    const normalizedSql = allMigrationSql.replace(/\s+/g, " ").toLowerCase();
 
     expect(normalizedSql).toContain("create unique index if not exists source_runs_run_key_idx on source_runs (run_key)");
     expect(normalizedSql).toContain("create index if not exists wave_forecasts_spot_forecast_at_idx on wave_forecasts (spot_id, forecast_at)");
     expect(normalizedSql).toContain("create index if not exists tide_forecasts_spot_forecast_at_idx on tide_forecasts (spot_id, forecast_at)");
     expect(normalizedSql).toContain("create index if not exists wind_forecasts_spot_forecast_at_idx on wind_forecasts (spot_id, forecast_at)");
     expect(normalizedSql).toContain("create index if not exists forecast_reports_region_issued_at_idx on forecast_reports (region_id, issued_at)");
+    expect(normalizedSql).toContain("create index if not exists wind_forecast_issues_spot_forecast_at_idx on wind_forecast_issues (spot_id, forecast_at)");
+    expect(normalizedSql).toContain("create index if not exists forecast_snapshots_spot_valid_at_idx on forecast_snapshots (spot_id, valid_at)");
+    expect(normalizedSql).toContain("create index if not exists forecast_snapshots_captured_at_idx on forecast_snapshots (captured_at)");
+    expect(normalizedSql).toContain("create index if not exists wind_forecast_issues_captured_at_idx on wind_forecast_issues (captured_at)");
+    expect(normalizedSql).toContain("create index if not exists source_runs_started_at_idx on source_runs (started_at)");
+    expect(normalizedSql).toContain("create index if not exists source_artifacts_created_at_idx on source_artifacts (created_at)");
+    expect(normalizedSql).toContain("create index if not exists wave_forecasts_forecast_at_idx on wave_forecasts (forecast_at)");
+    expect(normalizedSql).toContain("create index if not exists tide_forecasts_forecast_at_idx on tide_forecasts (forecast_at)");
+    expect(normalizedSql).toContain("create index if not exists wind_forecasts_forecast_at_idx on wind_forecasts (forecast_at)");
+    expect(normalizedSql).toContain("create index if not exists wave_observations_observed_at_idx on wave_observations (observed_at)");
+    expect(normalizedSql).toContain("create index if not exists tide_observations_observed_at_idx on tide_observations (observed_at)");
+    expect(normalizedSql).toContain("create index if not exists wind_observations_observed_at_idx on wind_observations (observed_at)");
+    expect(normalizedSql).toContain("create index if not exists hazard_events_updated_at_idx on hazard_events (updated_at)");
+  });
+
+  it("adds forecast history without altering or dropping the live read-model tables", () => {
+    const normalizedHistory = historyMigrationSql.replace(/\s+/g, " ").toLowerCase();
+
+    expect(normalizedHistory).not.toContain("alter table");
+    expect(normalizedHistory).not.toContain("drop table");
+    expect(normalizedHistory).toContain(
+      "primary key (spot_id, source_id, issue_key, forecast_at)"
+    );
+    expect(normalizedHistory).toContain("primary key (spot_id, issue_id, valid_at)");
+    expect(normalizedHistory).toContain("primary key (spot_id, config_hash)");
+    expect(normalizedHistory).toContain("primary key (spot_id, issue_id)");
+    expect(normalizedHistory).toContain(
+      "foreign key (spot_id, spot_config_hash) references forecast_configs(spot_id, config_hash)"
+    );
   });
 });
 
@@ -59,6 +129,8 @@ describe("v1 seed SQL", () => {
     const sourceIds = [
       "noaa-gfswave-norcal",
       "cdip-mop-norcal-unmapped",
+      "ndbc:realtime2-standard-meteorological",
+      "ndbc-46237",
       "ndbc-46026",
       "ndbc-46013",
       "ndbc-46012",
@@ -66,6 +138,7 @@ describe("v1 seed SQL", () => {
       "coops-9414131",
       "coops-9414958",
       "coops:tide-predictions",
+      "nws:mtr-grid-wave",
       "nws-grid-norcal",
       "nws-alerts-norcal",
       "nws:point-forecast-alerts"

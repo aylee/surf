@@ -1,9 +1,11 @@
 ---
-status: active
+status: executed
 type: session-brief
+mission: one-shot-v1
 created: 2026-07-08
 workstream: cc_state/noaa-surf-engine/WORKSTREAM.md
 plan: cc_state/noaa-surf-engine/implementation-plan.md
+superseded_by: session-brief-calibrate-break-truth.md
 ---
 
 # Brief: One-Shot Working v1
@@ -64,3 +66,18 @@ Turn the bootstrap into a working NorCal public-data forecast:
 4. Reconcile Phase 3 scoring/API after adapters land.
 5. Finish with dashboard/report/docs/smoke.
 
+---
+
+## Receipt
+
+_Status: EXECUTED - 2026-07-09_
+
+- **Shipped:** The working v1, followed by the quiet accuracy release on
+  `aylee/surf-v1-accuracy`; production Worker
+  `07c34188-549d-4919-85d1-1f498e79f979`.
+- **Deltas from plan:** Direct public CDIP MOP point forecasts replaced the
+  generic coastal scalar for five spots; the product was simplified into a
+  daily report plus five-day detail; issued-history, reproducibility evidence,
+  and bounded retention were added before release.
+- **Decisions minted:** OD-5 through OD-10 in `WORKSTREAM.md`.
+- **Superseded by:** `session-brief-calibrate-break-truth.md`.

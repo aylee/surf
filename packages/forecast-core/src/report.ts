@@ -1,7 +1,7 @@
 import type { ForecastResponse, ScoredForecastWindow } from "@surf/contracts";
 
 function bestWindow(windows: ScoredForecastWindow[]): ScoredForecastWindow | undefined {
-  return [...windows].sort((left, right) => {
+  return windows.filter((window) => window.ratingStatus === "scored").sort((left, right) => {
     if (right.score !== left.score) return right.score - left.score;
     return right.confidence - left.confidence;
   })[0];

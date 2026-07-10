@@ -90,6 +90,7 @@ describe("NWS adapter", () => {
       if (url === forecastUrl) {
         return Response.json({
           properties: {
+            updated: "2026-07-08T18:30:00Z",
             periods: [
               {
                 startTime: "2026-07-08T12:00:00-07:00",
@@ -131,6 +132,7 @@ describe("NWS adapter", () => {
     expect(outcome.metadata.hazardCount).toBe(1);
     expect(outcome.rows[0]?.windForecasts[0]).toMatchObject({
       spotId: "obsf-central",
+      issuedAt: "2026-07-08T18:30:00.000Z",
       windSpeedKt: 6.5,
       windDirectionDeg: 315,
       gustKt: 13
