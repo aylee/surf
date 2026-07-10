@@ -1,7 +1,7 @@
 [project]
 name = "surf-extractor"
-version = "0.0.0"
-description = "Python extraction shell for public surf forecast data feeds."
+version = "1.0.0"
+description = "Scientific extraction and forecast-evaluation tools for public ocean data."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

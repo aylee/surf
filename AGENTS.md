@@ -1,71 +1,67 @@
 # AGENTS.md
 
-## Project Identity
+Instructions for coding agents and automated contributors working in this
+repository.
 
-`surf` is a self-hosted public-data surf forecast engine. The repo owns code,
-tests, runtime operations, forecast schemas, data adapters, and implementation
-truth. The alex-os binder owns PM context and historical product thinking.
-
-## First Reads
+## Start here
 
 1. `README.md`
-2. `cc_state/noaa-surf-engine/WORKSTREAM.md`
-3. `cc_state/noaa-surf-engine/PRD.md`
-4. `cc_state/noaa-surf-engine/RFC.md`
-5. `cc_state/noaa-surf-engine/implementation-plan.md`
-6. `docs/feed-adapters.md`
-
-## Non-Negotiable Invariants
-
-- Free public ocean/weather feeds are the default substrate. Do not add a paid
-  marine API as a required path without a new RFC.
-- LLMs may generate reports, explanations, and diagnostics from structured
-  forecast facts. They must not perform wave physics or numeric scoring.
-- Raw NOAA/CDIP/model artifacts belong in R2. Normalized operational rows
-  belong in D1. Cacheable source/config state belongs in KV.
-- Python is for heavy scientific processing: GRIB2, netCDF, xarray, ecCodes,
-  CDIP extraction, and later bathymetry transforms. TypeScript owns app/API,
-  contracts, scoring orchestration, and UI.
-- Secrets are never committed. Local secrets live in `~/.config/env/surf.env`
-  or `.dev.vars`; deployed secrets live in Cloudflare Worker secrets.
-- The first geography is NorCal. Do not broaden the spot database until the
-  first end-to-end pipeline works for the v1 spots.
+2. `docs/architecture.md`
+3. `docs/feed-adapters.md`
+4. `CONTRIBUTING.md`
 
 ## Commands
 
 ```bash
-pnpm install
-pnpm check
-pnpm test
-uv run --project services/extractor pytest
+pnpm install --frozen-lockfile
+pnpm setup:local
 pnpm dev
-pnpm cf:provision
+# In a second terminal, after the Worker is listening:
+pnpm ingest:local
 pnpm smoke:local
+pnpm verify
+pnpm check:cloudflare
 ```
 
-## Source Of Truth
+`pnpm verify` is the canonical final gate and matches CI: an isolated fresh D1
+migration and seed, generated/config/type checks, TypeScript and Python tests,
+production build, and a secretless Wrangler bundle dry-run. It does not alter
+the normal local development database.
 
-- Product/PM background: alex-os binder `desk/personal-surf-forecast/`
-- Active repo execution: `cc_state/noaa-surf-engine/WORKSTREAM.md`
-- Task DAG: `cc_state/noaa-surf-engine/implementation-plan.md`
-- Public operator docs: `docs/`
-- Accepted implementation truth: code, tests, migrations, and durable docs in
-  this repo
+## Remote mutation boundary
 
-## Coding Posture
+Default to local commands and `pnpm check:cloudflare`, which does not change
+Cloudflare state. Do not run `pnpm setup:cloudflare`, `pnpm deploy`,
+`pnpm ingest:remote`, `wrangler ... --remote`, Queue create/delete, secret,
+migration, or remote D1 write commands without explicit operator authorization
+and a named backup/rollback plan. Ambient credentials are not authorization.
 
-- **Think Before Coding** - Do not assume; name tradeoffs and unknowns before
-  writing code when intent is unclear.
-- **Simplicity First** - Write the minimum code that solves the stated problem.
-  No speculative abstractions.
-- **Surgical Changes** - Touch only what the task requires. Do not reformat,
-  rename, or refactor unrelated code in the same diff.
-- **Goal-Driven Execution** - Define the success criterion before starting and
-  loop until it is met. State explicitly when it is not.
+## Non-negotiable invariants
 
-## Data And Safety Notes
+- Free public ocean/weather feeds are the default substrate. Do not add a paid
+  marine API as a required path without an explicit architecture decision.
+- Numeric wave, tide, wind, condition, confidence, and score fields must be
+  deterministic and testable. LLMs may explain structured facts only.
+- Preserve source attribution, issue/valid times, freshness, and uncertainty.
+- Raw provider artifacts belong in R2 and normalized operational rows in D1.
+- Python owns heavy GRIB2, netCDF, xarray, ecCodes, and scientific evaluation.
+  TypeScript owns the Worker/API, contracts, scoring orchestration, and UI.
+- The checked-in spot catalog is the NorCal reference configuration. Do not
+  imply that arbitrary regions work without implementing and testing them.
+- Never commit secrets, account-specific Cloudflare resource IDs, generated
+  local Wrangler state, or proprietary forecast data.
 
-This is not a navigation, emergency, or maritime safety product. Forecast output
-is for personal surf planning only. Always keep source attribution and freshness
-visible in user-facing surfaces.
+## Working posture
 
+- Define the observable success criterion before coding.
+- Make the smallest coherent change that satisfies it.
+- SQL migrations are the database schema authority. Keep the checked-in spot
+  catalog and generated seed synchronized with `pnpm spots:sync`, and cover
+  migration changes with fresh-database tests.
+- Add or update tests for contracts, scoring, source mappings, adapters,
+  migrations, and configuration behavior.
+- Preserve unrelated work in a dirty tree and avoid destructive Git commands.
+- For stateful changes, name the backup and rollback path before deployment.
+
+This is for personal surf planning, not navigation, emergency response, or
+maritime safety.

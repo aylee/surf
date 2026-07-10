@@ -1,19 +1,21 @@
 {
   "name": "@surf/db",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "main": "./src/schema.ts",
-  "types": "./src/schema.ts",
   "scripts": {
-    "check": "tsc -p tsconfig.json --noEmit",
+    "check": "tsc -p tsconfig.json --noEmit && pnpm seed:check",
+    "seed:generate": "tsx scripts/generate-norcal-seed.ts",
+    "seed:check": "tsx scripts/generate-norcal-seed.ts --check",
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
-    "drizzle-orm": "latest"
+    "@surf/forecast-core": "workspace:*"
   },
   "devDependencies": {
-    "drizzle-kit": "latest",
-    "typescript": "latest"
+    "@types/node": "24.13.3",
+    "tsx": "4.23.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10"
   }
 }

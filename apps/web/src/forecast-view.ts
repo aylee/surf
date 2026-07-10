@@ -1,4 +1,4 @@
-import type { ScoredForecastWindow, SpotProfile } from "@surf/contracts";
+import type { ScoredForecastWindow, SpotId, SpotProfile } from "@surf/contracts";
 import {
   directionInCircularWindow,
   surfaceConditionForWind,
@@ -17,6 +17,14 @@ export type LocalDateParts = {
 
 const DAYTIME_START_HOUR = 6;
 const DAYTIME_END_HOUR = 18;
+
+export function selectedSpotIdFromSearch(
+  search: string,
+  availableSpotIds: readonly SpotId[]
+): SpotId | null {
+  const value = new URLSearchParams(search).get("spot");
+  return value && availableSpotIds.some((spotId) => spotId === value) ? value : null;
+}
 
 const qualityRank: Record<ScoredForecastWindow["qualityLabel"], number> = {
   excellent: 5,

@@ -1,4 +1,5 @@
-import type { SpotId, SpotProfile } from "@surf/contracts";
+import type { SpotId } from "@surf/contracts";
+import type { NorcalSpotProfile } from "@surf/forecast-core";
 import type { AdapterOutcome, SourceCaveat, SourceFetch } from "./types";
 import { combineStatus, errorMessage } from "./types";
 
@@ -162,7 +163,7 @@ async function fetchStationPredictions(
 }
 
 export async function fetchCoopsTidePredictionsForSpots(
-  spots: SpotProfile[],
+  spots: NorcalSpotProfile[],
   options: {
     fetcher?: SourceFetch;
     now?: Date;
@@ -173,7 +174,9 @@ export async function fetchCoopsTidePredictionsForSpots(
   const now = options.now ?? new Date();
   const start = new Date(now);
   const end = new Date(now.getTime() + (options.horizonHours ?? 72) * 60 * 60 * 1000);
-  const stationIds = [...new Set(spots.map((spot) => spot.tideStation).filter(Boolean))].sort();
+  const stationIds = [
+    ...new Set(spots.map((spot) => spot.sourceMap.coopsTide.stationId).filter(Boolean))
+  ].sort();
   const rows: TidePredictionRow[] = [];
   const caveats: SourceCaveat[] = [];
   const errors: string[] = [];
@@ -190,7 +193,9 @@ export async function fetchCoopsTidePredictionsForSpots(
       rowCountByStation[stationId] = stationResult.rows.length;
       statuses.push(stationResult.errors.length > 0 || stationResult.rows.length === 0 ? "failure" : "success");
 
-      const stationSpots = spots.filter((spot) => spot.tideStation === stationId);
+      const stationSpots = spots.filter(
+        (spot) => spot.sourceMap.coopsTide.stationId === stationId
+      );
       for (const spot of stationSpots) {
         rows.push(...stationResult.rows.map((row) => ({ ...row, spotId: spot.id })));
       }

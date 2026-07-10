@@ -8,6 +8,7 @@ import {
   earliestAvailableLocalDateKey,
   formatWindowSpan,
   isPlanningWindow,
+  selectedSpotIdFromSearch,
   surfHeightRange,
   surfaceCondition
 } from "./forecast-view";
@@ -50,7 +51,14 @@ function windowAt(
 }
 
 describe("forecast presentation", () => {
-  it("keeps planning recommendations inside Alex's 6am–6pm local window", () => {
+  it("accepts any spot returned by the runtime catalog", () => {
+    expect(selectedSpotIdFromSearch("?spot=new-break", ["bolinas", "new-break"])).toBe(
+      "new-break"
+    );
+    expect(selectedSpotIdFromSearch("?spot=not-loaded", ["bolinas", "new-break"])).toBeNull();
+  });
+
+  it("keeps planning recommendations inside the configured 6am–6pm local window", () => {
     const now = new Date("2026-07-10T00:00:00Z");
     expect(isPlanningWindow(windowAt("2026-07-10T13:00:00Z"), spot.timezone, now)).toBe(true);
     expect(isPlanningWindow(windowAt("2026-07-10T12:00:00Z"), spot.timezone, now)).toBe(false);

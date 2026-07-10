@@ -1,14 +1,24 @@
-## Summary
+## What changed
+
+<!-- Describe the user/operator-visible outcome and why this change is needed. -->
+
+## Risk and data impact
+
+<!-- Note forecast semantics, source/provenance, schema, migration, cost, privacy, or operational impact. -->
 
 ## Verification
 
-- [ ] `pnpm check`
-- [ ] `pnpm test`
-- [ ] `uv run --project services/extractor pytest`
+- [ ] `pnpm verify`
+- [ ] Relevant local/manual behavior was checked
 
-## Data / AI Safety
+## Stateful changes
 
-- [ ] No secrets or private data committed
-- [ ] No required paid data dependency added
-- [ ] LLM behavior, if changed, is report/explanation only
+- [ ] No migration or stateful runtime change
+- [ ] Or: backup, rollout, and rollback/recovery steps are described above
 
+## Public-data and AI invariants
+
+- [ ] No secrets, private data, proprietary forecast output, or account-specific resource IDs are committed
+- [ ] Required sources remain public and attributed
+- [ ] Numeric forecast facts remain deterministic
+- [ ] Material AI-generated code is disclosed and understood by the contributor

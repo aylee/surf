@@ -1,26 +1,40 @@
 import { zValidator } from "@hono/zod-validator";
-import { buildDeterministicReport, NORCAL_SPOTS } from "@surf/forecast-core";
-import { SpotIdSchema } from "@surf/contracts";
+import {
+  getOperationalObservedWaveSources,
+  isNorcalSpotId,
+  NORCAL_SPOTS
+} from "@surf/forecast-core";
+import { SpotIdSchema, SpotsResponseSchema } from "@surf/contracts";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
+import { bearerTokenMatches } from "./auth";
 import { buildForecastResponse } from "./forecast";
-import { normalizeIngestMessage, runNorcalIngest } from "./ingest";
+import { ingestRequiresRetry, normalizeIngestMessage, runNorcalIngest } from "./ingest";
 
-export type Env = {
-  ASSETS: Fetcher;
-  DB: D1Database;
-  RAW_ARTIFACTS: R2Bucket;
-  CACHE: KVNamespace;
-  INGEST_QUEUE: Queue;
+export type Env = Omit<
+  CloudflareBindings,
+  "ENVIRONMENT" | "SURF_REGION" | "SURF_USER_AGENT"
+> & {
   ENVIRONMENT: string;
-  SURF_REGION: string;
-  REPORT_AGENT_ENABLED: string;
+  SURF_REGION: "norcal";
+  SURF_USER_AGENT: string;
   INGEST_TOKEN?: string;
-  OPENAI_API_KEY?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
+
+const spotsResponse = SpotsResponseSchema.parse({
+  spots: NORCAL_SPOTS.map((spot) => ({
+    ...spot,
+    sourceMap: {
+      ...spot.sourceMap,
+      observedWave: getOperationalObservedWaveSources(spot)
+    }
+  })),
+  sourceNote:
+    "NorCal spot registry with verified NWS MTR coastal-wave grids and transparent cold-start breaking-height scales."
+});
 
 app.use("/api/*", cors());
 
@@ -34,62 +48,27 @@ app.get("/api/health", (c) =>
   })
 );
 
-app.get("/api/spots", (c) =>
-  c.json({
-    spots: NORCAL_SPOTS,
-    sourceNote:
-      "NorCal spot registry with verified NWS MTR coastal-wave grids and transparent cold-start breaking-height scales."
-  })
-);
+app.get("/api/spots", (c) => c.json(spotsResponse));
 
 app.get(
   "/api/forecast/:spotId",
-  zValidator("param", z.object({ spotId: SpotIdSchema })),
+  zValidator(
+    "param",
+    z.object({
+      spotId: SpotIdSchema.refine(isNorcalSpotId, "Spot is not present in the NorCal reference config")
+    })
+  ),
   async (c) => {
     const { spotId } = c.req.valid("param");
     return c.json(await buildForecastResponse(c.env, spotId));
   }
 );
 
-app.get("/api/reports/today", async (c) => {
-  const enabled = c.env.REPORT_AGENT_ENABLED === "true" && Boolean(c.env.OPENAI_API_KEY);
-  if (!enabled) {
-    return c.json({
-      enabled: false,
-      generatedAt: null,
-      reportMarkdown: null,
-      reason: "Report agent disabled until REPORT_AGENT_ENABLED=true and OPENAI_API_KEY is configured.",
-      sourceRunIds: [],
-      caveats: ["Disabled report path does not call an LLM or create numeric forecast facts."]
-    });
-  }
-
-  const forecasts = await Promise.all(NORCAL_SPOTS.map((spot) => buildForecastResponse(c.env, spot.id)));
-  const generatedAt = new Date();
-  const sourceRunIds = forecasts
-    .flatMap((forecast) => forecast.windows.flatMap((window) => window.sourceRunIds))
-    .filter((id, index, all) => all.indexOf(id) === index);
-  const caveats = forecasts
-    .flatMap((forecast) => forecast.windows.flatMap((window) => window.caveats))
-    .filter((caveat, index, all) => all.indexOf(caveat) === index);
-
-  return c.json({
-    enabled: true,
-    generatedAt: generatedAt.toISOString(),
-    reportMarkdown: buildDeterministicReport(forecasts, generatedAt),
-    reason: null,
-    sourceRunIds,
-    caveats
-  });
-});
-
 app.post("/api/ingest/once", async (c) => {
   const hostname = new URL(c.req.url).hostname;
-  const isLocalRequest = hostname === "127.0.0.1" || hostname === "localhost";
-  if (c.env.ENVIRONMENT === "production" && !isLocalRequest) {
-    const expected = c.env.INGEST_TOKEN;
-    const supplied = c.req.header("Authorization");
-    if (!expected || supplied !== `Bearer ${expected}`) {
+  const isLocalRequest = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
+  if (!isLocalRequest) {
+    if (!(await bearerTokenMatches(c.req.header("Authorization"), c.env.INGEST_TOKEN))) {
       return c.json({ error: "Unauthorized" }, 401, {
         "WWW-Authenticate": "Bearer"
       });
@@ -126,12 +105,30 @@ export default {
           requestedAt: body.requestedAt,
           region: body.region
         });
-        if (summary.status !== "success") {
+        if (ingestRequiresRetry(summary)) {
           throw new Error(`ingest completed with ${summary.status}: ${summary.errors.join("; ")}`);
+        }
+        if (summary.status === "partial") {
+          console.warn(
+            JSON.stringify({
+              message: "ingest queue message completed with source caveats",
+              messageId: message.id,
+              caveatCount: summary.caveats.length,
+              partialSources: summary.sourceRuns
+                .filter((run) => run.status === "partial")
+                .map((run) => run.sourceId)
+            })
+          );
         }
         message.ack();
       } catch (error) {
-        console.error("ingest queue message failed", error);
+        console.error(
+          JSON.stringify({
+            message: "ingest queue message failed",
+            messageId: message.id,
+            error: error instanceof Error ? error.message : String(error)
+          })
+        );
         message.retry();
       }
     }

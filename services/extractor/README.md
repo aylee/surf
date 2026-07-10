@@ -8,10 +8,11 @@ Cloudflare Worker:
 - NDBC/CDIP historical observations for backtesting.
 - Future bathymetry/SWAN/regional transforms.
 
-The bootstrap package only plans requests and validates fixtures. The v1
-implementation adds `wgrib2`, ecCodes/cfgrib, xarray, and netCDF processing.
+The base install keeps common planning, validation, and evaluation commands
+lightweight. GRIB2/netCDF decoding is available through the optional `grib`
+dependency group and a local `wgrib2` or ecCodes toolchain.
 
-## NOAA GFSwave v1 shell
+## NOAA GFSwave research path
 
 The current GFSwave path can:
 
@@ -27,13 +28,13 @@ either `wgrib2` or the optional `cfgrib` + `xarray` stack installed. Check the
 current machine with:
 
 ```bash
-uv run --project services/extractor surf-extractor grib-tooling-status
+uv run --project services/extractor --locked surf-extractor grib-tooling-status
 ```
 
 ```bash
-uv run --project services/extractor surf-extractor inspect-fixtures
-uv run --project services/extractor surf-extractor validate-gfswave-cycle --forecast-hour 0 --forecast-hour 3
-uv run --project services/extractor pytest
+uv run --project services/extractor --locked surf-extractor inspect-fixtures
+uv run --project services/extractor --locked surf-extractor validate-gfswave-cycle --forecast-hour 0 --forecast-hour 3
+uv run --project services/extractor --locked pytest
 ```
 
 ## Physical evaluation
@@ -43,7 +44,7 @@ descriptive command is named accordingly and uses the file's declared header
 (older no-minute layouts are supported) plus circular direction statistics:
 
 ```bash
-uv run --project services/extractor surf-extractor summarize-ndbc-history --station-id 46026 --year 2025
+uv run --project services/extractor --locked surf-extractor summarize-ndbc-history --station-id 46026 --year 2025
 ```
 
 Accuracy evaluation requires immutable, issued forecasts and time-aligned
@@ -53,12 +54,13 @@ observations. Both inputs are JSONL. Forecast rows require `source_id`,
 and `direction_deg`. Timestamps must include a UTC offset.
 
 ```bash
-uv run --project services/extractor surf-extractor evaluate-jsonl \
-  --forecast-jsonl issued-forecasts.jsonl \
-  --observation-jsonl observations.jsonl \
+mkdir -p data/raw data/tmp
+uv run --project services/extractor --locked surf-extractor evaluate-jsonl \
+  --forecast-jsonl data/raw/issued-forecasts.jsonl \
+  --observation-jsonl data/raw/observations.jsonl \
   --match-tolerance-minutes 30 \
-  --output-json evaluation.json \
-  --samples-jsonl matched-samples.jsonl
+  --output-json data/tmp/evaluation.json \
+  --samples-jsonl data/tmp/matched-samples.jsonl
 ```
 
 The evaluator defaults to no-lookahead observation matching, preserves
@@ -77,19 +79,19 @@ must supply the exact MOP mapping and fixed height scale being tested:
 
 ```json
 {
-  "spot_id": "bolinas",
-  "cdip_point_id": "M0000",
-  "dataset_url": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/M0000_nowcast.nc",
-  "height_scale": 0.65
+  "spot_id": "obsf-central",
+  "cdip_point_id": "SF029",
+  "dataset_url": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SF029_nowcast.nc",
+  "height_scale": 1.0
 }
 ```
 
 ```bash
-uv run --project services/extractor surf-extractor evaluate-cdip-transform \
-  --mapping-json bolinas-cdip.json \
-  --forecast-jsonl issued-offshore-forecasts.jsonl \
+uv run --project services/extractor --locked surf-extractor evaluate-cdip-transform \
+  --mapping-json data/raw/obsf-central-cdip.json \
+  --forecast-jsonl data/raw/issued-offshore-forecasts.jsonl \
   --start-index 0 --stop-index 500 \
-  --output-json bolinas-transform-evaluation.json
+  --output-json data/tmp/obsf-central-transform-evaluation.json
 ```
 
 CDIP MOP output is labeled `modeled_nearshore_proxy` in the result. It is
@@ -108,20 +110,21 @@ with a CDIP MOP nowcast proxy through the same physical evaluator.
 Install the optional decoder stack; the base extractor install remains light:
 
 ```bash
-uv sync --project services/extractor --extra grib
+uv sync --project services/extractor --locked --extra grib
 ```
 
-The mapping is deliberately operator-supplied. An exact MOP point must be
-chosen before treating the comparison as relevant to a spot:
+The mapping is deliberately operator-supplied. The example below mirrors the
+verified Ocean Beach Central registry entry. Never copy an experimental point
+into the production catalog without source evidence and mapping tests.
 
 ```json
 {
-  "spot_id": "bolinas",
-  "target_latitude": 37.909,
-  "target_longitude": -122.730,
-  "cdip_point_id": "M0000",
-  "cdip_nowcast_url": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/M0000_nowcast.nc",
-  "current_height_scale": 0.65,
+  "spot_id": "obsf-central",
+  "target_latitude": 37.75892,
+  "target_longitude": -122.52074,
+  "cdip_point_id": "SF029",
+  "cdip_nowcast_url": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SF029_nowcast.nc",
+  "current_height_scale": 1.0,
   "max_grid_distance_km": 5.0
 }
 ```
@@ -133,15 +136,15 @@ strictly chronological and are capped at 100 snapshots. The train cutoff is
 also an issue timestamp; later forecasts are reported separately as holdout.
 
 ```bash
-uv run --project services/extractor --extra grib \
+uv run --project services/extractor --locked --extra grib \
   surf-extractor evaluate-ndfd-mop-history \
-  --mapping-json bolinas-ndfd-mop.json \
+  --mapping-json data/raw/obsf-central-ndfd-mop.json \
   --issue-at 2025-04-01T12:00:00Z \
   --issue-at 2025-07-01T12:00:00Z \
   --issue-at 2025-10-01T12:00:00Z \
   --train-cutoff 2025-07-31T23:59:59Z \
-  --output-json results/bolinas-ndfd-mop.json \
-  --samples-jsonl results/bolinas-ndfd-mop.samples.jsonl
+  --output-json data/tmp/obsf-central-ndfd-mop.json \
+  --samples-jsonl data/tmp/obsf-central-ndfd-mop.samples.jsonl
 ```
 
 Safety and interpretation:

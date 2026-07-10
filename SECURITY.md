@@ -1,24 +1,36 @@
 # Security Policy
 
-## Supported Versions
+## Supported version
 
-The project is pre-v1. Security fixes should target `main`.
+Security fixes target the latest commit on `main`. This project has not yet
+published a stable compatibility promise.
 
-## Reporting
+## Report a vulnerability
 
-Open a private security advisory on GitHub when available, or contact Alex
-directly if the issue exposes secrets, account access, or user data.
+Please use a [private GitHub security advisory](https://github.com/aylee/surf/security/advisories/new).
+Do not open a public issue for vulnerabilities involving authentication,
+secret exposure, Cloudflare account access, injection, or private data.
 
-## Secrets
+Include the affected commit, reproduction steps, expected impact, and any
+suggested mitigation. Reports should use test accounts and redact tokens,
+account IDs, and source data that is not already public. We aim to acknowledge
+a report within seven days and will coordinate disclosure after a fix is
+available.
 
-Never commit:
+## Scope
 
-- `.env`
-- `.dev.vars`
-- Cloudflare API tokens
-- OpenAI/API provider keys
-- private calibration or camera data unless explicitly anonymized and licensed
+Security-sensitive surfaces include:
 
-Local personal secrets belong in `~/.config/env/surf.env` with mode `600`.
-Deployed secrets belong in Cloudflare Worker secrets.
+- the production manual-ingest endpoint and `INGEST_TOKEN` handling;
+- Cloudflare Worker, D1, R2, and Queue bindings;
+- upstream response parsing and raw-artifact capture;
+- dependency or workflow compromise; and
+- accidental secret or account-identifier exposure.
 
+Forecast disagreement, model error, and source staleness are data-quality
+issues unless they also expose a security boundary. Use the bug template for
+those reports.
+
+Never commit `.env`, `.dev.vars`, API tokens, provider keys, or exported
+production data. If a secret reaches Git history, revoke and rotate it before
+removing the value from the repository.

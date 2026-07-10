@@ -1,4 +1,4 @@
-import type { SpotId, SpotProfile } from "@surf/contracts";
+import { SpotProfileSchema, type SpotId, type SpotProfile } from "@surf/contracts";
 
 export type SourceMappingStatus = "verified" | "absent" | "blocked";
 
@@ -7,21 +7,6 @@ export type SourceEvidence = {
   label: string;
   url: string;
   checkedAt: string;
-  notes: string;
-};
-
-export type GfsWaveSourceMapping = {
-  sourceId: "noaa-gfswave-wcoast-0p16";
-  provider: "NOAA/NCEP GFSwave";
-  capability: "forecast_wave_offshore";
-  domain: "wcoast";
-  gridResolutionDeg: 0.16;
-  referencePoint: {
-    lat: number;
-    lon: number;
-  };
-  variables: string[];
-  evidence: SourceEvidence[];
   notes: string;
 };
 
@@ -73,21 +58,6 @@ export type CoopsTideSourceMapping = {
   notes: string;
 };
 
-export type NwsPointSourceMapping = {
-  capabilities: ["wind", "hazard"];
-  office: "MTR";
-  gridId: "MTR";
-  gridX: number;
-  gridY: number;
-  pointType: "land" | "marine";
-  forecastZone: string;
-  forecastGridData: string;
-  forecastHourly: string;
-  observationStations: string;
-  evidence: SourceEvidence[];
-  notes: string;
-};
-
 export type NwsWaveGridSourceMapping = {
   sourceId: "nws:mtr-grid-wave";
   provider: "NOAA/NWS MTR";
@@ -107,11 +77,9 @@ export type NwsWaveGridSourceMapping = {
 };
 
 export type SpotSourceMap = {
-  gfsWave: GfsWaveSourceMapping;
   observedWave: ObservedWaveSourceMapping[];
   cdipMop: CdipMopSourceMapping;
   coopsTide: CoopsTideSourceMapping;
-  nwsPoint: NwsPointSourceMapping;
   nwsWaveGrid: NwsWaveGridSourceMapping;
 };
 
@@ -122,13 +90,6 @@ export type NorcalSpotProfile = SpotProfile & {
 const checkedAt = "2026-07-08";
 
 const evidence = {
-  nomadsGfswave: {
-    id: "nomads-gfswave-filter",
-    label: "NOMADS GFSwave filter",
-    url: "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl",
-    checkedAt,
-    notes: "Filter UI exposes /gfs.YYYYMMDD/HH/wave/gridded and wcoast 0p16 GRIB2 files with wave variables."
-  },
   ndbc46026: {
     id: "ndbc-46026",
     label: "NDBC 46026 San Francisco",
@@ -215,21 +176,19 @@ const evidence = {
   }
 } satisfies Record<string, SourceEvidence>;
 
-function gfsWave(referencePoint: { lat: number; lon: number }, notes: string): GfsWaveSourceMapping {
-  return {
-    sourceId: "noaa-gfswave-wcoast-0p16",
-    provider: "NOAA/NCEP GFSwave",
-    capability: "forecast_wave_offshore",
-    domain: "wcoast",
-    gridResolutionDeg: 0.16,
-    referencePoint,
-    variables: ["HTSGW", "PERPW", "DIRPW", "SWELL", "SWPER", "SWDIR", "WVHGT", "WVPER", "WVDIR"],
-    evidence: [evidence.nomadsGfswave],
-    notes
-  };
-}
-
 const observedSources = {
+  ndbc46237: {
+    sourceId: "ndbc-46237",
+    provider: "NDBC",
+    capability: "observed_wave",
+    stationId: "46237",
+    name: "San Francisco Bar",
+    lat: 37.788,
+    lon: -122.6318,
+    role: "primary",
+    evidence: [evidence.cdip142],
+    notes: "Nearshore San Francisco Bar reference, operated as CDIP 142 and published as NDBC 46237."
+  },
   ndbc46026: {
     sourceId: "ndbc-46026",
     provider: "NDBC",
@@ -266,18 +225,6 @@ const observedSources = {
     evidence: [evidence.ndbc46012],
     notes: "South-of-SF offshore reference, especially useful for Pacifica."
   },
-  cdip142: {
-    sourceId: "cdip-142",
-    provider: "CDIP",
-    capability: "observed_wave",
-    stationId: "142",
-    name: "San Francisco Bar",
-    lat: 37.788,
-    lon: -122.6318,
-    role: "primary",
-    evidence: [evidence.cdip142],
-    notes: "Nearshore/bar observation station for Ocean Beach, Pacifica, and the Golden Gate approach."
-  },
   cdip029: {
     sourceId: "cdip-029",
     provider: "CDIP",
@@ -286,7 +233,7 @@ const observedSources = {
     name: "Point Reyes",
     lat: 37.9415,
     lon: -123.4645,
-    role: "secondary",
+    role: "validation",
     evidence: [evidence.cdip029],
     notes: "Deep offshore Point Reyes reference for Marin and north swell validation."
   }
@@ -358,16 +305,6 @@ const coopsTideStations = {
   }
 } satisfies Record<string, CoopsTideSourceMapping>;
 
-function nwsPoint(input: Omit<NwsPointSourceMapping, "capabilities" | "office" | "gridId" | "evidence">): NwsPointSourceMapping {
-  return {
-    capabilities: ["wind", "hazard"],
-    office: "MTR",
-    gridId: "MTR",
-    evidence: [evidence.nwsPoints],
-    ...input
-  };
-}
-
 function nwsWaveGrid(
   input: Omit<
     NwsWaveGridSourceMapping,
@@ -386,7 +323,7 @@ function nwsWaveGrid(
   };
 }
 
-export const NORCAL_SPOTS: NorcalSpotProfile[] = [
+const norcalSpots: NorcalSpotProfile[] = [
   {
     id: "obsf-north",
     name: "Ocean Beach North",
@@ -402,20 +339,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 140 },
     maxGoodWindKt: 8,
     maxOkWindKt: 15,
-    referenceBuoys: ["46237", "46026", "46013"],
-    cdipStations: ["142"],
-    tideStation: "9414290",
     notes: "Exposed SF beachbreak. Cold-start prior favors clean wind and moderate tides.",
     sourceMap: {
-      gfsWave: gfsWave(
-        { lat: 37.76, lon: -122.88 },
-        "Nearest offshore wcoast 0p16 point west of Ocean Beach and close to NDBC 46026."
-      ),
       observedWave: [
+        observedSources.ndbc46237,
         observedSources.ndbc46026,
-        observedSources.cdip142,
         observedSources.ndbc46013,
-        observedSources.ndbc46012
+        { ...observedSources.ndbc46012, role: "validation" }
       ],
       cdipMop: cdipMop(
         "sf",
@@ -432,16 +362,6 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         "SF043 is the verified public 10 m MOP point at Ocean Beach North. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.sanFrancisco,
-      nwsPoint: nwsPoint({
-        gridX: 81,
-        gridY: 106,
-        pointType: "marine",
-        forecastZone: "PZZ545",
-        forecastGridData: "https://api.weather.gov/gridpoints/MTR/81,106",
-        forecastHourly: "https://api.weather.gov/gridpoints/MTR/81,106/forecast/hourly",
-        observationStations: "https://api.weather.gov/gridpoints/MTR/81,106/stations",
-        notes: "Live NWS point metadata returned a marine point on forecast zone PZZ545."
-      }),
       nwsWaveGrid: nwsWaveGrid({
         gridX: 81,
         gridY: 106,
@@ -466,20 +386,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 140 },
     maxGoodWindKt: 8,
     maxOkWindKt: 15,
-    referenceBuoys: ["46237", "46026", "46013"],
-    cdipStations: ["142"],
-    tideStation: "9414290",
     notes: "Primary v1 OBSF reference spot.",
     sourceMap: {
-      gfsWave: gfsWave(
-        { lat: 37.76, lon: -122.88 },
-        "Nearest offshore wcoast 0p16 point west of the central Ocean Beach reference coordinate."
-      ),
       observedWave: [
+        observedSources.ndbc46237,
         observedSources.ndbc46026,
-        observedSources.cdip142,
         observedSources.ndbc46013,
-        observedSources.ndbc46012
+        { ...observedSources.ndbc46012, role: "validation" }
       ],
       cdipMop: cdipMop(
         "sf",
@@ -496,16 +409,6 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         "SF029 is the verified public 10.01 m MOP point at Ocean Beach Central. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.sanFrancisco,
-      nwsPoint: nwsPoint({
-        gridX: 81,
-        gridY: 105,
-        pointType: "land",
-        forecastZone: "CAZ006",
-        forecastGridData: "https://api.weather.gov/gridpoints/MTR/81,105",
-        forecastHourly: "https://api.weather.gov/gridpoints/MTR/81,105/forecast/hourly",
-        observationStations: "https://api.weather.gov/gridpoints/MTR/81,105/stations",
-        notes: "Live NWS point metadata returned MTR grid 81,105 on San Francisco forecast zone CAZ006."
-      }),
       nwsWaveGrid: nwsWaveGrid({
         gridX: 81,
         gridY: 105,
@@ -530,20 +433,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 145 },
     maxGoodWindKt: 8,
     maxOkWindKt: 15,
-    referenceBuoys: ["46237", "46026", "46013"],
-    cdipStations: ["142"],
-    tideStation: "9414290",
     notes: "Exposed beachbreak; needs local calibration for bars and tide sensitivity.",
     sourceMap: {
-      gfsWave: gfsWave(
-        { lat: 37.76, lon: -122.88 },
-        "Nearest offshore wcoast 0p16 point west of southern Ocean Beach; same offshore point as OBSF central at this grid resolution."
-      ),
       observedWave: [
+        observedSources.ndbc46237,
         observedSources.ndbc46026,
-        observedSources.cdip142,
         observedSources.ndbc46013,
-        observedSources.ndbc46012
+        { ...observedSources.ndbc46012, role: "validation" }
       ],
       cdipMop: cdipMop(
         "sf",
@@ -560,16 +456,6 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         "SF015 is the verified public 10.01 m MOP point at Ocean Beach South. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.sanFrancisco,
-      nwsPoint: nwsPoint({
-        gridX: 81,
-        gridY: 104,
-        pointType: "land",
-        forecastZone: "CAZ006",
-        forecastGridData: "https://api.weather.gov/gridpoints/MTR/81,104",
-        forecastHourly: "https://api.weather.gov/gridpoints/MTR/81,104/forecast/hourly",
-        observationStations: "https://api.weather.gov/gridpoints/MTR/81,104/stations",
-        notes: "Live NWS point metadata returned MTR grid 81,104 on San Francisco forecast zone CAZ006."
-      }),
       nwsWaveGrid: nwsWaveGrid({
         gridX: 80,
         gridY: 104,
@@ -594,19 +480,12 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 145 },
     maxGoodWindKt: 8,
     maxOkWindKt: 14,
-    referenceBuoys: ["46012", "46237", "46026"],
-    cdipStations: ["142"],
-    tideStation: "9414131",
     notes: "Protected beginner-friendly beach; smaller swell windows matter.",
     sourceMap: {
-      gfsWave: gfsWave(
-        { lat: 37.6, lon: -122.88 },
-        "Nearest offshore wcoast 0p16 point west of Pacifica; validate against Half Moon Bay buoy 46012."
-      ),
       observedWave: [
         { ...observedSources.ndbc46012, role: "primary" },
-        observedSources.ndbc46026,
-        observedSources.cdip142
+        observedSources.ndbc46237,
+        observedSources.ndbc46026
       ],
       cdipMop: cdipMop(
         "sf",
@@ -623,16 +502,6 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         "SM371 is a verified public 15.01 m approach point outside Linda Mar's cove. The explicit 0.60 final cove scale remains a cold-start proxy and must stay visible."
       ),
       coopsTide: coopsTideStations.pillarPoint,
-      nwsPoint: nwsPoint({
-        gridX: 80,
-        gridY: 98,
-        pointType: "land",
-        forecastZone: "CAZ509",
-        forecastGridData: "https://api.weather.gov/gridpoints/MTR/80,98",
-        forecastHourly: "https://api.weather.gov/gridpoints/MTR/80,98/forecast/hourly",
-        observationStations: "https://api.weather.gov/gridpoints/MTR/80,98/stations",
-        notes: "Live NWS point metadata returned MTR grid 80,98 for Pacifica forecast zone CAZ509."
-      }),
       nwsWaveGrid: nwsWaveGrid({
         gridX: 79,
         gridY: 98,
@@ -657,20 +526,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 135 },
     maxGoodWindKt: 8,
     maxOkWindKt: 14,
-    referenceBuoys: ["46237", "46013", "46026"],
-    cdipStations: ["142", "029"],
-    tideStation: "9414958",
     notes: "More sheltered than OBSF; local transform and tide calibration needed.",
     sourceMap: {
-      gfsWave: gfsWave(
-        { lat: 37.92, lon: -123.04 },
-        "Nearest offshore wcoast 0p16 point outside the Golden Gate for Marin; GFSwave cannot resolve Stinson's nearshore sheltering."
-      ),
       observedWave: [
+        observedSources.ndbc46237,
+        observedSources.ndbc46013,
         observedSources.ndbc46026,
-        observedSources.cdip142,
-        observedSources.cdip029,
-        observedSources.ndbc46013
+        observedSources.cdip029
       ],
       cdipMop: cdipMop(
         "sf",
@@ -687,16 +549,6 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         "MA122 is the verified public 15 m MOP point nearest Stinson. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.bolinasLagoon,
-      nwsPoint: nwsPoint({
-        gridX: 78,
-        gridY: 112,
-        pointType: "marine",
-        forecastZone: "PZZ545",
-        forecastGridData: "https://api.weather.gov/gridpoints/MTR/78,112",
-        forecastHourly: "https://api.weather.gov/gridpoints/MTR/78,112/forecast/hourly",
-        observationStations: "https://api.weather.gov/gridpoints/MTR/78,112/stations",
-        notes: "Live NWS point metadata returned a marine point on forecast zone PZZ545."
-      }),
       nwsWaveGrid: nwsWaveGrid({
         gridX: 78,
         gridY: 112,
@@ -721,20 +573,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 270, maxDeg: 20 },
     maxGoodWindKt: 8,
     maxOkWindKt: 14,
-    referenceBuoys: ["46237", "46013", "46026"],
-    cdipStations: ["142", "029"],
-    tideStation: "9414958",
     notes: "Regional Wharf/Brighton-facing Bolinas report. NW/WNW is offshore for the southeast-facing beach; keep wave-height confidence low until a direct nearshore source is resolved.",
     sourceMap: {
-      gfsWave: gfsWave(
-        { lat: 37.92, lon: -123.04 },
-        "Nearest offshore wcoast 0p16 point west of Bolinas Lagoon; requires CDIP/local transform before confident nearshore sizing."
-      ),
       observedWave: [
+        observedSources.ndbc46237,
+        observedSources.ndbc46013,
         observedSources.ndbc46026,
-        observedSources.cdip142,
-        observedSources.cdip029,
-        observedSources.ndbc46013
+        observedSources.cdip029
       ],
       cdipMop: cdipMop(
         "sf",
@@ -743,16 +588,6 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         "No safe direct MOP point is mapped for Bolinas. Keep the spot uncalibrated on the NWS coastal-grid fallback rather than borrowing Stinson or an offshore Marin point."
       ),
       coopsTide: coopsTideStations.bolinasLagoon,
-      nwsPoint: nwsPoint({
-        gridX: 77,
-        gridY: 113,
-        pointType: "land",
-        forecastZone: "CAZ505",
-        forecastGridData: "https://api.weather.gov/gridpoints/MTR/77,113",
-        forecastHourly: "https://api.weather.gov/gridpoints/MTR/77,113/forecast/hourly",
-        observationStations: "https://api.weather.gov/gridpoints/MTR/77,113/stations",
-        notes: "Live NWS point metadata returned MTR grid 77,113 for coastal Marin forecast zone CAZ505."
-      }),
       nwsWaveGrid: nwsWaveGrid({
         gridX: 75,
         gridY: 113,
@@ -763,6 +598,56 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     }
   }
 ];
+
+export const NORCAL_REFERENCE_CONFIG_VERSION = 1 as const;
+
+function validateNorcalReferenceConfig(spots: NorcalSpotProfile[]): void {
+  const seenIds = new Set<string>();
+
+  for (const spot of spots) {
+    SpotProfileSchema.parse(spot);
+
+    if (seenIds.has(spot.id)) {
+      throw new Error(`Duplicate spot ID in NorCal reference config: ${spot.id}`);
+    }
+    seenIds.add(spot.id);
+
+    if (spot.region !== "norcal") {
+      throw new Error(`NorCal reference spot ${spot.id} has unexpected region ${spot.region}`);
+    }
+    const observedStationIds = spot.sourceMap.observedWave.map((source) => source.stationId);
+    if (observedStationIds.length === 0 || new Set(observedStationIds).size !== observedStationIds.length) {
+      throw new Error(`Observed-wave source order for ${spot.id} must be nonempty and unique`);
+    }
+  }
+}
+
+validateNorcalReferenceConfig(norcalSpots);
+
+/**
+ * Versioned reference deployment. It intentionally describes one curated
+ * NorCal configuration; it is not a runtime multi-region registry.
+ */
+export const NORCAL_REFERENCE_CONFIG = Object.freeze({
+  schemaVersion: NORCAL_REFERENCE_CONFIG_VERSION,
+  id: "norcal-reference-v1",
+  region: "norcal" as const,
+  spots: norcalSpots
+});
+
+export const NORCAL_SPOTS: NorcalSpotProfile[] = NORCAL_REFERENCE_CONFIG.spots;
+
+export function getOperationalObservedWaveSources(
+  spot: NorcalSpotProfile
+): ObservedWaveSourceMapping[] {
+  return spot.sourceMap.observedWave.filter(
+    (source) => source.provider === "NDBC" && source.role !== "validation"
+  );
+}
+
+export function isNorcalSpotId(id: string): id is SpotId {
+  return NORCAL_SPOTS.some((spot) => spot.id === id);
+}
 
 export function getSpotProfile(id: SpotId): NorcalSpotProfile {
   const spot = NORCAL_SPOTS.find((candidate) => candidate.id === id);
