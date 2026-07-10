@@ -3,7 +3,7 @@ import { getSpotProfile, scoreSpotWindow } from "@surf/forecast-core";
 import type { ScoredForecastWindow } from "@surf/contracts";
 import {
   availableLocalDateKeys,
-  bestWindow,
+  calmestWindow,
   cardinalDirection,
   earliestAvailableLocalDateKey,
   formatWindowSpan,
@@ -26,7 +26,7 @@ function windowAt(
     primaryDirectionDeg: 245,
     tideFt: 2.5,
     windSpeedKt: 5,
-    windDirectionDeg: 90,
+    windDirectionDeg: 300,
     sourceFreshnessMinutes: 20,
     activeCapabilities: ["forecast_wave_nearshore", "observed_wave", "tide", "wind"]
   });
@@ -37,7 +37,7 @@ function windowAt(
     primaryDirectionDeg: 245,
     tideFt: 2.5,
     windSpeedKt: 5,
-    windDirectionDeg: 90,
+    windDirectionDeg: 300,
     sourceFreshnessMinutes: 20,
     activeCapabilities: ["forecast_wave_nearshore", "observed_wave", "tide", "wind"],
     sourceRunIds: ["run"],
@@ -68,7 +68,7 @@ describe("forecast presentation", () => {
       score: 100
     });
     const ready = windowAt("2026-07-10T19:00:00Z", { score: 61 });
-    expect(bestWindow(spot, [past, unknown, ready], now)?.forecastAt).toBe(ready.forecastAt);
+    expect(calmestWindow(spot, [past, unknown, ready], now)?.forecastAt).toBe(ready.forecastAt);
   });
 
   it("moves the report to the next daylight day after the 6pm planning window", () => {
@@ -79,9 +79,22 @@ describe("forecast presentation", () => {
     expect(availableLocalDateKeys(spot, [tonight, tomorrowMorning], now)).toEqual([
       "2026-07-11"
     ]);
-    expect(bestWindow(spot, [tonight, tomorrowMorning], now, "2026-07-11")?.forecastAt).toBe(
+    expect(calmestWindow(spot, [tonight, tomorrowMorning], now, "2026-07-11")?.forecastAt).toBe(
       tomorrowMorning.forecastAt
     );
+  });
+
+  it("moves to the next day when today's daylight rows are all unknown", () => {
+    const now = new Date("2026-07-10T12:00:00Z");
+    const unknownToday = windowAt("2026-07-10T16:00:00Z", {
+      ratingStatus: "unknown",
+      qualityLabel: "unknown"
+    });
+    const readyTomorrow = windowAt("2026-07-11T16:00:00Z");
+
+    expect(
+      earliestAvailableLocalDateKey([{ spot, windows: [unknownToday, readyTomorrow] }], now)
+    ).toBe("2026-07-11");
   });
 
   it("keeps a regional report date when one spot has no forecast windows", () => {
@@ -101,8 +114,8 @@ describe("forecast presentation", () => {
 
   it("translates wind into surf-language surface conditions", () => {
     expect(surfaceCondition(spot, { windSpeedKt: 2, windDirectionDeg: 270 })).toBe("clean");
-    expect(surfaceCondition(spot, { windSpeedKt: 7, windDirectionDeg: 90 })).toBe("clean");
-    expect(surfaceCondition(spot, { windSpeedKt: 13, windDirectionDeg: 270 })).toBe("choppy");
+    expect(surfaceCondition(spot, { windSpeedKt: 7, windDirectionDeg: 300 })).toBe("clean");
+    expect(surfaceCondition(spot, { windSpeedKt: 13, windDirectionDeg: 145 })).toBe("choppy");
     expect(surfaceCondition(spot, { windSpeedKt: null, windDirectionDeg: null })).toBe("unknown");
   });
 

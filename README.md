@@ -28,7 +28,7 @@ v1 targets NorCal:
 - Ocean Beach South
 - Linda Mar / Pacifica
 - Stinson
-- Bolinas
+- Bolinas — Wharf/Brighton
 
 Additional spots are welcome after the first pipeline works end to end.
 

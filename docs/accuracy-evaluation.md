@@ -16,6 +16,16 @@ Only the fourth category can establish whether a particular break was truly
 available now, but its significant wave height is still modeled at depth, not
 a breaking-face measurement.
 
+The compact [evaluation manifest](accuracy-evaluation-manifest.json) pins the
+36 selected NDFD archive objects, equivalent strict post-upload as-of times,
+spot mappings, run options, and published summaries. The original exploratory
+run selected objects nearest to 06:00 UTC, including 06:07 products, so those
+anchors themselves were not strict no-lookahead cutoffs. The manifest records
+strict later timestamps that select the same objects. Exact CDIP MOP nowcast
+response bytes were not retained, which makes the evidence object-selection
+reproducible but not byte-for-byte reproducible; that limitation is intentional
+and should travel with every citation of the results.
+
 ## What was tested
 
 ### 1. NOAA NDFD archive against CDIP MOP nearshore output
@@ -81,6 +91,15 @@ nearshore forecast source. It is not enough to claim stable accuracy: the
 sample contains one issue cycle and MOP nowcast is a buoy-driven modeled proxy,
 not an independent breaking-wave observation.
 
+Those metrics validate the source forecast at its mapped point; they do not
+validate conversion to a breaking surf height. Production therefore keeps the
+exposure-adjusted MOP Hs as the displayed estimate. It also records a
+deterministic cold-start diagnostic from point Hs to first depth-limited
+breaking using linear dispersion, Snell refraction, conserved shore-normal
+energy flux, and `H_b = 0.78 h_b`. Every input and factor is preserved in
+provenance, but the diagnostic does not affect displayed height, scoring, or
+rankings. It can be promoted only after passing the actual-break gates.
+
 ### 3. Same-time Bolinas peer alignment
 
 At approximately 9 PM PDT on July 9, all three products saw essentially the
@@ -98,9 +117,12 @@ tide.
 The useful result is not a winner between vendors. Surf Captain and Surfline
 disagreed on surf size despite agreeing closely on swell, wind, and tide. The
 actionable failure was ours: both peers treated NW/WNW as offshore for the
-regional Bolinas page, while the current profile treated it as onshore. Bolinas
-must use the intended lagoon-mouth break geometry, and it must remain
-low-confidence until that target is confirmed and labeled.
+regional Bolinas page, while the deployed profile treated it as onshore. The
+corrected profile explicitly represents the regional Wharf/Brighton-facing
+page and treats wind from 270° through north to 20° as offshore. Sea Drift's
+east-side rights should become a separate profile rather than mixing two break
+geometries. Wave height remains low-confidence until a direct nearshore target
+is confirmed and labeled.
 
 Surf Captain's own [FAQ](https://surfcaptain.com/faq) says its height is a
 wave-face estimate for average-to-better spots in a region, not an individual
@@ -118,15 +140,16 @@ The forecast engine owns the initial weights; vendors do not set them.
 1. Use source wave energy and components, never an LLM, to compute numeric
    surf facts.
 2. Prefer a mapped CDIP MOP nearshore forecast over a generic coastal-grid
-   scalar.
+   scalar; keep any breaking transform diagnostic until actual-break labels
+   establish that it improves the headline estimate.
 3. Keep size separate from surface quality. A clean one-foot wave remains
    clean.
 4. Derive clean/fair/choppy from wind speed and direction relative to the
    actual break geometry. Commercial overall quality ratings are not equivalent.
 5. Treat tide and swell organization as ranking context, not as a hidden
    redefinition of "clean."
-6. Preserve every issued forecast, source fingerprint, configuration hash, and
-   display call so future tests cannot use hindsight.
+6. Preserve every captured six-hour issuance, source fingerprint,
+   configuration hash, and display call so future tests cannot use hindsight.
 7. Produce one-foot surf ranges from held-out residual quantiles once enough
    actual-break labels exist. Until then, retain low confidence and show the
    physical nearshore estimate honestly.
@@ -145,5 +168,8 @@ holdout. Initial targets are:
 - physical forecast: at least 10% lower MAE than persistence/raw baselines in
   each main lead bucket.
 
-The immutable snapshot tables and raw-source artifacts added with this work are
-the prospective dataset for those gates.
+The append-only issue/snapshot tables and raw-source artifacts added with this
+work are the prospective dataset for those gates within a 400-day retention
+window. Production capture is sampled every six hours, stores only the 6 AM–6
+PM planning horizon, and content-addresses spot configuration; this is
+sufficient for chronological seasonal holdouts without unbounded D1 growth.

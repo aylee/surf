@@ -85,11 +85,30 @@ export type IngestSummary = {
 };
 
 const SOURCE_RUNS_CONTRACT =
-  "D1 binding DB must expose source_runs with run_key/run_kind plus normalized wave_forecasts, wave_observations, tide_forecasts, wind_forecasts, wind_forecast_issues, hazard_events, and forecast_snapshots tables.";
+  "D1 binding DB must expose source_runs with run_key/run_kind plus normalized wave_forecasts, wave_observations, tide_forecasts, wind_forecasts, wind_forecast_issues, hazard_events, forecast_configs, forecast_issues, and forecast_snapshots tables.";
 
 const NDBC_REALTIME_STATIONS = ["46237", "46026", "46013", "46012"];
 const DEFAULT_RAW_CAPTURE_LIMIT_BYTES = 2 * 1024 * 1024;
 const CDIP_RAW_CAPTURE_LIMIT_BYTES = 64 * 1024;
+export const FORECAST_HISTORY_RETENTION_DAYS = 400;
+
+export function shouldCaptureForecastHistory(kind: IngestKind, requestedAt: string): boolean {
+  if (kind === "manual-ingest") return true;
+  const time = new Date(requestedAt);
+  return !Number.isNaN(time.getTime()) && time.getUTCHours() % 6 === 0;
+}
+
+function isDaylightForecastAt(spotId: string, forecastAt: string): boolean {
+  const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
+  if (!spot) return false;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    hourCycle: "h23",
+    timeZone: spot.timezone
+  }).formatToParts(new Date(forecastAt));
+  const hour = Number(parts.find((part) => part.type === "hour")?.value);
+  return Number.isInteger(hour) && hour >= 6 && hour < 18;
+}
 
 function requestUrl(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
@@ -798,7 +817,8 @@ async function persistNwsRows(
   db: D1Database,
   sourceRunId: string,
   rows: NwsContextRow[],
-  createdAt: string
+  createdAt: string,
+  captureHistory: boolean
 ): Promise<PersistenceResult> {
   if (typeof db.prepare !== "function") {
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for NWS rows."] };
@@ -911,25 +931,27 @@ async function persistNwsRows(
             createdAt
           )
       });
-      pending.push({
-        label: `wind_forecast_issues ${wind.spotId} ${wind.forecastAt}`,
-        statement: windIssueStatement.bind(
-          wind.spotId,
-          "nws:point-forecast-alerts",
-          sourceRunId,
-          issueKey,
-          issuedAt,
-          officialIssuedAt,
-          wind.forecastAt,
-          Number.isFinite(leadHours) ? leadHours : null,
-          ktToMs(wind.windSpeedKt),
-          wind.windDirectionDeg,
-          ktToMs(wind.gustKt),
-          wind.shortForecast,
-          payloadJson,
-          createdAt
-        )
-      });
+      if (captureHistory && isDaylightForecastAt(wind.spotId, wind.forecastAt)) {
+        pending.push({
+          label: `wind_forecast_issues ${wind.spotId} ${wind.forecastAt}`,
+          statement: windIssueStatement.bind(
+            wind.spotId,
+            "nws:point-forecast-alerts",
+            sourceRunId,
+            issueKey,
+            issuedAt,
+            officialIssuedAt,
+            wind.forecastAt,
+            Number.isFinite(leadHours) ? leadHours : null,
+            ktToMs(wind.windSpeedKt),
+            wind.windDirectionDeg,
+            ktToMs(wind.gustKt),
+            wind.shortForecast,
+            null,
+            createdAt
+          )
+        });
+      }
     }
 
     for (const hazard of context.hazards) {
@@ -987,6 +1009,29 @@ async function persistIssuedForecasts(
   return { rowsWritten, errors };
 }
 
+async function pruneForecastHistory(db: D1Database, now: Date): Promise<PersistenceResult> {
+  if (typeof db.prepare !== "function") {
+    return { rowsWritten: 0, errors: ["D1 binding does not expose prepare() for history retention."] };
+  }
+  const cutoff = new Date(
+    now.getTime() - FORECAST_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000
+  ).toISOString();
+  return runPendingStatements(db, [
+    {
+      label: "prune forecast_snapshots",
+      statement: db.prepare("delete from forecast_snapshots where captured_at < ?").bind(cutoff)
+    },
+    {
+      label: "prune forecast_issues",
+      statement: db.prepare("delete from forecast_issues where captured_at < ?").bind(cutoff)
+    },
+    {
+      label: "prune wind_forecast_issues",
+      statement: db.prepare("delete from wind_forecast_issues where captured_at < ?").bind(cutoff)
+    }
+  ]);
+}
+
 function bodyString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
@@ -1025,6 +1070,7 @@ export async function runNorcalIngest(
   const region = options.region ?? env.SURF_REGION;
   const now = options.now ?? new Date();
   const idSuffix = options.idSuffix ?? defaultRunIdSuffix();
+  const captureHistory = shouldCaptureForecastHistory(options.kind, requestedAt);
   const horizonHours = 120;
   const caveats: SourceCaveat[] = [];
 
@@ -1074,8 +1120,7 @@ export async function runNorcalIngest(
     coops: coops.rows,
     nws: nws.rows,
     nwsWave: nwsWave.rows,
-    cdipMop: cdipMop.rows,
-    ndbc: ndbc.rows
+    cdipMop: cdipMop.rows
   });
   const sourceRuns = [
     await recordSourceRun(env.DB, coops, {
@@ -1110,7 +1155,13 @@ export async function runNorcalIngest(
   const cdipMopRun = sourceRuns[3]!;
   const ndbcRun = sourceRuns[4]!;
   const tidePersistence = await persistTideForecasts(env.DB, coopsRun.id, coops.rows, fetchedAt);
-  const nwsPersistence = await persistNwsRows(env.DB, nwsRun.id, nws.rows, fetchedAt);
+  const nwsPersistence = await persistNwsRows(
+    env.DB,
+    nwsRun.id,
+    nws.rows,
+    fetchedAt,
+    captureHistory
+  );
   const wavePersistence = await persistWaveForecasts(env.DB, nwsWaveRun.id, nwsWave.rows, fetchedAt);
   const cdipMopPersistence = await persistCdipMopForecasts(env.DB, cdipMopRun.id, cdipMop.rows, fetchedAt);
   const observationPersistence = await persistWaveObservations(env.DB, ndbcRun.id, ndbc.rows, fetchedAt);
@@ -1136,12 +1187,12 @@ export async function runNorcalIngest(
     await finalizeSourceRun(env.DB, cdipMopRun, cdipMop, normalizedPersistence[3]!, artifactPersistence[3]!, completedAt),
     await finalizeSourceRun(env.DB, ndbcRun, ndbc, normalizedPersistence[4]!, artifactPersistence[4]!, completedAt)
   ];
-  const snapshotPersistence = await persistIssuedForecasts(
-    env,
-    now,
-    completedAt,
-    sourceIssueFingerprint
-  );
+  const snapshotPersistence = captureHistory
+    ? await persistIssuedForecasts(env, now, completedAt, sourceIssueFingerprint)
+    : { rowsWritten: 0, errors: [] };
+  const retentionPersistence = captureHistory
+    ? await pruneForecastHistory(env.DB, now)
+    : { rowsWritten: 0, errors: [] };
 
   const dbErrors = finalizedRuns.flatMap((run) => (run.recorded ? [] : [`${run.sourceId}: ${run.error}`]));
   const persistenceErrors = [
@@ -1151,7 +1202,8 @@ export async function runNorcalIngest(
     ...cdipMopPersistence.errors,
     ...observationPersistence.errors,
     ...artifactPersistence.flatMap((result) => result.errors),
-    ...snapshotPersistence.errors
+    ...snapshotPersistence.errors,
+    ...retentionPersistence.errors
   ];
   const adapterErrors = outcomes.flatMap((outcome) => outcome.errors);
   const dbCaveats = finalizedRuns.flatMap((run): SourceCaveat[] =>

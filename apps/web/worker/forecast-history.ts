@@ -1,6 +1,7 @@
 import type { ForecastResponse, ScoredForecastWindow, SpotProfile } from "@surf/contracts";
+import { surfaceConditionForWind } from "@surf/forecast-core";
 
-export const FORECAST_ENGINE_VERSION = "nws-mtr-cold-start-v1+objective-score-v1";
+export const FORECAST_ENGINE_VERSION = "cdip-mop-hs-v1+nws-fallback-v1+objective-score-v1";
 export const FORECAST_PRESENTATION_VERSION = "surf-height-range-v1+surface-condition-v1";
 export const FORECAST_SNAPSHOT_SCHEMA_VERSION = 1;
 
@@ -44,38 +45,11 @@ export async function sha256StableJson(value: unknown): Promise<string> {
   return bytesToHex(await crypto.subtle.digest("SHA-256", encoded));
 }
 
-function circularDistance(left: number, right: number): number {
-  return Math.abs((((left - right) % 360) + 540) % 360 - 180);
-}
-
-function directionInWindow(value: number, min: number, max: number): boolean {
-  return min <= max ? value >= min && value <= max : value >= min || value <= max;
-}
-
 export function snapshotSurfaceCondition(
   spot: SpotProfile,
   window: Pick<ScoredForecastWindow, "windSpeedKt" | "windDirectionDeg">
 ): "clean" | "fair" | "choppy" | "unknown" {
-  const speed = window.windSpeedKt;
-  const direction = window.windDirectionDeg;
-  if (speed === null || direction === null) return "unknown";
-  if (speed <= 3) return "clean";
-  if (
-    directionInWindow(direction, spot.offshoreWindFromDeg.minDeg, spot.offshoreWindFromDeg.maxDeg) &&
-    speed <= spot.maxOkWindKt
-  ) {
-    return "clean";
-  }
-  if (speed <= spot.maxGoodWindKt) return "fair";
-
-  const offshoreCenter =
-    spot.offshoreWindFromDeg.minDeg <= spot.offshoreWindFromDeg.maxDeg
-      ? (spot.offshoreWindFromDeg.minDeg + spot.offshoreWindFromDeg.maxDeg) / 2
-      : (spot.offshoreWindFromDeg.minDeg +
-          (spot.offshoreWindFromDeg.maxDeg + 360 - spot.offshoreWindFromDeg.minDeg) / 2) %
-        360;
-  const onshoreCenter = (offshoreCenter + 180) % 360;
-  return circularDistance(direction, onshoreCenter) <= 75 ? "choppy" : "fair";
+  return surfaceConditionForWind(spot, window);
 }
 
 export function snapshotHeightLabel(value: number | null): string {
@@ -96,13 +70,16 @@ function iso(label: string, value: string): string {
 
 function issueIdentityWindow(spot: SpotProfile, window: ScoredForecastWindow): unknown {
   return {
+    spotId: window.spotId,
     forecastAt: window.forecastAt,
     ratingStatus: window.ratingStatus,
     qualityLabel: window.qualityLabel,
     score: window.score,
+    confidence: window.confidence,
     waveScore: window.waveScore,
     windScore: window.windScore,
     tideScore: window.tideScore,
+    sourceScore: window.sourceScore,
     waveHeightFt: window.waveHeightFt,
     peakPeriodSec: window.peakPeriodSec,
     primaryDirectionDeg: window.primaryDirectionDeg,
@@ -110,6 +87,7 @@ function issueIdentityWindow(spot: SpotProfile, window: ScoredForecastWindow): u
     tideTrend: window.tideTrend ?? null,
     windSpeedKt: window.windSpeedKt,
     windDirectionDeg: window.windDirectionDeg,
+    sourceFreshnessMinutes: window.sourceFreshnessMinutes,
     activeCapabilities: window.activeCapabilities,
     primarySwell: window.primarySwell,
     secondarySwell: window.secondarySwell,
@@ -119,6 +97,16 @@ function issueIdentityWindow(spot: SpotProfile, window: ScoredForecastWindow): u
   };
 }
 
+function isDaylightWindow(spot: SpotProfile, forecastAt: string): boolean {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    hourCycle: "h23",
+    timeZone: spot.timezone
+  }).formatToParts(new Date(forecastAt));
+  const hour = Number(parts.find((part) => part.type === "hour")?.value);
+  return Number.isInteger(hour) && hour >= 6 && hour < 18;
+}
+
 function changedRows(result: D1Result | undefined): number {
   const changes = result?.meta?.changes;
   return typeof changes === "number" ? changes : 1;
@@ -126,7 +114,8 @@ function changedRows(result: D1Result | undefined): number {
 
 async function execute(
   db: D1Database,
-  statements: D1PreparedStatement[]
+  statements: D1PreparedStatement[],
+  label: string
 ): Promise<{ rowsWritten: number; errors: string[] }> {
   let rowsWritten = 0;
   const errors: string[] = [];
@@ -145,7 +134,7 @@ async function execute(
       }
     } catch (error) {
       errors.push(
-        `forecast_snapshots batch starting at ${start}: ${error instanceof Error ? error.message : String(error)}`
+        `${label} batch starting at ${start}: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }
@@ -166,10 +155,13 @@ export async function persistForecastSnapshots(
   const issuedAt = iso("issuedAt", options.issuedAt);
   const spotConfigJson = stableJson(response.spot);
   const spotConfigHash = await sha256StableJson(response.spot);
+  const historyWindows = response.windows.filter((window) =>
+    isDaylightWindow(response.spot, window.forecastAt)
+  );
   const sourceIssueFingerprint =
     options.sourceIssueFingerprint ??
     (await sha256StableJson(
-      response.windows.map((window) => issueIdentityWindow(response.spot, window))
+      historyWindows.map((window) => issueIdentityWindow(response.spot, window))
     ));
   const issueId = `sha256:${await sha256StableJson({
     spotId: response.spot.id,
@@ -177,8 +169,41 @@ export async function persistForecastSnapshots(
     sourceIssueFingerprint,
     forecastEngineVersion: FORECAST_ENGINE_VERSION,
     presentationVersion: FORECAST_PRESENTATION_VERSION,
-    windows: response.windows.map((window) => issueIdentityWindow(response.spot, window))
+    windows: historyWindows.map((window) => issueIdentityWindow(response.spot, window))
   })}`;
+
+  const configStatement = db.prepare(
+    `insert into forecast_configs (spot_id, config_hash, config_json, created_at)
+     values (?, ?, ?, ?)
+     on conflict(spot_id, config_hash) do nothing`
+  ).bind(response.spot.id, spotConfigHash, spotConfigJson, capturedAt);
+  const issueContextJson = stableJson({
+    observation: response.observation ?? null,
+    caveats: [...new Set(response.windows.flatMap((window) => window.caveats))].sort()
+  });
+  const issueStatement = db.prepare(
+    `insert into forecast_issues (
+      spot_id, issue_id, captured_at, issued_at, source_issue_fingerprint,
+      spot_config_hash, source_note, issue_context_json, expected_window_count,
+      forecast_engine_version, presentation_version, snapshot_schema_version,
+      created_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    on conflict(spot_id, issue_id) do nothing`
+  ).bind(
+    response.spot.id,
+    issueId,
+    capturedAt,
+    issuedAt,
+    sourceIssueFingerprint,
+    spotConfigHash,
+    response.sourceNote,
+    issueContextJson,
+    historyWindows.length,
+    FORECAST_ENGINE_VERSION,
+    FORECAST_PRESENTATION_VERSION,
+    FORECAST_SNAPSHOT_SCHEMA_VERSION,
+    capturedAt
+  );
 
   const statement = db.prepare(
     `insert into forecast_snapshots (
@@ -195,7 +220,7 @@ export async function persistForecastSnapshots(
     on conflict(spot_id, issue_id, valid_at) do nothing`
   );
 
-  const statements = response.windows.map((window) => {
+  const statements = historyWindows.map((window) => {
     const validAt = iso("forecastAt", window.forecastAt);
     const surfaceCondition = snapshotSurfaceCondition(response.spot, window);
     const displayedHeightLabel = snapshotHeightLabel(window.waveHeightFt);
@@ -205,17 +230,13 @@ export async function persistForecastSnapshots(
           {
             sourceId: window.waveProvenance.sourceId,
             sourceUpdatedAt: window.waveProvenance.sourceUpdatedAt,
+            modelCycleAt: window.waveProvenance.modelCycleAt ?? null,
+            transformVersion: window.waveProvenance.transformVersion ?? null,
             derivation: window.waveProvenance.derivation
           }
         ]
       : [];
-    const rawFactsJson = stableJson({
-      ...window,
-      displayedHeightLabel,
-      surfaceCondition,
-      observation: response.observation ?? null,
-      sourceNote: response.sourceNote
-    });
+    const rawFactsJson = stableJson(issueIdentityWindow(response.spot, window));
 
     return statement.bind(
       response.spot.id,
@@ -246,7 +267,7 @@ export async function persistForecastSnapshots(
       stableJson(sourceVersions),
       sourceIssueFingerprint,
       rawFactsJson,
-      spotConfigJson,
+      stableJson({ configHash: spotConfigHash }),
       spotConfigHash,
       FORECAST_ENGINE_VERSION,
       FORECAST_PRESENTATION_VERSION,
@@ -255,6 +276,35 @@ export async function persistForecastSnapshots(
     );
   });
 
-  const result = await execute(db, statements);
+  if (typeof db.batch === "function") {
+    try {
+      const results = await db.batch([configStatement, issueStatement, ...statements]);
+      return {
+        issueId,
+        rowsWritten: results
+          .slice(2)
+          .reduce((sum, result) => sum + changedRows(result), 0),
+        errors: []
+      };
+    } catch (error) {
+      return {
+        issueId,
+        rowsWritten: 0,
+        errors: [
+          `atomic forecast issue batch failed: ${error instanceof Error ? error.message : String(error)}`
+        ]
+      };
+    }
+  }
+
+  const metadataResult = await execute(
+    db,
+    [configStatement, issueStatement],
+    "forecast issue metadata"
+  );
+  if (metadataResult.errors.length > 0) {
+    return { issueId, rowsWritten: 0, errors: metadataResult.errors };
+  }
+  const result = await execute(db, statements, "forecast snapshots");
   return { issueId, ...result };
 }

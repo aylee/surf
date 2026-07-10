@@ -71,13 +71,13 @@ insert into spots (
   ),
   (
     'bolinas',
-    'Bolinas',
+    'Bolinas — Wharf/Brighton',
     'norcal',
     37.909,
     -122.687,
     'America/Los_Angeles',
     215,
-    '{"bestSwellDeg":{"minDeg":210,"maxDeg":285},"workableSwellDeg":{"minDeg":190,"maxDeg":310},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":0.5,"max":4.5},"offshoreWindFromDeg":{"minDeg":45,"maxDeg":135},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46237","46013","46026"],"tideStation":"9414958","notes":"Sheltered longboard-friendly option; exact source mapping is a v1 task."}',
+    '{"bestSwellDeg":{"minDeg":210,"maxDeg":285},"workableSwellDeg":{"minDeg":190,"maxDeg":310},"bestPeriodSec":{"min":8,"max":15},"bestTideFt":{"min":0.5,"max":4.5},"offshoreWindFromDeg":{"minDeg":270,"maxDeg":20},"maxGoodWindKt":8,"maxOkWindKt":14,"referenceBuoys":["46237","46013","46026"],"tideStation":"9414958","notes":"Regional Wharf/Brighton-facing Bolinas report; NW/WNW is offshore. Height remains low-confidence without a direct nearshore source."}',
     1
   )
 on conflict(id) do update set
@@ -145,10 +145,10 @@ insert into sources (
     'opendap_ascii',
     'worker',
     'Coastal Data Information Program MOP modeled wave forecasts',
-    'Public CDIP model output. Retain point ID, raw Hs, depth, Last-Modified source update, and the distinction from breaking-wave truth.',
+    'Public CDIP model output. Retain point ID, raw Hs, depth, Last-Modified source update, deterministic transform inputs, and the distinction from observed surf-face truth.',
     180,
     1,
-    '{"adapter":"fetchCdipMopForecastsForSpots","variables":["waveTime","waveHs","waveTp","waveDp","waveDm"],"sourceTimestampSemantics":"http_last_modified_source_update_not_model_cycle","heightSemantics":"modeled_significant_wave_height_not_breaking_face_height"}'
+    '{"adapter":"fetchCdipMopForecastsForSpots","variables":["waveTime","waveHs","waveTp","waveDp","waveDm"],"sourceTimestampSemantics":"http_last_modified_source_update_not_model_cycle","heightSemantics":"modeled_significant_wave_height_not_breaking_face_height","experimentalTransform":"bulk-hs-linear-shoaling-v1","experimentalTransformAffectsDisplay":false,"breakerIndex":0.78}'
   ),
   (
     'ndbc:realtime2-standard-meteorological',

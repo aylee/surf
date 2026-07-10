@@ -32,6 +32,44 @@ create index if not exists wind_forecast_issues_source_issued_at_idx
 create index if not exists wind_forecast_issues_source_run_idx
   on wind_forecast_issues (source_run_id);
 
+create index if not exists wind_forecast_issues_captured_at_idx
+  on wind_forecast_issues (captured_at);
+
+create table if not exists forecast_configs (
+  spot_id text not null,
+  config_hash text not null,
+  config_json text not null,
+  created_at text not null,
+  primary key (spot_id, config_hash),
+  foreign key (spot_id) references spots(id)
+);
+
+create table if not exists forecast_issues (
+  spot_id text not null,
+  issue_id text not null,
+  captured_at text not null,
+  issued_at text not null,
+  source_issue_fingerprint text not null,
+  spot_config_hash text not null,
+  source_note text not null,
+  issue_context_json text not null,
+  expected_window_count integer not null,
+  forecast_engine_version text not null,
+  presentation_version text not null,
+  snapshot_schema_version integer not null,
+  created_at text not null,
+  primary key (spot_id, issue_id),
+  foreign key (spot_id) references spots(id),
+  foreign key (spot_id, spot_config_hash)
+    references forecast_configs(spot_id, config_hash)
+);
+
+create index if not exists forecast_issues_spot_issued_at_idx
+  on forecast_issues (spot_id, issued_at);
+
+create index if not exists forecast_issues_captured_at_idx
+  on forecast_issues (captured_at);
+
 create table if not exists forecast_snapshots (
   spot_id text not null,
   issue_id text not null,
@@ -79,3 +117,6 @@ create index if not exists forecast_snapshots_spot_issued_at_idx
 
 create index if not exists forecast_snapshots_issue_idx
   on forecast_snapshots (issue_id);
+
+create index if not exists forecast_snapshots_captured_at_idx
+  on forecast_snapshots (captured_at);

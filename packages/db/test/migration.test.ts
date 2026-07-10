@@ -57,6 +57,20 @@ describe("D1 migration", () => {
       "spot_config_hash text not null",
       "forecast_engine_version text not null"
     ],
+    forecast_configs: [
+      "config_hash text not null",
+      "config_json text not null",
+      "created_at text not null"
+    ],
+    forecast_issues: [
+      "issue_id text not null",
+      "captured_at text not null",
+      "issued_at text not null",
+      "source_issue_fingerprint text not null",
+      "spot_config_hash text not null",
+      "issue_context_json text not null",
+      "expected_window_count integer not null"
+    ],
     forecast_reports: ["status text not null", "model_summary_json text not null", "report_markdown text", "disabled_reason text"]
   };
 
@@ -79,6 +93,8 @@ describe("D1 migration", () => {
     expect(normalizedSql).toContain("create index if not exists forecast_reports_region_issued_at_idx on forecast_reports (region_id, issued_at)");
     expect(normalizedSql).toContain("create index if not exists wind_forecast_issues_spot_forecast_at_idx on wind_forecast_issues (spot_id, forecast_at)");
     expect(normalizedSql).toContain("create index if not exists forecast_snapshots_spot_valid_at_idx on forecast_snapshots (spot_id, valid_at)");
+    expect(normalizedSql).toContain("create index if not exists forecast_snapshots_captured_at_idx on forecast_snapshots (captured_at)");
+    expect(normalizedSql).toContain("create index if not exists wind_forecast_issues_captured_at_idx on wind_forecast_issues (captured_at)");
   });
 
   it("adds forecast history without altering or dropping the live read-model tables", () => {
@@ -90,6 +106,11 @@ describe("D1 migration", () => {
       "primary key (spot_id, source_id, issue_key, forecast_at)"
     );
     expect(normalizedHistory).toContain("primary key (spot_id, issue_id, valid_at)");
+    expect(normalizedHistory).toContain("primary key (spot_id, config_hash)");
+    expect(normalizedHistory).toContain("primary key (spot_id, issue_id)");
+    expect(normalizedHistory).toContain(
+      "foreign key (spot_id, spot_config_hash) references forecast_configs(spot_id, config_hash)"
+    );
   });
 });
 

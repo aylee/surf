@@ -88,6 +88,29 @@ describe("scoreSpotWindow", () => {
     expect(far.confidence).toBeLessThan(near.confidence);
   });
 
+  it("scores just-outside wraparound offshore wind without a discontinuity", () => {
+    const spot = getSpotProfile("bolinas");
+    const input = {
+      spotId: spot.id,
+      forecastAt: "2026-07-10T15:00:00.000Z",
+      waveHeightFt: 2.5,
+      peakPeriodSec: 12,
+      primaryDirectionDeg: 245,
+      tideFt: 2,
+      windSpeedKt: 10,
+      sourceFreshnessMinutes: 30,
+      activeCapabilities: ["forecast_wave_nearshore", "tide", "wind"] as Array<
+        "forecast_wave_nearshore" | "tide" | "wind"
+      >
+    };
+
+    const boundary = scoreSpotWindow(spot, { ...input, windDirectionDeg: 20 });
+    const justOutside = scoreSpotWindow(spot, { ...input, windDirectionDeg: 25 });
+
+    expect(boundary.windScore - justOutside.windScore).toBeLessThanOrEqual(10);
+    expect(justOutside.windScore).toBeGreaterThan(75);
+  });
+
   it("builds fixture forecasts for the v1 spots", () => {
     const forecast = buildFixtureForecast("bolinas", new Date("2026-07-08T12:00:00.000Z"));
     expect(forecast.windows).toHaveLength(25);

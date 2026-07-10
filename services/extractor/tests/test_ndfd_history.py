@@ -8,6 +8,7 @@ import pytest
 from surf_extractor.backtest import EvaluationConfig
 from surf_extractor.cdip import CdipMopMetadata, CdipMopValue
 from surf_extractor.ndfd_history import (
+    CfgribNdfdPointExtractor,
     NdfdArchiveObject,
     NdfdArchiveSelectionError,
     NdfdArchiveSnapshot,
@@ -210,6 +211,71 @@ def test_nearest_grid_cell_skips_missing_and_normalizes_longitude() -> None:
             target_longitude=-122.730,
             max_distance_km=5,
         )
+
+
+def test_cfgrib_extractor_keeps_coordinate_value_association(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    np = pytest.importorskip("numpy", reason="optional GRIB dependencies are not installed")
+    xr = pytest.importorskip("xarray", reason="optional GRIB dependencies are not installed")
+    cfgrib = pytest.importorskip(
+        "cfgrib", reason="optional GRIB dependencies are not installed"
+    )
+    issue_at = utc(1, 4, 7)
+    dataset = xr.Dataset(
+        data_vars={
+            "shww": (
+                ("step", "y", "x"),
+                np.array(
+                    [
+                        [[8.8, 7.7], [6.6, 1.5]],
+                        [[8.8, 7.7], [2.2, np.nan]],
+                    ]
+                ),
+                {"units": "m", "GRIB_shortName": "shww"},
+            )
+        },
+        coords={
+            "step": [0, 1],
+            "valid_time": (
+                "step",
+                np.array(["2025-04-01T05:07", "2025-04-01T06:07"], dtype="datetime64[ns]"),
+            ),
+            "latitude": (
+                ("y", "x"),
+                np.array([[37.90, 37.90], [37.91, 37.91]]),
+            ),
+            "longitude": (
+                ("y", "x"),
+                np.array([[237.26, 237.27], [237.26, 237.27]]),
+            ),
+        },
+    )
+    payload = b"synthetic-grib-boundary"
+
+    def open_synthetic(path: str, *, backend_kwargs: dict[str, str]):
+        assert Path(path).read_bytes() == payload
+        assert backend_kwargs == {"indexpath": ""}
+        return [dataset]
+
+    monkeypatch.setattr(cfgrib, "open_datasets", open_synthetic)
+
+    rows = CfgribNdfdPointExtractor().extract(
+        payload,
+        archive_object("YKUZ98_KWBN", issue_at, size_bytes=len(payload)),
+        mapping(),
+    )
+
+    assert [row.valid_at for row in rows] == [
+        datetime(2025, 4, 1, 5, 7, tzinfo=UTC),
+        datetime(2025, 4, 1, 6, 7, tzinfo=UTC),
+    ]
+    assert rows[0].raw_wave_height_m == 1.5
+    assert rows[0].grid_latitude == 37.91
+    assert rows[0].grid_longitude == pytest.approx(-122.73)
+    assert rows[1].raw_wave_height_m == 2.2
+    assert rows[1].grid_latitude == 37.91
+    assert rows[1].grid_longitude == pytest.approx(-122.74)
 
 
 class FakeExtractor:

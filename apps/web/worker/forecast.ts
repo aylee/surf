@@ -8,7 +8,12 @@ import type {
   WaveObservationSummary,
   WaveProvenance
 } from "@surf/contracts";
-import { getSpotProfile, scoreSpotWindow } from "@surf/forecast-core";
+import {
+  getSpotProfile,
+  scoreSpotWindow,
+  surfaceConditionForWind,
+  type NorcalSpotProfile
+} from "@surf/forecast-core";
 import { CDIP_MOP_SOURCE_ID } from "./adapters/cdip-mop";
 import { NDBC_STALE_AFTER_MINUTES } from "./adapters/ndbc";
 import { NWS_GRID_WAVE_SOURCE_ID } from "./adapters/nws-grid-wave";
@@ -80,9 +85,19 @@ type WavePayload = {
   nearshoreHeightScale?: unknown;
   significantHeightM?: unknown;
   nearshoreHeightM?: unknown;
+  exposureAdjustedPointHeightM?: unknown;
   estimatedBreakingHeightM?: unknown;
+  experimentalBreakingHeightM?: unknown;
+  breakingDepthM?: unknown;
+  shoalingFactor?: unknown;
+  totalHeightFactor?: unknown;
+  breakerIndex?: unknown;
+  incidenceAngleDeg?: unknown;
+  transformMethod?: unknown;
+  transformVersion?: unknown;
   modelPointId?: unknown;
   modelPointWaterDepthM?: unknown;
+  modelPointShoreNormalDeg?: unknown;
   pointRelationship?: unknown;
   sourceTimestampSemantics?: unknown;
   heightSemantics?: unknown;
@@ -148,15 +163,36 @@ export function preferredWaveAt(rows: WaveRow[], forecastAt: string): WaveRow | 
   );
 }
 
-function strongestWindInWindow(rows: WindRow[], forecastAt: string): WindRow | null {
+function worstWindInWindow(
+  rows: WindRow[],
+  forecastAt: string,
+  spot: NorcalSpotProfile
+): WindRow | null {
   const start = new Date(forecastAt).getTime();
   const end = start + 3 * 60 * 60 * 1000;
   const inWindow = rows.filter((row) => {
     const time = new Date(row.forecast_at).getTime();
     return Number.isFinite(time) && time >= start && time < end;
   });
+  const complete = inWindow.filter(
+    (row) => row.wind_speed_ms !== null && row.wind_direction_deg !== null
+  );
+  const severity = { unknown: -1, clean: 0, fair: 1, choppy: 2 } as const;
+  const worstComplete = complete.sort((left, right) => {
+    const leftSurface = surfaceConditionForWind(spot, {
+      windSpeedKt: left.wind_speed_ms! * 1.94384,
+      windDirectionDeg: left.wind_direction_deg
+    });
+    const rightSurface = surfaceConditionForWind(spot, {
+      windSpeedKt: right.wind_speed_ms! * 1.94384,
+      windDirectionDeg: right.wind_direction_deg
+    });
+    const surfaceDelta = severity[rightSurface] - severity[leftSurface];
+    if (surfaceDelta !== 0) return surfaceDelta;
+    return right.wind_speed_ms! - left.wind_speed_ms!;
+  })[0];
   return (
-    inWindow.sort(
+    worstComplete ?? inWindow.sort(
       (left, right) =>
         (right.wind_speed_ms ?? Number.NEGATIVE_INFINITY) -
         (left.wind_speed_ms ?? Number.NEGATIVE_INFINITY)
@@ -421,7 +457,7 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
 
     const windows: ScoredForecastWindow[] = forecastTimes.map((forecastAt) => {
       const tide = closestByTime(tideRows, forecastAt, (row) => row.forecast_at, 90 * 60 * 1000);
-      const wind = strongestWindInWindow(windRows, forecastAt);
+      const wind = worstWindInWindow(windRows, forecastAt, spot);
       const wave = preferredWaveAt(waveRows, forecastAt);
       const hazard = activeHazardAt(hazardRows, forecastAt);
       const payload = parseWavePayload(wave?.payload_json ?? null);
@@ -524,6 +560,14 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
       }
       const modelPointId = typeof payload.modelPointId === "string" ? payload.modelPointId : null;
       const modelPointWaterDepthM = finiteNumber(payload.modelPointWaterDepthM);
+      const modelPointShoreNormalDeg = finiteNumber(payload.modelPointShoreNormalDeg);
+      const exposureAdjustedPointHeightM = finiteNumber(payload.exposureAdjustedPointHeightM);
+      const experimentalBreakingHeightM = finiteNumber(payload.experimentalBreakingHeightM);
+      const shoalingFactor = finiteNumber(payload.shoalingFactor);
+      const totalHeightFactor = finiteNumber(payload.totalHeightFactor);
+      const breakerIndex = finiteNumber(payload.breakerIndex);
+      const breakingDepthM = finiteNumber(payload.breakingDepthM);
+      const incidenceAngleDeg = finiteNumber(payload.incidenceAngleDeg);
       const pointRelationship =
         payload.pointRelationship === "direct_nearshore_point" ||
         payload.pointRelationship === "outside_cove_approach_proxy"
@@ -534,6 +578,7 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
         rawSignificantHeightFt !== null &&
         waveHeightFt !== null &&
         cdipNearshoreHeightScale !== null &&
+        exposureAdjustedPointHeightM !== null &&
         sourceUrl &&
         waveSourceUpdatedAt &&
         modelPointId &&
@@ -548,11 +593,27 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
           modelCycleAt: wave.model_cycle_at,
           rawSignificantHeightFt,
           breakingHeightScale: cdipNearshoreHeightScale,
+          exposureScale: cdipNearshoreHeightScale,
+          shoalingFactor: shoalingFactor ?? undefined,
+          totalHeightFactor: totalHeightFactor ?? undefined,
+          breakerIndex: breakerIndex ?? undefined,
+          breakingDepthM: breakingDepthM ?? undefined,
+          incidenceAngleDeg: incidenceAngleDeg ?? undefined,
+          experimentalBreakingHeightFt: metersToFeet(experimentalBreakingHeightM),
+          transformMethod:
+            payload.transformMethod === "linear-energy-flux-snell-depth-limited"
+              ? payload.transformMethod
+              : undefined,
+          transformVersion:
+            payload.transformVersion === "bulk-hs-linear-shoaling-v1"
+              ? payload.transformVersion
+              : undefined,
           estimatedBreakingHeightFt: null,
           modeledNearshoreSignificantHeightFt: waveHeightFt,
           heightSemantics: "modeled_significant_wave_height_not_breaking_face_height",
           modelPointId,
           modelPointWaterDepthM,
+          modelPointShoreNormalDeg: modelPointShoreNormalDeg ?? undefined,
           pointRelationship,
           sourceTimestampSemantics: "http_last_modified_source_update_not_model_cycle",
           derivation:
@@ -565,8 +626,18 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
             ? `Linda Mar uses CDIP ${modelPointId} modeled Hs outside the cove × ${cdipNearshoreHeightScale.toFixed(2)} final cove scale; this is not breaking-wave face truth.`
             : `CDIP ${modelPointId} is modeled significant wave height at ${modelPointWaterDepthM} m, not observed breaking-wave face height.`
         );
+        if (experimentalBreakingHeightM !== null) {
+          caveats.push(
+            "An experimental bulk-Hs breaking proxy is retained for backtesting only and does not affect the displayed height or score."
+          );
+        }
         caveats.push("CDIP HTTP Last-Modified is the source-file update time, not an underlying model cycle.");
       }
+
+      const cdipPrimaryHeightM =
+        wave?.source_id === CDIP_MOP_SOURCE_ID
+          ? exposureAdjustedPointHeightM ?? finiteNumber(payload.significantHeightM)
+          : null;
 
       return {
         ...score,
@@ -588,9 +659,9 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
         sourceRunIds: runIds,
         caveats,
         primarySwell: swellComponent(
-          wave?.swell_height_m ?? payload.primarySwellHeightM,
-          wave?.swell_period_s ?? payload.primarySwellPeriodS,
-          wave?.swell_direction_deg ?? payload.primarySwellDirectionDeg
+          wave?.swell_height_m ?? payload.primarySwellHeightM ?? cdipPrimaryHeightM,
+          wave?.swell_period_s ?? payload.primarySwellPeriodS ?? (wave?.source_id === CDIP_MOP_SOURCE_ID ? wave.peak_period_s : null),
+          wave?.swell_direction_deg ?? payload.primarySwellDirectionDeg ?? (wave?.source_id === CDIP_MOP_SOURCE_ID ? wave.primary_direction_deg : null)
         ),
         secondarySwell: swellComponent(
           payload.secondarySwellHeightM,
@@ -602,7 +673,7 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
     });
     const usesCdipMop = windows.some((window) => window.waveProvenance?.sourceId === CDIP_MOP_SOURCE_ID);
     const sourceNote = usesCdipMop
-      ? "Wave conditions prefer public CDIP MOP modeled significant wave height at the mapped 10/15 m point, with NOAA/NWS MTR coastal-grid waves retained as fallback and NOAA/NDBC buoys as current context. CDIP Hs is not observed breaking-wave face height; Linda Mar alone keeps the visible 0.60 final cove scale. HTTP Last-Modified is a source-file update, not a model cycle."
+      ? "Wave conditions prefer public CDIP MOP modeled significant wave height at the mapped 10/15 m point, with NOAA/NWS MTR coastal-grid waves retained as fallback and NOAA/NDBC buoys as current context. CDIP Hs is not observed breaking-wave face height; Linda Mar alone keeps the visible 0.60 final cove scale. An experimental breaking proxy is retained for future evaluation but does not affect the displayed height or score. HTTP Last-Modified is a source-file update, not a model cycle."
       : spotId === "bolinas"
         ? "Bolinas has no safe direct CDIP MOP mapping and remains uncalibrated on official NOAA/NWS MTR coastal-grid data as the fallback. Its visible spot scale is a cold-start estimate, not breaking-wave truth; NOAA/NDBC buoys provide current context."
         : "CDIP MOP is mapped but no usable row was available for this window, so wave conditions use the official NOAA/NWS MTR coastal-grid fallback with NOAA/NDBC buoy context. The NWS spot scale is a visible cold-start breaking-height estimate. Missing wave data returns an unknown call."

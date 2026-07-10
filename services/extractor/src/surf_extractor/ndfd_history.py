@@ -219,6 +219,17 @@ class NdfdPointExtractor(Protocol):
     ) -> tuple[NdfdPointForecast, ...]: ...
 
 
+def require_ndfd_grib_tooling() -> None:
+    try:
+        import cfgrib  # noqa: F401
+        import numpy  # noqa: F401
+    except ImportError as error:
+        raise NdfdGribToolingUnavailable(
+            "NDFD history extraction requires the optional grib dependencies: "
+            "run `uv sync --project services/extractor --extra grib`"
+        ) from error
+
+
 def _xml_text(element: ElementTree.Element, child_name: str) -> str:
     for child in element:
         if child.tag.rsplit("}", 1)[-1] == child_name and child.text is not None:
@@ -474,13 +485,21 @@ def _datetime_from_array_value(value: object) -> datetime:
     return datetime.fromtimestamp(epoch_ns / 1_000_000_000, tz=timezone.utc)
 
 
-def _select_coordinate_value(data_array, dataset, selectors: dict[str, int]):  # type: ignore[no-untyped-def]
+def _select_coordinate_value(  # type: ignore[no-untyped-def]
+    data_array,
+    dataset,
+    selectors: dict[str, int],
+):
     coordinate = data_array.coords.get("valid_time")
     if coordinate is None:
         coordinate = dataset.coords.get("valid_time")
     if coordinate is None:
         raise NdfdGribExtractionError("GRIB dataset omitted valid_time")
-    applicable = {dimension: index for dimension, index in selectors.items() if dimension in coordinate.dims}
+    applicable = {
+        dimension: index
+        for dimension, index in selectors.items()
+        if dimension in coordinate.dims
+    }
     selected = coordinate.isel(applicable) if applicable else coordinate
     values = selected.values.reshape(-1)
     if len(values) != 1:
@@ -497,14 +516,9 @@ class CfgribNdfdPointExtractor:
         item: NdfdArchiveObject,
         mapping: NdfdMopHistoryMapping,
     ) -> tuple[NdfdPointForecast, ...]:
-        try:
-            import cfgrib
-            import numpy as np
-        except ImportError as error:
-            raise NdfdGribToolingUnavailable(
-                "NDFD history extraction requires the optional grib dependencies: "
-                "run `uv sync --project services/extractor --extra grib`"
-            ) from error
+        require_ndfd_grib_tooling()
+        import cfgrib
+        import numpy as np
 
         payload_sha256 = hashlib.sha256(payload).hexdigest()
         with tempfile.NamedTemporaryFile(suffix=".grib2") as temporary:
@@ -546,29 +560,74 @@ class CfgribNdfdPointExtractor:
                     raise NdfdGribExtractionError(
                         "GRIB latitude/longitude coordinates do not share a spatial grid"
                     )
+                latitude_values, longitude_values = np.broadcast_arrays(
+                    latitude.values,
+                    longitude.values,
+                )
+                flat_latitudes = latitude_values.reshape(-1)
+                flat_longitudes = (
+                    (longitude_values.reshape(-1) + 180) % 360 - 180
+                )
+                target_latitude_rad = np.radians(mapping.target_latitude)
+                latitude_radians = np.radians(flat_latitudes)
+                delta_latitudes = latitude_radians - target_latitude_rad
+                delta_longitudes = np.radians(
+                    (flat_longitudes - mapping.target_longitude + 180) % 360 - 180
+                )
+                chord = (
+                    np.sin(delta_latitudes / 2) ** 2
+                    + np.cos(target_latitude_rad)
+                    * np.cos(latitude_radians)
+                    * np.sin(delta_longitudes / 2) ** 2
+                )
+                distances = 6371.0088 * 2 * np.arcsin(
+                    np.minimum(1.0, np.sqrt(chord))
+                )
+                coordinate_mask = (
+                    np.isfinite(flat_latitudes)
+                    & np.isfinite(flat_longitudes)
+                    & np.isfinite(distances)
+                    & (distances <= mapping.max_grid_distance_km)
+                )
+                nearby_indices = np.flatnonzero(coordinate_mask)
+                if not len(nearby_indices):
+                    raise NdfdGribExtractionError(
+                        "NDFD grid has no coordinate within max_grid_distance_km="
+                        f"{mapping.max_grid_distance_km}"
+                    )
+                nearby_indices = nearby_indices[
+                    np.argsort(distances[nearby_indices], kind="stable")
+                ]
                 extra_dimensions = [
                     dimension
                     for dimension in data_array.dims
                     if dimension not in spatial_dimensions
                 ]
-                index_ranges = [range(data_array.sizes[dimension]) for dimension in extra_dimensions]
+                index_ranges = [
+                    range(data_array.sizes[dimension])
+                    for dimension in extra_dimensions
+                ]
                 combinations = itertools.product(*index_ranges) if index_ranges else [()]
                 for combination in combinations:
                     selectors = dict(zip(extra_dimensions, combination))
                     sliced = data_array.isel(selectors) if selectors else data_array
                     sliced = sliced.transpose(*spatial_dimensions)
-                    latitudes, longitudes, heights = np.broadcast_arrays(
-                        latitude.values,
-                        longitude.values,
-                        sliced.values,
+                    heights = np.asarray(sliced.values).reshape(-1)
+                    nearby_heights = heights[nearby_indices]
+                    finite_offsets = np.flatnonzero(
+                        np.isfinite(nearby_heights) & (nearby_heights >= 0)
                     )
-                    cell = nearest_finite_grid_cell(
-                        latitudes.reshape(-1).tolist(),
-                        longitudes.reshape(-1).tolist(),
-                        heights.reshape(-1).tolist(),
-                        target_latitude=mapping.target_latitude,
-                        target_longitude=mapping.target_longitude,
-                        max_distance_km=mapping.max_grid_distance_km,
+                    if not len(finite_offsets):
+                        raise NdfdGribExtractionError(
+                            "NDFD shww grid has no finite value within "
+                            f"max_grid_distance_km={mapping.max_grid_distance_km}"
+                        )
+                    flat_index = int(nearby_indices[int(finite_offsets[0])])
+                    cell = NdfdGridCell(
+                        latitude=float(flat_latitudes[flat_index]),
+                        longitude=float(flat_longitudes[flat_index]),
+                        wave_height_m=float(heights[flat_index]),
+                        distance_km=float(distances[flat_index]),
                     )
                     valid_at = _datetime_from_array_value(
                         _select_coordinate_value(data_array, dataset, selectors)

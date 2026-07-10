@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "./index";
 import worker from "./index";
+import { shouldCaptureForecastHistory } from "./ingest";
 
 function dbMock() {
   const runs: unknown[][] = [];
@@ -39,6 +40,12 @@ function env(db: D1Database = dbMock().db): Env {
 }
 
 describe("worker api", () => {
+  it("samples scheduled history every six hours while preserving manual captures", () => {
+    expect(shouldCaptureForecastHistory("queued-ingest", "2026-07-10T00:17:00Z")).toBe(true);
+    expect(shouldCaptureForecastHistory("queued-ingest", "2026-07-10T01:17:00Z")).toBe(false);
+    expect(shouldCaptureForecastHistory("manual-ingest", "2026-07-10T01:17:00Z")).toBe(true);
+  });
+
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -233,7 +240,7 @@ describe("worker api", () => {
     expect(body.counts.nwsWaveForecastRows).toBe(246);
     expect(body.counts.cdipMopWaveForecastRows).toBe(10);
     expect(body.counts.ndbcObservationRows).toBe(4);
-    expect(body.counts.forecastSnapshotRows).toBe(246);
+    expect(body.counts.forecastSnapshotRows).toBe(120);
     expect(body.sourceRuns.map((run) => run.sourceId)).toEqual([
       "coops:tide-predictions",
       "nws:point-forecast-alerts",
@@ -248,7 +255,10 @@ describe("worker api", () => {
     expect(runs.some((values) => values[1] === "nws:mtr-grid-wave")).toBe(true);
     expect(runs.some((values) => values.some((value) => typeof value === "string" && value.startsWith("raw/")))).toBe(true);
     expect(sqls.filter((sql) => sql.includes("insert into wind_forecast_issues"))).toHaveLength(6);
-    expect(sqls.filter((sql) => sql.includes("insert into forecast_snapshots"))).toHaveLength(246);
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_configs"))).toHaveLength(6);
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_issues"))).toHaveLength(6);
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_snapshots"))).toHaveLength(120);
+    expect(sqls.filter((sql) => sql.includes("delete from forecast_snapshots"))).toHaveLength(1);
     const bolinasWindWrite = runs.find(
       (values, index) =>
         sqls[index]?.includes("insert into wind_forecasts") &&

@@ -11,18 +11,15 @@ import {
   AlertTriangle,
   ChevronRight,
   Clock3,
-  Compass,
   Database,
-  Droplets,
   Info,
   RefreshCw,
   Radio,
-  Waves,
-  Wind
+  Waves
 } from "lucide-react";
 import {
   availableLocalDateKeys,
-  bestWindow,
+  calmestWindow,
   cardinalDirection,
   confidenceLabel,
   earliestAvailableLocalDateKey,
@@ -208,6 +205,10 @@ function primarySwellText(window: ScoredForecastWindow): string {
   return `${swell.heightFt.toFixed(1)} ft @ ${swell.periodSec.toFixed(0)}s ${cardinalDirection(swell.directionDeg)}`;
 }
 
+function isCdipMop(window: ScoredForecastWindow): boolean {
+  return window.waveProvenance?.sourceId === "cdip:mop-forecast";
+}
+
 function regionalReport(rows: DailySpotRow[], dateKey: string | null): { title: string; body: string } {
   const ready = rows.filter((row): row is DailySpotRow & { window: ScoredForecastWindow } => Boolean(row.window));
   if (ready.length === 0 || !dateKey) {
@@ -230,7 +231,7 @@ function regionalReport(rows: DailySpotRow[], dateKey: string | null): { title: 
   const sizeStory =
     heights.length > 0
       ? `${smallest.spot.name} is smallest at ${surfHeightRange(smallest.window.waveHeightFt)}; ${largest.spot.name} carries the most size at ${surfHeightRange(largest.window.waveHeightFt)}.`
-      : "Breaking-wave size is not available.";
+      : "Modeled size is not available.";
   return {
     title,
     body: `The calmest surface forecast is ${top.spot.name} around ${formatWindowSpan(top.window.forecastAt, top.spot.timezone)}. ${sizeStory}`
@@ -298,7 +299,7 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
   const rows = summaries
     .map((summary) => ({
       ...summary,
-      window: reportDateKey ? bestWindow(summary.spot, summary.windows, now, reportDateKey) : undefined
+      window: reportDateKey ? calmestWindow(summary.spot, summary.windows, now, reportDateKey) : undefined
     }))
     .sort(sortDailyRows);
   const report = regionalReport(rows, reportDateKey);
@@ -343,8 +344,8 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
         <div className="compareList">
           <div className="compareHeader" aria-hidden="true">
             <span>Spot</span>
-            <span>Best window</span>
-            <span>Surf</span>
+            <span>Calmest window</span>
+            <span>Size estimate</span>
             <span>Wind / surface</span>
             <span>Tide</span>
             <span />
@@ -357,8 +358,8 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
               </span>
               {row.window ? (
                 <>
-                  <span data-label="Best window">{formatWindowSpan(row.window.forecastAt, row.spot.timezone)}</span>
-                  <strong data-label="Surf">{surfHeightRange(row.window.waveHeightFt)}</strong>
+                  <span data-label="Calmest window">{formatWindowSpan(row.window.forecastAt, row.spot.timezone)}</span>
+                  <strong data-label="Size estimate">{surfHeightRange(row.window.waveHeightFt)}</strong>
                   <span data-label="Wind / surface">
                     {windRelation(row.spot, row.window)} · {cardinalDirection(row.window.windDirectionDeg)} {formatNumber(row.window.windSpeedKt, " kt")}
                   </span>
@@ -384,23 +385,12 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
         </summary>
         <div className="disclosureBody">
           <p>
-            Breaking-height ranges are deterministic estimates from official NWS coastal-marine wave grids, spot exposure factors, NOAA tide predictions, and NWS wind forecasts. Three-hour windows use the strongest hourly wind in the interval; size and cleanliness stay separate so you can make the call.
+            Size ranges use mapped CDIP MOP significant wave height at 10/15 m where available; the NWS fallback uses an explicit cold-start spot scale. They are modeled planning estimates, not measured wave-face height. Three-hour surface labels use the roughest hourly wind in the interval; size and cleanliness stay separate so you can make the call.
           </p>
           <p>This is for personal surf planning, not navigation or maritime safety.</p>
         </div>
       </details>
     </>
-  );
-}
-
-function Fact({ icon: Icon, label, value, detail }: { icon: typeof Waves; label: string; value: string; detail: string }) {
-  return (
-    <div className="fact">
-      <Icon size={19} aria-hidden="true" />
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{detail}</small>
-    </div>
   );
 }
 
@@ -477,8 +467,8 @@ function SelectedWindowDetails({ spot, windows, window }: { spot: ApiSpot; windo
         <ConditionPill spot={spot} window={window} />
       </div>
       <dl className="detailGrid">
-        <div><dt>Surf estimate</dt><dd>{surfHeightRange(window.waveHeightFt)}</dd></div>
-        <div><dt>Primary swell</dt><dd>{primarySwellText(window)}</dd></div>
+        <div><dt>Size estimate</dt><dd>{surfHeightRange(window.waveHeightFt)}</dd></div>
+        <div><dt>{isCdipMop(window) ? "MOP wave input" : "Primary swell"}</dt><dd>{primarySwellText(window)}</dd></div>
         <div><dt>Secondary swell</dt><dd>{secondary?.heightFt !== null && secondary?.heightFt !== undefined ? `${secondary.heightFt.toFixed(1)} ft @ ${formatNumber(secondary.periodSec, "s")} ${cardinalDirection(secondary.directionDeg)}` : "None resolved"}</dd></div>
         <div><dt>Wind</dt><dd>{cardinalDirection(window.windDirectionDeg)} {formatNumber(window.windSpeedKt, " kt")} · {windRelation(spot, window)}</dd></div>
         <div><dt>Tide</dt><dd>{formatNumber(window.tideFt, " ft", 1)} · {tideTrend(windows, window)}</dd></div>
@@ -493,7 +483,7 @@ function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summari
   const observation = forecast?.status === "ready" ? forecast.data.observation : null;
   const current = closestWindow(windows, now);
   const reportDateKey = availableLocalDateKeys(spot, windows, now)[0];
-  const dayBest = reportDateKey ? bestWindow(spot, windows, now, reportDateKey) : undefined;
+  const dayBest = reportDateKey ? calmestWindow(spot, windows, now, reportDateKey) : undefined;
   const featured = dayBest ?? current;
   const [selectedAt, setSelectedAt] = useState<string | null>(featured?.forecastAt ?? null);
   const selected = windows.find((window) => window.forecastAt === selectedAt) ?? featured;
@@ -523,8 +513,8 @@ function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summari
           <h1>{spot.name}</h1>
           {featured ? (
             <p className="spotCall">
-              <strong>{formatDay(featured.forecastAt, spot.timezone, false)}:</strong> {surfHeightRange(featured.waveHeightFt)} and {surfaceCondition(spot, featured)}.
-              {dayBest && <> Best setup: <strong>{formatWindowSpan(dayBest.forecastAt, spot.timezone)}</strong>.</>}
+              <strong>{formatDay(featured.forecastAt, spot.timezone, false)}:</strong> {surfHeightRange(featured.waveHeightFt)} modeled size and {surfaceCondition(spot, featured)} surface.
+              {dayBest && <> Calmest window: <strong>{formatWindowSpan(dayBest.forecastAt, spot.timezone)}</strong>.</>}
             </p>
           ) : (
             <p className="spotCall">No reliable wave call yet. Wind and tide may still be available below.</p>
@@ -541,23 +531,6 @@ function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summari
       )}
 
       <HazardNotice messages={hazards} />
-
-      {featured && (
-        <section className="factStrip" aria-label="Featured daylight surf conditions">
-          <Fact icon={Waves} label="Surf" value={surfHeightRange(featured.waveHeightFt)} detail="Nearshore estimate" />
-          <Fact icon={Compass} label="Swell" value={primarySwellText(featured)} detail={featured.primarySwell?.directionDeg !== null && featured.primarySwell?.directionDeg !== undefined ? `${featured.primarySwell.directionDeg.toFixed(0)}° model direction` : "Direction unavailable"} />
-          <Fact icon={Wind} label="Wind" value={`${cardinalDirection(featured.windDirectionDeg)} ${formatNumber(featured.windSpeedKt, " kt")}`} detail={windRelation(spot, featured)} />
-          <Fact icon={Droplets} label="Tide" value={formatNumber(featured.tideFt, " ft", 1)} detail={tideTrend(windows, featured)} />
-          {observation && (
-            <Fact
-              icon={Radio}
-              label={`Buoy ${observation.stationId}`}
-              value={`${observation.waveHeightFt.toFixed(1)} ft @ ${formatNumber(observation.dominantPeriodSec ?? observation.averagePeriodSec, "s")}`}
-              detail={`${cardinalDirection(observation.meanWaveDirectionDeg)} · ${observation.waterTempF === null ? "water temp unavailable" : `${observation.waterTempF.toFixed(0)}°F water`} · ${formatFreshness(observation.sourceFreshnessMinutes).replace("Updated ", "")}`}
-            />
-          )}
-        </section>
-      )}
 
       <section className="forecastSection" aria-labelledby="forecast-heading">
         <div className="sectionTitle">
@@ -576,24 +549,6 @@ function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summari
         )}
       </section>
 
-      <section className="nearbySection" aria-labelledby="nearby-heading">
-        <div className="sectionTitle"><div><p className="kicker">Same day</p><h2 id="nearby-heading">Nearby comparison</h2></div></div>
-        <div className="nearbyGrid">
-          {summaries.filter((item) => item.spot.id !== spot.id).map((item) => {
-            const candidate = reportDateKey
-              ? bestWindow(item.spot, item.windows, now, reportDateKey)
-              : undefined;
-            return (
-              <a href={forecastHref(item.spot.id)} key={item.spot.id}>
-                <span><strong>{item.spot.name}</strong><small>{candidate ? formatWindowSpan(candidate.forecastAt, item.spot.timezone) : "No call"}</small></span>
-                <span>{candidate ? surfHeightRange(candidate.waveHeightFt) : "—"}</span>
-                <ChevronRight size={17} aria-hidden="true" />
-              </a>
-            );
-          })}
-        </div>
-      </section>
-
       <details className="dataDisclosure">
         <summary>
           <span><Radio size={17} aria-hidden="true" /> Data &amp; confidence</span>
@@ -604,9 +559,21 @@ function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summari
             <dl className="provenanceGrid">
               <div><dt>Wave source</dt><dd>{featured.waveProvenance.provider}</dd></div>
               <div><dt>Source updated</dt><dd>{formatFetchedAt(featured.waveProvenance.sourceUpdatedAt)}</dd></div>
-              <div><dt>Raw coastal height</dt><dd>{featured.waveProvenance.rawSignificantHeightFt.toFixed(1)} ft</dd></div>
-              <div><dt>Spot exposure factor</dt><dd>× {featured.waveProvenance.breakingHeightScale.toFixed(2)}</dd></div>
+              <div><dt>{isCdipMop(featured) ? "MOP Hs at point" : "Raw coastal height"}</dt><dd>{featured.waveProvenance.rawSignificantHeightFt.toFixed(1)} ft</dd></div>
+              {isCdipMop(featured) ? (
+                <>
+                  <div><dt>Spot exposure factor</dt><dd>× {(featured.waveProvenance.exposureScale ?? 1).toFixed(2)}</dd></div>
+                  <div><dt>Height used</dt><dd>{featured.waveProvenance.modeledNearshoreSignificantHeightFt?.toFixed(1) ?? "—"} ft modeled Hs</dd></div>
+                </>
+              ) : (
+                <div><dt>Spot exposure factor</dt><dd>× {featured.waveProvenance.breakingHeightScale.toFixed(2)}</dd></div>
+              )}
             </dl>
+          )}
+          {observation && (
+            <p>
+              Buoy {observation.stationId}: {observation.waveHeightFt.toFixed(1)} ft @ {formatNumber(observation.dominantPeriodSec ?? observation.averagePeriodSec, "s")} {cardinalDirection(observation.meanWaveDirectionDeg)} · {observation.waterTempF === null ? "water temperature unavailable" : `${observation.waterTempF.toFixed(0)}°F water`} · {formatFreshness(observation.sourceFreshnessMinutes).replace("Updated ", "")}.
+            </p>
           )}
           <p>Active layers: {capabilities.length > 0 ? capabilities.map(capabilityName).join(" · ") : "none"}.</p>
           {sourceCaveats.length > 0 && <ul>{sourceCaveats.slice(0, 6).map((caveat) => <li key={caveat}>{caveat}</li>)}</ul>}

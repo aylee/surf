@@ -1,4 +1,13 @@
-import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  foreignKey,
+  index,
+  integer,
+  primaryKey,
+  real,
+  sqliteTable,
+  text,
+  uniqueIndex
+} from "drizzle-orm/sqlite-core";
 
 export const spots = sqliteTable("spots", {
   id: text("id").primaryKey(),
@@ -226,7 +235,8 @@ export const windForecastIssues = sqliteTable(
       table.sourceId,
       table.issuedAt
     ),
-    sourceRunIdx: index("wind_forecast_issues_source_run_idx").on(table.sourceRunId)
+    sourceRunIdx: index("wind_forecast_issues_source_run_idx").on(table.sourceRunId),
+    capturedAtIdx: index("wind_forecast_issues_captured_at_idx").on(table.capturedAt)
   })
 );
 
@@ -425,6 +435,61 @@ export const backtestMetrics = sqliteTable(
 );
 
 /**
+ * Deduplicated spot configurations referenced by immutable forecast issues.
+ */
+export const forecastConfigs = sqliteTable(
+  "forecast_configs",
+  {
+    spotId: text("spot_id")
+      .notNull()
+      .references(() => spots.id),
+    configHash: text("config_hash").notNull(),
+    configJson: text("config_json").notNull(),
+    createdAt: text("created_at").notNull()
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.spotId, table.configHash] })
+  })
+);
+
+/**
+ * One immutable issuance envelope per spot. Shared context and configuration
+ * live here instead of being duplicated into every valid-time row.
+ */
+export const forecastIssues = sqliteTable(
+  "forecast_issues",
+  {
+    spotId: text("spot_id")
+      .notNull()
+      .references(() => spots.id),
+    issueId: text("issue_id").notNull(),
+    capturedAt: text("captured_at").notNull(),
+    issuedAt: text("issued_at").notNull(),
+    sourceIssueFingerprint: text("source_issue_fingerprint").notNull(),
+    spotConfigHash: text("spot_config_hash").notNull(),
+    sourceNote: text("source_note").notNull(),
+    issueContextJson: text("issue_context_json").notNull(),
+    expectedWindowCount: integer("expected_window_count").notNull(),
+    forecastEngineVersion: text("forecast_engine_version").notNull(),
+    presentationVersion: text("presentation_version").notNull(),
+    snapshotSchemaVersion: integer("snapshot_schema_version").notNull(),
+    createdAt: text("created_at").notNull()
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.spotId, table.issueId] }),
+    configFk: foreignKey({
+      columns: [table.spotId, table.spotConfigHash],
+      foreignColumns: [forecastConfigs.spotId, forecastConfigs.configHash]
+    }),
+    spotIssuedAtIdx: index("forecast_issues_spot_issued_at_idx").on(
+      table.spotId,
+      table.issuedAt
+    ),
+    capturedAtIdx: index("forecast_issues_captured_at_idx").on(table.capturedAt)
+  })
+);
+
+/**
  * Immutable per-window product snapshots. These rows preserve exactly what
  * the app issued so later backtests do not accidentally compare observations
  * against today's recomputation of an old forecast.
@@ -473,7 +538,8 @@ export const forecastSnapshots = sqliteTable(
     pk: primaryKey({ columns: [table.spotId, table.issueId, table.validAt] }),
     spotValidAtIdx: index("forecast_snapshots_spot_valid_at_idx").on(table.spotId, table.validAt),
     spotIssuedAtIdx: index("forecast_snapshots_spot_issued_at_idx").on(table.spotId, table.issuedAt),
-    issueIdx: index("forecast_snapshots_issue_idx").on(table.issueId)
+    issueIdx: index("forecast_snapshots_issue_idx").on(table.issueId),
+    capturedAtIdx: index("forecast_snapshots_captured_at_idx").on(table.capturedAt)
   })
 );
 

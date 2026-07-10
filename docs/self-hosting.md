@@ -40,6 +40,7 @@ In another shell:
 ```bash
 cd apps/web
 pnpm exec wrangler d1 execute surf --local --file ../../packages/db/migrations/0000_initial.sql
+pnpm exec wrangler d1 execute surf --local --file ../../packages/db/migrations/0001_forecast_history.sql
 pnpm exec wrangler d1 execute surf --local --file ../../packages/db/seeds/0000_v1_norcal.sql
 cd ../..
 pnpm ingest:once
@@ -67,8 +68,9 @@ Cloudflare usage and optional LLM report generation are the expected costs.
 
 ## Current Data Caveats
 
-CO-OPS tides and NWS wind/hazards run live in the Worker. GFSwave is validated
-against live NOMADS inventories and raw GRIB2 artifact keys are deterministic,
-but numeric GRIB extraction is intentionally caveated until the Python runtime
-includes GRIB tooling. CDIP/MOP nearshore coverage is mapped as a visible caveat
-where direct public model-point access remains unavailable.
+CO-OPS tides, NWS wind/hazards, NDBC observations, NWS coastal-grid fallback,
+and the mapped CDIP MOP point forecasts run live in the Worker. GFSwave is
+validated against live NOMADS inventories and raw GRIB2 artifact keys are
+deterministic, while historical NDFD GRIB evaluation uses the optional Python
+GRIB dependencies. Bolinas intentionally has no direct MOP point and remains a
+low-confidence NWS fallback.

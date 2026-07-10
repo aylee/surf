@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ForecastResponseSchema } from "@surf/contracts";
+import { estimateBreakingWaveHeight } from "@surf/forecast-core";
 import { buildForecastResponse } from "./forecast";
 import type { Env } from "./index";
 
@@ -174,11 +175,18 @@ describe("forecast assembly", () => {
 
   it("explicitly prefers a usable CDIP MOP row over the NWS fallback", async () => {
     const rows = liveRows();
+    const breaking = estimateBreakingWaveHeight({
+      significantHeightM: 1.2,
+      peakPeriodSec: 15.384616,
+      pointDepthM: 10,
+      waveFromDirectionDeg: 294.3,
+      shoreNormalDeg: 305.41
+    });
     rows.wave.push({
       source_id: "cdip:mop-forecast",
       forecast_at: "2026-07-10T03:00:00.000Z",
       model_cycle_at: "2026-07-07T00:00:00.000Z",
-      nearshore_height_m: 1.2,
+      nearshore_height_m: breaking.pointHeightM,
       offshore_height_m: null,
       significant_height_m: 1.2,
       peak_period_s: 15.384616,
@@ -196,9 +204,19 @@ describe("forecast assembly", () => {
         modelPointWaterDepthM: 10,
         pointRelationship: "direct_nearshore_point",
         significantHeightM: 1.2,
-        nearshoreHeightM: 1.2,
+        nearshoreHeightM: breaking.pointHeightM,
+        exposureAdjustedPointHeightM: breaking.pointHeightM,
+        experimentalBreakingHeightM: breaking.estimatedBreakingHeightM,
+        breakingDepthM: breaking.breakingDepthM,
+        shoalingFactor: breaking.shoalingFactor,
+        totalHeightFactor: breaking.totalHeightFactor,
+        breakerIndex: breaking.breakerIndex,
+        incidenceAngleDeg: breaking.incidenceAngleDeg,
+        transformMethod: breaking.method,
+        transformVersion: "bulk-hs-linear-shoaling-v1",
         nearshoreHeightScale: 1,
-        heightSemantics: "modeled_significant_wave_height_not_breaking_face_height"
+        heightSemantics: "modeled_significant_wave_height_not_breaking_face_height",
+        modelPointShoreNormalDeg: 305.41
       })
     });
     rows.source.push({
@@ -216,9 +234,14 @@ describe("forecast assembly", () => {
 
     expect(() => ForecastResponseSchema.parse(response)).not.toThrow();
     expect(response.windows[0]).toMatchObject({
-      waveHeightFt: 1.2 * 3.28084,
+      waveHeightFt: breaking.pointHeightM * 3.28084,
       peakPeriodSec: 15.384616,
       primaryDirectionDeg: 294.3,
+      primarySwell: {
+        heightFt: 1.2 * 3.28084,
+        periodSec: 15.384616,
+        directionDeg: 294.3
+      },
       sourceRunIds: ["tide-run", "wind-run", "cdip-run", "ndbc-run", "hazard-run"],
       waveProvenance: {
         sourceId: "cdip:mop-forecast",
@@ -227,10 +250,20 @@ describe("forecast assembly", () => {
         modelCycleAt: "2026-07-07T00:00:00.000Z",
         rawSignificantHeightFt: 1.2 * 3.28084,
         breakingHeightScale: 1,
+        exposureScale: 1,
+        shoalingFactor: breaking.shoalingFactor,
+        totalHeightFactor: breaking.totalHeightFactor,
+        breakerIndex: 0.78,
+        breakingDepthM: breaking.breakingDepthM,
+        incidenceAngleDeg: breaking.incidenceAngleDeg,
+        experimentalBreakingHeightFt: breaking.estimatedBreakingHeightM * 3.28084,
+        transformMethod: "linear-energy-flux-snell-depth-limited",
+        transformVersion: "bulk-hs-linear-shoaling-v1",
         estimatedBreakingHeightFt: null,
         modeledNearshoreSignificantHeightFt: 1.2 * 3.28084,
         modelPointId: "SF043",
         modelPointWaterDepthM: 10,
+        modelPointShoreNormalDeg: 305.41,
         pointRelationship: "direct_nearshore_point",
         sourceTimestampSemantics: "http_last_modified_source_update_not_model_cycle",
         derivation: "cdip_mop_point_hs"
@@ -239,6 +272,7 @@ describe("forecast assembly", () => {
     expect(response.windows[0]?.sourceRunIds).not.toContain("wave-run");
     expect(response.windows[0]?.confidence).toBeLessThanOrEqual(74);
     expect(response.windows[0]?.caveats.join(" ")).toContain("not observed breaking-wave face height");
+    expect(response.windows[0]?.caveats.join(" ")).toContain("does not affect the displayed height or score");
     expect(response.sourceNote).toContain("prefer public CDIP MOP");
     expect(response.sourceNote).toContain("not a model cycle");
   });
@@ -293,14 +327,19 @@ describe("forecast assembly", () => {
     expect(response.windows[0]?.activeCapabilities).toContain("observed_wave");
   });
 
-  it("uses the strongest hourly wind inside each three-hour planning window", async () => {
+  it("uses the roughest hourly surface inside each three-hour planning window", async () => {
     const rows = liveRows();
+    rows.wind[0] = {
+      ...rows.wind[0] as object,
+      wind_speed_ms: 12 / 1.94384,
+      wind_direction_deg: 145
+    };
     rows.wind.push({
       forecast_at: "2026-07-10T05:00:00.000Z",
-      wind_speed_ms: 10,
-      wind_direction_deg: 270,
-      gust_ms: 12,
-      weather_summary: "Breezy",
+      wind_speed_ms: 13 / 1.94384,
+      wind_direction_deg: 300,
+      gust_ms: 8,
+      weather_summary: "Offshore",
       source_run_id: "wind-run"
     });
 
@@ -310,9 +349,7 @@ describe("forecast assembly", () => {
       new Date("2026-07-10T02:53:07.000Z")
     );
 
-    expect(response.windows[0]).toMatchObject({
-      windSpeedKt: 10 * 1.94384,
-      windDirectionDeg: 270
-    });
+    expect(response.windows[0]?.windDirectionDeg).toBe(145);
+    expect(response.windows[0]?.windSpeedKt).toBeCloseTo(12, 8);
   });
 });

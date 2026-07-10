@@ -9,30 +9,24 @@ import type {
   SurfScore
 } from "@surf/contracts";
 import { getSpotProfile } from "./spot-registry";
+import {
+  circularDistanceDeg,
+  distanceToCircularWindowDeg,
+  directionInCircularWindow
+} from "./surface";
 
 function clampScore(value: number): number {
   return Math.max(0, Math.min(100, Math.round(value)));
 }
 
-function circularDistance(a: number, b: number): number {
-  const diff = Math.abs((((a - b) % 360) + 540) % 360 - 180);
-  return diff;
-}
-
-function withinWindow(value: number, min: number, max: number): boolean {
-  if (min <= max) return value >= min && value <= max;
-  return value >= min || value <= max;
-}
-
-function directionWindowScore(value: number, bestMin: number, bestMax: number, fallbackCenter: number): number {
-  if (withinWindow(value, bestMin, bestMax)) return 100;
-  return clampScore(100 - circularDistance(value, fallbackCenter) * 2.2);
+function directionWindowScore(value: number, bestMin: number, bestMax: number): number {
+  return clampScore(100 - distanceToCircularWindowDeg(value, bestMin, bestMax) * 2.2);
 }
 
 function swellDirectionScore(spot: SpotProfile, value: number): number {
-  if (withinWindow(value, spot.bestSwellDeg.minDeg, spot.bestSwellDeg.maxDeg)) return 100;
-  if (withinWindow(value, spot.workableSwellDeg.minDeg, spot.workableSwellDeg.maxDeg)) return 65;
-  return clampScore(45 - circularDistance(value, spot.shoreNormalDeg));
+  if (directionInCircularWindow(value, spot.bestSwellDeg.minDeg, spot.bestSwellDeg.maxDeg)) return 100;
+  if (directionInCircularWindow(value, spot.workableSwellDeg.minDeg, spot.workableSwellDeg.maxDeg)) return 65;
+  return clampScore(45 - circularDistanceDeg(value, spot.shoreNormalDeg));
 }
 
 function rangeScore(value: number, min: number, max: number): number {
@@ -107,8 +101,7 @@ export function scoreSpotWindow(spot: SpotProfile, input: ForecastWindowInput): 
     const windDirectionScore = directionWindowScore(
       input.windDirectionDeg,
       spot.offshoreWindFromDeg.minDeg,
-      spot.offshoreWindFromDeg.maxDeg,
-      (spot.offshoreWindFromDeg.minDeg + spot.offshoreWindFromDeg.maxDeg) / 2
+      spot.offshoreWindFromDeg.maxDeg
     );
     const windSpeedScore =
       input.windSpeedKt <= spot.maxGoodWindKt

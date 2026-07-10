@@ -1,4 +1,4 @@
-import { getSpotProfile, NORCAL_SPOTS } from "@surf/forecast-core";
+import { estimateBreakingWaveHeight, getSpotProfile, NORCAL_SPOTS } from "@surf/forecast-core";
 import { describe, expect, it } from "vitest";
 import {
   CDIP_MOP_SOURCE_ID,
@@ -114,7 +114,7 @@ describe("CDIP MOP forecast adapter", () => {
     });
   });
 
-  it("preserves HTTP Last-Modified as source update and applies only Linda Mar's explicit cove scale", async () => {
+  it("preserves source times and records the deterministic breaking transform", async () => {
     const outcome = await fetchCdipMopForecastsForSpots(
       [getSpotProfile("obsf-north"), getSpotProfile("linda-mar"), getSpotProfile("bolinas")],
       {
@@ -127,7 +127,24 @@ describe("CDIP MOP forecast adapter", () => {
     expect(outcome.status).toBe("success");
     expect(outcome.sourceId).toBe(CDIP_MOP_SOURCE_ID);
     expect(outcome.rows).toHaveLength(4);
-    expect(outcome.rows.find((row) => row.spotId === "obsf-north")).toMatchObject({
+    const north = outcome.rows.find((row) => row.spotId === "obsf-north");
+    const lindaMar = outcome.rows.find((row) => row.spotId === "linda-mar");
+    const northExpected = estimateBreakingWaveHeight({
+      significantHeightM: 1.2,
+      peakPeriodSec: 15.384616,
+      pointDepthM: 10,
+      waveFromDirectionDeg: 294.3,
+      shoreNormalDeg: 305.41
+    });
+    const lindaExpected = estimateBreakingWaveHeight({
+      significantHeightM: 1.2,
+      peakPeriodSec: 15.384616,
+      pointDepthM: 15.01,
+      waveFromDirectionDeg: 294.3,
+      shoreNormalDeg: 295.98,
+      exposureScale: 0.6
+    });
+    expect(north).toMatchObject({
       modelPointId: "SF043",
       sourceUpdatedAt: "2026-07-10T01:55:58.000Z",
       sourceTimestampSemantics: "http_last_modified_source_update_not_model_cycle",
@@ -135,13 +152,22 @@ describe("CDIP MOP forecast adapter", () => {
       leadHour: 3,
       significantHeightM: 1.2,
       nearshoreHeightM: 1.2,
+      exposureAdjustedPointHeightM: 1.2,
+      experimentalBreakingHeightM: Number(northExpected.estimatedBreakingHeightM.toFixed(5)),
+      shoalingFactor: Number(northExpected.shoalingFactor.toFixed(5)),
+      breakerIndex: 0.78,
+      transformMethod: "linear-energy-flux-snell-depth-limited",
+      transformVersion: "bulk-hs-linear-shoaling-v1",
       nearshoreHeightScale: 1,
       heightSemantics: "modeled_significant_wave_height_not_breaking_face_height"
     });
-    expect(outcome.rows.find((row) => row.spotId === "linda-mar")).toMatchObject({
+    expect(lindaMar).toMatchObject({
       modelPointId: "SM371",
       significantHeightM: 1.2,
+      exposureAdjustedPointHeightM: 0.72,
       nearshoreHeightM: 0.72,
+      experimentalBreakingHeightM: Number(lindaExpected.estimatedBreakingHeightM.toFixed(5)),
+      shoalingFactor: Number(lindaExpected.shoalingFactor.toFixed(5)),
       nearshoreHeightScale: 0.6,
       pointRelationship: "outside_cove_approach_proxy"
     });
@@ -188,6 +214,26 @@ describe("CDIP MOP forecast adapter", () => {
     expect(outcome.status).toBe("failure");
     expect(outcome.rows).toEqual([]);
     expect(outcome.errors.join(" ")).toContain("exactly one runtime -s");
+  });
+
+  it("keeps primary MOP Hs when the experimental diagnostic is out of bounds", async () => {
+    const outcome = await fetchCdipMopForecastsForSpots([getSpotProfile("obsf-north")], {
+      fetcher: successfulFetcher(asciiFixture({ waveDp: "40, 40" })),
+      now: new Date("2026-07-10T02:00:00Z"),
+      horizonHours: 6
+    });
+
+    expect(outcome.status).toBe("success");
+    expect(outcome.rows).toHaveLength(2);
+    expect(outcome.rows[0]).toMatchObject({
+      significantHeightM: 1.2,
+      nearshoreHeightM: 1.2,
+      experimentalBreakingHeightM: null,
+      transformMethod: null
+    });
+    expect(outcome.caveats).toContainEqual(
+      expect.objectContaining({ code: "cdip_mop_breaking_diagnostic_unavailable" })
+    );
   });
 
   it("reports an upstream failure without manufacturing fallback rows", async () => {

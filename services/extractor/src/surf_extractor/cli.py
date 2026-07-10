@@ -44,6 +44,7 @@ from .ndfd_history import (
     NdfdS3ArchiveClient,
     evaluate_ndfd_mop_history,
     extract_ndfd_point_forecasts,
+    require_ndfd_grib_tooling,
     select_ndfd_archive_snapshots,
     write_ndfd_mop_history_artifacts,
 )
@@ -430,6 +431,7 @@ def evaluate_ndfd_mop_history_command(
             param_hint="--network-timeout-seconds",
         )
     try:
+        require_ndfd_grib_tooling()
         with httpx.Client(
             timeout=network_timeout_seconds,
             follow_redirects=True,

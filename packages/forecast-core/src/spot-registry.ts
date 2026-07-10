@@ -708,7 +708,7 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
   },
   {
     id: "bolinas",
-    name: "Bolinas",
+    name: "Bolinas — Wharf/Brighton",
     region: "norcal",
     lat: 37.909,
     lon: -122.687,
@@ -718,13 +718,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     workableSwellDeg: { minDeg: 190, maxDeg: 310 },
     bestPeriodSec: { min: 8, max: 15 },
     bestTideFt: { min: 0.5, max: 4.5 },
-    offshoreWindFromDeg: { minDeg: 45, maxDeg: 135 },
+    offshoreWindFromDeg: { minDeg: 270, maxDeg: 20 },
     maxGoodWindKt: 8,
     maxOkWindKt: 14,
     referenceBuoys: ["46237", "46013", "46026"],
     cdipStations: ["142", "029"],
     tideStation: "9414958",
-    notes: "Sheltered longboard-friendly option; exact source mapping must keep confidence low until nearshore transform access is resolved.",
+    notes: "Regional Wharf/Brighton-facing Bolinas report. NW/WNW is offshore for the southeast-facing beach; keep wave-height confidence low until a direct nearshore source is resolved.",
     sourceMap: {
       gfsWave: gfsWave(
         { lat: 37.92, lon: -123.04 },

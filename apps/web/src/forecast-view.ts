@@ -1,6 +1,11 @@
 import type { ScoredForecastWindow, SpotProfile } from "@surf/contracts";
+import {
+  directionInCircularWindow,
+  surfaceConditionForWind,
+  type SurfaceCondition as CoreSurfaceCondition
+} from "@surf/forecast-core";
 
-export type SurfaceCondition = "clean" | "fair" | "choppy" | "unknown";
+export type SurfaceCondition = CoreSurfaceCondition;
 
 export type LocalDateParts = {
   key: string;
@@ -21,14 +26,6 @@ const qualityRank: Record<ScoredForecastWindow["qualityLabel"], number> = {
   poor: 1,
   unknown: 0
 };
-
-function circularDistance(left: number, right: number): number {
-  return Math.abs((((left - right) % 360) + 540) % 360 - 180);
-}
-
-function directionInWindow(value: number, min: number, max: number): boolean {
-  return min <= max ? value >= min && value <= max : value >= min || value <= max;
-}
 
 export function localDateParts(value: string | Date, timeZone: string): LocalDateParts {
   const date = value instanceof Date ? value : new Date(value);
@@ -72,30 +69,7 @@ export function surfaceCondition(
   spot: SpotProfile,
   window: Pick<ScoredForecastWindow, "windSpeedKt" | "windDirectionDeg">
 ): SurfaceCondition {
-  const speed = window.windSpeedKt;
-  const direction = window.windDirectionDeg;
-  if (speed === null || direction === null) return "unknown";
-  if (speed <= 3) return "clean";
-  if (
-    directionInWindow(
-      direction,
-      spot.offshoreWindFromDeg.minDeg,
-      spot.offshoreWindFromDeg.maxDeg
-    ) &&
-    speed <= spot.maxOkWindKt
-  ) {
-    return "clean";
-  }
-  if (speed <= spot.maxGoodWindKt) return "fair";
-
-  const offshoreCenter =
-    spot.offshoreWindFromDeg.minDeg <= spot.offshoreWindFromDeg.maxDeg
-      ? (spot.offshoreWindFromDeg.minDeg + spot.offshoreWindFromDeg.maxDeg) / 2
-      : (spot.offshoreWindFromDeg.minDeg +
-          ((spot.offshoreWindFromDeg.maxDeg + 360 - spot.offshoreWindFromDeg.minDeg) / 2)) %
-        360;
-  const onshoreCenter = (offshoreCenter + 180) % 360;
-  return circularDistance(direction, onshoreCenter) <= 75 ? "choppy" : "fair";
+  return surfaceConditionForWind(spot, window);
 }
 
 export function windRelation(
@@ -106,7 +80,7 @@ export function windRelation(
   const direction = window.windDirectionDeg;
   if (speed === null || direction === null) return "Wind unavailable";
   if (speed <= 3) return "Light / glassy";
-  if (directionInWindow(direction, spot.offshoreWindFromDeg.minDeg, spot.offshoreWindFromDeg.maxDeg)) {
+  if (directionInCircularWindow(direction, spot.offshoreWindFromDeg.minDeg, spot.offshoreWindFromDeg.maxDeg)) {
     return speed <= spot.maxOkWindKt ? "Offshore" : "Strong offshore";
   }
   return surfaceCondition(spot, window) === "choppy" ? "Onshore" : "Cross-shore";
@@ -151,7 +125,7 @@ export function confidenceLabel(value: number): "High" | "Medium" | "Low" {
   return "Low";
 }
 
-export function bestWindow(
+export function calmestWindow(
   spot: SpotProfile,
   windows: ScoredForecastWindow[],
   now = new Date(),
@@ -191,7 +165,13 @@ export function earliestAvailableLocalDateKey(
   now = new Date()
 ): string | null {
   return forecasts
-    .flatMap(({ spot, windows }) => availableLocalDateKeys(spot, windows, now))
+    .flatMap(({ spot, windows }) =>
+      availableLocalDateKeys(
+        spot,
+        windows.filter((window) => window.ratingStatus === "scored"),
+        now
+      )
+    )
     .sort()[0] ?? null;
 }
 

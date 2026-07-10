@@ -136,6 +136,15 @@ export const WaveProvenanceSchema = z.object({
   modelCycleAt: z.string().nullable().optional(),
   rawSignificantHeightFt: z.number().nonnegative(),
   breakingHeightScale: z.number().positive(),
+  exposureScale: z.number().positive().optional(),
+  shoalingFactor: z.number().positive().optional(),
+  totalHeightFactor: z.number().positive().optional(),
+  breakerIndex: z.number().min(0.5).max(1).optional(),
+  breakingDepthM: z.number().positive().optional(),
+  incidenceAngleDeg: z.number().min(0).max(180).optional(),
+  experimentalBreakingHeightFt: z.number().nonnegative().nullable().optional(),
+  transformMethod: z.literal("linear-energy-flux-snell-depth-limited").optional(),
+  transformVersion: z.literal("bulk-hs-linear-shoaling-v1").optional(),
   estimatedBreakingHeightFt: z.number().nonnegative().nullable(),
   modeledNearshoreSignificantHeightFt: z.number().nonnegative().nullable().optional(),
   heightSemantics: z.enum([
@@ -144,6 +153,7 @@ export const WaveProvenanceSchema = z.object({
   ]).optional(),
   modelPointId: z.string().optional(),
   modelPointWaterDepthM: z.number().positive().optional(),
+  modelPointShoreNormalDeg: z.number().min(0).max(360).optional(),
   pointRelationship: z.enum(["direct_nearshore_point", "outside_cove_approach_proxy"]).optional(),
   sourceTimestampSemantics: z.literal("http_last_modified_source_update_not_model_cycle").optional(),
   derivation: z.enum([

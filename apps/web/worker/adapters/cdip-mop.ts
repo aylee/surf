@@ -1,5 +1,5 @@
 import type { SpotId } from "@surf/contracts";
-import type { NorcalSpotProfile } from "@surf/forecast-core";
+import { estimateBreakingWaveHeight, type NorcalSpotProfile } from "@surf/forecast-core";
 import type { AdapterOutcome, AdapterStatus, SourceCaveat, SourceFetch } from "./types";
 import { combineStatus, errorMessage } from "./types";
 
@@ -47,6 +47,15 @@ export type CdipMopForecastRow = {
   leadHour: number;
   significantHeightM: number;
   nearshoreHeightM: number;
+  exposureAdjustedPointHeightM: number;
+  experimentalBreakingHeightM: number | null;
+  breakingDepthM: number | null;
+  shoalingFactor: number | null;
+  totalHeightFactor: number | null;
+  breakerIndex: number | null;
+  incidenceAngleDeg: number | null;
+  transformMethod: "linear-energy-flux-snell-depth-limited" | null;
+  transformVersion: "bulk-hs-linear-shoaling-v1";
   nearshoreHeightScale: number;
   peakPeriodS: number;
   peakDirectionDeg: number;
@@ -345,10 +354,27 @@ async function fetchSpotForecast(
     if (parsed.samples.some((sample) => sample.epochSeconds * 1000 < modelCycleMs)) {
       throw new Error(`CDIP MOP ${point.id} contained a forecast time before its runtime cycle.`);
     }
+    let transformFailureCount = 0;
     const rows = parsed.samples.flatMap((sample): CdipMopForecastRow[] => {
       const forecastMs = sample.epochSeconds * 1000;
       if (forecastMs < startMs || forecastMs > endMs) return [];
-      const nearshoreHeightM = round(sample.significantHeightM * point.nearshoreHeightScale);
+      let breaking: ReturnType<typeof estimateBreakingWaveHeight> | null = null;
+      try {
+        breaking = estimateBreakingWaveHeight({
+          significantHeightM: sample.significantHeightM,
+          peakPeriodSec: sample.peakPeriodS,
+          pointDepthM: point.waterDepthM,
+          waveFromDirectionDeg: sample.peakDirectionDeg,
+          shoreNormalDeg: point.shoreNormalDeg,
+          exposureScale: point.nearshoreHeightScale
+        });
+      } catch {
+        transformFailureCount += 1;
+      }
+      const exposureAdjustedPointHeightM = round(
+        sample.significantHeightM * point.nearshoreHeightScale
+      );
+      const nearshoreHeightM = exposureAdjustedPointHeightM;
       return [
         {
           spotId: spot.id,
@@ -369,6 +395,15 @@ async function fetchSpotForecast(
           leadHour: Math.round((forecastMs - modelCycleMs) / (60 * 60 * 1000)),
           significantHeightM: sample.significantHeightM,
           nearshoreHeightM,
+          exposureAdjustedPointHeightM,
+          experimentalBreakingHeightM: breaking ? round(breaking.estimatedBreakingHeightM) : null,
+          breakingDepthM: breaking ? round(breaking.breakingDepthM) : null,
+          shoalingFactor: breaking ? round(breaking.shoalingFactor) : null,
+          totalHeightFactor: breaking ? round(breaking.totalHeightFactor) : null,
+          breakerIndex: breaking?.breakerIndex ?? null,
+          incidenceAngleDeg: breaking ? round(breaking.incidenceAngleDeg) : null,
+          transformMethod: breaking?.method ?? null,
+          transformVersion: "bulk-hs-linear-shoaling-v1",
           nearshoreHeightScale: point.nearshoreHeightScale,
           peakPeriodS: sample.peakPeriodS,
           peakDirectionDeg: sample.peakDirectionDeg,
@@ -389,7 +424,11 @@ async function fetchSpotForecast(
     const caveats: SourceCaveat[] = [
       {
         code: "cdip_mop_hs_not_breaking_truth",
-        message: `CDIP MOP ${point.id} reports modeled significant wave height at ${point.waterDepthM} m; it is not observed breaking-wave face height.`
+        message: `CDIP MOP ${point.id} reports modeled significant wave height at ${point.waterDepthM} m; that exposure-adjusted Hs drives the displayed estimate and is not observed breaking-wave face height.`
+      },
+      {
+        code: "cdip_mop_bulk_breaking_diagnostic",
+        message: `An experimental bulk-Hs breaking proxy is retained only for future evaluation; it does not affect displayed height or scoring.`
       },
       {
         code: "cdip_mop_last_modified_not_cycle",
@@ -399,7 +438,13 @@ async function fetchSpotForecast(
     if (point.relationship === "outside_cove_approach_proxy") {
       caveats.push({
         code: "cdip_mop_linda_mar_cove_scale",
-        message: `Linda Mar uses outside-cove point ${point.id} Hs × ${point.nearshoreHeightScale.toFixed(2)} as an explicit cold-start final cove scale.`
+        message: `Linda Mar uses outside-cove point ${point.id} Hs × ${point.nearshoreHeightScale.toFixed(2)} as the explicit final cove exposure scale.`
+      });
+    }
+    if (transformFailureCount > 0) {
+      caveats.push({
+        code: "cdip_mop_breaking_diagnostic_unavailable",
+        message: `CDIP MOP ${point.id} could not compute the experimental breaking diagnostic for ${transformFailureCount} rows; primary Hs rows remain available.`
       });
     }
     if (parsed.skippedRowCount > 0) {
