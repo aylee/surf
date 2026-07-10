@@ -136,12 +136,13 @@ Tracked only in the Open Items & Decisions Ledger above.
 ## Links
 
 - **Branch:** `aylee/surf-v1-accuracy`
+- **PR:** https://github.com/aylee/surf/pull/2 (ready for review)
 - **Live:** `https://surf.alex-1ca.workers.dev`
 - **PM binder:** `/Users/alex/code/alex-os/desk/personal-surf-forecast/`
 
 ## Verification
 
-Verified at `8c315e4` plus deployed version
+Verified at code checkpoint `8c315e4`, handoff commit `6b1a51d`, and deployed version
 `07c34188-549d-4919-85d1-1f498e79f979`:
 
 - `pnpm check` passed.
@@ -157,7 +158,7 @@ Verified at `8c315e4` plus deployed version
 
 ## Next Action
 
-**Review and merge the ready PR for `aylee/surf-v1-accuracy`, then execute
+**Review and merge ready PR #2 for `aylee/surf-v1-accuracy`, then execute
 `session-brief-calibrate-break-truth.md` without changing the production height
 transform first.**
 
