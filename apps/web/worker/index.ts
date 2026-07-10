@@ -16,6 +16,7 @@ export type Env = {
   ENVIRONMENT: string;
   SURF_REGION: string;
   REPORT_AGENT_ENABLED: string;
+  INGEST_TOKEN?: string;
   OPENAI_API_KEY?: string;
 };
 
@@ -36,7 +37,8 @@ app.get("/api/health", (c) =>
 app.get("/api/spots", (c) =>
   c.json({
     spots: NORCAL_SPOTS,
-    sourceNote: "Cold-start spot registry. CDIP/MOP mapping is a v1 task."
+    sourceNote:
+      "NorCal spot registry with verified NWS MTR coastal-wave grids and transparent cold-start breaking-height scales."
   })
 );
 
@@ -82,6 +84,18 @@ app.get("/api/reports/today", async (c) => {
 });
 
 app.post("/api/ingest/once", async (c) => {
+  const hostname = new URL(c.req.url).hostname;
+  const isLocalRequest = hostname === "127.0.0.1" || hostname === "localhost";
+  if (c.env.ENVIRONMENT === "production" && !isLocalRequest) {
+    const expected = c.env.INGEST_TOKEN;
+    const supplied = c.req.header("Authorization");
+    if (!expected || supplied !== `Bearer ${expected}`) {
+      return c.json({ error: "Unauthorized" }, 401, {
+        "WWW-Authenticate": "Bearer"
+      });
+    }
+  }
+
   const requestedAt = new Date().toISOString();
   const summary = await runNorcalIngest(c.env, {
     kind: "manual-ingest",
@@ -107,11 +121,14 @@ export default {
     for (const message of batch.messages) {
       try {
         const body = normalizeIngestMessage(message.body, env.SURF_REGION);
-        await runNorcalIngest(env, {
+        const summary = await runNorcalIngest(env, {
           kind: "queued-ingest",
           requestedAt: body.requestedAt,
           region: body.region
         });
+        if (summary.status !== "success") {
+          throw new Error(`ingest completed with ${summary.status}: ${summary.errors.join("; ")}`);
+        }
         message.ack();
       } catch (error) {
         console.error("ingest queue message failed", error);

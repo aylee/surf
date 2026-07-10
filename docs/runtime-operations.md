@@ -14,7 +14,7 @@ Provisioned in Alex's Cloudflare account on 2026-07-08:
 
 ## Jobs
 
-- Worker cron enqueues ingest cycles.
+- Worker cron enqueues ingest cycles hourly at minute 17.
 - Queue consumer fans out source/spot extraction work.
 - Python extractor processes GRIB2/netCDF/CDIP work that does not belong inside
   a Worker.
@@ -24,15 +24,20 @@ Provisioned in Alex's Cloudflare account on 2026-07-08:
 ## v1 Ingest Behavior
 
 `POST /api/ingest/once` runs the NorCal ingest coordinator immediately. It
-fetches live NOAA CO-OPS tide predictions and NWS point forecasts/alerts for all
-six v1 spots, writes `source_runs`, and persists normalized `tide_forecasts`,
-`wind_forecasts`, and `hazard_events` rows in D1.
+fetches live NOAA CO-OPS tide predictions, NWS point forecasts/alerts and
+coastal-grid wave guidance, plus current NDBC buoy observations for all six v1
+spots. It writes `source_runs` and persists normalized tide, wind, hazard, wave
+forecast, and buoy-observation rows in D1.
 
-NOAA GFSwave is validated in the Python extractor today: it selects complete
-cycles, validates NOMADS `.idx` inventories, and plans deterministic R2 keys for
-raw GRIB2 subsets. Numeric GRIB point extraction remains blocked until the
-runtime includes `wgrib2` or `cfgrib` + `xarray`; forecast confidence is lowered
-and caveats are exposed while that layer falls back.
+The public dashboard uses NWS MTR coastal-grid wave layers with explicit,
+visible cold-start spot exposure factors. NOAA GFSwave remains available in the
+Python extractor for inventory validation, R2 artifact planning, and future
+calibration.
+
+Production manual ingest requires an `INGEST_TOKEN` Worker secret and a matching
+`SURF_INGEST_TOKEN` environment variable when running `pnpm ingest:once` against
+the deployed URL. Loopback development requests remain available without a
+token. Scheduled queue ingestion does not use this route.
 
 Apply local D1 schema and seed before local ingest:
 
@@ -42,11 +47,30 @@ pnpm exec wrangler d1 execute surf --local --file ../../packages/db/migrations/0
 pnpm exec wrangler d1 execute surf --local --file ../../packages/db/seeds/0000_v1_norcal.sql
 ```
 
+Apply the same idempotent seed before a production deploy that adds sources or
+spot mappings:
+
+```bash
+cd apps/web
+pnpm exec wrangler d1 execute surf --remote --file ../../packages/db/seeds/0000_v1_norcal.sql
+```
+
 ## Deployment
 
 Bootstrap Worker URL:
 
 - `https://surf.alex-1ca.workers.dev`
+
+Rollback to a Worker version from before the NWS coastal-grid reader requires
+removing the new rows first; the older reader cannot disclose their cold-start
+derivation:
+
+```bash
+cd apps/web
+pnpm exec wrangler d1 execute surf --remote --command \
+  "delete from wave_forecasts where source_id = 'nws:mtr-grid-wave'"
+# Then redeploy the prior Worker version.
+```
 
 ## Checks
 
@@ -79,6 +103,11 @@ Local personal/dev secrets:
 
 Do not read or print existing secret files in agent sessions. Deployed runtime
 secrets should be set with Cloudflare Worker secrets.
+
+Raw upstream responses are archived under `raw/<source>/<date>/<run>/` in R2.
+Each source run points to a checksum-bearing manifest and corresponding
+`source_artifacts` rows in D1; normalized writes finalize the run only after
+artifact persistence succeeds.
 
 ## Remaining Clickops
 

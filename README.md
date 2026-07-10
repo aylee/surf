@@ -10,10 +10,12 @@ report layer.
 
 ## Current Status
 
-Working v1 implementation in progress. The app has live CO-OPS tide and NWS
-wind/hazard ingest, D1 source-run/read-model storage, deterministic 72-hour
-forecast windows for the six NorCal spots, an API-backed dashboard, guarded
-report output, and a Python GFSwave/backtest extractor shell. Read the active
+Deployed v1: [surf.alex-1ca.workers.dev](https://surf.alex-1ca.workers.dev).
+The app has live CO-OPS tide, NWS wind/hazard/coastal-grid wave guidance, NDBC
+buoy observations, checksum-linked R2 raw artifacts, and deterministic
+five-day forecast windows for six NorCal spots. The web product opens with a
+quiet regional daily report and drills into objective surf, swell, wind, tide,
+buoy, hazard, and confidence detail per spot. Read the active
 workstream before extending v1:
 [`cc_state/noaa-surf-engine/WORKSTREAM.md`](cc_state/noaa-surf-engine/WORKSTREAM.md).
 
@@ -83,6 +85,8 @@ pnpm cf:provision
 
 Local personal secrets belong in `~/.config/env/surf.env` with mode `600`.
 Never commit `.env`, `.dev.vars`, API tokens, OpenAI keys, or provider secrets.
+Production manual ingestion (`POST /api/ingest/once`) requires the
+`INGEST_TOKEN` Worker secret; scheduled ingestion continues through the queue.
 
 ## Repo Layout
 

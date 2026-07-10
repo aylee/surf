@@ -188,6 +188,48 @@ export const windForecasts = sqliteTable(
   })
 );
 
+/**
+ * Append-only wind issues used for forecast-as-issued evaluation. The
+ * wind_forecasts table remains the compact latest-value read model.
+ */
+export const windForecastIssues = sqliteTable(
+  "wind_forecast_issues",
+  {
+    spotId: text("spot_id")
+      .notNull()
+      .references(() => spots.id),
+    sourceId: text("source_id")
+      .notNull()
+      .references(() => sources.id),
+    sourceRunId: text("source_run_id")
+      .notNull()
+      .references(() => sourceRuns.id),
+    issueKey: text("issue_key").notNull(),
+    issuedAt: text("issued_at").notNull(),
+    modelCycleAt: text("model_cycle_at"),
+    forecastAt: text("forecast_at").notNull(),
+    leadHours: real("lead_hours"),
+    windSpeedMs: real("wind_speed_ms"),
+    windDirectionDeg: integer("wind_direction_deg"),
+    gustMs: real("gust_ms"),
+    weatherSummary: text("weather_summary"),
+    payloadJson: text("payload_json"),
+    capturedAt: text("captured_at").notNull()
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.spotId, table.sourceId, table.issueKey, table.forecastAt] }),
+    spotForecastAtIdx: index("wind_forecast_issues_spot_forecast_at_idx").on(
+      table.spotId,
+      table.forecastAt
+    ),
+    sourceIssuedAtIdx: index("wind_forecast_issues_source_issued_at_idx").on(
+      table.sourceId,
+      table.issuedAt
+    ),
+    sourceRunIdx: index("wind_forecast_issues_source_run_idx").on(table.sourceRunId)
+  })
+);
+
 export const waveObservations = sqliteTable(
   "wave_observations",
   {
@@ -379,6 +421,59 @@ export const backtestMetrics = sqliteTable(
   (table) => ({
     pk: primaryKey({ columns: [table.backtestRunId, table.spotId, table.sourceId, table.metric] }),
     spotMetricIdx: index("backtest_metrics_spot_metric_idx").on(table.spotId, table.metric)
+  })
+);
+
+/**
+ * Immutable per-window product snapshots. These rows preserve exactly what
+ * the app issued so later backtests do not accidentally compare observations
+ * against today's recomputation of an old forecast.
+ */
+export const forecastSnapshots = sqliteTable(
+  "forecast_snapshots",
+  {
+    spotId: text("spot_id")
+      .notNull()
+      .references(() => spots.id),
+    issueId: text("issue_id").notNull(),
+    capturedAt: text("captured_at").notNull(),
+    issuedAt: text("issued_at").notNull(),
+    validAt: text("valid_at").notNull(),
+    leadHours: real("lead_hours").notNull(),
+    ratingStatus: text("rating_status").notNull(),
+    qualityLabel: text("quality_label").notNull(),
+    surfaceCondition: text("surface_condition").notNull(),
+    displayedHeightFt: real("displayed_height_ft"),
+    displayedHeightLabel: text("displayed_height_label").notNull(),
+    score: integer("score").notNull(),
+    confidence: integer("confidence").notNull(),
+    waveScore: integer("wave_score").notNull(),
+    windScore: integer("wind_score").notNull(),
+    tideScore: integer("tide_score").notNull(),
+    sourceScore: integer("source_score").notNull(),
+    peakPeriodS: real("peak_period_s"),
+    primaryDirectionDeg: integer("primary_direction_deg"),
+    tideFt: real("tide_ft"),
+    tideTrend: text("tide_trend"),
+    windSpeedKt: real("wind_speed_kt"),
+    windDirectionDeg: integer("wind_direction_deg"),
+    sourceUpdatedAt: text("source_updated_at"),
+    sourceRunIdsJson: text("source_run_ids_json").notNull(),
+    sourceVersionsJson: text("source_versions_json").notNull(),
+    sourceIssueFingerprint: text("source_issue_fingerprint").notNull(),
+    rawFactsJson: text("raw_facts_json").notNull(),
+    spotConfigJson: text("spot_config_json").notNull(),
+    spotConfigHash: text("spot_config_hash").notNull(),
+    forecastEngineVersion: text("forecast_engine_version").notNull(),
+    presentationVersion: text("presentation_version").notNull(),
+    snapshotSchemaVersion: integer("snapshot_schema_version").notNull(),
+    createdAt: text("created_at").notNull()
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.spotId, table.issueId, table.validAt] }),
+    spotValidAtIdx: index("forecast_snapshots_spot_valid_at_idx").on(table.spotId, table.validAt),
+    spotIssuedAtIdx: index("forecast_snapshots_spot_issued_at_idx").on(table.spotId, table.issuedAt),
+    issueIdx: index("forecast_snapshots_issue_idx").on(table.issueId)
   })
 );
 

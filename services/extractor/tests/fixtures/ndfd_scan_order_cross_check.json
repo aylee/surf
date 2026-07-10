@@ -1,0 +1,35 @@
+{
+  "checked_at": "2026-07-10T04:30:00Z",
+  "ndfd_object_key": "wmo/waveh/2026/07/10/YKUZ98_KWBN_202607100407",
+  "scope": "Dated coordinate/value association check, not a general decoder proof",
+  "checks": [
+    {
+      "spot_id": "bolinas",
+      "target_latitude": 37.909,
+      "target_longitude": -122.73,
+      "nearest_grid_latitude": 37.9017183286,
+      "nearest_grid_longitude": -122.7308987854,
+      "grid_distance_km": 0.8121,
+      "valid_at": "2026-07-10T05:00:00Z",
+      "cfgrib_shww_m": 1.5,
+      "nws_grid_id": "MTR/75,113",
+      "nws_update_at": "2026-07-10T03:46:36Z",
+      "nws_wave_height_m": 1.524,
+      "absolute_delta_m": 0.024
+    },
+    {
+      "spot_id": "obsf-central",
+      "target_latitude": 37.759,
+      "target_longitude": -122.53,
+      "nearest_grid_latitude": 37.7544316268,
+      "nearest_grid_longitude": -122.5197962155,
+      "grid_distance_km": 1.0291,
+      "valid_at": "2026-07-10T05:00:00Z",
+      "cfgrib_shww_m": 0.9,
+      "nws_grid_id": "MTR/81,105",
+      "nws_update_at": "2026-07-10T03:46:36Z",
+      "nws_wave_height_m": 0.9144,
+      "absolute_delta_m": 0.0144
+    }
+  ]
+}

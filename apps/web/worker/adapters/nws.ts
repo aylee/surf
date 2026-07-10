@@ -4,6 +4,7 @@ import { combineStatus, errorMessage } from "./types";
 
 export type NwsWindForecastRow = {
   spotId: SpotId;
+  issuedAt: string | null;
   forecastAt: string;
   periodEndAt: string | null;
   windSpeedKt: number | null;
@@ -61,6 +62,8 @@ type NwsForecastPeriod = {
 
 type NwsForecastResponse = {
   properties?: {
+    updated?: unknown;
+    generatedAt?: unknown;
     periods?: NwsForecastPeriod[];
   };
 };
@@ -212,6 +215,8 @@ async function fetchSpotContext(fetcher: SourceFetch, spot: SpotProfile): Promis
       if (!Array.isArray(periods) || periods.length === 0) {
         caveats.push({ code: "nws_empty_forecast", message: `NWS returned no forecast periods for ${spot.id}.` });
       } else {
+        const issuedAt =
+          isoOrNull(forecast.properties?.updated) ?? isoOrNull(forecast.properties?.generatedAt);
         windForecasts = periods.flatMap((period) => {
           const forecastAt = isoOrNull(period.startTime);
           if (!forecastAt) {
@@ -224,6 +229,7 @@ async function fetchSpotContext(fetcher: SourceFetch, spot: SpotProfile): Promis
           return [
             {
               spotId: spot.id,
+              issuedAt,
               forecastAt,
               periodEndAt: isoOrNull(period.endTime),
               windSpeedKt: parseSpeedKt(period.windSpeed),

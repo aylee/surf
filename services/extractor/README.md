@@ -36,12 +36,62 @@ uv run --project services/extractor surf-extractor validate-gfswave-cycle --fore
 uv run --project services/extractor pytest
 ```
 
-## Public observation backtest harness
+## Physical evaluation
 
-The first calibration harness summarizes public NDBC historical standard
-meteorological files. It is intentionally physical-data-only: it does not use
-private session labels or proprietary forecast text.
+An NDBC annual file is observation history, not a forecast backtest. The
+descriptive command is named accordingly and uses the file's declared header
+(older no-minute layouts are supported) plus circular direction statistics:
 
 ```bash
-uv run --project services/extractor surf-extractor backtest-ndbc-history --station-id 46026 --year 2025
+uv run --project services/extractor surf-extractor summarize-ndbc-history --station-id 46026 --year 2025
 ```
+
+Accuracy evaluation requires immutable, issued forecasts and time-aligned
+observations. Both inputs are JSONL. Forecast rows require `source_id`,
+`issued_at`, and `valid_at`; observation rows require `source_id` and
+`observed_at`. Optional physical fields are `wave_height_m`, `peak_period_s`,
+and `direction_deg`. Timestamps must include a UTC offset.
+
+```bash
+uv run --project services/extractor surf-extractor evaluate-jsonl \
+  --forecast-jsonl issued-forecasts.jsonl \
+  --observation-jsonl observations.jsonl \
+  --match-tolerance-minutes 30 \
+  --output-json evaluation.json \
+  --samples-jsonl matched-samples.jsonl
+```
+
+The evaluator defaults to no-lookahead observation matching, preserves
+unmatched forecasts, and reports coverage plus MAE, RMSE, bias, median absolute
+error, and within-tolerance rate. Direction errors use the shortest circular
+angle. Metrics are repeated for `0-12h`, `12-24h`, `24-48h`, `48-72h`,
+`72-120h`, and `120h+` lead buckets. These artifacts measure physical fields;
+they do not establish whether waves were clean, surfable, or breaking at a
+particular peak.
+
+## CDIP MOP nearshore proxy
+
+The public CDIP THREDDS OPeNDAP adapter can read bounded `waveTime`, `waveHs`,
+`waveTp`, and `waveDp` slices without adding netCDF dependencies. An operator
+must supply the exact MOP mapping and fixed height scale being tested:
+
+```json
+{
+  "spot_id": "bolinas",
+  "cdip_point_id": "M0000",
+  "dataset_url": "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/M0000_nowcast.nc",
+  "height_scale": 0.65
+}
+```
+
+```bash
+uv run --project services/extractor surf-extractor evaluate-cdip-transform \
+  --mapping-json bolinas-cdip.json \
+  --forecast-jsonl issued-offshore-forecasts.jsonl \
+  --start-index 0 --stop-index 500 \
+  --output-json bolinas-transform-evaluation.json
+```
+
+CDIP MOP output is labeled `modeled_nearshore_proxy` in the result. It is
+valuable for testing a crude fixed offshore-to-nearshore scale, but it is not
+an observed breaking-wave-height truth label and is never represented as one.

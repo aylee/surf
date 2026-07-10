@@ -39,10 +39,24 @@ export type ObservedWaveSourceMapping = {
 };
 
 export type CdipMopSourceMapping = {
+  sourceId: "cdip:mop-forecast";
+  provider: "CDIP/MOP";
   capability: "forecast_wave_nearshore";
   coverageStatus: SourceMappingStatus;
   dataAccessStatus: SourceMappingStatus;
   modelRegion: "sf" | "nocal";
+  modelPoint: {
+    id: string;
+    lat: number;
+    lon: number;
+    waterDepthM: number;
+    shoreNormalDeg: number;
+    forecastAsciiUrl: string;
+    forecastDasUrl: string;
+    forecastFileUrl: string;
+    nearshoreHeightScale: number;
+    relationship: "direct_nearshore_point" | "outside_cove_approach_proxy";
+  } | null;
   observedStationIds: string[];
   evidence: SourceEvidence[];
   notes: string;
@@ -74,12 +88,31 @@ export type NwsPointSourceMapping = {
   notes: string;
 };
 
+export type NwsWaveGridSourceMapping = {
+  sourceId: "nws:mtr-grid-wave";
+  provider: "NOAA/NWS MTR";
+  capability: "forecast_wave_nearshore";
+  office: "MTR";
+  gridX: number;
+  gridY: number;
+  lookupPoint: {
+    lat: number;
+    lon: number;
+  };
+  forecastZone: "PZZ545";
+  forecastGridData: string;
+  breakingHeightScale: number;
+  evidence: SourceEvidence[];
+  notes: string;
+};
+
 export type SpotSourceMap = {
   gfsWave: GfsWaveSourceMapping;
   observedWave: ObservedWaveSourceMapping[];
   cdipMop: CdipMopSourceMapping;
   coopsTide: CoopsTideSourceMapping;
   nwsPoint: NwsPointSourceMapping;
+  nwsWaveGrid: NwsWaveGridSourceMapping;
 };
 
 export type NorcalSpotProfile = SpotProfile & {
@@ -144,6 +177,13 @@ const evidence = {
     url: "https://cdip.ucsd.edu/documents/index/product_docs/mops/mop_intro.html",
     checkedAt,
     notes: "Public MOP docs describe alongshore sea and swell predictions north of Point Conception and say to contact CDIP for model predictions."
+  },
+  cdipMopForecast: {
+    id: "cdip-mop-public-forecast",
+    label: "CDIP MOP public per-point forecast",
+    url: "https://thredds.cdip.ucsd.edu/thredds/catalog/cdip/model/MOP_alongshore/catalog.html",
+    checkedAt: "2026-07-09",
+    notes: "Public THREDDS exposes per-point forecast NetCDF files and constrained OPeNDAP ASCII responses. Exact point metadata and five bulk forecast variables were verified live."
   },
   coops9414290: {
     id: "coops-9414290",
@@ -252,14 +292,35 @@ const observedSources = {
   }
 } satisfies Record<string, ObservedWaveSourceMapping>;
 
-function cdipMop(modelRegion: "sf" | "nocal", observedStationIds: string[], notes: string): CdipMopSourceMapping {
+const CDIP_MOP_BASE = "https://thredds.cdip.ucsd.edu/thredds";
+
+function cdipMop(
+  modelRegion: "sf" | "nocal",
+  observedStationIds: string[],
+  modelPoint: Omit<
+    NonNullable<CdipMopSourceMapping["modelPoint"]>,
+    "forecastAsciiUrl" | "forecastDasUrl" | "forecastFileUrl"
+  > | null,
+  notes: string
+): CdipMopSourceMapping {
+  const pointWithUrls = modelPoint
+    ? {
+        ...modelPoint,
+        forecastAsciiUrl: `${CDIP_MOP_BASE}/dodsC/cdip/model/MOP_alongshore/${modelPoint.id}_forecast.nc.ascii?waveTime,waveHs,waveTp,waveDp,waveDm`,
+        forecastDasUrl: `${CDIP_MOP_BASE}/dodsC/cdip/model/MOP_alongshore/${modelPoint.id}_forecast.nc.das`,
+        forecastFileUrl: `${CDIP_MOP_BASE}/fileServer/cdip/model/MOP_alongshore/${modelPoint.id}_forecast.nc`
+      }
+    : null;
   return {
+    sourceId: "cdip:mop-forecast",
+    provider: "CDIP/MOP",
     capability: "forecast_wave_nearshore",
-    coverageStatus: "verified",
-    dataAccessStatus: "blocked",
+    coverageStatus: pointWithUrls ? "verified" : "absent",
+    dataAccessStatus: "verified",
     modelRegion,
+    modelPoint: pointWithUrls,
     observedStationIds,
-    evidence: [evidence.cdipSfModel, evidence.cdipMopIntro],
+    evidence: [evidence.cdipSfModel, evidence.cdipMopIntro, evidence.cdipMopForecast],
     notes
   };
 }
@@ -307,6 +368,24 @@ function nwsPoint(input: Omit<NwsPointSourceMapping, "capabilities" | "office" |
   };
 }
 
+function nwsWaveGrid(
+  input: Omit<
+    NwsWaveGridSourceMapping,
+    "sourceId" | "provider" | "capability" | "office" | "forecastZone" | "forecastGridData" | "evidence"
+  >
+): NwsWaveGridSourceMapping {
+  return {
+    sourceId: "nws:mtr-grid-wave",
+    provider: "NOAA/NWS MTR",
+    capability: "forecast_wave_nearshore",
+    office: "MTR",
+    forecastZone: "PZZ545",
+    forecastGridData: `https://api.weather.gov/gridpoints/MTR/${input.gridX},${input.gridY}`,
+    evidence: [evidence.nwsPoints],
+    ...input
+  };
+}
+
 export const NORCAL_SPOTS: NorcalSpotProfile[] = [
   {
     id: "obsf-north",
@@ -323,7 +402,7 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 140 },
     maxGoodWindKt: 8,
     maxOkWindKt: 15,
-    referenceBuoys: ["46026", "46013"],
+    referenceBuoys: ["46237", "46026", "46013"],
     cdipStations: ["142"],
     tideStation: "9414290",
     notes: "Exposed SF beachbreak. Cold-start prior favors clean wind and moderate tides.",
@@ -341,7 +420,16 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
       cdipMop: cdipMop(
         "sf",
         ["142"],
-        "CDIP San Francisco regional model covers the Golden Gate/Ocean Beach area, but exact MOP alongshore point IDs are not publicly exposed without contacting CDIP."
+        {
+          id: "SF043",
+          lat: 37.7839,
+          lon: -122.51468,
+          waterDepthM: 10,
+          shoreNormalDeg: 305.41,
+          nearshoreHeightScale: 1,
+          relationship: "direct_nearshore_point"
+        },
+        "SF043 is the verified public 10 m MOP point at Ocean Beach North. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.sanFrancisco,
       nwsPoint: nwsPoint({
@@ -353,6 +441,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         forecastHourly: "https://api.weather.gov/gridpoints/MTR/81,106/forecast/hourly",
         observationStations: "https://api.weather.gov/gridpoints/MTR/81,106/stations",
         notes: "Live NWS point metadata returned a marine point on forecast zone PZZ545."
+      }),
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 81,
+        gridY: 106,
+        lookupPoint: { lat: 37.782, lon: -122.514 },
+        breakingHeightScale: 1,
+        notes: "Verified coastal-marine grid at the Ocean Beach North point; raw significant height is used without a spot reduction."
       })
     }
   },
@@ -371,7 +466,7 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 140 },
     maxGoodWindKt: 8,
     maxOkWindKt: 15,
-    referenceBuoys: ["46026", "46013"],
+    referenceBuoys: ["46237", "46026", "46013"],
     cdipStations: ["142"],
     tideStation: "9414290",
     notes: "Primary v1 OBSF reference spot.",
@@ -389,7 +484,16 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
       cdipMop: cdipMop(
         "sf",
         ["142"],
-        "CDIP San Francisco regional model coverage is verified for the SF approach, while direct MOP point access remains blocked by CDIP contact-gated predictions."
+        {
+          id: "SF029",
+          lat: 37.75892,
+          lon: -122.52074,
+          waterDepthM: 10.01,
+          shoreNormalDeg: 265,
+          nearshoreHeightScale: 1,
+          relationship: "direct_nearshore_point"
+        },
+        "SF029 is the verified public 10.01 m MOP point at Ocean Beach Central. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.sanFrancisco,
       nwsPoint: nwsPoint({
@@ -401,6 +505,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         forecastHourly: "https://api.weather.gov/gridpoints/MTR/81,105/forecast/hourly",
         observationStations: "https://api.weather.gov/gridpoints/MTR/81,105/stations",
         notes: "Live NWS point metadata returned MTR grid 81,105 on San Francisco forecast zone CAZ006."
+      }),
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 81,
+        gridY: 105,
+        lookupPoint: { lat: 37.759, lon: -122.53 },
+        breakingHeightScale: 1,
+        notes: "Verified by an adjacent coastal-marine lookup point on PZZ545; raw significant height is used without a spot reduction."
       })
     }
   },
@@ -419,7 +530,7 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 145 },
     maxGoodWindKt: 8,
     maxOkWindKt: 15,
-    referenceBuoys: ["46026", "46013"],
+    referenceBuoys: ["46237", "46026", "46013"],
     cdipStations: ["142"],
     tideStation: "9414290",
     notes: "Exposed beachbreak; needs local calibration for bars and tide sensitivity.",
@@ -437,7 +548,16 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
       cdipMop: cdipMop(
         "sf",
         ["142"],
-        "CDIP San Francisco regional model covers the SF shore approach; missing direct MOP point IDs should lower nearshore-transform confidence."
+        {
+          id: "SF015",
+          lat: 37.73442,
+          lon: -122.51637,
+          waterDepthM: 10.01,
+          shoreNormalDeg: 268.53,
+          nearshoreHeightScale: 1,
+          relationship: "direct_nearshore_point"
+        },
+        "SF015 is the verified public 10.01 m MOP point at Ocean Beach South. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.sanFrancisco,
       nwsPoint: nwsPoint({
@@ -449,6 +569,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         forecastHourly: "https://api.weather.gov/gridpoints/MTR/81,104/forecast/hourly",
         observationStations: "https://api.weather.gov/gridpoints/MTR/81,104/stations",
         notes: "Live NWS point metadata returned MTR grid 81,104 on San Francisco forecast zone CAZ006."
+      }),
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 80,
+        gridY: 104,
+        lookupPoint: { lat: 37.735, lon: -122.53 },
+        breakingHeightScale: 1,
+        notes: "Verified adjacent PZZ545 marine cell for Ocean Beach South; raw significant height is used without a spot reduction."
       })
     }
   },
@@ -467,7 +594,7 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 145 },
     maxGoodWindKt: 8,
     maxOkWindKt: 14,
-    referenceBuoys: ["46026", "46012"],
+    referenceBuoys: ["46012", "46237", "46026"],
     cdipStations: ["142"],
     tideStation: "9414131",
     notes: "Protected beginner-friendly beach; smaller swell windows matter.",
@@ -484,7 +611,16 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
       cdipMop: cdipMop(
         "sf",
         ["142"],
-        "CDIP San Francisco model region includes the SF-to-Half Moon Bay coastal reach, but public direct MOP point extraction is blocked pending CDIP access."
+        {
+          id: "SM371",
+          lat: 37.59555,
+          lon: -122.52342,
+          waterDepthM: 15.01,
+          shoreNormalDeg: 295.98,
+          nearshoreHeightScale: 0.6,
+          relationship: "outside_cove_approach_proxy"
+        },
+        "SM371 is a verified public 15.01 m approach point outside Linda Mar's cove. The explicit 0.60 final cove scale remains a cold-start proxy and must stay visible."
       ),
       coopsTide: coopsTideStations.pillarPoint,
       nwsPoint: nwsPoint({
@@ -496,6 +632,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         forecastHourly: "https://api.weather.gov/gridpoints/MTR/80,98/forecast/hourly",
         observationStations: "https://api.weather.gov/gridpoints/MTR/80,98/stations",
         notes: "Live NWS point metadata returned MTR grid 80,98 for Pacifica forecast zone CAZ509."
+      }),
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 79,
+        gridY: 98,
+        lookupPoint: { lat: 37.594, lon: -122.53 },
+        breakingHeightScale: 0.6,
+        notes: "Verified adjacent PZZ545 marine cell; cold-start 0.60 scale estimates Linda Mar breaking height from raw coastal-grid height."
       })
     }
   },
@@ -514,7 +657,7 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 135 },
     maxGoodWindKt: 8,
     maxOkWindKt: 14,
-    referenceBuoys: ["46026", "46013"],
+    referenceBuoys: ["46237", "46013", "46026"],
     cdipStations: ["142", "029"],
     tideStation: "9414958",
     notes: "More sheltered than OBSF; local transform and tide calibration needed.",
@@ -532,7 +675,16 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
       cdipMop: cdipMop(
         "sf",
         ["142", "029"],
-        "CDIP San Francisco regional model imagery includes Bolinas/Stinson vicinity, but direct MOP alongshore point IDs remain contact-gated."
+        {
+          id: "MA122",
+          lat: 37.88907,
+          lon: -122.64715,
+          waterDepthM: 15,
+          shoreNormalDeg: 221.52,
+          nearshoreHeightScale: 1,
+          relationship: "direct_nearshore_point"
+        },
+        "MA122 is the verified public 15 m MOP point nearest Stinson. Its Hs is modeled nearshore significant wave height, not breaking-wave face height."
       ),
       coopsTide: coopsTideStations.bolinasLagoon,
       nwsPoint: nwsPoint({
@@ -544,6 +696,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         forecastHourly: "https://api.weather.gov/gridpoints/MTR/78,112/forecast/hourly",
         observationStations: "https://api.weather.gov/gridpoints/MTR/78,112/stations",
         notes: "Live NWS point metadata returned a marine point on forecast zone PZZ545."
+      }),
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 78,
+        gridY: 112,
+        lookupPoint: { lat: 37.899, lon: -122.644 },
+        breakingHeightScale: 0.55,
+        notes: "Verified PZZ545 coastal-marine grid; cold-start 0.55 scale represents Stinson sheltering."
       })
     }
   },
@@ -562,7 +721,7 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
     offshoreWindFromDeg: { minDeg: 45, maxDeg: 135 },
     maxGoodWindKt: 8,
     maxOkWindKt: 14,
-    referenceBuoys: ["46026", "46013"],
+    referenceBuoys: ["46237", "46013", "46026"],
     cdipStations: ["142", "029"],
     tideStation: "9414958",
     notes: "Sheltered longboard-friendly option; exact source mapping must keep confidence low until nearshore transform access is resolved.",
@@ -580,7 +739,8 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
       cdipMop: cdipMop(
         "sf",
         ["142", "029"],
-        "CDIP public San Francisco model shows Bolinas in the modeled region, but MOP alongshore prediction access requires contacting CDIP."
+        null,
+        "No safe direct MOP point is mapped for Bolinas. Keep the spot uncalibrated on the NWS coastal-grid fallback rather than borrowing Stinson or an offshore Marin point."
       ),
       coopsTide: coopsTideStations.bolinasLagoon,
       nwsPoint: nwsPoint({
@@ -592,6 +752,13 @@ export const NORCAL_SPOTS: NorcalSpotProfile[] = [
         forecastHourly: "https://api.weather.gov/gridpoints/MTR/77,113/forecast/hourly",
         observationStations: "https://api.weather.gov/gridpoints/MTR/77,113/stations",
         notes: "Live NWS point metadata returned MTR grid 77,113 for coastal Marin forecast zone CAZ505."
+      }),
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 75,
+        gridY: 113,
+        lookupPoint: { lat: 37.909, lon: -122.73 },
+        breakingHeightScale: 0.65,
+        notes: "First verified PZZ545 marine cell west of Bolinas; land cells 77,113 and 76,113 returned all-zero wave layers. Cold-start scale is 0.65."
       })
     }
   }

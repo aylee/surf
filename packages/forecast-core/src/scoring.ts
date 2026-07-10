@@ -29,6 +29,12 @@ function directionWindowScore(value: number, bestMin: number, bestMax: number, f
   return clampScore(100 - circularDistance(value, fallbackCenter) * 2.2);
 }
 
+function swellDirectionScore(spot: SpotProfile, value: number): number {
+  if (withinWindow(value, spot.bestSwellDeg.minDeg, spot.bestSwellDeg.maxDeg)) return 100;
+  if (withinWindow(value, spot.workableSwellDeg.minDeg, spot.workableSwellDeg.maxDeg)) return 65;
+  return clampScore(45 - circularDistance(value, spot.shoreNormalDeg));
+}
+
 function rangeScore(value: number, min: number, max: number): number {
   if (value >= min && value <= max) return 100;
   const distance = value < min ? min - value : value - max;
@@ -43,52 +49,92 @@ function qualityLabel(score: number): QualityLabel {
   return "poor";
 }
 
-function sourceScore(activeCapabilities: SourceCapability[], freshnessMinutes: number): number {
-  const required: SourceCapability[] = [
-    "forecast_wave_offshore",
-    "observed_wave",
-    "tide",
-    "wind"
-  ];
-  const coverage = required.filter((capability) => activeCapabilities.includes(capability)).length / required.length;
-  const freshnessPenalty = Math.min(35, freshnessMinutes / 12);
-  return clampScore(coverage * 100 - freshnessPenalty);
+function sourceScore(
+  activeCapabilities: SourceCapability[],
+  freshnessMinutes: number,
+  forecastLeadHours = 0,
+  usesColdStartTransform = false
+): number {
+  const hasWave =
+    activeCapabilities.includes("forecast_wave_nearshore") ||
+    activeCapabilities.includes("forecast_wave_offshore");
+  const coverage =
+    (hasWave ? 45 : 0) +
+    (activeCapabilities.includes("wind") ? 25 : 0) +
+    (activeCapabilities.includes("tide") ? 20 : 0) +
+    (activeCapabilities.includes("observed_wave") ? 10 : 0);
+  const freshnessPenalty = Math.min(15, freshnessMinutes / 120);
+  const leadPenalty = Math.min(25, forecastLeadHours / 5);
+  const transformPenalty = usesColdStartTransform ? 15 : 0;
+  const score = clampScore(coverage - freshnessPenalty - leadPenalty - transformPenalty);
+  return usesColdStartTransform ? Math.min(74, score) : score;
 }
 
 export function scoreSpotWindow(spot: SpotProfile, input: ForecastWindowInput): SurfScore {
-  const waveDirectionScore = directionWindowScore(
-    input.primaryDirectionDeg,
-    spot.bestSwellDeg.minDeg,
-    spot.bestSwellDeg.maxDeg,
-    spot.shoreNormalDeg
+  const source = sourceScore(
+    input.activeCapabilities,
+    input.sourceFreshnessMinutes,
+    input.forecastLeadHours,
+    input.usesColdStartTransform
   );
-  const periodScore = rangeScore(input.peakPeriodSec, spot.bestPeriodSec.min, spot.bestPeriodSec.max);
-  const heightScore = rangeScore(input.waveHeightFt, 2, spot.id.startsWith("obsf") ? 8 : 5);
-  const waveScore = clampScore(waveDirectionScore * 0.45 + periodScore * 0.35 + heightScore * 0.2);
+  const hasWave =
+    input.waveHeightFt !== null && input.peakPeriodSec !== null && input.primaryDirectionDeg !== null;
+  if (!hasWave) {
+    return {
+      spotId: spot.id,
+      forecastAt: input.forecastAt,
+      ratingStatus: "unknown",
+      qualityLabel: "unknown",
+      score: 0,
+      confidence: 0,
+      waveScore: 0,
+      windScore: 0,
+      tideScore: 0,
+      sourceScore: source,
+      explanation: "No surf call: a sourced wave height, period, and direction are required."
+    };
+  }
 
-  const windDirectionScore = directionWindowScore(
-    input.windDirectionDeg,
-    spot.offshoreWindFromDeg.minDeg,
-    spot.offshoreWindFromDeg.maxDeg,
-    (spot.offshoreWindFromDeg.minDeg + spot.offshoreWindFromDeg.maxDeg) / 2
-  );
-  const windSpeedScore =
-    input.windSpeedKt <= spot.maxGoodWindKt
-      ? 100
-      : input.windSpeedKt <= spot.maxOkWindKt
-        ? 70
-        : clampScore(70 - (input.windSpeedKt - spot.maxOkWindKt) * 8);
-  const windScore = clampScore(windDirectionScore * 0.55 + windSpeedScore * 0.45);
+  const waveDirectionScore = swellDirectionScore(spot, input.primaryDirectionDeg!);
+  const periodScore = rangeScore(input.peakPeriodSec!, spot.bestPeriodSec.min, spot.bestPeriodSec.max);
+  // Size is reported separately. A clean one-foot wave is not downgraded merely for being small.
+  const waveScore = clampScore(waveDirectionScore * 0.6 + periodScore * 0.4);
 
-  const tideScore = rangeScore(input.tideFt, spot.bestTideFt.min, spot.bestTideFt.max);
-  const source = sourceScore(input.activeCapabilities, input.sourceFreshnessMinutes);
+  let weightedScore = waveScore * 0.5;
+  let scoreWeight = 0.5;
+  let windScore = 0;
+  if (input.windSpeedKt !== null && input.windDirectionDeg !== null) {
+    const windDirectionScore = directionWindowScore(
+      input.windDirectionDeg,
+      spot.offshoreWindFromDeg.minDeg,
+      spot.offshoreWindFromDeg.maxDeg,
+      (spot.offshoreWindFromDeg.minDeg + spot.offshoreWindFromDeg.maxDeg) / 2
+    );
+    const windSpeedScore =
+      input.windSpeedKt <= spot.maxGoodWindKt
+        ? 100
+        : input.windSpeedKt <= spot.maxOkWindKt
+          ? 70
+          : clampScore(70 - (input.windSpeedKt - spot.maxOkWindKt) * 8);
+    windScore = clampScore(windDirectionScore * 0.55 + windSpeedScore * 0.45);
+    weightedScore += windScore * 0.3;
+    scoreWeight += 0.3;
+  }
 
-  const score = clampScore(waveScore * 0.42 + windScore * 0.28 + tideScore * 0.18 + source * 0.12);
-  const confidence = clampScore(source * 0.75 + Math.min(100, input.activeCapabilities.length * 12.5) * 0.25);
+  let tideScore = 0;
+  if (input.tideFt !== null) {
+    tideScore = rangeScore(input.tideFt, spot.bestTideFt.min, spot.bestTideFt.max);
+    weightedScore += tideScore * 0.2;
+    scoreWeight += 0.2;
+  }
+
+  const score = clampScore(weightedScore / scoreWeight);
+  const confidence = source;
 
   return {
     spotId: spot.id,
     forecastAt: input.forecastAt,
+    ratingStatus: "scored",
     qualityLabel: qualityLabel(score),
     score,
     confidence,
@@ -96,7 +142,7 @@ export function scoreSpotWindow(spot: SpotProfile, input: ForecastWindowInput): 
     windScore,
     tideScore,
     sourceScore: source,
-    explanation: `Cold-start deterministic score: wave ${waveScore}, wind ${windScore}, tide ${tideScore}, source ${source}.`
+    explanation: `Objective condition score: swell organization ${waveScore}, wind ${windScore}, tide ${tideScore}; size is reported separately. Source confidence ${source}.`
   };
 }
 
@@ -134,7 +180,14 @@ export function buildFixtureForecast(spotId: SpotId, now = new Date()): Forecast
       sourceFreshnessMinutes: input.sourceFreshnessMinutes,
       activeCapabilities,
       sourceRunIds: ["fixture"],
-      caveats: ["Fixture forecast. Live source rows have not been loaded for this window."]
+      caveats: ["Fixture forecast. Live source rows have not been loaded for this window."],
+      primarySwell: {
+        heightFt: input.waveHeightFt,
+        periodSec: input.peakPeriodSec,
+        directionDeg: input.primaryDirectionDeg
+      },
+      secondarySwell: null,
+      waveProvenance: null
     };
   });
 
