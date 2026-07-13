@@ -1,0 +1,2 @@
+packages/db/migrations/*.sql text eol=lf
+*.png binary

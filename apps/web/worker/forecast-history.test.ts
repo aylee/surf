@@ -1,4 +1,4 @@
-import { buildFixtureForecast } from "@surf/forecast-core";
+import { buildFixtureForecast } from "@surf/forecast-core/test-support";
 import { describe, expect, it } from "vitest";
 import {
   FORECAST_ENGINE_VERSION,

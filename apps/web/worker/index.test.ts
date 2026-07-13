@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NORCAL_SPOTS } from "@surf/forecast-core";
 import type { Env } from "./index";
 import worker from "./index";
 import {
@@ -7,6 +8,7 @@ import {
   pruneRetainedData,
   shouldCaptureForecastHistory
 } from "./ingest";
+import { stableThreeHourForecastTimes } from "./time";
 
 function dbMock() {
   const runs: unknown[][] = [];
@@ -35,11 +37,10 @@ function env(db: D1Database = dbMock().db): Env {
   return {
     ENVIRONMENT: "test",
     SURF_REGION: "norcal",
-    REPORT_AGENT_ENABLED: "false",
+    SURF_USER_AGENT: "surf-test/1.0 (+https://example.test/contact)",
     ASSETS: { fetch: () => Promise.resolve(new Response("asset")) } as unknown as Fetcher,
     DB: db,
     RAW_ARTIFACTS: { put: async () => ({}) } as unknown as R2Bucket,
-    CACHE: {} as KVNamespace,
     INGEST_QUEUE: { send: async () => undefined } as unknown as Queue
   };
 }
@@ -58,7 +59,7 @@ describe("worker api", () => {
     const result = await pruneRetainedData(db, now);
 
     expect(result.errors).toEqual([]);
-    expect(sqls).toHaveLength(14);
+    expect(sqls).toHaveLength(11);
     for (const table of ["wave_forecasts", "tide_forecasts", "wind_forecasts"]) {
       const index = sqls.findIndex((sql) => sql.includes(`delete from ${table}`));
       expect(index).toBeGreaterThanOrEqual(0);
@@ -73,10 +74,7 @@ describe("worker api", () => {
       "forecast_issues",
       "wind_forecast_issues",
       "wave_observations",
-      "tide_observations",
-      "wind_observations",
       "hazard_events",
-      "spot_scores",
       "source_artifacts",
       "source_runs"
     ]) {
@@ -95,6 +93,7 @@ describe("worker api", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -108,8 +107,27 @@ describe("worker api", () => {
   it("returns v1 spots", async () => {
     const request = new Request("http://surf.test/api/spots") as unknown as Parameters<typeof worker.fetch>[0];
     const response = await worker.fetch(request, env(), {} as ExecutionContext);
-    const body = (await response.json()) as { spots: unknown[] };
+    const body = (await response.json()) as {
+      spots: Array<{
+        id: string;
+        sourceMap: { observedWave: Array<{ provider: string; stationId: string }> };
+      }>;
+    };
     expect(body.spots).toHaveLength(6);
+    expect(body.spots.find((spot) => spot.id === "stinson")?.sourceMap.observedWave).toEqual([
+      expect.objectContaining({ provider: "NDBC", stationId: "46237" }),
+      expect.objectContaining({ provider: "NDBC", stationId: "46013" }),
+      expect.objectContaining({ provider: "NDBC", stationId: "46026" })
+    ]);
+  });
+
+  it("rejects well-formed spot IDs that are not configured", async () => {
+    const request = new Request("http://surf.test/api/forecast/not-configured") as unknown as Parameters<
+      typeof worker.fetch
+    >[0];
+    const response = await worker.fetch(request, env(), {} as ExecutionContext);
+
+    expect(response.status).toBe(400);
   });
 
   it("fails closed with unknown windows when normalized forecast rows cannot be read", async () => {
@@ -123,20 +141,16 @@ describe("worker api", () => {
     };
     expect(response.status).toBe(200);
     expect(body.spot.id).toBe("obsf-central");
+    expect(body.spot).not.toHaveProperty("sourceMap");
     expect(body.windows.length).toBeGreaterThan(0);
     expect(body.windows[0]).toMatchObject({ ratingStatus: "unknown", waveHeightFt: null, sourceRunIds: [] });
   });
 
-  it("keeps reports disabled without an explicit provider secret", async () => {
-    const request = new Request("http://surf.test/api/reports/today") as unknown as Parameters<typeof worker.fetch>[0];
-    const response = await worker.fetch(request, env(), {} as ExecutionContext);
-    const body = (await response.json()) as { enabled: boolean; reason: string };
-    expect(response.status).toBe(200);
-    expect(body.enabled).toBe(false);
-    expect(body.reason).toContain("REPORT_AGENT_ENABLED");
-  });
-
   it("runs manual ingest and records source-run-like D1 rows", async () => {
+    const now = new Date("2026-07-08T15:00:00.000Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+
     const { db, runs, sqls } = dbMock();
     const forecastUrl = "https://api.weather.gov/gridpoints/MTR/85,105/forecast/hourly";
     const observedAt = new Date(Date.now() - 30 * 60 * 1000);
@@ -263,7 +277,7 @@ describe("worker api", () => {
       throw new Error(`unexpected URL ${url}`);
     });
 
-    const request = new Request("http://surf.test/api/ingest/once", { method: "POST" }) as unknown as Parameters<
+    const request = new Request("http://127.0.0.1/api/ingest/once", { method: "POST" }) as unknown as Parameters<
       typeof worker.fetch
     >[0];
     const response = await worker.fetch(request, env(db), {} as ExecutionContext);
@@ -288,7 +302,24 @@ describe("worker api", () => {
     expect(body.counts.nwsWaveForecastRows).toBe(246);
     expect(body.counts.cdipMopWaveForecastRows).toBe(10);
     expect(body.counts.ndbcObservationRows).toBe(4);
-    expect(body.counts.forecastSnapshotRows).toBe(120);
+    const expectedSnapshotRows = NORCAL_SPOTS.reduce(
+      (total, spot) =>
+        total +
+        stableThreeHourForecastTimes(now, 120, spot.timezone).filter((forecastAt) => {
+          const hour = Number(
+            new Intl.DateTimeFormat("en-US", {
+              hour: "2-digit",
+              hourCycle: "h23",
+              timeZone: spot.timezone
+            })
+              .formatToParts(new Date(forecastAt))
+              .find((part) => part.type === "hour")?.value
+          );
+          return hour >= 6 && hour < 18;
+        }).length,
+      0
+    );
+    expect(body.counts.forecastSnapshotRows).toBe(expectedSnapshotRows);
     expect(body.sourceRuns.map((run) => run.sourceId)).toEqual([
       "coops:tide-predictions",
       "nws:point-forecast-alerts",
@@ -305,7 +336,9 @@ describe("worker api", () => {
     expect(sqls.filter((sql) => sql.includes("insert into wind_forecast_issues"))).toHaveLength(6);
     expect(sqls.filter((sql) => sql.includes("insert into forecast_configs"))).toHaveLength(6);
     expect(sqls.filter((sql) => sql.includes("insert into forecast_issues"))).toHaveLength(6);
-    expect(sqls.filter((sql) => sql.includes("insert into forecast_snapshots"))).toHaveLength(120);
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_snapshots"))).toHaveLength(
+      expectedSnapshotRows
+    );
     expect(sqls.filter((sql) => sql.includes("delete from forecast_snapshots"))).toHaveLength(1);
     expect(sqls.filter((sql) => sql.includes("delete from wave_forecasts"))).toHaveLength(1);
     const bolinasWindWrite = runs.find(

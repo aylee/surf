@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  ApiSpot,
   ForecastResponse,
   ScoredForecastWindow,
   SourceCapability,
   SpotId,
-  SpotProfile
+  SpotsResponse
 } from "@surf/contracts";
 import {
   ArrowLeft,
@@ -28,38 +29,12 @@ import {
   formatWindowSpan,
   isPlanningWindow,
   localDateParts,
+  selectedSpotIdFromSearch,
   surfaceCondition,
   surfHeightRange,
   windRelation,
   type SurfaceCondition
 } from "./forecast-view";
-
-type SourceMapSummary = {
-  nwsWaveGrid?: {
-    provider: string;
-    forecastGridData: string;
-    breakingHeightScale: number;
-    notes: string;
-  };
-  observedWave?: Array<{
-    provider: string;
-    stationId: string;
-    name: string;
-  }>;
-  coopsTide?: {
-    stationId: string;
-    name: string;
-  };
-};
-
-type ApiSpot = SpotProfile & {
-  sourceMap?: SourceMapSummary;
-};
-
-type SpotsResponse = {
-  spots: ApiSpot[];
-  sourceNote: string;
-};
 
 type ForecastResult =
   | { status: "ready"; data: ForecastResponse }
@@ -90,15 +65,6 @@ const initialState: DashboardState = {
   forecasts: {},
   fetchedAt: null
 };
-
-const spotIds = new Set<SpotId>([
-  "obsf-north",
-  "obsf-central",
-  "obsf-south",
-  "linda-mar",
-  "stinson",
-  "bolinas"
-]);
 
 const surfaceRank: Record<SurfaceCondition, number> = {
   clean: 3,
@@ -141,11 +107,6 @@ function formatFetchedAt(value: string | null): string {
     hour: "numeric",
     minute: "2-digit"
   }).format(new Date(value));
-}
-
-function activeSpotId(): SpotId | null {
-  const value = new URLSearchParams(window.location.search).get("spot") as SpotId | null;
-  return value && spotIds.has(value) ? value : null;
 }
 
 function forecastHref(spotId: SpotId): string {
@@ -455,7 +416,6 @@ function Timeline({
 }
 
 function SelectedWindowDetails({ spot, windows, window }: { spot: ApiSpot; windows: ScoredForecastWindow[]; window: ScoredForecastWindow }) {
-  const primary = window.primarySwell;
   const secondary = window.secondarySwell;
   return (
     <div className="selectedWindow" aria-live="polite">
@@ -676,7 +636,10 @@ export function App() {
       }),
     [state.forecasts, state.spots]
   );
-  const selectedSpotId = activeSpotId();
+  const selectedSpotId = selectedSpotIdFromSearch(
+    window.location.search,
+    state.spots.map((spot) => spot.id)
+  );
   const selectedSummary = summaries.find((summary) => summary.spot.id === selectedSpotId);
 
   return (

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildFixtureForecast, getSpotProfile, scoreSpotWindow } from "../src/index";
+import { getSpotProfile, scoreSpotWindow } from "../src/index";
+import { buildFixtureForecast } from "../test-support";
 
 describe("scoreSpotWindow", () => {
   it("scores a clean OBSF window as good or better", () => {

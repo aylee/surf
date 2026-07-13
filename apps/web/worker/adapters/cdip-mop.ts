@@ -2,6 +2,7 @@ import type { SpotId } from "@surf/contracts";
 import { estimateBreakingWaveHeight, type NorcalSpotProfile } from "@surf/forecast-core";
 import type { AdapterOutcome, AdapterStatus, SourceCaveat, SourceFetch } from "./types";
 import { combineStatus, errorMessage } from "./types";
+import { PUBLIC_FEED_USER_AGENT } from "./http";
 
 export const CDIP_MOP_SOURCE_ID = "cdip:mop-forecast";
 export const CDIP_MOP_DOCUMENTATION_URL =
@@ -295,7 +296,7 @@ async function fetchSpotForecast(
     const response = await fetcher(requestUrl, {
       headers: {
         Accept: "text/plain",
-        "User-Agent": "surf/0.0.0 (https://github.com/aylee/surf)"
+        "User-Agent": PUBLIC_FEED_USER_AGENT
       }
     });
     if (!response.ok) {
@@ -305,7 +306,7 @@ async function fetchSpotForecast(
     const dasResponse = await fetcher(metadataUrl, {
       headers: {
         Accept: "text/plain",
-        "User-Agent": "surf/0.0.0 (https://github.com/aylee/surf)"
+        "User-Agent": PUBLIC_FEED_USER_AGENT
       }
     });
     if (!dasResponse.ok) {
@@ -321,7 +322,7 @@ async function fetchSpotForecast(
     if (!sourceUpdatedAt) {
       const fileResponse = await fetcher(sourceFileUrl, {
         method: "HEAD",
-        headers: { "User-Agent": "surf/0.0.0 (https://github.com/aylee/surf)" }
+        headers: { "User-Agent": PUBLIC_FEED_USER_AGENT }
       });
       if (!fileResponse.ok) {
         return failed(

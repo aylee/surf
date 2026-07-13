@@ -1,14 +1,16 @@
-import type {
-  ForecastResponse,
-  ForecastWindowInput,
-  ScoredForecastWindow,
-  SourceCapability,
-  SpotId,
-  SwellComponent,
-  WaveObservationSummary,
-  WaveProvenance
+import {
+  ForecastResponseSchema,
+  type ForecastResponse,
+  type ForecastWindowInput,
+  type ScoredForecastWindow,
+  type SourceCapability,
+  type SpotId,
+  type SwellComponent,
+  type WaveObservationSummary,
+  type WaveProvenance
 } from "@surf/contracts";
 import {
+  getOperationalObservedWaveSources,
   getSpotProfile,
   scoreSpotWindow,
   surfaceConditionForWind,
@@ -19,6 +21,13 @@ import { NDBC_STALE_AFTER_MINUTES } from "./adapters/ndbc";
 import { NWS_GRID_WAVE_SOURCE_ID } from "./adapters/nws-grid-wave";
 import type { Env } from "./index";
 import { stableThreeHourForecastTimes } from "./time";
+
+/*
+ * Keep the wire response projected through the public schema. Internal spot
+ * source maps are exposed only by /api/spots through its dedicated summary.
+ */
+const publicForecastResponse = (value: ForecastResponse): ForecastResponse =>
+  ForecastResponseSchema.parse(value);
 
 type TideRow = {
   forecast_at: string;
@@ -267,14 +276,18 @@ function activeHazardAt(rows: HazardRow[], forecastAt: string): HazardRow | null
 }
 
 function preferredObservation(
-  referenceBuoys: string[],
+  observedSources: Array<{ stationId: string }>,
   rows: ObservationRow[],
   now: Date
 ): { row: ObservationRow; summary: WaveObservationSummary; isFresh: boolean } | null {
+  const priorityByStation = new Map(
+    observedSources.map((source, index) => [source.stationId, index])
+  );
   const sorted = rows
     .filter(
       (row) =>
         typeof row.source_id === "string" &&
+        priorityByStation.has(row.source_id.replace(/^ndbc-/, "")) &&
         typeof row.observed_at === "string" &&
         Number.isFinite(new Date(row.observed_at).getTime()) &&
         typeof row.wave_height_m === "number" &&
@@ -290,7 +303,8 @@ function preferredObservation(
 
       const leftStation = left.source_id.replace(/^ndbc-/, "");
       const rightStation = right.source_id.replace(/^ndbc-/, "");
-      const priorityDelta = referenceBuoys.indexOf(leftStation) - referenceBuoys.indexOf(rightStation);
+      const priorityDelta =
+        priorityByStation.get(leftStation)! - priorityByStation.get(rightStation)!;
       if (priorityDelta !== 0) return priorityDelta;
       return right.observed_at.localeCompare(left.observed_at);
     });
@@ -352,13 +366,13 @@ function unavailableWindows(spotId: SpotId, now: Date, caveat: string): ScoredFo
 }
 
 function unavailableForecast(spotId: SpotId, now: Date, sourceNote: string, caveat: string): ForecastResponse {
-  return {
+  return publicForecastResponse({
     spot: getSpotProfile(spotId),
     windows: unavailableWindows(spotId, now, caveat),
     generatedAt: now.toISOString(),
     sourceNote,
     observation: null
-  };
+  });
 }
 
 export async function buildForecastResponse(env: Env, spotId: SpotId, now = new Date()): Promise<ForecastResponse> {
@@ -453,7 +467,11 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
       )
     ]);
 
-    const observation = preferredObservation(spot.referenceBuoys, observationRows, now);
+    const observation = preferredObservation(
+      getOperationalObservedWaveSources(spot),
+      observationRows,
+      now
+    );
 
     const windows: ScoredForecastWindow[] = forecastTimes.map((forecastAt) => {
       const tide = closestByTime(tideRows, forecastAt, (row) => row.forecast_at, 90 * 60 * 1000);
@@ -678,13 +696,13 @@ export async function buildForecastResponse(env: Env, spotId: SpotId, now = new 
         ? "Bolinas has no safe direct CDIP MOP mapping and remains uncalibrated on official NOAA/NWS MTR coastal-grid data as the fallback. Its visible spot scale is a cold-start estimate, not breaking-wave truth; NOAA/NDBC buoys provide current context."
         : "CDIP MOP is mapped but no usable row was available for this window, so wave conditions use the official NOAA/NWS MTR coastal-grid fallback with NOAA/NDBC buoy context. The NWS spot scale is a visible cold-start breaking-height estimate. Missing wave data returns an unknown call."
 
-    return {
+    return publicForecastResponse({
       spot,
       windows,
       generatedAt: now.toISOString(),
       sourceNote,
       observation: observation?.summary ?? null
-    };
+    });
   } catch (error) {
     console.error(
       JSON.stringify({

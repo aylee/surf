@@ -1,10 +1,19 @@
 {
-  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Keep the Worker, D1, and Queue names in one instance namespace.
   "name": "surf",
   "main": "worker/index.ts",
   "compatibility_date": "2026-07-08",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    }
+  },
   "assets": {
     "directory": "./dist/client",
     "binding": "ASSETS",
@@ -13,26 +22,18 @@
   "vars": {
     "ENVIRONMENT": "production",
     "SURF_REGION": "norcal",
-    "REPORT_AGENT_ENABLED": "false",
-    "CLOUDFLARE_ACCOUNT_ID": "1cad681ec2a198b48cd88f4ad5f455ce"
+    "SURF_USER_AGENT": "surf-self-hosted/1.0 (+https://github.com/aylee/surf)"
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "surf",
-      "database_id": "a3e856fe-9ce3-4e71-ba60-f33ca3a15d4e"
+      "migrations_dir": "../../packages/db/migrations"
     }
   ],
   "r2_buckets": [
     {
-      "binding": "RAW_ARTIFACTS",
-      "bucket_name": "surf-raw"
-    }
-  ],
-  "kv_namespaces": [
-    {
-      "binding": "CACHE",
-      "id": "392b927b791d406bbd662be3844b1b2a"
+      "binding": "RAW_ARTIFACTS"
     }
   ],
   "queues": {

@@ -4,16 +4,16 @@ The project does not pick one marine API. It composes public feeds by role.
 
 ## Capability Roles
 
-| Capability | Default source | Required for v1 | Notes |
+| Capability | Default source | Live Worker | Notes |
 |---|---|---:|---|
-| `forecast_wave_offshore` | NOAA/NCEP GFSwave via NOMADS | yes | GRIB2 subset/extract in Python. |
+| `forecast_wave_offshore` | NOAA/NCEP GFSwave via NOMADS | no | Optional Python research/evaluation path; not an input to the deployed v1 Worker. |
 | `forecast_wave_nearshore` | CDIP MOP per-point forecast; NWS coastal grid fallback | yes | Prefer mapped CDIP modeled Hs at Ocean Beach, Linda Mar, and Stinson. Keep NWS as the explicit fallback and for unmapped Bolinas. |
-| `observed_wave` | NDBC + CDIP buoys | yes | Ground truth for nowcast and bias checks. |
+| `observed_wave` | NDBC + CDIP buoys | yes | Offshore/nearshore observation context and physical validation; not breaking-wave truth. |
 | `tide` | NOAA CO-OPS | yes | Tide predictions and water levels. |
 | `wind` | NWS first, model winds later | yes | Surface quality and hazards. |
 | `hazard` | NWS alerts/forecast products | yes | Display context, not scoring alone. |
 | `bathymetry` | NOAA ETOPO / regional DEMs | later | For SWAN/custom transforms after v1. |
-| `quality_label` | Alex/community ratings | later | Surf-quality calibration labels. |
+| `quality_label` | Human/community ratings | later | Surf-quality calibration labels. |
 | `comparison_forecast` | Open-Meteo/manual comparison | optional | Eval oracle only, not source of truth. |
 
 ## Adapter Contract
@@ -36,7 +36,7 @@ needed for audit/backtesting.
 ## Runtime Split
 
 - Worker/TypeScript: JSON APIs, lightweight NOAA/NWS/CO-OPS fetches, bounded
-  CDIP OPeNDAP ASCII forecast reads, queue orchestration, scoring API, report API.
+  CDIP OPeNDAP ASCII forecast reads, queue orchestration, and the forecast API.
 - Python extractor: GRIB2, netCDF, xarray, historical CDIP/THREDDS extraction,
   wgrib2/ecCodes, and future bathymetry transforms.
 
@@ -44,7 +44,7 @@ needed for audit/backtesting.
 
 | Adapter | Runtime | Status | Notes |
 |---|---|---|---|
-| NOAA GFSwave inventory/artifact planning | Python | live inventory validation | Validates `wcoast.0p16` `.idx` inventories for f000-f072 and plans R2 keys. Numeric GRIB extraction waits on `wgrib2` or `cfgrib` + `xarray`. |
+| NOAA GFSwave inventory/artifact planning | Python | research tooling | Validates `wcoast.0p16` `.idx` inventories for f000-f072 and plans R2 keys. It is not a deployed v1 input; numeric extraction requires `wgrib2` or `cfgrib` + `xarray`. |
 | NOAA CO-OPS tide predictions | Worker | live ingest | Fetches hourly MLLW predictions for mapped v1 stations and writes `tide_forecasts`. |
 | NWS point forecast and alerts | Worker | live ingest | Resolves spot point forecasts, hourly wind periods, and active alerts; writes `wind_forecasts` and `hazard_events`. |
 | NWS MTR coastal grid waves | Worker | live ingest | Reads official `forecastGridData` wave/swell layers at six verified PZZ545 marine cells, expands ISO-8601 value intervals onto five days of local-clock 3-hour slots, preserves raw significant height, and writes a separately identified cold-start breaking-height estimate to `wave_forecasts`. |

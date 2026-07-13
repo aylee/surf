@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a focused forecast, source, UI, or self-hosting improvement.
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operator or contributor problem should this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe observable behavior, not only an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: data
+    attributes:
+      label: Data and source implications
+      description: Name public feeds, licensing/attribution, geography, freshness, and calibration needs.
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and alternatives
+      description: Note forecast, schema, privacy, cost, or operational tradeoffs.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      placeholder: |
+        - [ ] …
+        - [ ] …
+    validations:
+      required: true

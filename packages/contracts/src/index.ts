@@ -14,43 +14,14 @@ export const SourceCapabilitySchema = z.enum([
 
 export type SourceCapability = z.infer<typeof SourceCapabilitySchema>;
 
-export const SourceStatusSchema = z.enum([
-  "planned",
-  "live",
-  "stale",
-  "unavailable",
-  "blocked",
-  "failed"
-]);
-
-export type SourceStatus = z.infer<typeof SourceStatusSchema>;
-
-export const SourceMappingSchema = z.object({
-  sourceId: z.string(),
-  capability: SourceCapabilitySchema,
-  provider: z.string(),
-  name: z.string(),
-  url: z.string().url().optional(),
-  stationId: z.string().optional(),
-  modelPointId: z.string().optional(),
-  lat: z.number().optional(),
-  lon: z.number().optional(),
-  distanceKm: z.number().nonnegative().optional(),
-  weight: z.number().nonnegative().optional(),
-  status: SourceStatusSchema,
-  notes: z.string()
-});
-
-export type SourceMapping = z.infer<typeof SourceMappingSchema>;
-
-export const SpotIdSchema = z.enum([
-  "obsf-north",
-  "obsf-central",
-  "obsf-south",
-  "linda-mar",
-  "stinson",
-  "bolinas"
-]);
+// Spot identifiers are part of the public data contract, not a closed list of
+// the reference deployment's six spots. Deployments validate membership
+// against their configured registry at the API boundary.
+export const SpotIdSchema = z
+  .string()
+  .min(1)
+  .max(80)
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Spot IDs must be lowercase kebab-case slugs");
 
 export type SpotId = z.infer<typeof SpotIdSchema>;
 
@@ -79,14 +50,43 @@ export const SpotProfileSchema = z.object({
   offshoreWindFromDeg: DirectionWindowSchema,
   maxGoodWindKt: z.number(),
   maxOkWindKt: z.number(),
-  referenceBuoys: z.array(z.string()),
-  cdipStations: z.array(z.string()),
-  tideStation: z.string(),
-  sourceMappings: z.array(SourceMappingSchema).optional(),
   notes: z.string()
 });
 
 export type SpotProfile = z.infer<typeof SpotProfileSchema>;
+
+export const SpotSourceSummarySchema = z.object({
+  nwsWaveGrid: z.object({
+    provider: z.string(),
+    forecastGridData: z.string().url(),
+    breakingHeightScale: z.number().positive(),
+    notes: z.string()
+  }),
+  observedWave: z.array(
+    z.object({
+      provider: z.string(),
+      stationId: z.string(),
+      name: z.string()
+    })
+  ),
+  coopsTide: z.object({
+    stationId: z.string(),
+    name: z.string()
+  })
+});
+
+export const ApiSpotSchema = SpotProfileSchema.extend({
+  sourceMap: SpotSourceSummarySchema
+});
+
+export type ApiSpot = z.infer<typeof ApiSpotSchema>;
+
+export const SpotsResponseSchema = z.object({
+  spots: z.array(ApiSpotSchema),
+  sourceNote: z.string()
+});
+
+export type SpotsResponse = z.infer<typeof SpotsResponseSchema>;
 
 export const ForecastWindowInputSchema = z.object({
   spotId: SpotIdSchema,
@@ -222,44 +222,3 @@ export const ForecastResponseSchema = z.object({
 });
 
 export type ForecastResponse = z.infer<typeof ForecastResponseSchema>;
-
-export const SourceRunSchema = z.object({
-  id: z.string(),
-  sourceId: z.string(),
-  capability: SourceCapabilitySchema,
-  provider: z.string(),
-  status: SourceStatusSchema,
-  startedAt: z.string(),
-  completedAt: z.string().nullable(),
-  cycleAt: z.string().nullable(),
-  forecastHour: z.number().int().nullable(),
-  rawR2Key: z.string().nullable(),
-  recordsWritten: z.number().int().nonnegative(),
-  error: z.string().nullable(),
-  metadata: z.record(z.string(), z.unknown()).optional()
-});
-
-export type SourceRun = z.infer<typeof SourceRunSchema>;
-
-export const IngestResponseSchema = z.object({
-  enqueued: z.boolean(),
-  processed: z.boolean(),
-  requestedAt: z.string(),
-  completedAt: z.string().nullable(),
-  region: z.literal("norcal"),
-  sourceRuns: z.array(SourceRunSchema),
-  caveats: z.array(z.string())
-});
-
-export type IngestResponse = z.infer<typeof IngestResponseSchema>;
-
-export const ReportResponseSchema = z.object({
-  enabled: z.boolean(),
-  generatedAt: z.string().nullable(),
-  reportMarkdown: z.string().nullable(),
-  reason: z.string().nullable(),
-  sourceRunIds: z.array(z.string()).optional(),
-  caveats: z.array(z.string()).optional()
-});
-
-export type ReportResponse = z.infer<typeof ReportResponseSchema>;

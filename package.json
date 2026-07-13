@@ -1,24 +1,37 @@
 {
   "name": "surf",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Self-hosted public-data surf forecast engine.",
+  "description": "Self-hosted daily surf report from public NOAA and CDIP data.",
   "license": "MIT",
+  "engines": {
+    "node": ">=24 <25",
+    "pnpm": ">=11 <12"
+  },
   "packageManager": "pnpm@11.7.0",
   "scripts": {
-    "check": "pnpm -r --if-present check",
-    "test": "pnpm -r --if-present test && uv run --project services/extractor pytest",
+    "check": "node scripts/check-portability.mjs && pnpm check:wrangler-wrapper && pnpm -r --if-present check",
+    "check:wrangler-wrapper": "pnpm wrangler -- --version",
+    "test": "node --test scripts/test/*.test.mjs && pnpm -r --if-present test && uv run --project services/extractor --locked pytest",
+    "verify": "pnpm verify:local-d1 && pnpm check && pnpm test && pnpm check:cloudflare",
+    "verify:local-d1": "node scripts/verify-local-d1.mjs",
+    "setup:local": "pnpm --filter @surf/web setup:local",
     "dev": "pnpm --filter @surf/web dev",
+    "dev:ui": "pnpm --filter @surf/web dev:ui",
+    "dev:worker": "pnpm --filter @surf/web dev:worker",
     "build": "pnpm -r --if-present build",
-    "ingest:once": "pnpm --filter @surf/web ingest:once && uv run --project services/extractor surf-extractor inspect-fixtures",
-    "report:today": "pnpm --filter @surf/web report:today",
-    "cf:provision": "node scripts/cf-provision.mjs",
+    "ingest:local": "pnpm --filter @surf/web ingest:local",
+    "ingest:remote": "pnpm --filter @surf/web ingest:remote",
+    "setup:cloudflare": "node scripts/cf-deploy.mjs setup",
+    "deploy": "node scripts/cf-deploy.mjs deploy",
+    "check:cloudflare": "node scripts/cf-deploy.mjs setup --dry-run",
+    "wrangler": "node scripts/wrangler.mjs",
     "smoke:local": "node scripts/smoke-local.mjs",
-    "smoke:cloudflare": "pnpm --filter @surf/web smoke:cloudflare"
+    "smoke:cloudflare": "pnpm --filter @surf/web smoke:cloudflare",
+    "spots:sync": "pnpm --filter @surf/db seed:generate",
+    "spots:check": "pnpm --filter @surf/db seed:check"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "typescript": "latest",
-    "vitest": "latest"
+    "jsonc-parser": "3.3.1"
   }
 }

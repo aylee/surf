@@ -35,11 +35,10 @@ function env(db: D1Database): Env {
   return {
     ENVIRONMENT: "test",
     SURF_REGION: "norcal",
-    REPORT_AGENT_ENABLED: "false",
+    SURF_USER_AGENT: "surf-test/1.0 (+https://example.test/contact)",
     ASSETS: {} as Fetcher,
     DB: db,
     RAW_ARTIFACTS: {} as R2Bucket,
-    CACHE: {} as KVNamespace,
     INGEST_QUEUE: {} as Queue
   };
 }

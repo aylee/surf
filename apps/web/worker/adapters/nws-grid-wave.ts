@@ -2,6 +2,7 @@ import type { SpotId } from "@surf/contracts";
 import type { NorcalSpotProfile } from "@surf/forecast-core";
 import type { AdapterOutcome, AdapterStatus, SourceCaveat, SourceFetch } from "./types";
 import { combineStatus, errorMessage } from "./types";
+import { PUBLIC_FEED_USER_AGENT } from "./http";
 import { stableThreeHourForecastTimes } from "../time";
 
 export const NWS_GRID_WAVE_SOURCE_ID = "nws:mtr-grid-wave";
@@ -178,7 +179,7 @@ async function fetchSpotGridWave(
   const response = await fetcher(requestUrl, {
     headers: {
       Accept: "application/geo+json",
-      "User-Agent": "surf/0.0.0 (https://github.com/aylee/surf)"
+      "User-Agent": PUBLIC_FEED_USER_AGENT
     }
   });
   if (!response.ok) {

@@ -1,6 +1,7 @@
 import type { SpotId, SpotProfile } from "@surf/contracts";
 import type { AdapterOutcome, SourceCaveat, SourceFetch } from "./types";
 import { combineStatus, errorMessage } from "./types";
+import { PUBLIC_FEED_USER_AGENT } from "./http";
 
 export type NwsWindForecastRow = {
   spotId: SpotId;
@@ -141,7 +142,7 @@ export function buildNwsAlertsUrl(lat: number, lon: number): string {
 function nwsHeaders(): HeadersInit {
   return {
     Accept: "application/geo+json",
-    "User-Agent": "surf/0.0.0 (https://github.com/aylee/surf)"
+    "User-Agent": PUBLIC_FEED_USER_AGENT
   };
 }
 
