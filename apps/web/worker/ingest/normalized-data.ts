@@ -1,7 +1,7 @@
 import { getOperationalObservedWaveSources, NORCAL_SPOTS } from "@surf/forecast-core";
 import type { CdipMopForecastRow } from "../adapters/cdip-mop";
 import { CDIP_MOP_SOURCE_ID } from "../adapters/cdip-mop";
-import type { TidePredictionRow } from "../adapters/coops";
+import type { TideEventRow, TidePredictionRow } from "../adapters/coops";
 import type { NdbcObservationRow } from "../adapters/ndbc";
 import type { NwsContextRow } from "../adapters/nws";
 import type { NwsGridWaveForecastRow } from "../adapters/nws-grid-wave";
@@ -75,6 +75,55 @@ export async function persistTideForecasts(
       Math.round(row.tideFtMllw * 0.3048 * 1000) / 1000,
       row.tideTrend,
       null,
+      JSON.stringify(row),
+      createdAt
+    )
+  }));
+
+  return runPendingStatements(db, pending);
+}
+
+export async function persistTideEvents(
+  db: D1Database,
+  sourceRunId: string,
+  rows: TideEventRow[],
+  createdAt: string
+): Promise<PersistenceResult> {
+  if (typeof db.prepare !== "function") {
+    return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for tide_events."] };
+  }
+
+  const statement = db.prepare(
+    `insert into tide_events (
+      spot_id,
+      source_id,
+      source_run_id,
+      station_id,
+      event_at,
+      tide_ft_mllw,
+      event_type,
+      payload_json,
+      created_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    on conflict(spot_id, station_id, event_at) do update set
+      source_id = excluded.source_id,
+      source_run_id = excluded.source_run_id,
+      tide_ft_mllw = excluded.tide_ft_mllw,
+      event_type = excluded.event_type,
+      payload_json = excluded.payload_json,
+      created_at = excluded.created_at`
+  );
+
+  const pending = rows.map((row) => ({
+    label: `tide_events ${row.spotId} ${row.eventAt}`,
+    statement: statement.bind(
+      row.spotId,
+      "coops:tide-predictions",
+      sourceRunId,
+      row.stationId,
+      row.eventAt,
+      row.tideFtMllw,
+      row.eventType,
       JSON.stringify(row),
       createdAt
     )

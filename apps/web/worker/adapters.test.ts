@@ -1,6 +1,10 @@
 import { NORCAL_SPOTS } from "@surf/forecast-core";
 import { describe, expect, it } from "vitest";
-import { buildCoopsTidePredictionsUrl, fetchCoopsTidePredictionsForSpots } from "./adapters/coops";
+import {
+  buildCoopsTideEventsUrl,
+  buildCoopsTidePredictionsUrl,
+  fetchCoopsTidePredictionsForSpots
+} from "./adapters/coops";
 import { buildNwsAlertsUrl, buildNwsPointUrl, fetchNwsContextForSpots } from "./adapters/nws";
 import type { SourceFetch } from "./adapters/types";
 
@@ -14,12 +18,22 @@ describe("CO-OPS tide adapter", () => {
     expect(url).toContain("datum=MLLW");
     expect(url).toContain("interval=h");
     expect(url).toContain("format=json");
+    expect(buildCoopsTideEventsUrl("9414290", now, new Date("2026-07-09T12:00:00Z")))
+      .toContain("interval=hilo");
   });
 
   it("fetches tide prediction rows for mapped v1 spots", async () => {
     const fetcher: SourceFetch = async (input) => {
       const url = String(input);
       expect(url).toContain("api.tidesandcurrents.noaa.gov");
+      if (url.includes("interval=hilo")) {
+        return Response.json({
+          predictions: [
+            { t: "2026-07-08 12:27", v: "2.1", type: "H" },
+            { t: "2026-07-08 18:44", v: "0.2", type: "L" }
+          ]
+        });
+      }
       return Response.json({
         predictions: [
           { t: "2026-07-08 12:00", v: "1.2" },
@@ -44,7 +58,58 @@ describe("CO-OPS tide adapter", () => {
       tideFtMllw: 1.2,
       tideTrend: "rising"
     });
+    expect(outcome.events).toEqual([
+      {
+        spotId: "obsf-central",
+        stationId: "9414290",
+        eventAt: "2026-07-08T12:27:00.000Z",
+        tideFtMllw: 2.1,
+        eventType: "high"
+      },
+      {
+        spotId: "obsf-central",
+        stationId: "9414290",
+        eventAt: "2026-07-08T18:44:00.000Z",
+        tideFtMllw: 0.2,
+        eventType: "low"
+      }
+    ]);
   });
+
+  it.each(["network", "invalid-json", "http"] as const)(
+    "retains hourly tides when the additive high/low request has a %s failure",
+    async (failureMode) => {
+      const fetcher: SourceFetch = async (input) => {
+        const url = String(input);
+        if (!url.includes("interval=hilo")) {
+          return Response.json({
+            predictions: [
+              { t: "2026-07-08 12:00", v: "1.2" },
+              { t: "2026-07-08 13:00", v: "1.8" }
+            ]
+          });
+        }
+        if (failureMode === "network") throw new Error("event endpoint unavailable");
+        if (failureMode === "invalid-json") {
+          return new Response("{", { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return Response.json({ error: { message: "temporarily unavailable" } }, { status: 503 });
+      };
+
+      const outcome = await fetchCoopsTidePredictionsForSpots([NORCAL_SPOTS[1]!], {
+        fetcher,
+        now,
+        horizonHours: 24
+      });
+
+      expect(outcome.status).toBe("partial");
+      expect(outcome.rows).toHaveLength(2);
+      expect(outcome.events).toEqual([]);
+      expect(outcome.errors).toEqual([]);
+      expect(outcome.caveats.some((caveat) => caveat.code === "coops_tide_events_unavailable"))
+        .toBe(true);
+    }
+  );
 
   it("reports CO-OPS API failures without fabricating rows", async () => {
     const fetcher: SourceFetch = async () =>

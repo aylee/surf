@@ -9,6 +9,8 @@ export {
 } from "./spot-registry";
 export type { NorcalSpotProfile, NwsWaveGridSourceMapping } from "./spot-registry";
 export { scoreSpotWindow } from "./scoring";
+export { selectCanonicalRecommendationIds } from "./recommendations";
+export type { CanonicalRecommendationCandidate } from "./recommendations";
 export { DEFAULT_BREAKER_INDEX, estimateBreakingWaveHeight } from "./wave-transform";
 export type { BreakingWaveEstimate, BreakingWaveInput } from "./wave-transform";
 export {

@@ -8,7 +8,7 @@ import type {
 } from "./types";
 
 export const SOURCE_RUNS_CONTRACT =
-  "D1 binding DB must expose source_runs with run_key/run_kind plus normalized wave_forecasts, wave_observations, tide_forecasts, wind_forecasts, wind_forecast_issues, hazard_events, forecast_configs, forecast_issues, and forecast_snapshots tables.";
+  "D1 binding DB must expose source_runs with run_key/run_kind plus normalized wave_forecasts, wave_observations, tide_forecasts, tide_events, wind_forecasts, wind_forecast_issues, hazard_events, forecast_configs, forecast_issues, and forecast_snapshots tables.";
 
 export function defaultRunIdSuffix(): string {
   return crypto.randomUUID();
@@ -20,6 +20,10 @@ function sourceRunId(sourceId: string, suffix: string): string {
 }
 
 function outcomeRowCount(outcome: AdapterOutcome<unknown, unknown>): number {
+  if (outcome.sourceId === "coops:tide-predictions") {
+    const events = (outcome as AdapterOutcome<unknown, unknown> & { events?: unknown }).events;
+    return outcome.rows.length + (Array.isArray(events) ? events.length : 0);
+  }
   if (outcome.sourceId === "nws:point-forecast-alerts") {
     const metadata = outcome.metadata as { windRowCount?: unknown };
     const windRowCount = metadata.windRowCount;

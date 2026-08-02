@@ -4,12 +4,17 @@ import { estimateBreakingWaveHeight } from "@surf/forecast-core";
 import { buildForecastResponse } from "./forecast";
 import type { Env } from "./index";
 
-type QueryRows = Record<"tide" | "wind" | "wave" | "observation" | "hazard" | "source", unknown[]>;
+type QueryRows = Record<
+  "tide" | "tideEvent" | "wind" | "wave" | "observation" | "hazard" | "source" | "issue" | "snapshot",
+  unknown[]
+>;
 
 function queryDb(rows: QueryRows): D1Database {
   return {
     prepare(sql: string) {
-      const key = sql.includes("from tide_forecasts")
+      const key = sql.includes("from tide_events")
+        ? "tideEvent"
+        : sql.includes("from tide_forecasts")
         ? "tide"
         : sql.includes("from wind_forecasts")
           ? "wind"
@@ -17,9 +22,13 @@ function queryDb(rows: QueryRows): D1Database {
             ? "wave"
             : sql.includes("from wave_observations")
               ? "observation"
-            : sql.includes("from hazard_events")
-              ? "hazard"
-              : "source";
+              : sql.includes("from hazard_events")
+                ? "hazard"
+                : sql.includes("from forecast_issues")
+                  ? "issue"
+                  : sql.includes("from forecast_snapshots")
+                    ? "snapshot"
+                    : "source";
       const all = async () => ({ results: rows[key], success: true, meta: {} });
       return {
         bind() {
@@ -55,9 +64,19 @@ function liveRows(): QueryRows {
         source_run_id: "tide-run"
       }
     ],
+    tideEvent: [
+      {
+        station_id: "9414290",
+        event_at: "2026-07-10T06:12:00.000Z",
+        tide_ft_mllw: 4.8,
+        event_type: "high",
+        source_run_id: "tide-run"
+      }
+    ],
     wind: [
       {
         forecast_at: forecastAt,
+        model_cycle_at: "2026-07-10T01:00:00.000Z",
         wind_speed_ms: 3,
         wind_direction_deg: 90,
         gust_ms: 5,
@@ -118,7 +137,9 @@ function liveRows(): QueryRows {
       source_id: id,
       status: "success",
       completed_at: "2026-07-10T02:40:00.000Z"
-    }))
+    })),
+    issue: [],
+    snapshot: []
   };
 }
 
@@ -131,6 +152,7 @@ describe("forecast assembly", () => {
     );
 
     expect(response.windows).toHaveLength(41);
+    expect(response.interval).toBe("3h");
     expect(() => ForecastResponseSchema.parse(response)).not.toThrow();
     expect(response.windows[0]).toMatchObject({
       forecastAt,
@@ -157,6 +179,29 @@ describe("forecast assembly", () => {
         breakingHeightScale: 0.65,
         estimatedBreakingHeightFt: 0.78 * 3.28084,
         derivation: "nws_coastal_grid_spot_scale"
+      },
+      waveState: {
+        semantics: "nws_fallback",
+        calibrationStatus: "cold_start_uncalibrated",
+        validFrom: forecastAt,
+        validTo: "2026-07-10T07:00:00.000Z",
+        sourceResolutionHours: 3,
+        modeledNearshoreHeightFt: 1.2 * 3.28084,
+        breakingSurfHeightFt: 0.78 * 3.28084
+      },
+      windGustKt: 5 * 1.94384,
+      weatherSummary: "Clear",
+      surfaceCondition: "fair",
+      resolution: {
+        wave: { method: "exact", sourceIntervalMinutes: 180, displayIntervalMinutes: 180 },
+        wind: { method: "aggregated", sourceIntervalMinutes: 60, displayIntervalMinutes: 180 },
+        tide: {
+          method: "exact",
+          sourceIntervalMinutes: 60,
+          displayIntervalMinutes: 180,
+          validFrom: forecastAt,
+          validTo: "2026-07-10T05:00:00.000Z"
+        }
       }
     });
     expect(response.windows[0]?.caveats).toContain("Active NWS hazard: Beach Hazards Statement");
@@ -170,6 +215,16 @@ describe("forecast assembly", () => {
       waterTempF: 57.74,
       sourceFreshnessMinutes: 23
     });
+    expect(response.observations).toHaveLength(1);
+    expect(response.tideEvents).toEqual([
+      {
+        stationId: "9414290",
+        eventAt: "2026-07-10T06:12:00.000Z",
+        heightFtMllw: 4.8,
+        type: "high",
+        sourceRunId: "tide-run"
+      }
+    ]);
   });
 
   it("explicitly prefers a usable CDIP MOP row over the NWS fallback", async () => {
@@ -236,11 +291,8 @@ describe("forecast assembly", () => {
       waveHeightFt: breaking.pointHeightM * 3.28084,
       peakPeriodSec: 15.384616,
       primaryDirectionDeg: 294.3,
-      primarySwell: {
-        heightFt: 1.2 * 3.28084,
-        periodSec: 15.384616,
-        directionDeg: 294.3
-      },
+      primarySwell: null,
+      secondarySwell: null,
       sourceRunIds: ["tide-run", "wind-run", "cdip-run", "ndbc-run", "hazard-run"],
       waveProvenance: {
         sourceId: "cdip:mop-forecast",
@@ -266,14 +318,76 @@ describe("forecast assembly", () => {
         pointRelationship: "direct_nearshore_point",
         sourceTimestampSemantics: "http_last_modified_source_update_not_model_cycle",
         derivation: "cdip_mop_point_hs"
+      },
+      waveState: {
+        semantics: "direct_nearshore",
+        calibrationStatus: "modeled_uncalibrated",
+        validFrom: "2026-07-10T03:00:00.000Z",
+        validTo: "2026-07-10T06:00:00.000Z",
+        modeledNearshoreHeightFt: breaking.pointHeightM * 3.28084,
+        breakingSurfHeightFt: null
       }
     });
     expect(response.windows[0]?.sourceRunIds).not.toContain("wave-run");
-    expect(response.windows[0]?.confidence).toBeLessThanOrEqual(74);
+    expect(response.windows[0]?.confidence).toBeGreaterThan(74);
+    expect(response.windows[0]?.confidence).toBeLessThanOrEqual(89);
+    expect(response.windows[0]?.caveats.join(" ")).toContain("uncalibrated-model cap of 89");
     expect(response.windows[0]?.caveats.join(" ")).toContain("not observed breaking-wave face height");
     expect(response.windows[0]?.caveats.join(" ")).toContain("does not affect the displayed height or score");
     expect(response.sourceNote).toContain("prefer public CDIP MOP");
     expect(response.sourceNote).toContain("not a model cycle");
+  });
+
+  it("keeps the outside-cove CDIP mapping explicitly proxy-calibrated and confidence-capped", async () => {
+    const rows = liveRows();
+    rows.wave.push({
+      source_id: "cdip:mop-forecast",
+      forecast_at: forecastAt,
+      model_cycle_at: "2026-07-09T00:00:00.000Z",
+      nearshore_height_m: 0.72,
+      offshore_height_m: null,
+      significant_height_m: 1.2,
+      peak_period_s: 12,
+      primary_direction_deg: 285,
+      swell_height_m: null,
+      swell_period_s: null,
+      swell_direction_deg: null,
+      source_run_id: "cdip-run",
+      payload_json: JSON.stringify({
+        sourceUrl: "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SM371_forecast.nc.ascii?waveTime,waveHs,waveTp,waveDp,waveDm",
+        sourceUpdatedAt: "2026-07-10T01:55:58.000Z",
+        modelPointId: "SM371",
+        modelPointWaterDepthM: 15.01,
+        pointRelationship: "outside_cove_approach_proxy",
+        significantHeightM: 1.2,
+        exposureAdjustedPointHeightM: 0.72,
+        nearshoreHeightScale: 0.6
+      })
+    });
+    rows.source.push({
+      id: "cdip-run",
+      source_id: "cdip:mop-forecast",
+      status: "success",
+      completed_at: "2026-07-10T02:40:00.000Z"
+    });
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "linda-mar",
+      new Date("2026-07-10T02:53:07.000Z")
+    );
+
+    expect(response.windows[0]).toMatchObject({
+      primarySwell: null,
+      secondarySwell: null,
+      waveState: {
+        semantics: "cove_proxy",
+        calibrationStatus: "proxy_uncalibrated",
+        modeledNearshoreHeightFt: 0.72 * 3.28084,
+        breakingSurfHeightFt: null
+      }
+    });
+    expect(response.windows[0]?.confidence).toBeLessThanOrEqual(74);
   });
 
   it("makes an explicit unknown call when wave data is missing and never substitutes fixtures", async () => {
@@ -350,5 +464,228 @@ describe("forecast assembly", () => {
 
     expect(response.windows[0]?.windDirectionDeg).toBe(145);
     expect(response.windows[0]?.windSpeedKt).toBeCloseTo(12, 8);
+  });
+
+  it("uses exact hourly wind and tide while holding one declared three-hour wave state", async () => {
+    const rows = liveRows();
+    rows.tide.push(
+      {
+        forecast_at: "2026-07-10T05:00:00.000Z",
+        tide_ft_mllw: 3.4,
+        tide_trend: "rising",
+        source_run_id: "tide-run"
+      },
+      {
+        forecast_at: "2026-07-10T06:00:00.000Z",
+        tide_ft_mllw: 3.7,
+        tide_trend: "rising",
+        source_run_id: "tide-run"
+      }
+    );
+    rows.wind.push(
+      {
+        forecast_at: "2026-07-10T05:00:00.000Z",
+        wind_speed_ms: 5 / 1.94384,
+        wind_direction_deg: 270,
+        gust_ms: 8 / 1.94384,
+        weather_summary: "Partly cloudy",
+        source_run_id: "wind-run"
+      },
+      {
+        forecast_at: "2026-07-10T06:00:00.000Z",
+        wind_speed_ms: 9 / 1.94384,
+        wind_direction_deg: 280,
+        gust_ms: 12 / 1.94384,
+        weather_summary: "Mostly cloudy",
+        source_run_id: "wind-run"
+      }
+    );
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      new Date("2026-07-10T03:01:00.000Z"),
+      "1h"
+    );
+
+    expect(response.interval).toBe("1h");
+    expect(response.windows).toHaveLength(121);
+    expect(response.windows.slice(0, 3).map((window) => window.forecastAt)).toEqual([
+      "2026-07-10T04:00:00.000Z",
+      "2026-07-10T05:00:00.000Z",
+      "2026-07-10T06:00:00.000Z"
+    ]);
+    expect(response.windows.slice(0, 3).map((window) => window.waveHeightFt)).toEqual([
+      0.78 * 3.28084,
+      0.78 * 3.28084,
+      0.78 * 3.28084
+    ]);
+    expect(response.windows.slice(0, 3).map((window) => window.windSpeedKt)).toEqual([
+      3 * 1.94384,
+      5,
+      9
+    ]);
+    expect(response.windows.slice(0, 3).map((window) => window.tideFt)).toEqual([3.2, 3.4, 3.7]);
+    expect(response.windows.slice(0, 3).every((window) =>
+      window.waveState?.validFrom === forecastAt &&
+      window.waveState.validTo === "2026-07-10T07:00:00.000Z" &&
+      window.resolution?.wave.method === "held"
+    )).toBe(true);
+    expect(response.windows[1]).toMatchObject({
+      weatherSummary: "Partly cloudy",
+      resolution: {
+        wind: { method: "exact", displayIntervalMinutes: 60 },
+        tide: { method: "exact", displayIntervalMinutes: 60 }
+      }
+    });
+    expect(response.windows[1]?.windGustKt).toBeCloseTo(8, 8);
+  });
+
+  it("holds CDIP rows by their actual source timestamps and switches without interpolation", async () => {
+    const rows = liveRows();
+    const cdipRow = (forecastAtValue: string, heightM: number) => ({
+      source_id: "cdip:mop-forecast",
+      forecast_at: forecastAtValue,
+      model_cycle_at: "2026-07-10T00:00:00.000Z",
+      nearshore_height_m: heightM,
+      offshore_height_m: null,
+      significant_height_m: heightM,
+      peak_period_s: 12,
+      primary_direction_deg: 290,
+      swell_height_m: null,
+      swell_period_s: null,
+      swell_direction_deg: null,
+      source_run_id: "cdip-run",
+      payload_json: JSON.stringify({
+        sourceUrl: "https://thredds.cdip.ucsd.edu/thredds/dodsC/cdip/model/MOP_alongshore/SF043_forecast.nc.ascii?waveTime,waveHs,waveTp,waveDp,waveDm",
+        sourceUpdatedAt: "2026-07-10T02:30:00.000Z",
+        modelPointId: "SF043",
+        modelPointWaterDepthM: 10,
+        pointRelationship: "direct_nearshore_point",
+        significantHeightM: heightM,
+        exposureAdjustedPointHeightM: heightM,
+        nearshoreHeightScale: 1
+      })
+    });
+    rows.wave = [
+      cdipRow("2026-07-10T03:00:00.000Z", 1),
+      cdipRow("2026-07-10T06:00:00.000Z", 2)
+    ];
+    rows.source.push({
+      id: "cdip-run",
+      source_id: "cdip:mop-forecast",
+      status: "success",
+      completed_at: "2026-07-10T02:40:00.000Z"
+    });
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "obsf-north",
+      new Date("2026-07-10T03:01:00.000Z"),
+      "1h"
+    );
+
+    expect(response.windows.slice(0, 3).map((window) => window.waveHeightFt)).toEqual([
+      1 * 3.28084,
+      1 * 3.28084,
+      2 * 3.28084
+    ]);
+    expect(response.windows.slice(0, 3).map((window) => window.waveState?.validFrom)).toEqual([
+      "2026-07-10T03:00:00.000Z",
+      "2026-07-10T03:00:00.000Z",
+      "2026-07-10T06:00:00.000Z"
+    ]);
+    expect(response.windows.slice(0, 3).every((window) =>
+      window.resolution?.wave.method === "held"
+    )).toBe(true);
+  });
+
+  it("fails closed when a CDIP row omits recognized point semantics", async () => {
+    const rows = liveRows();
+    rows.wave = [{
+      source_id: "cdip:mop-forecast",
+      forecast_at: "2026-07-10T03:00:00.000Z",
+      model_cycle_at: "2026-07-10T00:00:00.000Z",
+      nearshore_height_m: 1.2,
+      offshore_height_m: null,
+      significant_height_m: 1.2,
+      peak_period_s: 12,
+      primary_direction_deg: 290,
+      swell_height_m: null,
+      swell_period_s: null,
+      swell_direction_deg: null,
+      source_run_id: "cdip-run",
+      payload_json: JSON.stringify({
+        sourceUrl: "https://example.test/cdip",
+        sourceUpdatedAt: "2026-07-10T02:30:00.000Z"
+      })
+    }];
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "obsf-north",
+      new Date("2026-07-10T02:53:07.000Z")
+    );
+
+    expect(response.windows[0]).toMatchObject({
+      ratingStatus: "unknown",
+      waveHeightFt: null,
+      waveState: null,
+      waveProvenance: null
+    });
+    expect(response.windows[0]?.activeCapabilities).not.toContain("forecast_wave_nearshore");
+    expect(response.windows[0]?.caveats.join(" ")).toContain("omitted recognized nearshore semantics");
+  });
+
+  it("uses the official NWS wind issue time for selected-window freshness", async () => {
+    const rows = liveRows();
+    rows.wind[0] = {
+      ...rows.wind[0] as object,
+      model_cycle_at: "2026-07-09T12:00:00.000Z"
+    };
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      new Date("2026-07-10T02:53:00.000Z")
+    );
+    const windFreshness = response.windows[0]?.sourceFreshness?.find(
+      (entry) => entry.capability === "wind"
+    );
+
+    expect(windFreshness).toMatchObject({
+      updatedAt: "2026-07-09T12:00:00.000Z",
+      freshnessMinutes: 893,
+      status: "stale"
+    });
+    expect(response.windows[0]?.sourceFreshnessMinutes).toBe(893);
+  });
+
+  it("summarizes changes between the latest two persisted deterministic issues", async () => {
+    const rows = liveRows();
+    rows.issue = [
+      { issue_id: "issue-new", issued_at: "2026-07-10T02:00:00.000Z" },
+      { issue_id: "issue-old", issued_at: "2026-07-09T20:00:00.000Z" }
+    ];
+    rows.snapshot = [
+      { issue_id: "issue-new", valid_at: forecastAt, raw_facts_json: "new" },
+      { issue_id: "issue-old", valid_at: forecastAt, raw_facts_json: "old" },
+      { issue_id: "issue-new", valid_at: "2026-07-10T07:00:00.000Z", raw_facts_json: "same" },
+      { issue_id: "issue-old", valid_at: "2026-07-10T07:00:00.000Z", raw_facts_json: "same" }
+    ];
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      new Date("2026-07-10T02:53:07.000Z")
+    );
+
+    expect(response.issueDelta).toEqual({
+      currentIssueId: "issue-new",
+      previousIssueId: "issue-old",
+      currentIssuedAt: "2026-07-10T02:00:00.000Z",
+      previousIssuedAt: "2026-07-09T20:00:00.000Z",
+      changedWindowCount: 1
+    });
   });
 });

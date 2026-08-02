@@ -13,6 +13,7 @@ import {
   persistCdipMopForecasts,
   persistIssuedForecasts,
   persistNwsRows,
+  persistTideEvents,
   persistTideForecasts,
   persistWaveForecasts,
   persistWaveObservations
@@ -176,6 +177,7 @@ export async function runNorcalIngest(
   const cdipMopRun = sourceRuns[3]!;
   const ndbcRun = sourceRuns[4]!;
   const tidePersistence = await persistTideForecasts(env.DB, coopsRun.id, coops.rows, fetchedAt);
+  const tideEventPersistence = await persistTideEvents(env.DB, coopsRun.id, coops.events, fetchedAt);
   const nwsPersistence = await persistNwsRows(
     env.DB,
     nwsRun.id,
@@ -186,13 +188,6 @@ export async function runNorcalIngest(
   const wavePersistence = await persistWaveForecasts(env.DB, nwsWaveRun.id, nwsWave.rows, fetchedAt);
   const cdipMopPersistence = await persistCdipMopForecasts(env.DB, cdipMopRun.id, cdipMop.rows, fetchedAt);
   const observationPersistence = await persistWaveObservations(env.DB, ndbcRun.id, ndbc.rows, fetchedAt);
-  const normalizedPersistence = [
-    tidePersistence,
-    nwsPersistence,
-    wavePersistence,
-    cdipMopPersistence,
-    observationPersistence
-  ];
   const artifactPersistence = [
     await persistRawArtifacts(env.RAW_ARTIFACTS, env.DB, coopsRun, captures[0], idSuffix, fetchedAt),
     await persistRawArtifacts(env.RAW_ARTIFACTS, env.DB, nwsRun, captures[1], idSuffix, fetchedAt),
@@ -202,11 +197,21 @@ export async function runNorcalIngest(
   ];
   const completedAt = new Date().toISOString();
   const finalizedRuns = [
-    await finalizeSourceRun(env.DB, coopsRun, coops, normalizedPersistence[0]!, artifactPersistence[0]!, completedAt),
-    await finalizeSourceRun(env.DB, nwsRun, nws, normalizedPersistence[1]!, artifactPersistence[1]!, completedAt),
-    await finalizeSourceRun(env.DB, nwsWaveRun, nwsWave, normalizedPersistence[2]!, artifactPersistence[2]!, completedAt),
-    await finalizeSourceRun(env.DB, cdipMopRun, cdipMop, normalizedPersistence[3]!, artifactPersistence[3]!, completedAt),
-    await finalizeSourceRun(env.DB, ndbcRun, ndbc, normalizedPersistence[4]!, artifactPersistence[4]!, completedAt)
+    await finalizeSourceRun(
+      env.DB,
+      coopsRun,
+      coops,
+      {
+        rowsWritten: tidePersistence.rowsWritten + tideEventPersistence.rowsWritten,
+        errors: [...tidePersistence.errors, ...tideEventPersistence.errors]
+      },
+      artifactPersistence[0]!,
+      completedAt
+    ),
+    await finalizeSourceRun(env.DB, nwsRun, nws, nwsPersistence, artifactPersistence[1]!, completedAt),
+    await finalizeSourceRun(env.DB, nwsWaveRun, nwsWave, wavePersistence, artifactPersistence[2]!, completedAt),
+    await finalizeSourceRun(env.DB, cdipMopRun, cdipMop, cdipMopPersistence, artifactPersistence[3]!, completedAt),
+    await finalizeSourceRun(env.DB, ndbcRun, ndbc, observationPersistence, artifactPersistence[4]!, completedAt)
   ];
   const snapshotPersistence = captureHistory
     ? await persistIssuedForecasts(env, now, completedAt, sourceIssueFingerprint)
@@ -218,6 +223,7 @@ export async function runNorcalIngest(
   const dbErrors = finalizedRuns.flatMap((run) => (run.recorded ? [] : [`${run.sourceId}: ${run.error}`]));
   const persistenceErrors = [
     ...tidePersistence.errors,
+    ...tideEventPersistence.errors,
     ...nwsPersistence.errors,
     ...wavePersistence.errors,
     ...cdipMopPersistence.errors,

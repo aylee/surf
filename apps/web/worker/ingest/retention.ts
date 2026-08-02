@@ -49,6 +49,12 @@ export async function pruneRetainedData(
         .bind(operationalCutoff)
     },
     {
+      label: "prune tide_events",
+      statement: db
+        .prepare("delete from tide_events where event_at < ?")
+        .bind(operationalCutoff)
+    },
+    {
       label: "prune wind_forecasts",
       statement: db
         .prepare("delete from wind_forecasts where forecast_at < ?")
@@ -92,6 +98,7 @@ export async function pruneRetainedData(
              and not exists (select 1 from source_artifacts where source_run_id = source_runs.id)
              and not exists (select 1 from wave_forecasts where source_run_id = source_runs.id)
              and not exists (select 1 from tide_forecasts where source_run_id = source_runs.id)
+             and not exists (select 1 from tide_events where source_run_id = source_runs.id)
              and not exists (select 1 from wind_forecasts where source_run_id = source_runs.id)
              and not exists (select 1 from wind_forecast_issues where source_run_id = source_runs.id)
              and not exists (select 1 from wave_observations where source_run_id = source_runs.id)

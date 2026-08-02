@@ -1,8 +1,8 @@
 import type { ForecastResponse, ScoredForecastWindow, SpotProfile } from "@surf/contracts";
 import { surfaceConditionForWind } from "@surf/forecast-core";
 
-export const FORECAST_ENGINE_VERSION = "cdip-mop-hs-v1+nws-fallback-v1+objective-score-v1";
-export const FORECAST_PRESENTATION_VERSION = "surf-height-range-v1+surface-condition-v1";
+export const FORECAST_ENGINE_VERSION = "cdip-mop-hs-v1+nws-fallback-v1+objective-score-v2-calibration";
+export const FORECAST_PRESENTATION_VERSION = "wave-semantics-v2+surface-condition-v1";
 export const FORECAST_SNAPSHOT_SCHEMA_VERSION = 1;
 
 export type ForecastSnapshotPersistenceResult = {

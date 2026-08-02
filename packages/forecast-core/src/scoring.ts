@@ -1,4 +1,5 @@
 import type {
+  CalibrationStatus,
   ForecastWindowInput,
   QualityLabel,
   SourceCapability,
@@ -43,8 +44,13 @@ function sourceScore(
   activeCapabilities: SourceCapability[],
   freshnessMinutes: number,
   forecastLeadHours = 0,
-  usesColdStartTransform = false
+  usesColdStartTransform = false,
+  calibrationStatus: CalibrationStatus = "unavailable"
 ): number {
+  const usesColdStartCalibration =
+    usesColdStartTransform ||
+    calibrationStatus === "proxy_uncalibrated" ||
+    calibrationStatus === "cold_start_uncalibrated";
   const hasWave =
     activeCapabilities.includes("forecast_wave_nearshore") ||
     activeCapabilities.includes("forecast_wave_offshore");
@@ -55,9 +61,16 @@ function sourceScore(
     (activeCapabilities.includes("observed_wave") ? 10 : 0);
   const freshnessPenalty = Math.min(15, freshnessMinutes / 120);
   const leadPenalty = Math.min(25, forecastLeadHours / 5);
-  const transformPenalty = usesColdStartTransform ? 15 : 0;
-  const score = clampScore(coverage - freshnessPenalty - leadPenalty - transformPenalty);
-  return usesColdStartTransform ? Math.min(74, score) : score;
+  const transformPenalty = usesColdStartCalibration ? 15 : 0;
+  const directModelCalibrationPenalty = calibrationStatus === "modeled_uncalibrated" ? 5 : 0;
+  const score = clampScore(
+    coverage - freshnessPenalty - leadPenalty - transformPenalty - directModelCalibrationPenalty
+  );
+  if (usesColdStartCalibration) return Math.min(74, score);
+  // Direct nearshore guidance has stronger physical support than a cold-start
+  // proxy, but it is not a calibrated breaking-surf estimate. Keep that
+  // distinction visible without borrowing the NWS fallback penalty.
+  return calibrationStatus === "modeled_uncalibrated" ? Math.min(89, score) : score;
 }
 
 export function scoreSpotWindow(spot: SpotProfile, input: ForecastWindowInput): SurfScore {
@@ -65,7 +78,8 @@ export function scoreSpotWindow(spot: SpotProfile, input: ForecastWindowInput): 
     input.activeCapabilities,
     input.sourceFreshnessMinutes,
     input.forecastLeadHours,
-    input.usesColdStartTransform
+    input.usesColdStartTransform,
+    input.calibrationStatus
   );
   const hasWave =
     input.waveHeightFt !== null && input.peakPeriodSec !== null && input.primaryDirectionDeg !== null;
