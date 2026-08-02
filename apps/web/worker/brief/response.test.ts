@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { assembleModelForecastBrief } from "./brief";
 import { buildForecastFactBundle } from "./facts";
 import {
@@ -39,6 +39,7 @@ describe("forecast brief public response", () => {
   });
 
   it("falls back deterministically when brief storage is unavailable", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const db = {
       prepare() {
         throw new Error("table unavailable");
@@ -50,7 +51,13 @@ describe("forecast brief public response", () => {
 
     expect(response.status).toBe("deterministic_fallback");
     expect(response.brief.provider).toBe("deterministic");
+    expect(response.fallbackReason).toBeNull();
     expect(response.availableRevisions).toBe(0);
+    expect(warning).toHaveBeenCalledOnce();
+    expect(warning.mock.calls[0]?.[0]).toContain('"errorName":"Error"');
+    expect(warning.mock.calls[0]?.[0]).toContain('"errorMessage":"table unavailable"');
+    expect(JSON.stringify(response)).not.toContain("table unavailable");
+    warning.mockRestore();
   });
 
   it("returns the latest validated model revision while its material facts remain current", async () => {

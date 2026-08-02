@@ -38,6 +38,8 @@ type ForecastResult =
 type DashboardState = {
   loading: boolean;
   error: string | null;
+  notice: string | null;
+  delayedSpotIds: SpotId[];
   spots: ApiSpot[];
   forecasts: Partial<Record<SpotId, ForecastResult>>;
   fetchedAt: string | null;
@@ -56,6 +58,8 @@ type DailySpotRow = SpotSummary & {
 const initialState: DashboardState = {
   loading: true,
   error: null,
+  notice: null,
+  delayedSpotIds: [],
   spots: [],
   forecasts: {},
   fetchedAt: null
@@ -444,7 +448,7 @@ export function App() {
     activeController.current?.abort();
     const controller = new AbortController();
     activeController.current = controller;
-    setState((current) => ({ ...current, loading: true, error: null }));
+    setState((current) => ({ ...current, loading: true, error: null, notice: null }));
     try {
       const spotsPayload = await fetchJson<SpotsResponse>("/api/spots", controller.signal);
       const forecastEntries = await Promise.all(
@@ -458,31 +462,76 @@ export function App() {
         })
       );
       if (controller.signal.aborted) return;
-      setState({
-        loading: false,
-        error: null,
-        spots: spotsPayload.spots,
-        forecasts: Object.fromEntries(forecastEntries) as Partial<Record<SpotId, ForecastResult>>,
-        fetchedAt: new Date().toISOString()
+      const fetchedAt = new Date().toISOString();
+      setState((current) => {
+        let retainedForecastCount = 0;
+        const forecasts = Object.fromEntries(
+          forecastEntries.map(([spotId, result]) => {
+            const previous = current.forecasts[spotId];
+            if (result.status === "error" && previous?.status === "ready") {
+              retainedForecastCount += 1;
+              return [spotId, previous] as const;
+            }
+            return [spotId, result] as const;
+          })
+        ) as Partial<Record<SpotId, ForecastResult>>;
+        const failedForecastCount = forecastEntries.filter(([, result]) => result.status === "error").length;
+        const delayedSpotIds = forecastEntries.flatMap(([spotId, result]) =>
+          result.status === "error" ? [spotId] : []
+        );
+        const notice = failedForecastCount === 0
+          ? null
+          : retainedForecastCount > 0
+            ? "Some forecast updates are delayed. Showing the last forecast we loaded."
+            : "Some forecasts are temporarily unavailable. We'll try again automatically.";
+        return {
+          loading: false,
+          error: null,
+          notice,
+          delayedSpotIds,
+          spots: spotsPayload.spots,
+          forecasts,
+          fetchedAt
+        };
       });
       lastFetchedAt.current = Date.now();
       setNow(new Date());
-    } catch (error) {
+    } catch {
       if (controller.signal.aborted) return;
       lastFetchedAt.current = Date.now();
-      setState((current) => ({ ...current, loading: false, error: errorMessage(error), fetchedAt: new Date().toISOString() }));
+      setState((current) => current.spots.length > 0
+        ? {
+            ...current,
+            loading: false,
+            error: null,
+            notice: "The latest update is delayed. Showing the last forecast we loaded.",
+            delayedSpotIds: []
+          }
+        : {
+            ...current,
+            loading: false,
+            error: "Surf data is temporarily unavailable. Please try again.",
+            notice: null,
+            delayedSpotIds: []
+          });
     }
   }, []);
 
   const acceptRecoveredForecast = useCallback((spotId: SpotId, forecast: ForecastResponse) => {
-    setState((current) => ({
-      ...current,
-      forecasts: {
-        ...current.forecasts,
-        [spotId]: { status: "ready", data: forecast }
-      },
-      fetchedAt: new Date().toISOString()
-    }));
+    setState((current) => {
+      const wasDelayed = current.delayedSpotIds.includes(spotId);
+      const delayedSpotIds = current.delayedSpotIds.filter((candidate) => candidate !== spotId);
+      return {
+        ...current,
+        forecasts: {
+          ...current.forecasts,
+          [spotId]: { status: "ready", data: forecast }
+        },
+        notice: wasDelayed && delayedSpotIds.length === 0 ? null : current.notice,
+        delayedSpotIds,
+        fetchedAt: new Date().toISOString()
+      };
+    });
   }, []);
 
   useEffect(() => {
@@ -523,6 +572,7 @@ export function App() {
     <main className="appShell">
       <Header state={state} onRefresh={() => void loadDashboard()} />
       {state.error && <div className="errorBanner" role="alert"><Info size={18} aria-hidden="true" /> {state.error}</div>}
+      {state.notice && <div className="noticeBanner" role="status"><Info size={18} aria-hidden="true" /> {state.notice}</div>}
       {state.loading && state.spots.length === 0 ? (
         <LoadingState />
       ) : selectedSummary ? (

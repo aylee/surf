@@ -12,7 +12,17 @@ import {
   Sparkles,
   TableProperties
 } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode
+} from "react";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "../../components/ui/accordion";
 import { Badge } from "../../components/ui/badge";
 import { Popover, PopoverContent, PopoverTrigger } from "../../components/ui/popover";
@@ -58,13 +68,19 @@ function formatFreshness(minutes: number | null): string {
 }
 
 function formatTimestamp(value: string, timezone: string): string {
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZone: timezone
-  }).format(new Date(value));
+  const timestamp = new Date(value);
+  if (!Number.isFinite(timestamp.getTime())) return "time unavailable";
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      timeZone: timezone
+    }).format(timestamp);
+  } catch {
+    return "time unavailable";
+  }
 }
 
 function formatClock(value: string, timezone: string): string {
@@ -221,15 +237,10 @@ function ForecastLearningGuide() {
 
 function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: boolean; spot: ApiSpot }) {
   const isAi = brief.status === "model" && brief.provider === "google";
-  const badgeLabel = isAi
-    ? "AI-curated facts"
-    : brief.status === "stale"
-      ? "Stale · deterministic"
-      : "Deterministic fallback";
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={loading}>
       <span className="srOnly" role="status" aria-live="polite">
-        {loading ? "Checking the latest daily forecaster brief." : `${badgeLabel} is ready.`}
+        {loading ? "Refreshing the daily outlook." : "Daily outlook is ready."}
       </span>
       <div className="dailyBriefIcon" aria-hidden="true">
         {isAi ? <BrainCircuit size={22} /> : <Sparkles size={22} />}
@@ -237,18 +248,14 @@ function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: 
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
           <p className="kicker">Daily forecaster</p>
-          <Badge className={isAi ? "aiBadge" : "fallbackBadge"}>
-            {badgeLabel}
-          </Badge>
-          {brief.status === "model" && brief.revision !== null && <span>Revision {brief.revision}</span>}
-          {brief.generatedAt && (
-            <time dateTime={brief.generatedAt}>Generated {formatTimestamp(brief.generatedAt, spot.timezone)}</time>
+          {isAi && <Badge className="aiBadge">AI-assisted</Badge>}
+          {isAi && brief.generatedAt && (
+            <time dateTime={brief.generatedAt}>Updated {formatTimestamp(brief.generatedAt, spot.timezone)}</time>
           )}
-          {loading && <span className="briefLoading">Checking latest brief…</span>}
+          {loading && <span className="briefLoading">Refreshing outlook…</span>}
         </div>
         <h2 id="daily-brief-heading">{brief.headline}</h2>
         <p className="dailyBriefSetup">{brief.setup}</p>
-        {brief.fallbackReason && <p className="briefFallbackReason">{brief.fallbackReason}</p>}
         {brief.picks.length > 0 && (
           <div className="briefPicks">
             {brief.picks.map((pick, index) => (
@@ -274,6 +281,34 @@ function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: 
             </details>
           )}
         </div>
+      </div>
+    </section>
+  );
+}
+
+class DailyBriefErrorBoundary extends Component<
+  { children: ReactNode; fallback: ReactNode },
+  { failed: boolean }
+> {
+  override state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  override render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
+function DailyBriefRecoveryCard({ brief }: { brief: DailyBrief }) {
+  return (
+    <section className="dailyBrief" aria-labelledby="daily-brief-recovery-heading">
+      <div className="dailyBriefIcon" aria-hidden="true"><Sparkles size={22} /></div>
+      <div className="dailyBriefBody">
+        <div className="dailyBriefMeta"><p className="kicker">Daily forecaster</p></div>
+        <h2 id="daily-brief-recovery-heading">{brief.headline}</h2>
+        <p className="dailyBriefSetup">{brief.setup}</p>
       </div>
     </section>
   );
@@ -615,9 +650,15 @@ export function ForecastWorkbench({
   const [cache, setCache] = useState<ForecastCache>(() => initialForecast ? { "3h": initialForecast } : {});
   const [intervalLoading, setIntervalLoading] = useState(initialUrl.interval === "1h");
   const [intervalError, setIntervalError] = useState<string | null>(null);
+  const [intervalNotice, setIntervalNotice] = useState<string | null>(null);
   const [brief, setBrief] = useState<DailyBrief | null>(null);
   const [briefLoading, setBriefLoading] = useState(false);
   const fetchController = useRef<AbortController | null>(null);
+  const cacheRef = useRef(cache);
+  const hourlyFailurePending = useRef(false);
+  const canonicalRecoveryState = useRef<"idle" | "pending" | "ready" | "failed">(
+    cache["3h"] ? "ready" : "idle"
+  );
   const explicitTimestampSelection = useRef(Boolean(initialUrl.at));
   const previousInitialForecast = useRef(initialForecast);
 
@@ -625,15 +666,21 @@ export function ForecastWorkbench({
     if (previousInitialForecast.current === initialForecast) return;
     previousInitialForecast.current = initialForecast;
     fetchController.current?.abort();
-    setCache(initialForecast ? { "3h": initialForecast } : {});
+    const nextCache: ForecastCache = initialForecast ? { "3h": initialForecast } : {};
+    cacheRef.current = nextCache;
+    hourlyFailurePending.current = false;
+    canonicalRecoveryState.current = initialForecast ? "ready" : "idle";
+    setCache(nextCache);
   }, [initialForecast]);
 
   useEffect(() => {
     replaceWorkbenchUrl({ interval, view });
   }, [interval, view]);
 
+  const activeIntervalForecast = cache[interval];
+
   useEffect(() => {
-    if (cache[interval]) {
+    if (activeIntervalForecast) {
       setIntervalLoading(false);
       setIntervalError(null);
       return;
@@ -646,31 +693,90 @@ export function ForecastWorkbench({
     void fetchForecast(spot.id, interval, controller.signal)
       .then((response) => {
         if (controller.signal.aborted) return;
-        setCache((current) => ({ ...current, [interval]: response }));
-        if (interval === "3h") onForecastRecovered?.(spot.id, response);
+        setCache((current) => {
+          const next = { ...current, [interval]: response };
+          cacheRef.current = next;
+          return next;
+        });
+        if (interval === "1h") hourlyFailurePending.current = false;
+        if (interval === "3h") {
+          canonicalRecoveryState.current = "ready";
+          onForecastRecovered?.(spot.id, response);
+        }
         setIntervalLoading(false);
+        setIntervalNotice(null);
       })
-      .catch((error: unknown) => {
+      .catch(() => {
         if (controller.signal.aborted) return;
+        if (interval === "1h") {
+          hourlyFailurePending.current = true;
+        }
+        if (interval === "1h" && cacheRef.current["3h"]) {
+          hourlyFailurePending.current = false;
+          setIntervalLoading(false);
+          setInterval("3h");
+          setSelectedAt(null);
+          setIntervalError(null);
+          setIntervalNotice("Hourly detail is temporarily unavailable. Showing the latest three-hour forecast.");
+          replaceWorkbenchUrl({ interval: "3h", at: null });
+          return;
+        }
+        if (interval === "1h") {
+          if (canonicalRecoveryState.current === "failed") {
+            hourlyFailurePending.current = false;
+            setIntervalLoading(false);
+            setIntervalError("Forecast detail is temporarily unavailable. Try refreshing in a moment");
+            return;
+          }
+          setIntervalLoading(true);
+          setIntervalError(null);
+          return;
+        }
+        canonicalRecoveryState.current = "failed";
         setIntervalLoading(false);
-        setIntervalError(error instanceof Error ? error.message : String(error));
+        setIntervalError("Forecast detail is temporarily unavailable. Try refreshing in a moment");
       });
     return () => controller.abort();
-  }, [cache, interval, onForecastRecovered, spot.id]);
+  }, [activeIntervalForecast, interval, onForecastRecovered, spot.id]);
+
+  const canonicalCacheEntry = cache["3h"];
 
   useEffect(() => {
-    if (interval !== "1h" || cache["3h"]) return;
+    if (interval !== "1h" || canonicalCacheEntry) return;
     const controller = new AbortController();
+    canonicalRecoveryState.current = "pending";
     void fetchForecast(spot.id, "3h", controller.signal)
       .then((response) => {
         if (!controller.signal.aborted) {
-          setCache((current) => ({ ...current, "3h": response }));
+          canonicalRecoveryState.current = "ready";
+          setCache((current) => {
+            const next = { ...current, "3h": response };
+            cacheRef.current = next;
+            return next;
+          });
           onForecastRecovered?.(spot.id, response);
+          if (hourlyFailurePending.current) {
+            hourlyFailurePending.current = false;
+            setIntervalLoading(false);
+            setInterval("3h");
+            setSelectedAt(null);
+            setIntervalError(null);
+            setIntervalNotice("Hourly detail is temporarily unavailable. Showing the latest three-hour forecast.");
+            replaceWorkbenchUrl({ interval: "3h", at: null });
+          }
         }
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        canonicalRecoveryState.current = "failed";
+        if (hourlyFailurePending.current) {
+          hourlyFailurePending.current = false;
+          setIntervalLoading(false);
+          setIntervalError("Forecast detail is temporarily unavailable. Try refreshing in a moment");
+        }
+      });
     return () => controller.abort();
-  }, [cache, interval, onForecastRecovered, spot.id]);
+  }, [canonicalCacheEntry, interval, onForecastRecovered, spot.id]);
 
   const rawForecast = cache[interval];
   const forecast = useMemo(
@@ -770,7 +876,10 @@ export function ForecastWorkbench({
   const changeInterval = useCallback((value: string) => {
     if (value !== "1h" && value !== "3h") return;
     explicitTimestampSelection.current = false;
+    hourlyFailurePending.current = false;
     setInterval(value);
+    setIntervalNotice(null);
+    setIntervalError(null);
     setSelectedAt(null);
     replaceWorkbenchUrl({ interval: value, at: null });
   }, []);
@@ -788,7 +897,12 @@ export function ForecastWorkbench({
 
   return (
     <TooltipProvider delayDuration={180}>
-      <DailyBriefCard brief={brief ?? fallbackBrief} loading={briefLoading} spot={spot} />
+      <DailyBriefErrorBoundary
+        key={`${spot.id}:${selectedDate ?? "none"}:${brief?.generatedAt ?? brief?.headline ?? "local"}`}
+        fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}
+      >
+        <DailyBriefCard brief={brief ?? fallbackBrief} loading={briefLoading} spot={spot} />
+      </DailyBriefErrorBoundary>
 
       <section className="workbenchSection" aria-labelledby="forecast-workbench-heading">
         <div className="workbenchHeading">
@@ -826,10 +940,13 @@ export function ForecastWorkbench({
           </div>
 
           {intervalError && (
-            <div className="workbenchError" role="alert"><Info size={17} aria-hidden="true" /><span>{intervalError}. No values were interpolated.</span></div>
+            <div className="workbenchError" role="alert"><Info size={17} aria-hidden="true" /><span>{intervalError}.</span></div>
           )}
-          {initialError && !rawForecast && (
-            <div className="workbenchError" role="alert"><Info size={17} aria-hidden="true" /><span>{initialError}</span></div>
+          {intervalNotice && (
+            <div className="coverageNotice" role="status"><Info size={17} aria-hidden="true" /><span>{intervalNotice}</span></div>
+          )}
+          {initialError && !rawForecast && !intervalError && (
+            <div className="workbenchError" role="alert"><Info size={17} aria-hidden="true" /><span>Forecast detail is temporarily unavailable. Try refreshing in a moment.</span></div>
           )}
           {initialError && rawForecast && (
             <span className="srOnly" role="status" aria-live="polite">Forecast detail recovered after the initial request failed.</span>
@@ -841,7 +958,7 @@ export function ForecastWorkbench({
               {Array.from({ length: 6 }, (_, index) => <Skeleton className="skeletonRow" key={index} />)}
             </div>
           ) : dayWindows.length === 0 ? (
-            <div className="workbenchEmpty" role="status"><CloudOff size={20} aria-hidden="true" /><span>No forecast rows returned for this day.</span></div>
+            <div className="workbenchEmpty" role="status"><CloudOff size={20} aria-hidden="true" /><span>No forecast detail is available for this day.</span></div>
           ) : (
             <>
               {hasCoverageGap && (

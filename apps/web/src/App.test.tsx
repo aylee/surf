@@ -107,8 +107,39 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Test Break" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Forecast workbench" })).toBeTruthy();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
-    expect(screen.getByText("Deterministic fallback")).toBeTruthy();
+    expect(screen.getByText("Daily forecaster")).toBeTruthy();
+    expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.getByRole("link", { name: /Daily report/ }).getAttribute("href")).toBe("/");
+  });
+
+  it("keeps the last good forecast visible when a background refresh fails", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    let forecastRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) {
+        forecastRequests += 1;
+        return forecastRequests === 1
+          ? jsonResponse(forecast)
+          : jsonResponse({ error: "temporarily unavailable" }, 503);
+      }
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 503);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(await screen.findByText("Some forecast updates are delayed. Showing the last forecast we loaded.")).toBeTruthy();
+    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+    expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
   });
 
   it("keeps the table, graph, interval, and selected timestamp in the URL", async () => {
@@ -163,12 +194,52 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { level: 1, name: "Test Break" })).toBeTruthy();
     expect(container.querySelector(".spotCall")?.textContent).toContain("No reliable wave call yet");
+    expect(screen.getByText("Some forecasts are temporarily unavailable. We'll try again automatically.")).toBeTruthy();
 
     releaseRecovery();
     await waitFor(() => {
       expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
       expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
+      expect(screen.queryByText("Some forecasts are temporarily unavailable. We'll try again automatically.")).toBeNull();
     });
+  });
+
+  it("does not clear a catalog-refresh warning when a forecast retry recovers", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    let spotRequests = 0;
+    let releaseRecovery!: () => void;
+    const recoveryGate = new Promise<void>((resolve) => {
+      releaseRecovery = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") {
+        spotRequests += 1;
+        return spotRequests === 1
+          ? jsonResponse(spotsResponse)
+          : jsonResponse({ error: "catalog unavailable" }, 503);
+      }
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse({ error: "temporarily unavailable" }, 503);
+      if (path === `/api/forecast/${spot.id}?interval=3h`) {
+        await recoveryGate;
+        return jsonResponse({ ...forecast, interval: "3h" });
+      }
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    const { container } = render(<App />);
+    expect(await screen.findByText("Some forecasts are temporarily unavailable. We'll try again automatically.")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText("The latest update is delayed. Showing the last forecast we loaded.")).toBeTruthy();
+
+    releaseRecovery();
+    await waitFor(() => {
+      expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+    });
+    expect(screen.getByText("The latest update is delayed. Showing the last forecast we loaded.")).toBeTruthy();
   });
 
   it("shows a visible error when the spot catalog API fails", async () => {
@@ -180,6 +251,8 @@ describe("App", () => {
     render(<App />);
 
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("/api/spots returned 503");
+    expect(alert.textContent).toContain("Surf data is temporarily unavailable. Please try again.");
+    expect(alert.textContent).not.toContain("/api/spots");
+    expect(alert.textContent).not.toContain("503");
   });
 });

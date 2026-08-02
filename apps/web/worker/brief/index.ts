@@ -1,4 +1,8 @@
-export { assembleModelForecastBrief, buildDeterministicForecastBrief } from "./brief";
+export {
+  assembleModelForecastBrief,
+  buildDeterministicForecastBrief,
+  buildUnavailableForecastBriefResponse
+} from "./brief";
 export {
   buildForecastFactBundle,
   forecastBriefFrame,

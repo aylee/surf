@@ -110,6 +110,7 @@ summary {
 .backLink,
 .dataDisclosure summary span,
 .errorBanner,
+.noticeBanner,
 .loadingState,
 .selectedWindowHeading,
 .sectionTitle {
@@ -873,6 +874,18 @@ strong {
   font-size: 0.85rem;
 }
 
+.noticeBanner {
+  min-height: 44px;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 13px;
+  border: 1px solid #d7c89d;
+  border-radius: 12px;
+  background: #fff9e8;
+  color: #685b30;
+  font-size: 0.85rem;
+}
+
 .loadingState {
   justify-content: center;
   min-height: 420px;
@@ -1433,12 +1446,6 @@ footer {
   color: #175d4c;
 }
 
-.fallbackBadge {
-  border-color: #d4dbd8;
-  background: #eef1ef;
-  color: #54666c;
-}
-
 .briefLoading {
   margin-left: auto;
 }
@@ -1457,17 +1464,6 @@ footer {
   color: #4e666d;
   font-size: 0.95rem;
   line-height: 1.55;
-}
-
-.briefFallbackReason {
-  max-width: 850px;
-  margin: 10px 0 0;
-  padding: 8px 10px;
-  border-left: 3px solid #d2a24d;
-  background: #fff8e8;
-  color: #675a36;
-  font-size: 0.75rem;
-  line-height: 1.45;
 }
 
 .briefPicks {

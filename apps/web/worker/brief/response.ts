@@ -46,11 +46,24 @@ export async function buildForecastBriefResponse(
         : "Forecast inputs changed materially after the latest validated model brief.",
       availableRevisions
     });
-  } catch {
+  } catch (error) {
+    const errorName = error instanceof Error && error.name ? error.name : "UnknownError";
+    const errorMessage = (error instanceof Error ? error.message : String(error))
+      .replace(/\s+/g, " ")
+      .slice(0, 240);
+    console.warn(
+      JSON.stringify({
+        message: "forecast brief storage read used the fact-based summary",
+        spotId: bundle.input.spotId,
+        localDate: bundle.input.localDate,
+        errorName,
+        errorMessage
+      })
+    );
     return ForecastBriefResponseSchema.parse({
       status: "deterministic_fallback",
       brief: buildDeterministicForecastBrief(bundle),
-      fallbackReason: "Model brief storage is unavailable.",
+      fallbackReason: null,
       availableRevisions: 0
     });
   }
