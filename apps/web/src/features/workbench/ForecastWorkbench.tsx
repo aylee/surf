@@ -91,6 +91,19 @@ function formatClock(value: string, timezone: string): string {
   }).format(new Date(value));
 }
 
+function presentBriefCopy(value: string): string {
+  const copy = value
+    .replace(/\bdeterministic engine\b/gi, "forecast")
+    .replace(/\bdeterministic condition score\b/gi, "condition score")
+    .replace(/\bdeterministic daylight recommendation\b/gi, "daylight outlook")
+    .replace(/\bdeterministic read\b/gi, "forecast read")
+    .replace(/\bdeterministic\b\s*/gi, "")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return copy || "Forecast update";
+}
+
 function bestCanonicalDayWindow(
   windows: WorkbenchWindow[],
   now: Date,
@@ -254,15 +267,15 @@ function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: 
           )}
           {loading && <span className="briefLoading">Refreshing outlook…</span>}
         </div>
-        <h2 id="daily-brief-heading">{brief.headline}</h2>
-        <p className="dailyBriefSetup">{brief.setup}</p>
+        <h2 id="daily-brief-heading">{presentBriefCopy(brief.headline)}</h2>
+        <p className="dailyBriefSetup">{presentBriefCopy(brief.setup)}</p>
         {brief.picks.length > 0 && (
           <div className="briefPicks">
             {brief.picks.map((pick, index) => (
               <div key={`${pick.windowId ?? "pick"}-${index}`}>
                 <strong>{pick.label ?? (index === 0 ? "Recommended window" : `Option ${index + 1}`)}</strong>
-                <p>{pick.why}</p>
-                {pick.tradeoff && <small>Tradeoff: {pick.tradeoff}</small>}
+                <p>{presentBriefCopy(pick.why)}</p>
+                {pick.tradeoff && <small>Tradeoff: {presentBriefCopy(pick.tradeoff)}</small>}
               </div>
             ))}
           </div>
@@ -270,14 +283,14 @@ function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: 
         <div className="briefFooter">
           {brief.lesson && (
             <div className="lessonCallout">
-              <span>{brief.lesson.topic ?? "Learn from this report"}</span>
-              <p>{brief.lesson.text}</p>
+              <span>{brief.lesson.topic ? presentBriefCopy(brief.lesson.topic) : "Learn from this report"}</span>
+              <p>{presentBriefCopy(brief.lesson.text)}</p>
             </div>
           )}
           {brief.bustFactors.length > 0 && (
             <details className="bustFactors">
               <summary>What could change the call</summary>
-              <ul>{brief.bustFactors.map((factor) => <li key={factor}>{factor}</li>)}</ul>
+              <ul>{brief.bustFactors.map((factor) => <li key={factor}>{presentBriefCopy(factor)}</li>)}</ul>
             </details>
           )}
         </div>
@@ -307,8 +320,8 @@ function DailyBriefRecoveryCard({ brief }: { brief: DailyBrief }) {
       <div className="dailyBriefIcon" aria-hidden="true"><Sparkles size={22} /></div>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta"><p className="kicker">Daily forecaster</p></div>
-        <h2 id="daily-brief-recovery-heading">{brief.headline}</h2>
-        <p className="dailyBriefSetup">{brief.setup}</p>
+        <h2 id="daily-brief-recovery-heading">{presentBriefCopy(brief.headline)}</h2>
+        <p className="dailyBriefSetup">{presentBriefCopy(brief.setup)}</p>
       </div>
     </section>
   );

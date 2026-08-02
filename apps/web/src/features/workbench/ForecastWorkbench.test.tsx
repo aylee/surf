@@ -221,6 +221,8 @@ describe("ForecastWorkbench", () => {
     );
 
     expect(await screen.findByText("First-light option")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Use the current forecast read" })).toBeTruthy();
+    expect(container.querySelector(".dailyBrief")?.textContent?.toLowerCase()).not.toContain("deterministic");
     expect(screen.queryByText("Stale · deterministic")).toBeNull();
     expect(screen.queryByText("Forecast inputs changed materially.")).toBeNull();
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();

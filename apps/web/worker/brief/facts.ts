@@ -229,12 +229,12 @@ export function forecastBriefFrame(bundle: Pick<ForecastFactBundle, "input">): {
 } {
   return bundle.input.recommendationWindowIds.length > 0
     ? {
-        headline: `${bundle.input.spotName} has a deterministic daylight recommendation`,
+        headline: `${bundle.input.spotName} daylight outlook`,
         setup: "Compare the cited wind, tide, modeled wave state, confidence, and source caveats before making the call."
       }
     : {
         headline: `${bundle.input.spotName} has no scored daylight recommendation`,
-        setup: "Sourced inputs are incomplete, so the deterministic engine is withholding a ranked session window."
+        setup: "Sourced inputs are incomplete, so no ranked session window is available yet."
       };
 }
 
