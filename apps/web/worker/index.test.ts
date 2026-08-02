@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ForecastBriefResponseSchema, ForecastResponseSchema } from "@surf/contracts";
 import { NORCAL_SPOTS } from "@surf/forecast-core";
 import type { Env } from "./index";
 import worker from "./index";
@@ -222,6 +223,103 @@ describe("worker api", () => {
     );
 
     expect(response.status).toBe(400);
+  });
+
+  it("returns a typed safe summary for a valid date outside the forecast horizon", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central/brief?date=2099-01-01") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      env(),
+      {} as ExecutionContext
+    );
+    const body = ForecastBriefResponseSchema.parse(await response.json());
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      status: "deterministic_fallback",
+      fallbackReason: null,
+      brief: {
+        spotId: "obsf-central",
+        localDate: "2099-01-01",
+        provider: "deterministic",
+        picks: []
+      }
+    });
+    expect(warning).toHaveBeenCalledOnce();
+    const logged = warning.mock.calls[0]?.[0];
+    expect(logged).toContain('"reason":"requested_date_unavailable"');
+    expect(logged).not.toContain("Forecast has no windows");
+  });
+
+  it("keeps brief and core forecast GETs independent from the Agent", async () => {
+    let agentLookups = 0;
+    const poisonAgent = {
+      getByName() {
+        agentLookups += 1;
+        throw new Error("Agent GET access is forbidden");
+      }
+    } as unknown as NonNullable<Env["FORECAST_BRIEF_AGENT"]>;
+    const agentEnv: Env = {
+      ...env(),
+      FORECAST_BRIEF_ENABLED: "true",
+      GEMINI_API_KEY: "test-key-never-sent",
+      FORECAST_BRIEF_AGENT: poisonAgent
+    };
+
+    const briefResponse = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central/brief") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      agentEnv,
+      {} as ExecutionContext
+    );
+    const forecastResponse = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      agentEnv,
+      {} as ExecutionContext
+    );
+
+    expect(briefResponse.status).toBe(200);
+    ForecastBriefResponseSchema.parse(await briefResponse.json());
+    expect(forecastResponse.status).toBe(200);
+    ForecastResponseSchema.parse(await forecastResponse.json());
+    expect(agentLookups).toBe(0);
+  });
+
+  it("returns a nontechnical typed brief when D1 reads fail", async () => {
+    const failureLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const failingDb = {
+      prepare() {
+        throw new Error("internal D1 failure details");
+      }
+    } as unknown as D1Database;
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central/brief") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      {
+        ...env(failingDb),
+        FORECAST_BRIEF_ENABLED: "true",
+        GEMINI_API_KEY: "test-key-never-sent"
+      },
+      {} as ExecutionContext
+    );
+    const body = ForecastBriefResponseSchema.parse(await response.json());
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      status: "deterministic_fallback",
+      fallbackReason: null,
+      brief: { provider: "deterministic", spotId: "obsf-central" }
+    });
+    expect(JSON.stringify(body)).not.toContain("internal D1 failure details");
+    expect(JSON.stringify(body)).not.toMatch(/database|storage|exception/i);
+    expect(failureLog).toHaveBeenCalled();
+    failureLog.mockRestore();
   });
 
   it("runs manual ingest and records source-run-like D1 rows", async () => {

@@ -13,10 +13,12 @@ import { bearerTokenMatches } from "./auth";
 import {
   buildDisabledForecastBriefResponse,
   buildForecastBriefResponse,
-  buildForecastFactBundle
+  buildForecastFactBundle,
+  buildUnavailableForecastBriefResponse
 } from "./brief";
 import { buildForecastResponse } from "./forecast";
 import { ingestRequiresRetry, normalizeIngestMessage, runNorcalIngest } from "./ingest";
+import { localDateForTime } from "./time";
 
 export type Env = Omit<
   CloudflareBindings,
@@ -71,6 +73,15 @@ function forecastBriefEnabled(env: Env): boolean {
   );
 }
 
+function briefAssemblyDiagnostic(error: unknown): { errorName: string; errorMessage: string } {
+  const errorName = error instanceof Error && error.name ? error.name : "UnknownError";
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  return {
+    errorName,
+    errorMessage: rawMessage.replace(/\s+/g, " ").slice(0, 240)
+  };
+}
+
 async function signalForecastBriefAgents(env: Env): Promise<void> {
   const namespace = env.FORECAST_BRIEF_AGENT;
   if (!namespace || !forecastBriefEnabled(env)) return;
@@ -120,19 +131,43 @@ app.get(
     const { spotId } = c.req.valid("param");
     const { date } = c.req.valid("query");
     const now = new Date();
-    const forecast = await buildForecastResponse(c.env, spotId, now, "3h");
+    let spotName = "This spot";
+    let localDate = date ?? now.toISOString().slice(0, 10);
     try {
+      // This GET is intentionally read-only. Agent signaling and model calls
+      // happen only after ingest; a page request may read a published revision
+      // but must never trigger generation.
+      const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
+      if (!spot) throw new Error("Validated spot metadata is unavailable");
+      spotName = spot.name;
+      localDate = date ?? localDateForTime(now.toISOString(), spot.timezone);
+      const forecast = await buildForecastResponse(c.env, spotId, now, "3h");
       const bundle = await buildForecastFactBundle(forecast, { localDate: date });
       if (!forecastBriefEnabled(c.env)) {
         return c.json(buildDisabledForecastBriefResponse(bundle));
       }
       return c.json(await buildForecastBriefResponse(c.env.DB, bundle, now));
     } catch (error) {
+      const reason =
+        error instanceof Error && error.message.startsWith("Forecast has no windows for")
+          ? "requested_date_unavailable"
+          : "brief_assembly_failed";
+      console.warn(
+        JSON.stringify({
+          message: "forecast brief response used the safe summary",
+          spotId,
+          localDate,
+          reason,
+          ...(reason === "brief_assembly_failed" ? briefAssemblyDiagnostic(error) : {})
+        })
+      );
       return c.json(
-        {
-          error: error instanceof Error ? error.message : "Forecast brief is unavailable for this date."
-        },
-        404
+        buildUnavailableForecastBriefResponse({
+          spotId,
+          spotName,
+          localDate,
+          generatedAt: now.toISOString()
+        })
       );
     }
   }

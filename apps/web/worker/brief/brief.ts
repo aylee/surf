@@ -3,8 +3,10 @@ import {
   FORECAST_BRIEF_MODEL_ID,
   FORECAST_BRIEF_PROMPT_VERSION,
   FORECAST_BRIEF_SCHEMA_VERSION,
+  ForecastBriefResponseSchema,
   ForecastBriefSchema,
   type ForecastBrief,
+  type ForecastBriefResponse,
   type ForecastBriefDraft,
   type ForecastFact,
   type ForecastFactBundle
@@ -92,5 +94,51 @@ export function buildDeterministicForecastBrief(
     modelId: null,
     promptVersion: FORECAST_BRIEF_PROMPT_VERSION,
     generatedAt: bundle.input.generatedAt
+  });
+}
+
+/**
+ * Last-resort public copy for a brief request that could not be assembled.
+ *
+ * This deliberately depends only on validated route metadata. It must remain
+ * usable when forecast rows, brief storage, the Agent, and the model are all
+ * unavailable.
+ */
+export function buildUnavailableForecastBriefResponse(input: {
+  spotId: ForecastBrief["spotId"];
+  spotName: string;
+  localDate: string;
+  generatedAt: string;
+}): ForecastBriefResponse {
+  return ForecastBriefResponseSchema.parse({
+    status: "deterministic_fallback",
+    brief: {
+      schemaVersion: FORECAST_BRIEF_SCHEMA_VERSION,
+      spotId: input.spotId,
+      localDate: input.localDate,
+      revision: 1,
+      inputFingerprint: `fallback:${input.spotId}:${input.localDate}`,
+      headline: `${input.spotName} daily summary is refreshing`,
+      setup:
+        "Use the forecast table and data-health details below for the latest available wave, wind, and tide context.",
+      picks: [],
+      bustFactors: [
+        {
+          text: "Some forecast inputs may be delayed; unavailable values remain blank.",
+          factRefs: ["fallback:data-health"]
+        }
+      ],
+      lesson: {
+        topic: "Read the available inputs",
+        text: "Wave, wind, tide, and source health remain useful independently when a daily summary is still refreshing.",
+        factRefs: ["fallback:forecast-details"]
+      },
+      provider: "deterministic",
+      modelId: null,
+      promptVersion: FORECAST_BRIEF_PROMPT_VERSION,
+      generatedAt: input.generatedAt
+    },
+    fallbackReason: null,
+    availableRevisions: 0
   });
 }

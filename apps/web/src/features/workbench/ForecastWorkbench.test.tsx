@@ -192,7 +192,7 @@ describe("ForecastWorkbench", () => {
     expect(screen.getByRole("heading", { name: "9:00 AM is the clearest daylight window" })).toBeTruthy();
   });
 
-  it("labels stale deterministic briefs, shows selected-source states, and lets a phone row collapse", async () => {
+  it("hides stale-brief internals, shows selected-source states, and lets a phone row collapse", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({
       status: "stale",
@@ -220,10 +220,11 @@ describe("ForecastWorkbench", () => {
       <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />
     );
 
-    expect(await screen.findByText("Stale · deterministic")).toBeTruthy();
-    expect(screen.getByText("Forecast inputs changed materially.")).toBeTruthy();
-    expect(screen.getByText("First-light option")).toBeTruthy();
-    expect(screen.getByText(/Generated Aug 2/)).toBeTruthy();
+    expect(await screen.findByText("First-light option")).toBeTruthy();
+    expect(screen.queryByText("Stale · deterministic")).toBeNull();
+    expect(screen.queryByText("Forecast inputs changed materially.")).toBeNull();
+    expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
+    expect(screen.queryByText(/Generated Aug 2/)).toBeNull();
     expect(screen.queryByText("AI explanation")).toBeNull();
     expect(screen.queryByText("Revision 4")).toBeNull();
 
@@ -241,6 +242,136 @@ describe("ForecastWorkbench", () => {
     fireEvent.click(expandedTrigger!);
     await waitFor(() => expect(expandedTrigger?.getAttribute("data-state")).toBe("closed"));
     expect(container.querySelector(".mobileForecastRows .uiAccordionItem.selectedRow")).toBeTruthy();
+  });
+
+  it("keeps the local outlook and workbench usable when the brief request fails", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "provider unavailable" }, 503)));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />);
+
+    expect(await screen.findByRole("heading", { name: /clearest daylight window/ })).toBeTruthy();
+    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
+    expect(screen.queryByText(/provider unavailable/i)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("ignores malformed brief timestamps without collapsing forecast detail", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({
+      status: "model",
+      brief: {
+        provider: "google",
+        headline: "A validated daily read",
+        setup: "The public inputs support the selected window.",
+        generatedAt: "not-a-timestamp",
+        picks: [],
+        bustFactors: []
+      }
+    })));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />);
+
+    expect(await screen.findByRole("heading", { name: "A validated daily read" })).toBeTruthy();
+    expect(screen.getByText("AI-assisted")).toBeTruthy();
+    expect(screen.queryByText(/time unavailable/i)).toBeNull();
+    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+  });
+
+  it("returns to the last good three-hour view when hourly detail cannot load", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas");
+    const threeHour = fixtureForecast();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+      if (url.includes("interval=1h")) return jsonResponse({ error: "unavailable" }, 503);
+      return jsonResponse({}, 503);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={threeHour} now={now} />);
+    fireEvent.click(screen.getByRole("radio", { name: "One-hour resolution" }));
+
+    expect(await screen.findByText("Hourly detail is temporarily unavailable. Showing the latest three-hour forecast.")).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Three-hour resolution" }).getAttribute("data-state")).toBe("on");
+    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(new URLSearchParams(window.location.search).get("interval")).toBe("3h");
+    expect(screen.queryByText("No forecast detail is available for this day.")).toBeNull();
+  });
+
+  it("uses one hourly request while a cold three-hour fallback arrives", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&interval=1h");
+    const threeHour = fixtureForecast();
+    let hourlyRequests = 0;
+    let releaseCanonical!: () => void;
+    const canonicalGate = new Promise<void>((resolve) => {
+      releaseCanonical = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+      if (url.includes("interval=1h")) {
+        hourlyRequests += 1;
+        return jsonResponse({ error: "hourly unavailable" }, 503);
+      }
+      if (url.includes("interval=3h")) {
+        await canonicalGate;
+        return jsonResponse(threeHour);
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={null} now={now} />);
+    await waitFor(() => expect(hourlyRequests).toBe(1));
+
+    releaseCanonical();
+
+    expect(await screen.findByText("Hourly detail is temporarily unavailable. Showing the latest three-hour forecast.")).toBeTruthy();
+    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(hourlyRequests).toBe(1);
+    expect(new URLSearchParams(window.location.search).get("interval")).toBe("3h");
+  });
+
+  it("does not restart a cold canonical backfill when hourly detail arrives first", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&interval=1h");
+    const threeHour = canonicalThreeHourForecast();
+    const oneHour = hourlyForecastWithLocalChallenger(threeHour);
+    let canonicalRequests = 0;
+    let releaseCanonical!: () => void;
+    const canonicalGate = new Promise<void>((resolve) => {
+      releaseCanonical = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+      if (url.includes("interval=1h")) return jsonResponse(oneHour);
+      if (url.includes("interval=3h")) {
+        canonicalRequests += 1;
+        await canonicalGate;
+        return jsonResponse(threeHour);
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={null} now={now} />);
+
+    expect(await screen.findByRole("table", { name: /One-hour surf-planning inputs/ })).toBeTruthy();
+    expect(canonicalRequests).toBe(1);
+    releaseCanonical();
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: /clearest daylight window/ })).toBeTruthy());
+    expect(canonicalRequests).toBe(1);
+    expect(screen.getByRole("table", { name: /One-hour surf-planning inputs/ })).toBeTruthy();
+    expect(new URLSearchParams(window.location.search).get("interval")).toBe("1h");
   });
 
   it("invalidates and refetches the active hourly cache when the canonical forecast changes", async () => {

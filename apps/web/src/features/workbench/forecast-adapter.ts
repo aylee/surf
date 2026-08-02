@@ -518,7 +518,10 @@ export function parseBriefResponse(payload: unknown): DailyBrief | null {
       ? { topic: lessonRecord ? stringValue(lessonRecord.topic) : null, text: lessonText }
       : null,
     revision: finiteNumber(source.revision),
-    generatedAt: stringValue(source.generatedAt)
+    generatedAt: (() => {
+      const value = stringValue(source.generatedAt);
+      return value && Number.isFinite(new Date(value).getTime()) ? value : null;
+    })()
   };
 }
 

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { assembleModelForecastBrief, buildDeterministicForecastBrief } from "./brief";
+import { ForecastBriefResponseSchema } from "@surf/contracts";
+import {
+  assembleModelForecastBrief,
+  buildDeterministicForecastBrief,
+  buildUnavailableForecastBriefResponse
+} from "./brief";
 import { buildForecastFactBundle } from "./facts";
 import { briefForecastFixture, validDraftFor } from "./test-helpers";
 
@@ -12,6 +17,28 @@ describe("forecast brief assembly", () => {
     expect(brief.modelId).toBeNull();
     expect(brief.picks.map((pick) => pick.windowId)).toEqual(bundle.input.recommendationWindowIds);
     expect(brief.bustFactors[0]?.factRefs.length).toBeGreaterThan(0);
+  });
+
+  it("builds a typed last-resort response without forecast or model dependencies", () => {
+    const response = buildUnavailableForecastBriefResponse({
+      spotId: "obsf-central",
+      spotName: "Ocean Beach Central",
+      localDate: "2026-08-02",
+      generatedAt: "2026-08-02T17:00:00.000Z"
+    });
+
+    expect(ForecastBriefResponseSchema.parse(response)).toMatchObject({
+      status: "deterministic_fallback",
+      fallbackReason: null,
+      availableRevisions: 0,
+      brief: {
+        spotId: "obsf-central",
+        localDate: "2026-08-02",
+        provider: "deterministic",
+        picks: []
+      }
+    });
+    expect(JSON.stringify(response)).not.toMatch(/database|durable object|gemini|exception/i);
   });
 
   it("attaches immutable model and input metadata to a validated draft", async () => {
