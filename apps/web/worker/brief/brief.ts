@@ -61,7 +61,7 @@ export function buildDeterministicForecastBrief(
     return {
       windowId,
       label: forecastBriefWindowLabel(bundle, windowId),
-      why: "The deterministic condition score places this daylight window among the leading options.",
+      why: "The condition score places this daylight window among the leading options.",
       tradeoff: `Confidence is ${confidenceBand ?? "unknown"}; modeled wave values describe nearshore state rather than observed breaking-wave faces.`,
       factRefs: [...new Set([condition.id, wave.id])]
     };
