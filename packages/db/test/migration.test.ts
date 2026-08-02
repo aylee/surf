@@ -8,7 +8,11 @@ const historyMigrationSql = readFileSync(
   new URL("../migrations/0001_forecast_history.sql", import.meta.url),
   "utf8"
 );
-const allMigrationSql = `${migrationSql}\n${historyMigrationSql}`;
+const trustWorkbenchMigrationSql = readFileSync(
+  new URL("../migrations/0002_trust_workbench.sql", import.meta.url),
+  "utf8"
+);
+const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}`;
 const seedSql = readFileSync(new URL("../seeds/0000_v1_norcal.sql", import.meta.url), "utf8");
 
 const appliedMigrationHashes = {
@@ -70,6 +74,22 @@ describe("D1 migration", () => {
       "spot_config_hash text not null",
       "issue_context_json text not null",
       "expected_window_count integer not null"
+    ],
+    tide_events: [
+      "station_id text not null",
+      "event_at text not null",
+      "tide_ft_mllw real not null",
+      "event_type text not null"
+    ],
+    forecast_brief_revisions: [
+      "local_date text not null",
+      "revision integer not null",
+      "input_fingerprint text not null",
+      "material_fingerprint text not null",
+      "status text not null",
+      "brief_json text not null",
+      "fact_refs_json text not null",
+      "validation_json text not null"
     ]
   };
 
@@ -109,6 +129,9 @@ describe("D1 migration", () => {
     expect(normalizedSql).toContain("create index if not exists wind_forecasts_forecast_at_idx on wind_forecasts (forecast_at)");
     expect(normalizedSql).toContain("create index if not exists wave_observations_observed_at_idx on wave_observations (observed_at)");
     expect(normalizedSql).toContain("create index if not exists hazard_events_updated_at_idx on hazard_events (updated_at)");
+    expect(normalizedSql).toContain("create index if not exists tide_events_spot_event_at_idx on tide_events (spot_id, event_at)");
+    expect(normalizedSql).toContain("create unique index if not exists forecast_brief_revisions_input_idx on forecast_brief_revisions (spot_id, local_date, input_fingerprint)");
+    expect(normalizedSql).toContain("create index if not exists forecast_brief_revisions_latest_idx on forecast_brief_revisions (spot_id, local_date, revision desc)");
   });
 
   it("adds forecast history without altering or dropping the live read-model tables", () => {
@@ -125,6 +148,16 @@ describe("D1 migration", () => {
     expect(normalizedHistory).toContain(
       "foreign key (spot_id, spot_config_hash) references forecast_configs(spot_id, config_hash)"
     );
+  });
+
+  it("adds the trust workbench tables without destructive statements", () => {
+    const normalizedTrust = trustWorkbenchMigrationSql.replace(/\s+/g, " ").toLowerCase();
+
+    expect(normalizedTrust).not.toContain("alter table");
+    expect(normalizedTrust).not.toContain("drop table");
+    expect(normalizedTrust).toContain("primary key (spot_id, station_id, event_at)");
+    expect(normalizedTrust).toContain("primary key (spot_id, local_date, revision)");
+    expect(normalizedTrust).toContain("status text not null check (status in ('validated'))");
   });
 });
 

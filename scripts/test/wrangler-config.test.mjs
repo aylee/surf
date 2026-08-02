@@ -27,3 +27,26 @@ test("instance validation rejects namespace, region, and contact drift", () => {
     "SURF_USER_AGENT must identify the instance with an operator contact."
   ]);
 });
+
+test("instance validation protects the Agent lifecycle and secret boundary", () => {
+  const config = structuredClone(canonical);
+  config.durable_objects.bindings[0].class_name = "WrongAgent";
+  config.exports.ForecastBriefAgent.storage = "kv";
+  config.vars.FORECAST_BRIEF_ENABLED = "true";
+  config.vars.GEMINI_API_KEY = "must-not-be-tracked";
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "FORECAST_BRIEF_AGENT must bind exactly once to ForecastBriefAgent.",
+    "ForecastBriefAgent must be declared as a live SQLite durable-object export.",
+    "The tracked config must keep FORECAST_BRIEF_ENABLED=false for the first Durable Object lifecycle deploy.",
+    "GEMINI_API_KEY must be a Wrangler secret, never a tracked Worker var."
+  ]);
+});
+
+test("an ignored instance config may enable the brief after the lifecycle deploy", () => {
+  const config = structuredClone(canonical);
+  config.vars.FORECAST_BRIEF_ENABLED = "true";
+  const instanceConfigPath = resolve(root, "apps/web/wrangler.instance.jsonc");
+
+  assert.deepEqual(wranglerStructureFailures(config, instanceConfigPath), []);
+});

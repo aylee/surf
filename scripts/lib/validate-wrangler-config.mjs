@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 
 function exactlyOne(collection, binding, kind, failures) {
   const matches = (collection ?? []).filter((entry) => entry.binding === binding);
@@ -59,6 +59,27 @@ export function wranglerStructureFailures(config, configPath) {
   }
 
   if (config?.assets?.binding !== "ASSETS") failures.push("Static assets binding must be ASSETS.");
+  const briefBindings = config?.durable_objects?.bindings ?? [];
+  const briefBinding = briefBindings.filter(
+    (entry) => entry.name === "FORECAST_BRIEF_AGENT"
+  );
+  if (
+    briefBinding.length !== 1 ||
+    briefBinding[0]?.class_name !== "ForecastBriefAgent"
+  ) {
+    failures.push(
+      "FORECAST_BRIEF_AGENT must bind exactly once to ForecastBriefAgent."
+    );
+  }
+  const briefExport = config?.exports?.ForecastBriefAgent;
+  if (
+    briefExport?.type !== "durable-object" ||
+    briefExport?.storage !== "sqlite"
+  ) {
+    failures.push(
+      "ForecastBriefAgent must be declared as a live SQLite durable-object export."
+    );
+  }
   if (config?.vars?.SURF_REGION !== "norcal") {
     failures.push("SURF_REGION must remain norcal until another runtime catalog is implemented.");
   }
@@ -67,6 +88,18 @@ export function wranglerStructureFailures(config, configPath) {
     config.vars.SURF_USER_AGENT.trim().length < 10
   ) {
     failures.push("SURF_USER_AGENT must identify the instance with an operator contact.");
+  }
+  const isTrackedCanonicalConfig = basename(configPath) === "wrangler.jsonc";
+  const briefEnabled = config?.vars?.FORECAST_BRIEF_ENABLED;
+  if (isTrackedCanonicalConfig && briefEnabled !== "false") {
+    failures.push(
+      "The tracked config must keep FORECAST_BRIEF_ENABLED=false for the first Durable Object lifecycle deploy."
+    );
+  } else if (!isTrackedCanonicalConfig && briefEnabled !== "false" && briefEnabled !== "true") {
+    failures.push("FORECAST_BRIEF_ENABLED must be either 'true' or 'false'.");
+  }
+  if (config?.vars?.GEMINI_API_KEY !== undefined) {
+    failures.push("GEMINI_API_KEY must be a Wrangler secret, never a tracked Worker var.");
   }
   if (config?.observability?.logs?.enabled !== true) {
     failures.push("Worker observability logs must be enabled.");

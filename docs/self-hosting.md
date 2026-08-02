@@ -12,7 +12,9 @@ or resource identifiers.
   plus a registered `workers.dev` subdomain
 
 The forecast feeds used by the reference configuration do not require paid API
-keys. Cloudflare usage is the expected hosting cost. Python 3.12 and
+keys. The optional daily explanation can use a Gemini API key; deterministic
+forecast data and fallback copy continue to work without it. Cloudflare usage
+is the expected hosting cost. Python 3.12 and
 [uv](https://docs.astral.sh/uv/) are needed only for the contributor gate and
 optional scientific extractor.
 
@@ -38,6 +40,48 @@ pnpm smoke:local
 
 The ingest uses live public endpoints. Temporary provider failures should be
 reported as missing/stale data; rerunning the command is safe.
+
+### Optional local Gemini brief
+
+Create a key in [Google AI Studio](https://aistudio.google.com/app/apikey) in a
+project with billing disabled. Under the [Gemini API pricing
+terms](https://ai.google.dev/gemini-api/docs/pricing), free-tier submitted
+content may be used to improve Google products; review the [Gemini API
+terms](https://ai.google.dev/gemini-api/terms) before enabling it. Surf
+therefore sends only public NOAA/CDIP/CO-OPS facts and no user prompt,
+identity, session history, IP-derived context, or private data. Keeping billing
+disabled makes quota exhaustion fail closed instead of creating spend.
+
+The repository includes a secret-free example. The local file is ignored:
+
+```bash
+cp apps/web/.dev.vars.example apps/web/.dev.vars
+chmod 600 apps/web/.dev.vars
+```
+
+Edit `apps/web/.dev.vars` and replace only the value after
+`GEMINI_API_KEY=`. Never paste the key into a command, issue, screenshot, test
+fixture, or tracked file. `FORECAST_BRIEF_ENABLED=true` enables local model
+generation; an invalid/missing key fails closed to deterministic copy.
+
+An opt-in evaluation makes exactly one provider call, validates the structured
+result against the same fact policy used by the Worker, and prints only the
+validated public prose (never the request or key):
+
+Gemini curates which allowlisted facts explain each deterministic pick; it does
+not write unrestricted forecast prose. Every published explanatory sentence is
+required to match a cited fact sentence exactly. This deliberately trades some
+voice for a validator that can independently reject label swaps, negation, new
+measurements, and uncited claims.
+
+```bash
+cd apps/web
+SURF_LIVE_GEMINI=1 node --env-file=.dev.vars \
+  ./node_modules/vitest/vitest.mjs run --config vitest.config.ts \
+  worker/brief/gemini.live.test.ts
+```
+
+Ordinary unit and CI runs skip this test and never require a Gemini key.
 
 ## Deploy to Cloudflare
 
@@ -127,7 +171,37 @@ Enter a long random value at the hidden prompt. When invoking the endpoint from
 your shell, provide the same value through the ignored environment variable
 `SURF_INGEST_TOKEN`; never paste it into a script or GitHub issue.
 
-### 5. Verify and populate
+### 5. Optional Gemini production rollout
+
+The tracked configuration deliberately sets `FORECAST_BRIEF_ENABLED=false`.
+This makes the first deployment that creates `ForecastBriefAgent` a
+deterministic-only lifecycle deploy. After that deployment is healthy, set the
+key through Wrangler's hidden prompt:
+
+```bash
+pnpm wrangler -- secret put GEMINI_API_KEY
+pnpm wrangler -- secret list
+```
+
+`secret list` verifies the binding name without revealing its value. To enable
+generation in a separate Worker version, copy the tracked config to the
+ignored instance config (if needed), change only
+`vars.FORECAST_BRIEF_ENABLED` to `"true"`, select that config, and deploy:
+
+```bash
+cp apps/web/wrangler.jsonc apps/web/wrangler.instance.jsonc
+export SURF_WRANGLER_CONFIG=wrangler.instance.jsonc
+pnpm deploy
+```
+
+Record the current D1 Time Travel bookmark and export D1 before the
+migration/deploy, then smoke the disabled version before enabling the model.
+A first Durable Object class lifecycle change cannot be
+rolled back to a pre-class Worker version; the operational rollback target is
+the disabled post-Agent version. Do not delete the Agent export/namespace as a
+rollback technique.
+
+### 6. Verify and populate
 
 Set the deployed URL returned by Wrangler, including `https://`:
 

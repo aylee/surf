@@ -13,6 +13,10 @@ flowchart LR
   rows --> api["Hono forecast API"]
   api --> core["Deterministic transforms + scoring"]
   core --> ui["React daily report + spot detail"]
+  rows --> facts["Allowlisted public fact bundle"]
+  facts --> agent["Per-spot ForecastBriefAgent"]
+  agent --> validate["Schema + claim validator"]
+  validate --> rows
   python["Python GRIB/netCDF evaluation"] -. validates .-> ingest
 ```
 
@@ -25,6 +29,7 @@ flowchart LR
 | `packages/contracts` | Validate API and forecast data at package boundaries |
 | `packages/forecast-core` | Own the reference spot catalog, wave transforms, surface classification, and scoring |
 | `packages/db` | Own the SQL migration history, generated reference seed, and migration checks |
+| `ForecastBriefAgent` | Coordinate one brief per spot/day, material revisions, bounded retries, and Gemini calls without owning forecast facts |
 | `services/extractor` | Decode/evaluate GRIB2 and netCDF data that is too heavy or specialized for a Worker |
 
 ## Data ownership
@@ -59,8 +64,14 @@ describes the surface; it is not an overall vendor-style surf rating. Every
 forecast window retains source run IDs and caveats so missing or stale data
 cannot be silently converted into certainty.
 
-LLMs do not own any numeric step. If an explanation layer is added later, it
-must consume already-structured facts and may not invent or repair them.
+LLMs do not own any numeric step. The optional daily forecaster receives only
+an allowlisted public-data fact bundle and deterministic picks. Its structured
+response is rejected if it references an unknown fact/window, introduces a
+numeric claim absent from the bundle, or emits links, HTML, or safety
+imperatives. D1 remains the published brief/history authority; per-spot Agent
+SQLite stores coordination state only.
+Gemini selects and orders exact allowlisted fact sentences rather than authoring
+free-form forecast prose.
 
 ## Configuration boundary
 

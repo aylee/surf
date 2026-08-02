@@ -133,6 +133,41 @@ issue cycle or lead. It is therefore a peer-alignment dataset, not ground truth.
 Surfline historical mode required a subscription in the test browser and was
 not bypassed.
 
+### 4. Trust-workbench acceptance snapshot (2026-08-02)
+
+The first local end-to-end run after the trust-contract changes ingested all
+six configured spots without source errors. The table below compares Surf's
+first daylight window with the commercial pages Alex would otherwise open.
+This is a product-alignment snapshot, **not** a forecast-accuracy label: the
+capture times, spatial footprints, and displayed semantics differ, and none of
+the commercial calls were used to tune Surf.
+
+| Spot | Surf at Sunday 6 AM | Surfline captured late Aug 1 | Surf Captain Sunday 6 AM | Interpretation |
+|---|---|---|---|---|
+| Ocean Beach North | 3.8 ft direct nearshore Hs, fair, 65 confidence | 3–4+ ft, poor | 4–6+ ft, fair (Ocean Beach regional) | Same broad size neighborhood; Surf reports modeled Hs, not face height. |
+| Ocean Beach Central | 5.7 ft direct nearshore Hs, fair, 65 confidence | 4–6 ft, poor-to-fair | 4–6+ ft, fair (Ocean Beach regional) | Size aligns; overall vendor quality labels are not equivalent to Surf's surface class. |
+| Ocean Beach South | 6.8 ft direct nearshore Hs, fair, 65 confidence | 4–6 ft, poor-to-fair | 4–6+ ft, fair (Ocean Beach regional) | Surf is at the high edge; retain mapped-point semantics and test against observations. |
+| Linda Mar / Pacifica | 3.2 ft cove approach proxy, fair, 55 confidence | 3–4+ ft, fair | 4–6+ ft, fair (Pacifica regional) | The explicit cove proxy and lower confidence explain why this is not direct vendor parity. |
+| Stinson | 2.9 ft direct nearshore Hs, fair, 65 confidence | 2–3 ft, poor-to-fair | 2+ ft, clean | Broad size alignment; surface vocabularies remain product-specific. |
+| Bolinas — Wharf/Brighton | 5.0 ft NWS fallback wave state, clean, 73 confidence | 1–2 ft, poor-to-fair | 2+ ft, clean | Material size divergence. Do not treat this fallback as breaking surf or promote it without a direct target/labels. |
+
+The trust UI makes the mismatch inspectable rather than hiding it. For the
+selected Linda Mar 10 AM hour it independently showed a held 8–11 AM wave
+interval, exact hourly wind and tide, and separate source ages (nearshore wave
+model about 5 hours, NWS wind about 17 minutes, NOAA tide about 5 minutes, buoy
+context about 1 hour in this run). The San Francisco Bar observation appeared
+only as context, never as the spot forecast.
+
+Responsive browser acceptance covered 390, 768, and 1440 CSS pixels. The phone
+and tablet surfaces used expandable rows; desktop exposed the semantic sticky
+table; Table/Graph, 1h/3h, day, and selected timestamp persisted in the URL;
+the graph kept the selected 10 AM timestamp across all four panels; and the
+browser console remained free of warnings and errors. Captures are checked in
+at `docs/images/surf-workbench-before.png` (the prior bar timeline),
+`docs/images/surf-workbench-phone.jpg`,
+`docs/images/surf-workbench-desktop.jpg`, and
+`docs/images/surf-workbench-graph.jpg`.
+
 ## Deterministic interpretation policy
 
 The forecast engine owns the initial weights; vendors do not set them.

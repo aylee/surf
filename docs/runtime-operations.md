@@ -14,6 +14,10 @@ rollback commands.
   6 AM–6 PM local planning horizon.
 - The report layer reads the best available normalized rows; it never replaces
   stale inputs with fixture data.
+- The optional per-spot daily brief lets Gemini select and order allowlisted
+  public fact sentences. Published prose must match those cited sentences
+  exactly; missing keys, quota, or rejected output falls back to deterministic
+  copy without delaying ingest.
 
 ## Health checks
 
@@ -61,16 +65,32 @@ authentication to simplify automation; use the scheduled Queue path instead.
 Raw R2 artifacts and source hashes are the evidence trail for parser and
 provider disagreements.
 
+## Daily brief failure
+
+The forecast API remains healthy when Gemini is disabled or unavailable. Check
+the brief response status first: `deterministic_fallback` is expected when the
+feature flag/key is absent, quota is exhausted, or output fails validation.
+Inspect structured Worker logs by spot, fingerprint, attempt, and failure code;
+the implementation never logs the API key or full provider request. Retry is
+bounded and material fingerprints prevent freshness-only regeneration.
+
 ## Backup and restore
 
-Create a dated directory outside the repository and export D1 before risky
-schema or retention work:
+Before risky schema or retention work, record the current automatically
+maintained D1 Time Travel bookmark, then create a dated export outside the
+repository:
 
 ```bash
+pnpm wrangler -- d1 time-travel info DB
 mkdir -p "$HOME/surf-backups"
 pnpm wrangler -- d1 export DB --remote \
   --output "$HOME/surf-backups/surf-$(date -u +%Y%m%dT%H%M%SZ).sql"
 ```
+
+Copy the bookmark from the command output into the rollout record without
+running a restore. Time Travel restore overwrites the remote database in place
+and is reserved for confirmed data corruption, with explicit operator
+approval. Prefer a forward fix or recovery database for application defects.
 
 Treat the export as potentially sensitive operational data. Verify the file is
 non-empty and store it according to your own backup policy.
@@ -133,6 +153,12 @@ pnpm wrangler -- rollback
 Do not roll Worker code behind an incompatible schema. For a risky migration,
 the pull request and release notes must name a forward-fix or recovery-database
 plan before deployment.
+
+The first deployment declaring `ForecastBriefAgent` is a Durable Object class
+lifecycle change and cannot be rolled back to a version from before that class
+existed. Deploy it with `FORECAST_BRIEF_ENABLED=false`, smoke it, and keep that
+disabled post-Agent version as the rollback target for later code/model
+versions. Do not remove or tombstone the export during routine rollback.
 
 If ingest must be stopped during recovery, pause Queue delivery and remove the
 cron trigger, wait for in-flight work to finish, and confirm `source_runs` has

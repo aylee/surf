@@ -89,6 +89,39 @@ describe("scoreSpotWindow", () => {
     expect(far.confidence).toBeLessThan(near.confidence);
   });
 
+  it("does not apply the cold-start confidence cap to a direct sourced wave state", () => {
+    const spot = getSpotProfile("obsf-central");
+    const input = {
+      spotId: spot.id,
+      forecastAt: "2026-07-10T15:00:00.000Z",
+      waveHeightFt: 4,
+      peakPeriodSec: 12,
+      primaryDirectionDeg: 290,
+      tideFt: 2.5,
+      windSpeedKt: 5,
+      windDirectionDeg: 90,
+      sourceFreshnessMinutes: 30,
+      forecastLeadHours: 3,
+      activeCapabilities: ["forecast_wave_nearshore", "observed_wave", "tide", "wind"] as Array<
+        "forecast_wave_nearshore" | "observed_wave" | "tide" | "wind"
+      >
+    };
+
+    const direct = scoreSpotWindow(spot, {
+      ...input,
+      calibrationStatus: "modeled_uncalibrated"
+    });
+    const coldStart = scoreSpotWindow(spot, {
+      ...input,
+      usesColdStartTransform: true,
+      calibrationStatus: "cold_start_uncalibrated"
+    });
+
+    expect(direct.confidence).toBeGreaterThan(74);
+    expect(direct.confidence).toBeLessThanOrEqual(89);
+    expect(coldStart.confidence).toBeLessThanOrEqual(74);
+  });
+
   it("scores just-outside wraparound offshore wind without a discontinuity", () => {
     const spot = getSpotProfile("bolinas");
     const input = {

@@ -1,6 +1,6 @@
 import type { SpotId } from "@surf/contracts";
 import type { NorcalSpotProfile } from "@surf/forecast-core";
-import type { AdapterOutcome, SourceCaveat, SourceFetch } from "./types";
+import type { AdapterOutcome, AdapterStatus, SourceCaveat, SourceFetch } from "./types";
 import { combineStatus, errorMessage } from "./types";
 
 export type TideTrend = "rising" | "falling" | "steady" | "unknown";
@@ -13,9 +13,18 @@ export type TidePredictionRow = {
   tideTrend: TideTrend;
 };
 
+export type TideEventRow = {
+  spotId: SpotId;
+  stationId: string;
+  eventAt: string;
+  tideFtMllw: number;
+  eventType: "high" | "low";
+};
+
 type CoopsPrediction = {
   t?: unknown;
   v?: unknown;
+  type?: unknown;
 };
 
 type CoopsResponse = {
@@ -27,6 +36,7 @@ export type CoopsTideMetadata = {
   stationIds: string[];
   requestUrls: string[];
   rowCountByStation: Record<string, number>;
+  eventCountByStation: Record<string, number>;
   windowStart: string;
   windowEnd: string;
 };
@@ -57,6 +67,12 @@ export function buildCoopsTidePredictionsUrl(stationId: string, start: Date, end
   });
 
   return `${COOPS_DATAGETTER_URL}?${params.toString()}`;
+}
+
+export function buildCoopsTideEventsUrl(stationId: string, start: Date, end: Date): string {
+  const url = new URL(buildCoopsTidePredictionsUrl(stationId, start, end));
+  url.searchParams.set("interval", "hilo");
+  return url.toString();
 }
 
 function parseCoopsTime(value: unknown): string | null {
@@ -98,21 +114,27 @@ async function fetchStationPredictions(
   end: Date
 ): Promise<{
   rows: Array<Omit<TidePredictionRow, "spotId">>;
-  requestUrl: string;
+  events: Array<Omit<TideEventRow, "spotId">>;
+  requestUrls: string[];
+  eventStatus: "success" | "partial";
   caveats: SourceCaveat[];
   errors: string[];
 }> {
   const requestUrl = buildCoopsTidePredictionsUrl(stationId, start, end);
-  const response = await fetcher(requestUrl, {
-    headers: {
-      Accept: "application/json"
-    }
-  });
+  const eventRequestUrl = buildCoopsTideEventsUrl(stationId, start, end);
+  const [responseResult, eventResponseResult] = await Promise.allSettled([
+    fetcher(requestUrl, { headers: { Accept: "application/json" } }),
+    fetcher(eventRequestUrl, { headers: { Accept: "application/json" } })
+  ]);
+  if (responseResult.status === "rejected") throw responseResult.reason;
+  const response = responseResult.value;
 
   if (!response.ok) {
     return {
       rows: [],
-      requestUrl,
+      events: [],
+      requestUrls: [requestUrl, eventRequestUrl],
+      eventStatus: "partial",
       caveats: [],
       errors: [`CO-OPS ${stationId} returned HTTP ${response.status}`]
     };
@@ -123,7 +145,9 @@ async function fetchStationPredictions(
   if (apiError) {
     return {
       rows: [],
-      requestUrl,
+      events: [],
+      requestUrls: [requestUrl, eventRequestUrl],
+      eventStatus: "partial",
       caveats: [],
       errors: [`CO-OPS ${stationId}: ${apiError}`]
     };
@@ -132,7 +156,9 @@ async function fetchStationPredictions(
   if (!Array.isArray(payload.predictions) || payload.predictions.length === 0) {
     return {
       rows: [],
-      requestUrl,
+      events: [],
+      requestUrls: [requestUrl, eventRequestUrl],
+      eventStatus: "partial",
       caveats: [{ code: "coops_empty_predictions", message: `CO-OPS returned no tide predictions for ${stationId}.` }],
       errors: []
     };
@@ -159,7 +185,59 @@ async function fetchStationPredictions(
     tideTrend: trendFor(index, heights)
   }));
 
-  return { rows, requestUrl, caveats, errors: [] };
+  const events: Array<Omit<TideEventRow, "spotId">> = [];
+  let eventStatus: "success" | "partial" = "success";
+  const eventUnavailable = (message: string) => {
+    eventStatus = "partial";
+    caveats.push({ code: "coops_tide_events_unavailable", message });
+  };
+  if (eventResponseResult.status === "rejected") {
+    eventUnavailable(
+      `CO-OPS ${stationId} high/low predictions could not be fetched: ${errorMessage(eventResponseResult.reason)}`
+    );
+  } else if (!eventResponseResult.value.ok) {
+    eventUnavailable(
+      `CO-OPS ${stationId} high/low predictions returned HTTP ${eventResponseResult.value.status}.`
+    );
+  } else {
+    try {
+      const eventPayload = (await eventResponseResult.value.json()) as CoopsResponse;
+      const eventApiError = coopsErrorMessage(eventPayload);
+      if (eventApiError) {
+        eventUnavailable(`CO-OPS ${stationId} high/low predictions: ${eventApiError}`);
+      } else if (!Array.isArray(eventPayload.predictions)) {
+        eventUnavailable(`CO-OPS ${stationId} high/low predictions omitted the predictions array.`);
+      } else {
+        for (const prediction of eventPayload.predictions) {
+          const eventAt = parseCoopsTime(prediction.t);
+          const tideFtMllw = parseCoopsHeightFt(prediction.v);
+          const eventType = prediction.type === "H" ? "high" : prediction.type === "L" ? "low" : null;
+          if (!eventAt || tideFtMllw === null || !eventType) {
+            eventStatus = "partial";
+            caveats.push({
+              code: "coops_invalid_tide_event",
+              message: `Skipped a malformed CO-OPS high/low prediction for ${stationId}.`
+            });
+            continue;
+          }
+          events.push({ stationId, eventAt, tideFtMllw, eventType });
+        }
+      }
+    } catch (error) {
+      eventUnavailable(
+        `CO-OPS ${stationId} high/low predictions returned invalid JSON: ${errorMessage(error)}`
+      );
+    }
+  }
+
+  return {
+    rows,
+    events: events.sort((left, right) => left.eventAt.localeCompare(right.eventAt)),
+    requestUrls: [requestUrl, eventRequestUrl],
+    eventStatus,
+    caveats,
+    errors: []
+  };
 }
 
 export async function fetchCoopsTidePredictionsForSpots(
@@ -169,7 +247,7 @@ export async function fetchCoopsTidePredictionsForSpots(
     now?: Date;
     horizonHours?: number;
   } = {}
-): Promise<AdapterOutcome<TidePredictionRow, CoopsTideMetadata>> {
+): Promise<AdapterOutcome<TidePredictionRow, CoopsTideMetadata> & { events: TideEventRow[] }> {
   const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
   const now = options.now ?? new Date();
   const start = new Date(now);
@@ -178,29 +256,38 @@ export async function fetchCoopsTidePredictionsForSpots(
     ...new Set(spots.map((spot) => spot.sourceMap.coopsTide.stationId).filter(Boolean))
   ].sort();
   const rows: TidePredictionRow[] = [];
+  const events: TideEventRow[] = [];
   const caveats: SourceCaveat[] = [];
   const errors: string[] = [];
   const requestUrls: string[] = [];
   const rowCountByStation: Record<string, number> = {};
-  const statuses: Array<"success" | "failure"> = [];
+  const eventCountByStation: Record<string, number> = {};
+  const statuses: AdapterStatus[] = [];
 
   for (const stationId of stationIds) {
     try {
       const stationResult = await fetchStationPredictions(fetcher, stationId, start, end);
-      requestUrls.push(stationResult.requestUrl);
+      requestUrls.push(...stationResult.requestUrls);
       caveats.push(...stationResult.caveats);
       errors.push(...stationResult.errors);
       rowCountByStation[stationId] = stationResult.rows.length;
-      statuses.push(stationResult.errors.length > 0 || stationResult.rows.length === 0 ? "failure" : "success");
+      eventCountByStation[stationId] = stationResult.events.length;
+      statuses.push(
+        stationResult.errors.length > 0 || stationResult.rows.length === 0
+          ? "failure"
+          : stationResult.eventStatus
+      );
 
       const stationSpots = spots.filter(
         (spot) => spot.sourceMap.coopsTide.stationId === stationId
       );
       for (const spot of stationSpots) {
         rows.push(...stationResult.rows.map((row) => ({ ...row, spotId: spot.id })));
+        events.push(...stationResult.events.map((event) => ({ ...event, spotId: spot.id })));
       }
     } catch (error) {
       rowCountByStation[stationId] = 0;
+      eventCountByStation[stationId] = 0;
       errors.push(`CO-OPS ${stationId}: ${errorMessage(error)}`);
       statuses.push("failure");
     }
@@ -217,6 +304,7 @@ export async function fetchCoopsTidePredictionsForSpots(
     capabilities: ["tide"],
     status,
     rows,
+    events,
     caveats,
     errors,
     fetchedAt: new Date().toISOString(),
@@ -224,6 +312,7 @@ export async function fetchCoopsTidePredictionsForSpots(
       stationIds,
       requestUrls,
       rowCountByStation,
+      eventCountByStation,
       windowStart: start.toISOString(),
       windowEnd: end.toISOString()
     }

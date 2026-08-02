@@ -1,5 +1,6 @@
 .DS_Store
 node_modules/
+.pnpm-store/
 dist/
 dist-*/
 .wrangler/
@@ -11,6 +12,7 @@ coverage/
 .env.*
 !.env.example
 .dev.vars*
+!/apps/web/.dev.vars.example
 /apps/web/wrangler.instance.jsonc
 
 .venv/
