@@ -3,7 +3,6 @@ import type {
   ApiSpot,
   ForecastResponse,
   ScoredForecastWindow,
-  SourceCapability,
   SpotId,
   SpotsResponse
 } from "@surf/contracts";
@@ -15,26 +14,22 @@ import {
   Database,
   Info,
   RefreshCw,
-  Radio,
   Waves
 } from "lucide-react";
 import {
   availableLocalDateKeys,
   calmestWindow,
   cardinalDirection,
-  confidenceLabel,
   earliestAvailableLocalDateKey,
-  formatClock,
   formatDay,
   formatWindowSpan,
-  isPlanningWindow,
-  localDateParts,
   selectedSpotIdFromSearch,
   surfaceCondition,
   surfHeightRange,
   windRelation,
   type SurfaceCondition
 } from "./forecast-view";
+import { ForecastWorkbench } from "./features/workbench/ForecastWorkbench";
 
 type ForecastResult =
   | { status: "ready"; data: ForecastResponse }
@@ -92,11 +87,18 @@ function formatNumber(value: number | null, suffix: string, digits = 0): string 
   return `${value.toFixed(digits)}${suffix}`;
 }
 
-function formatFreshness(minutes: number | null): string {
-  if (minutes === null) return "Freshness unavailable";
-  if (minutes < 60) return `Updated ${Math.max(1, Math.round(minutes))}m ago`;
-  if (minutes < 24 * 60) return `Updated ${Math.round(minutes / 60)}h ago`;
-  return `Updated ${Math.round(minutes / (24 * 60))}d ago`;
+function formatSourceAgeRange(values: number[]): string {
+  if (values.length === 0) return "Source ages unavailable";
+  const minimum = Math.min(...values);
+  const maximum = Math.max(...values);
+  const formatAge = (minutes: number) => {
+    if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
+    if (minutes < 24 * 60) return `${Math.round(minutes / 60)}h`;
+    return `${Math.round(minutes / (24 * 60))}d`;
+  };
+  return minimum === maximum
+    ? `Source data ${formatAge(maximum)} old`
+    : `Sources ${formatAge(minimum)}–${formatAge(maximum)} old`;
 }
 
 function formatFetchedAt(value: string | null): string {
@@ -142,32 +144,12 @@ function tideTrend(windows: ScoredForecastWindow[], selected: ScoredForecastWind
   return difference > 0 ? "Rising" : "Falling";
 }
 
-function closestWindow(windows: ScoredForecastWindow[], now: Date): ScoredForecastWindow | undefined {
-  return windows
-    .filter((window) => window.ratingStatus === "scored")
-    .sort(
-      (left, right) =>
-        Math.abs(new Date(left.forecastAt).getTime() - now.getTime()) -
-        Math.abs(new Date(right.forecastAt).getTime() - now.getTime())
-    )[0];
-}
-
 function windowConditionText(spot: ApiSpot, window: ScoredForecastWindow): string {
   const surface = surfaceCondition(spot, window);
   if (window.ratingStatus !== "scored") return "No reliable surf call";
   if (surface === "unknown") return "Wind unavailable";
   if (surface === "fair") return "Fair surface";
   return surface[0]!.toUpperCase() + surface.slice(1);
-}
-
-function primarySwellText(window: ScoredForecastWindow): string {
-  const swell = window.primarySwell;
-  if (!swell || swell.heightFt === null || swell.periodSec === null) return "Swell unavailable";
-  return `${swell.heightFt.toFixed(1)} ft @ ${swell.periodSec.toFixed(0)}s ${cardinalDirection(swell.directionDeg)}`;
-}
-
-function isCdipMop(window: ScoredForecastWindow): boolean {
-  return window.waveProvenance?.sourceId === "cdip:mop-forecast";
 }
 
 function regionalReport(rows: DailySpotRow[], dateKey: string | null): { title: string; body: string } {
@@ -233,7 +215,7 @@ function Header({ state, onRefresh }: { state: DashboardState; onRefresh: () => 
   const sourceAges = Object.values(state.forecasts).flatMap((forecast) =>
     forecast?.status === "ready" ? forecast.data.windows.map((window) => window.sourceFreshnessMinutes) : []
   );
-  const freshest = sourceAges.length > 0 ? Math.min(...sourceAges) : null;
+  const sourceAgeRange = formatSourceAgeRange(sourceAges);
 
   return (
     <header className="appHeader">
@@ -242,9 +224,9 @@ function Header({ state, onRefresh }: { state: DashboardState; onRefresh: () => 
         <span>surf</span>
       </a>
       <div className="headerActions">
-        <span className="updateLabel" title={state.fetchedAt ? `Fetched ${formatFetchedAt(state.fetchedAt)}` : undefined}>
+        <span className="updateLabel" title={state.fetchedAt ? `Browser fetched ${formatFetchedAt(state.fetchedAt)}. ${sourceAgeRange}.` : sourceAgeRange}>
           <Clock3 size={15} aria-hidden="true" />
-          {formatFreshness(freshest)}
+          {sourceAgeRange}
         </span>
         <button className="refreshButton" type="button" onClick={onRefresh} disabled={state.loading}>
           <RefreshCw className={state.loading ? "spin" : undefined} size={17} aria-hidden="true" />
@@ -256,11 +238,26 @@ function Header({ state, onRefresh }: { state: DashboardState; onRefresh: () => 
 }
 
 function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }) {
-  const reportDateKey = earliestAvailableLocalDateKey(summaries, now);
+  const reportDateKey = earliestAvailableLocalDateKey(
+    summaries.map((summary) => ({
+      spot: summary.spot,
+      windows: summary.windows,
+      sunPhases: summary.forecast?.status === "ready" ? summary.forecast.data.sunPhases : undefined
+    })),
+    now
+  );
   const rows = summaries
     .map((summary) => ({
       ...summary,
-      window: reportDateKey ? calmestWindow(summary.spot, summary.windows, now, reportDateKey) : undefined
+      window: reportDateKey
+        ? calmestWindow(
+            summary.spot,
+            summary.windows,
+            now,
+            reportDateKey,
+            summary.forecast?.status === "ready" ? summary.forecast.data.sunPhases : undefined
+          )
+        : undefined
     }))
     .sort(sortDailyRows);
   const report = regionalReport(rows, reportDateKey);
@@ -355,104 +352,37 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
   );
 }
 
-function Timeline({
-  spot,
-  windows,
+function SpotDetail({
+  summary,
+  summaries,
   now,
-  selectedAt,
-  onSelect
+  onForecastRecovered
 }: {
-  spot: ApiSpot;
-  windows: ScoredForecastWindow[];
+  summary: SpotSummary;
+  summaries: SpotSummary[];
   now: Date;
-  selectedAt: string | null;
-  onSelect: (value: string) => void;
+  onForecastRecovered: (spotId: SpotId, forecast: ForecastResponse) => void;
 }) {
-  const dateKeys = availableLocalDateKeys(spot, windows, now).slice(0, 5);
-  const planningWindows = windows.filter((window) => isPlanningWindow(window, spot.timezone, now));
-  const maxHeight = Math.max(1, ...planningWindows.map((window) => window.waveHeightFt ?? 0));
-
-  return (
-    <div className="timelineViewport" tabIndex={0} aria-label="Five-day daylight forecast timeline">
-      <div className="timeline">
-        {dateKeys.map((dateKey) => {
-          const dayWindows = planningWindows.filter(
-            (window) => localDateParts(window.forecastAt, spot.timezone).key === dateKey
-          );
-          return (
-            <section className="timelineDay" key={dateKey}>
-              <h3>{dayWindows[0] ? formatDay(dayWindows[0].forecastAt, spot.timezone) : dateKey}</h3>
-              <div className="timelineSlots">
-                {dayWindows.map((window) => {
-                  const surface =
-                    window.ratingStatus === "scored" ? surfaceCondition(spot, window) : "unknown";
-                  const selected = selectedAt === window.forecastAt;
-                  const barHeight = window.waveHeightFt === null ? 8 : Math.max(12, (window.waveHeightFt / maxHeight) * 76);
-                  return (
-                    <button
-                      className={`timelineSlot ${surface}${selected ? " selected" : ""}`}
-                      type="button"
-                      key={window.forecastAt}
-                      onClick={() => onSelect(window.forecastAt)}
-                      aria-pressed={selected}
-                      aria-label={`${formatClock(window.forecastAt, spot.timezone)}, ${surfHeightRange(window.waveHeightFt)}, ${surface}`}
-                    >
-                      <span className="heightPlot" aria-hidden="true">
-                        <span style={{ height: `${barHeight}%` }} />
-                      </span>
-                      <strong>{surfHeightRange(window.waveHeightFt).replace(" ft", "")}</strong>
-                      <small>{formatClock(window.forecastAt, spot.timezone)}</small>
-                      <span className="surfaceBand" aria-hidden="true" />
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function SelectedWindowDetails({ spot, windows, window }: { spot: ApiSpot; windows: ScoredForecastWindow[]; window: ScoredForecastWindow }) {
-  const secondary = window.secondarySwell;
-  return (
-    <div className="selectedWindow" aria-live="polite">
-      <div className="selectedWindowHeading">
-        <div>
-          <p className="kicker">Selected window</p>
-          <h3>{formatDay(window.forecastAt, spot.timezone)} · {formatWindowSpan(window.forecastAt, spot.timezone)}</h3>
-        </div>
-        <ConditionPill spot={spot} window={window} />
-      </div>
-      <dl className="detailGrid">
-        <div><dt>Size estimate</dt><dd>{surfHeightRange(window.waveHeightFt)}</dd></div>
-        <div><dt>{isCdipMop(window) ? "MOP wave input" : "Primary swell"}</dt><dd>{primarySwellText(window)}</dd></div>
-        <div><dt>Secondary swell</dt><dd>{secondary?.heightFt !== null && secondary?.heightFt !== undefined ? `${secondary.heightFt.toFixed(1)} ft @ ${formatNumber(secondary.periodSec, "s")} ${cardinalDirection(secondary.directionDeg)}` : "None resolved"}</dd></div>
-        <div><dt>Wind</dt><dd>{cardinalDirection(window.windDirectionDeg)} {formatNumber(window.windSpeedKt, " kt")} · {windRelation(spot, window)}</dd></div>
-        <div><dt>Tide</dt><dd>{formatNumber(window.tideFt, " ft", 1)} · {tideTrend(windows, window)}</dd></div>
-        <div><dt>Confidence</dt><dd>{confidenceLabel(window.confidence)} · {formatFreshness(window.sourceFreshnessMinutes).replace("Updated ", "")}</dd></div>
-      </dl>
-    </div>
-  );
-}
-
-function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summaries: SpotSummary[]; now: Date }) {
   const { spot, windows, forecast } = summary;
-  const observation = forecast?.status === "ready" ? forecast.data.observation : null;
-  const current = closestWindow(windows, now);
-  const reportDateKey = availableLocalDateKeys(spot, windows, now)[0];
-  const dayBest = reportDateKey ? calmestWindow(spot, windows, now, reportDateKey) : undefined;
+  const forecastData = forecast?.status === "ready" ? forecast.data : null;
+  const reportDateKey = availableLocalDateKeys(
+    spot,
+    windows,
+    now,
+    forecastData?.sunPhases
+  )[0];
+  const dayBest = reportDateKey
+    ? calmestWindow(spot, windows, now, reportDateKey, forecastData?.sunPhases)
+    : undefined;
+  const current = windows
+    .filter((window) => window.ratingStatus === "scored")
+    .sort(
+      (left, right) =>
+        Math.abs(new Date(left.forecastAt).getTime() - now.getTime()) -
+        Math.abs(new Date(right.forecastAt).getTime() - now.getTime())
+    )[0];
   const featured = dayBest ?? current;
-  const [selectedAt, setSelectedAt] = useState<string | null>(featured?.forecastAt ?? null);
-  const selected = windows.find((window) => window.forecastAt === selectedAt) ?? featured;
-  const sourceCaveats = unique([
-    ...(forecast?.status === "ready" ? [forecast.data.sourceNote] : []),
-    ...windows.flatMap((window) => window.caveats)
-  ]).filter(Boolean);
-  const capabilities = unique(windows.flatMap((window) => window.activeCapabilities));
-  const hazards = activeHazardMessages([featured]);
+  const hazards = activeHazardMessages(windows);
 
   return (
     <>
@@ -469,11 +399,11 @@ function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summari
 
       <section className="spotHero">
         <div>
-          <p className="kicker">Five-day forecast</p>
+          <p className="kicker">Trust-first spot report</p>
           <h1>{spot.name}</h1>
           {featured ? (
             <p className="spotCall">
-              <strong>{formatDay(featured.forecastAt, spot.timezone, false)}:</strong> {surfHeightRange(featured.waveHeightFt)} modeled size and {surfaceCondition(spot, featured)} surface.
+              <strong>{formatDay(featured.forecastAt, spot.timezone, false)}:</strong> {formatNumber(featured.waveState?.modeledNearshoreHeightFt ?? featured.waveHeightFt, " ft", 1)} modeled nearshore Hs and {surfaceCondition(spot, featured)} surface.
               {dayBest && <> Calmest window: <strong>{formatWindowSpan(dayBest.forecastAt, spot.timezone)}</strong>.</>}
             </p>
           ) : (
@@ -483,80 +413,16 @@ function SpotDetail({ summary, summaries, now }: { summary: SpotSummary; summari
         {featured && <ConditionPill spot={spot} window={featured} />}
       </section>
 
-      {forecast?.status === "error" && (
-        <div className="errorBanner" role="alert">
-          <Info size={18} aria-hidden="true" />
-          <span>This spot forecast could not be loaded. Try refresh; no conditions were inferred.</span>
-        </div>
-      )}
-
       <HazardNotice messages={hazards} />
-
-      <section className="forecastSection" aria-labelledby="forecast-heading">
-        <div className="sectionTitle">
-          <div><p className="kicker">6am–6pm</p><h2 id="forecast-heading">Forecast timeline</h2></div>
-          <div className="timelineLegend" aria-label="Surface condition legend">
-            <span className="clean">Clean</span><span className="fair">Fair</span><span className="choppy">Choppy</span><span>Unknown</span>
-          </div>
-        </div>
-        {windows.length > 0 ? (
-          <>
-            <Timeline spot={spot} windows={windows} now={now} selectedAt={selectedAt} onSelect={setSelectedAt} />
-            {selected && <SelectedWindowDetails spot={spot} windows={windows} window={selected} />}
-          </>
-        ) : (
-          <div className="emptyState"><Info size={20} aria-hidden="true" /><span>No forecast windows returned.</span></div>
-        )}
-      </section>
-
-      <details className="dataDisclosure">
-        <summary>
-          <span><Radio size={17} aria-hidden="true" /> Data &amp; confidence</span>
-          <span>{featured ? `${confidenceLabel(featured.confidence)} confidence` : "No call"}</span>
-        </summary>
-        <div className="disclosureBody">
-          {featured?.waveProvenance && (
-            <dl className="provenanceGrid">
-              <div><dt>Wave source</dt><dd>{featured.waveProvenance.provider}</dd></div>
-              <div><dt>Source updated</dt><dd>{formatFetchedAt(featured.waveProvenance.sourceUpdatedAt)}</dd></div>
-              <div><dt>{isCdipMop(featured) ? "MOP Hs at point" : "Raw coastal height"}</dt><dd>{featured.waveProvenance.rawSignificantHeightFt.toFixed(1)} ft</dd></div>
-              {isCdipMop(featured) ? (
-                <>
-                  <div><dt>Spot exposure factor</dt><dd>× {(featured.waveProvenance.exposureScale ?? 1).toFixed(2)}</dd></div>
-                  <div><dt>Height used</dt><dd>{featured.waveProvenance.modeledNearshoreSignificantHeightFt?.toFixed(1) ?? "—"} ft modeled Hs</dd></div>
-                </>
-              ) : (
-                <div><dt>Spot exposure factor</dt><dd>× {featured.waveProvenance.breakingHeightScale.toFixed(2)}</dd></div>
-              )}
-            </dl>
-          )}
-          {observation && (
-            <p>
-              Buoy {observation.stationId}: {observation.waveHeightFt.toFixed(1)} ft @ {formatNumber(observation.dominantPeriodSec ?? observation.averagePeriodSec, "s")} {cardinalDirection(observation.meanWaveDirectionDeg)} · {observation.waterTempF === null ? "water temperature unavailable" : `${observation.waterTempF.toFixed(0)}°F water`} · {formatFreshness(observation.sourceFreshnessMinutes).replace("Updated ", "")}.
-            </p>
-          )}
-          <p>Active layers: {capabilities.length > 0 ? capabilities.map(capabilityName).join(" · ") : "none"}.</p>
-          {sourceCaveats.length > 0 && <ul>{sourceCaveats.slice(0, 6).map((caveat) => <li key={caveat}>{caveat}</li>)}</ul>}
-          <p>This forecast is for personal surf planning, not navigation or maritime safety.</p>
-        </div>
-      </details>
+      <ForecastWorkbench
+        spot={spot}
+        initialForecast={forecastData}
+        initialError={forecast?.status === "error" ? forecast.error : null}
+        now={now}
+        onForecastRecovered={onForecastRecovered}
+      />
     </>
   );
-}
-
-function capabilityName(capability: SourceCapability): string {
-  const labels: Record<SourceCapability, string> = {
-    forecast_wave_offshore: "offshore wave model",
-    forecast_wave_nearshore: "coastal wave model",
-    observed_wave: "buoy observation",
-    tide: "NOAA tide",
-    wind: "NWS wind",
-    hazard: "active hazard",
-    bathymetry: "bathymetry",
-    quality_label: "quality labels",
-    comparison_forecast: "comparison model"
-  };
-  return labels[capability];
 }
 
 function LoadingState() {
@@ -608,6 +474,17 @@ export function App() {
     }
   }, []);
 
+  const acceptRecoveredForecast = useCallback((spotId: SpotId, forecast: ForecastResponse) => {
+    setState((current) => ({
+      ...current,
+      forecasts: {
+        ...current.forecasts,
+        [spotId]: { status: "ready", data: forecast }
+      },
+      fetchedAt: new Date().toISOString()
+    }));
+  }, []);
+
   useEffect(() => {
     void loadDashboard();
     const interval = window.setInterval(() => void loadDashboard(), 15 * 60 * 1000);
@@ -649,7 +526,12 @@ export function App() {
       {state.loading && state.spots.length === 0 ? (
         <LoadingState />
       ) : selectedSummary ? (
-        <SpotDetail summary={selectedSummary} summaries={summaries} now={now} />
+        <SpotDetail
+          summary={selectedSummary}
+          summaries={summaries}
+          now={now}
+          onForecastRecovered={acceptRecoveredForecast}
+        />
       ) : (
         <DailyReport summaries={summaries} now={now} />
       )}

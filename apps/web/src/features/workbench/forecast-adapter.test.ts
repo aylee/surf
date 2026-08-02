@@ -1,0 +1,228 @@
+import { describe, expect, it } from "vitest";
+import { ForecastResponseSchema, type ApiSpot, type ForecastResponse } from "@surf/contracts";
+import { getSpotProfile } from "@surf/forecast-core";
+import { buildFixtureForecast } from "@surf/forecast-core/test-support";
+import {
+  adaptForecastResponse,
+  parseBriefResponse,
+  readWorkbenchUrl,
+  sourceHealthForWindow
+} from "./forecast-adapter";
+
+const profile = getSpotProfile("bolinas");
+const spot = {
+  ...profile,
+  sourceMap: {
+    nwsWaveGrid: {
+      provider: "NOAA/NWS MTR",
+      forecastGridData: "https://api.weather.gov/gridpoints/MTR/85,105",
+      breakingHeightScale: 1,
+      notes: "Test source"
+    },
+    observedWave: [{ provider: "NDBC", stationId: "46237", name: "San Francisco Bar" }],
+    coopsTide: { stationId: "9414958", name: "Bolinas Lagoon" }
+  }
+} satisfies ApiSpot;
+
+function fixture(overrides: Partial<ForecastResponse> = {}): ForecastResponse {
+  return ForecastResponseSchema.parse({ ...buildFixtureForecast("bolinas"), ...overrides });
+}
+
+describe("forecast workbench adapter", () => {
+  it("keeps a direct CDIP bulk wave state separate from swell components", () => {
+    const base = buildFixtureForecast("bolinas");
+    const forecast = fixture({
+      interval: "1h",
+      windows: [
+        {
+          ...base.windows[0]!,
+          windGustKt: 11,
+          weatherSummary: "Mostly cloudy",
+          waveState: {
+            semantics: "direct_nearshore",
+            calibrationStatus: "modeled_uncalibrated",
+            validFrom: base.windows[0]!.forecastAt,
+            validTo: new Date(new Date(base.windows[0]!.forecastAt).getTime() + 3 * 3_600_000).toISOString(),
+            sourceResolutionHours: 3,
+            modeledNearshoreHeightFt: 3.4,
+            breakingSurfHeightFt: null,
+            periodSec: 10,
+            directionDeg: 289
+          },
+          resolution: {
+            wave: {
+              sourceIntervalMinutes: 180,
+              displayIntervalMinutes: 60,
+              method: "held",
+              validFrom: base.windows[0]!.forecastAt,
+              validTo: new Date(new Date(base.windows[0]!.forecastAt).getTime() + 3 * 3_600_000).toISOString()
+            },
+            wind: {
+              sourceIntervalMinutes: 60,
+              displayIntervalMinutes: 60,
+              method: "exact",
+              validFrom: base.windows[0]!.forecastAt,
+              validTo: new Date(new Date(base.windows[0]!.forecastAt).getTime() + 3_600_000).toISOString()
+            },
+            tide: {
+              sourceIntervalMinutes: 60,
+              displayIntervalMinutes: 60,
+              method: "exact",
+              validFrom: base.windows[0]!.forecastAt,
+              validTo: new Date(new Date(base.windows[0]!.forecastAt).getTime() + 3_600_000).toISOString()
+            }
+          }
+        }
+      ],
+      tideEvents: [{
+        stationId: "9414958",
+        eventAt: base.windows[0]!.forecastAt,
+        type: "high",
+        heightFtMllw: 5.1,
+        sourceRunId: "run"
+      }]
+    });
+
+    const adapted = adaptForecastResponse(forecast, spot, "1h");
+
+    expect(adapted.interval).toBe("1h");
+    expect(adapted.windows[0]?.modeledHeightFt).toBe(3.4);
+    expect(adapted.windows[0]?.waveSemanticsLabel).toBe("Modeled nearshore Hs");
+    expect(adapted.windows[0]?.waveResolutionMethod).toBe("held");
+    expect(adapted.windows[0]?.resolutionHours).toBe(3);
+    expect(adapted.windows[0]?.swellComponents).toEqual([]);
+    expect(adapted.windows[0]?.windGustKt).toBe(11);
+    expect(adapted.tideEvents[0]).toMatchObject({ type: "high", heightFt: 5.1 });
+  });
+
+  it("retains explicit NWS swell partitions", () => {
+    const adapted = adaptForecastResponse(fixture(), spot, "3h");
+    expect(adapted.windows[0]?.waveSemantics).toBe("nws_fallback");
+    expect(adapted.windows[0]?.waveResolutionMethod).toBe("exact");
+    expect(adapted.windows[0]?.swellComponents[0]?.label).toBe("Primary");
+  });
+
+  it("keeps an unavailable wave field unavailable without inventing semantics or validity", () => {
+    const base = buildFixtureForecast("bolinas");
+    const forecast = fixture({
+      interval: "1h",
+      windows: [{
+        ...base.windows[0]!,
+        waveHeightFt: null,
+        peakPeriodSec: null,
+        primaryDirectionDeg: null,
+        primarySwell: null,
+        secondarySwell: null,
+        waveProvenance: null,
+        waveState: null,
+        sourceFreshness: [{
+          capability: "forecast_wave_nearshore",
+          sourceId: "wave:unavailable",
+          sourceRunId: null,
+          updatedAt: null,
+          freshnessMinutes: null,
+          status: "missing"
+        }],
+        resolution: {
+          wave: {
+            sourceIntervalMinutes: null,
+            displayIntervalMinutes: 60,
+            method: "unavailable",
+            validFrom: null,
+            validTo: null
+          },
+          wind: {
+            sourceIntervalMinutes: 60,
+            displayIntervalMinutes: 60,
+            method: "exact",
+            validFrom: base.windows[0]!.forecastAt,
+            validTo: new Date(new Date(base.windows[0]!.forecastAt).getTime() + 3_600_000).toISOString()
+          },
+          tide: {
+            sourceIntervalMinutes: 60,
+            displayIntervalMinutes: 60,
+            method: "exact",
+            validFrom: base.windows[0]!.forecastAt,
+            validTo: new Date(new Date(base.windows[0]!.forecastAt).getTime() + 3_600_000).toISOString()
+          }
+        }
+      }]
+    });
+
+    const adapted = adaptForecastResponse(forecast, spot, "1h");
+    const window = adapted.windows[0]!;
+
+    expect(window.waveSemantics).toBe("unavailable");
+    expect(window.waveSemanticsLabel).toBe("Wave state unavailable");
+    expect(window.waveResolutionMethod).toBe("unavailable");
+    expect(window.validFrom).toBeNull();
+    expect(window.validTo).toBeNull();
+    expect(window.resolutionHours).toBeNull();
+    expect(window.dataHealth).toBe("limited");
+    expect(sourceHealthForWindow(window)).toMatchObject([{
+      id: "forecast_wave_nearshore:wave:unavailable",
+      status: "missing",
+      ageMinutes: null
+    }]);
+  });
+
+  it("parses the validated brief envelope and object bust factors", () => {
+    const brief = parseBriefResponse({
+      status: "model",
+      brief: {
+        provider: "google",
+        headline: "Early wind window",
+        setup: "Public facts only.",
+        revision: 2,
+        generatedAt: "2026-08-02T12:00:00Z",
+        picks: [{ windowId: "window:1", label: "Sun 7:00 AM", why: "Wind is lighter.", tradeoff: "Lower tide." }],
+        bustFactors: [{ text: "Wind arrives early.", factRefs: ["wind:1"] }],
+        lesson: { topic: "Period", text: "Period changes wave energy.", factRefs: ["wave:1"] }
+      }
+    });
+
+    expect(brief).toMatchObject({
+      status: "model",
+      provider: "google",
+      headline: "Early wind window",
+      revision: 2,
+      picks: [{ label: "Sun 7:00 AM" }],
+      bustFactors: ["Wind arrives early."]
+    });
+  });
+
+  it("preserves a stale deterministic brief and its fallback reason", () => {
+    const brief = parseBriefResponse({
+      status: "stale",
+      fallbackReason: "Forecast inputs changed materially.",
+      availableRevisions: 3,
+      brief: {
+        provider: "deterministic",
+        headline: "Use the deterministic read",
+        setup: "The prior model brief no longer matches the inputs.",
+        revision: 3,
+        generatedAt: "2026-08-02T12:00:00Z",
+        picks: [{ windowId: "window:1", label: "Sun 7:00 AM", why: "The score leads.", tradeoff: "Check freshness." }],
+        bustFactors: [],
+        lesson: { topic: "Freshness", text: "Check source age." }
+      }
+    });
+
+    expect(brief).toMatchObject({
+      status: "stale",
+      provider: "deterministic",
+      fallbackReason: "Forecast inputs changed materially.",
+      availableRevisions: 3,
+      picks: [{ label: "Sun 7:00 AM" }]
+    });
+  });
+
+  it("defaults URL state to a three-hour table", () => {
+    expect(readWorkbenchUrl("?spot=bolinas")).toEqual({
+      interval: "3h",
+      view: "table",
+      date: null,
+      at: null
+    });
+  });
+});

@@ -1,6 +1,7 @@
-import type { ScoredForecastWindow, SpotId, SpotProfile } from "@surf/contracts";
+import type { ForecastResponse, ScoredForecastWindow, SpotId, SpotProfile } from "@surf/contracts";
 import {
   directionInCircularWindow,
+  selectCanonicalRecommendationIds,
   surfaceConditionForWind,
   type SurfaceCondition as CoreSurfaceCondition
 } from "@surf/forecast-core";
@@ -25,15 +26,6 @@ export function selectedSpotIdFromSearch(
   const value = new URLSearchParams(search).get("spot");
   return value && availableSpotIds.some((spotId) => spotId === value) ? value : null;
 }
-
-const qualityRank: Record<ScoredForecastWindow["qualityLabel"], number> = {
-  excellent: 5,
-  good: 4,
-  fun: 3,
-  fair: 2,
-  poor: 1,
-  unknown: 0
-};
 
 export function localDateParts(value: string | Date, timeZone: string): LocalDateParts {
   const date = value instanceof Date ? value : new Date(value);
@@ -65,12 +57,38 @@ export function localDateParts(value: string | Date, timeZone: string): LocalDat
 export function isPlanningWindow(
   window: ScoredForecastWindow,
   timeZone: string,
-  now = new Date()
+  now = new Date(),
+  sunPhases?: ForecastResponse["sunPhases"]
 ): boolean {
   const forecastAt = new Date(window.forecastAt);
   if (Number.isNaN(forecastAt.getTime()) || forecastAt.getTime() < now.getTime()) return false;
-  const { hour } = localDateParts(forecastAt, timeZone);
-  return hour >= DAYTIME_START_HOUR && hour < DAYTIME_END_HOUR;
+  const local = localDateParts(forecastAt, timeZone);
+  const phase = sunPhases?.find((candidate) => candidate.localDate === local.key);
+  if (!phase) return local.hour >= DAYTIME_START_HOUR && local.hour < DAYTIME_END_HOUR;
+  const minute = localMinuteOfDay(forecastAt, timeZone);
+  const firstLight = phaseMinuteOfDay(phase.firstLight, timeZone);
+  const lastLight = phaseMinuteOfDay(phase.lastLight, timeZone);
+  return firstLight !== null && lastLight !== null && minute >= firstLight && minute <= lastLight;
+}
+
+function localMinuteOfDay(value: string | Date, timeZone: string): number {
+  const date = value instanceof Date ? value : new Date(value);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZone
+  }).formatToParts(date);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((candidate) => candidate.type === type)?.value ?? Number.NaN);
+  return part("hour") * 60 + part("minute");
+}
+
+function phaseMinuteOfDay(value: string, timeZone: string): number | null {
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) return localMinuteOfDay(parsed, timeZone);
+  const clock = value.match(/^(\d{1,2}):(\d{2})/);
+  return clock ? Number(clock[1]) * 60 + Number(clock[2]) : null;
 }
 
 export function surfaceCondition(
@@ -137,47 +155,55 @@ export function calmestWindow(
   spot: SpotProfile,
   windows: ScoredForecastWindow[],
   now = new Date(),
-  dateKey?: string
+  dateKey?: string,
+  sunPhases?: ForecastResponse["sunPhases"]
 ): ScoredForecastWindow | undefined {
-  return windows
-    .filter((window) => {
-      if (!isPlanningWindow(window, spot.timezone, now)) return false;
-      if (dateKey && localDateParts(window.forecastAt, spot.timezone).key !== dateKey) return false;
-      return window.ratingStatus === "scored";
-    })
-    .sort((left, right) => {
-      const surfaceDelta =
-        ["unknown", "choppy", "fair", "clean"].indexOf(surfaceCondition(spot, right)) -
-        ["unknown", "choppy", "fair", "clean"].indexOf(surfaceCondition(spot, left));
-      if (surfaceDelta !== 0) return surfaceDelta;
-      const qualityDelta = qualityRank[right.qualityLabel] - qualityRank[left.qualityLabel];
-      if (qualityDelta !== 0) return qualityDelta;
-      if (right.score !== left.score) return right.score - left.score;
-      if (right.confidence !== left.confidence) return right.confidence - left.confidence;
-      return left.forecastAt.localeCompare(right.forecastAt);
-    })[0];
+  const eligible = windows.filter(
+    (window) =>
+      (!dateKey || localDateParts(window.forecastAt, spot.timezone).key === dateKey) &&
+      isPlanningWindow(window, spot.timezone, now, sunPhases)
+  );
+  const selectedId = selectCanonicalRecommendationIds(
+    eligible.map((window) => ({
+      windowId: window.forecastAt,
+      forecastAt: window.forecastAt,
+      isDaylight: true,
+      ratingStatus: window.ratingStatus,
+      surfaceCondition: window.surfaceCondition ?? surfaceCondition(spot, window),
+      score: window.score,
+      confidence: window.confidence
+    })),
+    now
+  )[0];
+  return eligible.find((window) => window.forecastAt === selectedId);
 }
 
 export function availableLocalDateKeys(
   spot: SpotProfile,
   windows: ScoredForecastWindow[],
-  now = new Date()
+  now = new Date(),
+  sunPhases?: ForecastResponse["sunPhases"]
 ): string[] {
-  return [...new Set(windows.filter((window) => isPlanningWindow(window, spot.timezone, now)).map((window) =>
+  return [...new Set(windows.filter((window) => isPlanningWindow(window, spot.timezone, now, sunPhases)).map((window) =>
     localDateParts(window.forecastAt, spot.timezone).key
   ))].sort();
 }
 
 export function earliestAvailableLocalDateKey(
-  forecasts: Array<{ spot: SpotProfile; windows: ScoredForecastWindow[] }>,
+  forecasts: Array<{
+    spot: SpotProfile;
+    windows: ScoredForecastWindow[];
+    sunPhases?: ForecastResponse["sunPhases"];
+  }>,
   now = new Date()
 ): string | null {
   return forecasts
-    .flatMap(({ spot, windows }) =>
+    .flatMap(({ spot, windows, sunPhases }) =>
       availableLocalDateKeys(
         spot,
         windows.filter((window) => window.ratingStatus === "scored"),
-        now
+        now,
+        sunPhases
       )
     )
     .sort()[0] ?? null;
