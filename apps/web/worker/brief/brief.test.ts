@@ -5,7 +5,7 @@ import {
   buildDeterministicForecastBrief,
   buildUnavailableForecastBriefResponse
 } from "./brief";
-import { buildForecastFactBundle } from "./facts";
+import { buildForecastFactBundle, forecastBriefWindowLabel } from "./facts";
 import { briefForecastFixture, validDraftFor } from "./test-helpers";
 
 describe("forecast brief assembly", () => {
@@ -17,6 +17,9 @@ describe("forecast brief assembly", () => {
     expect(brief.modelId).toBeNull();
     expect(brief.picks.map((pick) => pick.windowId)).toEqual(bundle.input.recommendationWindowIds);
     expect(brief.bustFactors[0]?.factRefs.length).toBeGreaterThan(0);
+    expect(brief.picks[0]?.why).not.toBe(brief.picks[1]?.why);
+    expect(brief.picks[0]?.tradeoff).not.toBe(brief.picks[1]?.tradeoff);
+    expect(JSON.stringify(brief)).not.toMatch(/condition score|deterministic fallback/i);
   });
 
   it("builds a typed last-resort response without forecast or model dependencies", () => {
@@ -51,10 +54,22 @@ describe("forecast brief assembly", () => {
     });
 
     expect(brief).toMatchObject({
+      schemaVersion: 2,
       provider: "google",
       modelId: "gemini-3.6-flash",
+      promptVersion: "surf-brief-v2",
       revision: 3,
-      inputFingerprint: bundle.inputFingerprint
+      inputFingerprint: bundle.inputFingerprint,
+      setup: validDraftFor(bundle).summary.text
+    });
+    expect(brief.headline).toMatch(/leads at Linda Mar/i);
+    expect(brief.picks.map((pick) => pick.label)).toEqual(
+      bundle.input.recommendationWindowIds.map((windowId) =>
+        forecastBriefWindowLabel(bundle, windowId)
+      )
+    );
+    expect(brief.bustFactors.at(-1)).toMatchObject({
+      text: expect.stringContaining("not an observed breaking-wave face height")
     });
   });
 });

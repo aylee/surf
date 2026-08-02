@@ -61,6 +61,20 @@ function parseRevision(row: ForecastBriefRevisionRow): PersistedForecastBriefRev
   ) {
     throw new Error("Stored forecast brief fact references do not match validation metadata");
   }
+  if (validation.claimRefs) {
+    const claimFactRefs = [
+      ...new Set(validation.claimRefs.flatMap((claim) => claim.factRefs))
+    ].sort();
+    if (
+      JSON.stringify(claimFactRefs) !==
+      JSON.stringify([...validation.referencedFactIds].sort())
+    ) {
+      throw new Error("Stored forecast brief claim references do not match validation metadata");
+    }
+  }
+  if (row.expires_at !== null && !Number.isFinite(new Date(row.expires_at).getTime())) {
+    throw new Error("Stored forecast brief expiration is invalid");
+  }
   if (
     brief.spotId !== row.spot_id ||
     brief.localDate !== row.local_date ||
@@ -102,6 +116,26 @@ export async function getLatestValidatedForecastBrief(
        limit 1`
     )
     .bind(spotId, localDate)
+    .first<ForecastBriefRevisionRow>();
+  return row ? parseRevision(row) : null;
+}
+
+export async function getLatestValidatedForecastBriefForMaterialFingerprint(
+  db: D1Database,
+  spotId: string,
+  localDate: string,
+  materialFingerprint: string
+): Promise<PersistedForecastBriefRevision | null> {
+  const row = await db
+    .prepare(
+      `select ${SELECT_COLUMNS}
+       from forecast_brief_revisions
+       where spot_id = ? and local_date = ? and material_fingerprint = ?
+         and status = 'validated'
+       order by revision desc
+       limit 1`
+    )
+    .bind(spotId, localDate, materialFingerprint)
     .first<ForecastBriefRevisionRow>();
   return row ? parseRevision(row) : null;
 }

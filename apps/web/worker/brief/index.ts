@@ -5,7 +5,9 @@ export {
 } from "./brief";
 export {
   buildForecastFactBundle,
+  FORECAST_BRIEF_GENERATION_CONTRACT,
   forecastBriefFrame,
+  forecastBriefLockedFacts,
   forecastBriefWindowLabel,
   isMaterialBriefChange,
   type BuildForecastFactBundleOptions
@@ -15,6 +17,7 @@ export type { BriefGenerator } from "./generator";
 export {
   countValidatedForecastBriefRevisions,
   getLatestValidatedForecastBrief,
+  getLatestValidatedForecastBriefForMaterialFingerprint,
   getValidatedForecastBriefByFingerprint,
   persistValidatedForecastBrief,
   type PersistedForecastBriefRevision
@@ -24,6 +27,8 @@ export {
   buildForecastBriefResponse
 } from "./response";
 export {
+  FORECAST_BRIEF_QUALITY_POLICY_VERSION,
+  FORECAST_FACT_BUNDLE_SCHEMA_VERSION,
   FORECAST_BRIEF_MODEL_ID,
   FORECAST_BRIEF_PROMPT_VERSION,
   FORECAST_BRIEF_SCHEMA_VERSION,

@@ -1245,6 +1245,8 @@ footer {
 .forecastDayPicker button:focus-visible,
 .forecastTable button:focus-visible,
 .graphTimeRail button:focus-visible,
+.lessonCallout summary:focus-visible,
+.bustFactors summary:focus-visible,
 .uiAccordionTrigger:focus-visible {
   outline: 3px solid rgb(46 139 120 / 25%);
   outline-offset: 2px;
@@ -1403,9 +1405,6 @@ footer {
 
 .dailyBrief {
   position: relative;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 16px;
   margin-top: 16px;
   padding: clamp(20px, 3vw, 28px);
   overflow: hidden;
@@ -1417,130 +1416,169 @@ footer {
   box-shadow: 0 10px 32px rgb(18 50 61 / 6%);
 }
 
-.dailyBriefIcon {
-  display: grid;
-  width: 44px;
-  height: 44px;
-  place-items: center;
-  border-radius: 13px;
-  background: #dceee7;
-  color: #1f6f5d;
-}
-
 .dailyBriefMeta {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 7px;
-  color: #6d7f84;
-  font-size: 0.69rem;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 9px;
+  color: #536a70;
+  font-size: 0.76rem;
 }
 
 .dailyBriefMeta .kicker {
   margin: 0;
 }
 
-.aiBadge {
-  border-color: #b9d9cf;
-  background: #def1ea;
-  color: #175d4c;
-}
-
-.briefLoading {
-  margin-left: auto;
-}
-
 .dailyBrief h2 {
-  max-width: 780px;
-  margin-bottom: 8px;
+  max-width: 760px;
+  margin-bottom: 9px;
   color: var(--ink);
-  font-size: clamp(1.45rem, 2.5vw, 2rem);
-  line-height: 1.08;
+  font-size: clamp(1.55rem, 2.7vw, 2.15rem);
+  line-height: 1.1;
 }
 
 .dailyBriefSetup {
-  max-width: 850px;
+  max-width: 780px;
   margin-bottom: 0;
   color: #4e666d;
-  font-size: 0.95rem;
-  line-height: 1.55;
+  font-size: 1rem;
+  line-height: 1.6;
 }
 
-.briefPicks {
+.briefRecommendations {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 8px;
-  margin-top: 16px;
+  grid-template-columns: minmax(0, 1.15fr) minmax(240px, 0.85fr);
+  gap: 12px;
+  margin-top: 20px;
 }
 
-.briefPicks > div {
-  padding: 13px 14px;
+.briefPrimaryPick,
+.briefAlternateList {
   border: 1px solid #d9e2de;
-  border-radius: 12px;
-  background: rgb(255 255 255 / 62%);
+  border-radius: 14px;
+  background: rgb(255 255 255 / 68%);
 }
 
-.briefPicks strong,
-.lessonCallout > span {
+.briefPrimaryPick {
+  padding: 17px 18px;
+  box-shadow: inset 3px 0 0 var(--sea);
+}
+
+.briefPrimaryPick:only-child {
+  grid-column: 1 / -1;
+}
+
+.briefAlternateList {
+  padding: 15px 16px;
+  background: rgb(255 255 255 / 42%);
+}
+
+.briefSectionLabel,
+.briefPickDetails dt,
+.lessonCallout summary > span {
+  margin: 0;
   color: #4c676c;
-  font-size: 0.68rem;
+  font-size: 0.7rem;
   font-weight: 800;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
-.briefPicks p,
-.briefPicks small {
-  display: block;
-  margin: 5px 0 0;
-  color: #29474f;
-  font-size: 0.79rem;
-  line-height: 1.45;
+.briefPrimaryPick h3,
+.briefAlternatePick h3 {
+  margin: 4px 0 0;
+  color: var(--ink);
+  line-height: 1.2;
 }
 
-.briefPicks small {
-  color: #6d7e82;
+.briefPrimaryPick h3 {
+  font-size: clamp(1.25rem, 2vw, 1.55rem);
+}
+
+.briefAlternatePick h3 {
+  font-size: 1rem;
+}
+
+.briefPickDetails {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 0;
+}
+
+.briefPickDetails > div {
+  display: grid;
+  gap: 3px;
+}
+
+.briefPickDetails dd {
+  margin: 0;
+  color: #29474f;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.briefAlternatePick {
+  padding-top: 13px;
+}
+
+.briefAlternatePick + .briefAlternatePick {
+  margin-top: 13px;
+  border-top: 1px solid #dce4e1;
 }
 
 .briefFooter {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
-  gap: 12px;
-  margin-top: 13px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 8px;
+  border-top: 1px solid #dce5e1;
 }
 
-.lessonCallout {
-  padding: 11px 13px;
-  border-left: 3px solid var(--sea);
-  background: #edf6f1;
+.lessonCallout,
+.bustFactors {
+  min-width: 0;
+  color: #5f7277;
+  font-size: 0.84rem;
+}
+
+.lessonCallout summary,
+.bustFactors summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 9px;
+  border-radius: 9px;
+  cursor: pointer;
+  font-weight: 720;
+}
+
+.lessonCallout summary:hover,
+.bustFactors summary:hover {
+  background: rgb(255 255 255 / 45%);
+}
+
+.lessonCallout summary small {
+  color: #536a70;
+  font-size: 0.78rem;
+  font-weight: 550;
+  text-transform: none;
 }
 
 .lessonCallout p {
-  margin: 4px 0 0;
+  margin: 2px 9px 10px;
   color: #476269;
-  font-size: 0.78rem;
-  line-height: 1.45;
-}
-
-.bustFactors {
-  min-width: 190px;
-  color: #5f7277;
-  font-size: 0.76rem;
-}
-
-.bustFactors summary {
-  padding: 8px 0;
-  cursor: pointer;
-  font-weight: 720;
+  line-height: 1.55;
 }
 
 .bustFactors ul {
   display: grid;
   gap: 5px;
-  margin: 5px 0 0;
-  padding-left: 18px;
-  line-height: 1.4;
+  margin: 2px 9px 10px;
+  padding-left: 20px;
+  line-height: 1.5;
 }
 
 .workbenchSection {
@@ -2325,32 +2363,31 @@ footer {
 
 @media (max-width: 800px) {
   .dailyBrief {
-    grid-template-columns: 1fr;
-    gap: 12px;
-    padding: 18px;
+    padding: 18px 16px;
     border-radius: 17px;
-  }
-
-  .dailyBriefIcon {
-    width: 38px;
-    height: 38px;
   }
 
   .dailyBriefMeta {
     flex-wrap: wrap;
+    justify-content: flex-start;
   }
 
-  .briefLoading {
+  .dailyBriefMeta time {
     width: 100%;
-    margin-left: 0;
   }
 
+  .briefRecommendations,
   .briefFooter {
     grid-template-columns: 1fr;
   }
 
-  .bustFactors {
-    min-width: 0;
+  .briefPrimaryPick,
+  .briefAlternateList {
+    padding: 15px;
+  }
+
+  .briefPickDetails dd {
+    font-size: 0.94rem;
   }
 
   .workbenchSection {

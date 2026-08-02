@@ -7,7 +7,11 @@ import {
   type ForecastFactBundle
 } from "../brief/types";
 import { validateForecastBriefDraft } from "../brief/validator";
-import { retryDelaySecondsAfterFailure } from "./retry-policy";
+import {
+  classifyForecastBriefFailure,
+  retryDelaySecondsAfterFailure,
+  StoredForecastFactBundleError
+} from "./retry-policy";
 
 export type ForecastBriefAgentEnv = Cloudflare.Env;
 
@@ -17,6 +21,7 @@ type BriefJobStatus =
   | "retry_wait"
   | "published"
   | "disabled"
+  | "terminal"
   | "exhausted";
 
 type BriefJobRow = {
@@ -34,7 +39,13 @@ type BriefJobRow = {
 };
 
 export type ForecastBriefSignalResult = {
-  status: "accepted" | "duplicate" | "ignored_non_material" | "disabled" | "exhausted";
+  status:
+    | "accepted"
+    | "duplicate"
+    | "ignored_non_material"
+    | "disabled"
+    | "terminal"
+    | "exhausted";
   inputFingerprint: string;
   materialFingerprint: string;
 };
@@ -55,6 +66,21 @@ type ProcessPayload = {
   generationToken: string;
 };
 
+type RetryPayload = ProcessPayload & {
+  attemptCount: number;
+};
+
+// Final failures should not hot-loop when a key or provider configuration is
+// wrong, but a later ingest must be able to recover after the operator fixes
+// it. A new input fingerprint proves this is a later signal; the cooldown
+// bounds retries while the underlying material forecast remains unchanged.
+export const FORECAST_BRIEF_FINAL_RECOVERY_COOLDOWN_MS = 5 * 60 * 1000;
+
+// `generating` is a lease rather than a permanent lock. If a Worker is
+// interrupted after claiming a queued item, a later signal can reclaim it
+// after this interval. Generation tokens keep a late callback from publishing.
+export const FORECAST_BRIEF_GENERATION_LEASE_MS = 10 * 60 * 1000;
+
 function enabled(value: string | undefined): boolean {
   return value?.trim().toLowerCase() === "true";
 }
@@ -63,7 +89,7 @@ function parseBundle(value: string): ForecastFactBundle {
   try {
     return ForecastFactBundleSchema.parse(JSON.parse(value));
   } catch (error) {
-    throw new Error(
+    throw new StoredForecastFactBundleError(
       `Stored forecast fact bundle is invalid: ${error instanceof Error ? error.message : "parse error"}`
     );
   }
@@ -72,6 +98,11 @@ function parseBundle(value: string): ForecastFactBundle {
 function safeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/AIza[0-9A-Za-z_-]{20,}/g, "[redacted]").slice(0, 500);
+}
+
+function elapsed(timestamp: string, durationMs: number, nowMs = Date.now()): boolean {
+  const updatedAtMs = new Date(timestamp).getTime();
+  return !Number.isFinite(updatedAtMs) || nowMs - updatedAtMs >= durationMs;
 }
 
 export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
@@ -137,9 +168,25 @@ export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
         materialFingerprint: bundle.materialFingerprint
       };
     }
+    const sameMaterial =
+      existing !== null && existing.material_fingerprint === bundle.materialFingerprint;
+    const recoverStaleGeneration =
+      existing !== null &&
+      sameMaterial &&
+      existing.status === "generating" &&
+      elapsed(existing.updated_at, FORECAST_BRIEF_GENERATION_LEASE_MS);
+    const recoverFinalFailure =
+      existing !== null &&
+      sameMaterial &&
+      (existing.status === "terminal" || existing.status === "exhausted") &&
+      existing.last_seen_fingerprint !== bundle.inputFingerprint &&
+      elapsed(existing.updated_at, FORECAST_BRIEF_FINAL_RECOVERY_COOLDOWN_MS);
     if (
-      existing?.material_fingerprint === bundle.materialFingerprint &&
-      existing.status !== "disabled"
+      existing !== null &&
+      sameMaterial &&
+      existing.status !== "disabled" &&
+      !recoverStaleGeneration &&
+      !recoverFinalFailure
     ) {
       return {
         status:
@@ -147,7 +194,9 @@ export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
             ? "ignored_non_material"
             : existing.status === "exhausted"
               ? "exhausted"
-              : "duplicate",
+              : existing.status === "terminal"
+                ? "terminal"
+                : "duplicate",
         inputFingerprint: bundle.inputFingerprint,
         materialFingerprint: bundle.materialFingerprint
       };
@@ -176,10 +225,32 @@ export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
         last_error = null,
         updated_at = excluded.updated_at
     `;
-    await this.queue("processPending", {
-      localDate: bundle.input.localDate,
-      generationToken
-    } satisfies ProcessPayload);
+    try {
+      await this.queue(
+        "processPending",
+        {
+          localDate: bundle.input.localDate,
+          generationToken
+        } satisfies ProcessPayload,
+        { retry: { maxAttempts: 1 } }
+      );
+    } catch (error) {
+      // The job row is coordination state, not product history. Remove the
+      // unsubmitted job so a later identical ingest can safely try again.
+      this.sql`
+        delete from forecast_brief_jobs
+        where local_date = ${bundle.input.localDate} and generation_token = ${generationToken}
+      `;
+      console.error(
+        JSON.stringify({
+          message: "forecast brief queue submission failed",
+          spotId: bundle.input.spotId,
+          localDate: bundle.input.localDate,
+          error: safeError(error)
+        })
+      );
+      throw error;
+    }
     return {
       status: "accepted",
       inputFingerprint: bundle.inputFingerprint,
@@ -192,9 +263,7 @@ export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
     if (
       !job ||
       job.generation_token !== payload.generationToken ||
-      job.status === "published" ||
-      job.status === "exhausted" ||
-      job.status === "disabled"
+      job.status !== "queued"
     ) {
       return;
     }
@@ -243,15 +312,23 @@ export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
     }
   }
 
-  async retryPending(payload: ProcessPayload): Promise<void> {
+  async retryPending(payload: RetryPayload): Promise<void> {
     const job = this.job(payload.localDate);
     if (
       !job ||
       job.generation_token !== payload.generationToken ||
-      job.status !== "retry_wait"
+      job.status !== "retry_wait" ||
+      job.attempt_count !== payload.attemptCount
     ) {
       return;
     }
+    this.sql`
+      update forecast_brief_jobs
+      set status = 'queued', updated_at = ${new Date().toISOString()}
+      where local_date = ${payload.localDate}
+        and generation_token = ${payload.generationToken}
+        and status = 'retry_wait'
+    `;
     await this.processPending(payload);
   }
 
@@ -262,8 +339,14 @@ export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
     const current = this.job(payload.localDate);
     if (!current || current.generation_token !== payload.generationToken) return;
     const attemptCount = current.attempt_count + 1;
-    const delaySeconds = retryDelaySecondsAfterFailure(attemptCount);
-    const status: BriefJobStatus = delaySeconds === null ? "exhausted" : "retry_wait";
+    const disposition = classifyForecastBriefFailure(error);
+    const delaySeconds = retryDelaySecondsAfterFailure(attemptCount, disposition);
+    const status: BriefJobStatus =
+      delaySeconds === null
+        ? disposition === "transient"
+          ? "exhausted"
+          : "terminal"
+        : "retry_wait";
     this.sql`
       update forecast_brief_jobs
       set status = ${status}, attempt_count = ${attemptCount}, last_error = ${safeError(error)},
@@ -276,12 +359,42 @@ export class ForecastBriefAgent extends Agent<ForecastBriefAgentEnv> {
         spotId: current.spot_id,
         localDate: current.local_date,
         attemptCount,
+        disposition,
         retryInSeconds: delaySeconds,
         error: safeError(error)
       })
     );
     if (delaySeconds !== null) {
-      await this.schedule(delaySeconds, "retryPending", payload, { idempotent: true });
+      try {
+        const retryPayload: RetryPayload = {
+          ...payload,
+          attemptCount
+        };
+        await this.schedule(delaySeconds, "retryPending", retryPayload, {
+          idempotent: true,
+          retry: { maxAttempts: 1 }
+        });
+      } catch (scheduleError) {
+        const schedulingFailure = `Retry scheduling failed: ${safeError(scheduleError)}`;
+        this.sql`
+          update forecast_brief_jobs
+          set status = 'terminal', last_error = ${schedulingFailure},
+              updated_at = ${new Date().toISOString()}
+          where local_date = ${payload.localDate}
+            and generation_token = ${payload.generationToken}
+            and status = 'retry_wait'
+        `;
+        console.error(
+          JSON.stringify({
+            message: "forecast brief retry scheduling failed",
+            spotId: current.spot_id,
+            localDate: current.local_date,
+            attemptCount,
+            disposition,
+            error: safeError(scheduleError)
+          })
+        );
+      }
     }
   }
 

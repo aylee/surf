@@ -1,7 +1,6 @@
 import type { ApiSpot, ForecastResponse } from "@surf/contracts";
 import { selectCanonicalRecommendationIds } from "@surf/forecast-core";
 import {
-  BrainCircuit,
   BookOpen,
   CloudOff,
   Database,
@@ -9,7 +8,6 @@ import {
   LineChart as LineChartIcon,
   Moon,
   Radio,
-  Sparkles,
   TableProperties
 } from "lucide-react";
 import {
@@ -143,7 +141,12 @@ function displayedCanonicalWindow(
     });
 }
 
-function deterministicBrief(spot: ApiSpot, dateKey: string | null, best: WorkbenchWindow | undefined): DailyBrief {
+function deterministicBrief(
+  spot: ApiSpot,
+  dateKey: string | null,
+  best: WorkbenchWindow | undefined,
+  generatedAt: string | null
+): DailyBrief {
   if (!dateKey || !best) {
     return {
       status: "deterministic_fallback",
@@ -159,7 +162,7 @@ function deterministicBrief(spot: ApiSpot, dateKey: string | null, best: Workben
         text: "A blank is useful information: it means the app does not have enough supported data to make that part of the call."
       },
       revision: null,
-      generatedAt: null
+      generatedAt
     };
   }
   return {
@@ -167,7 +170,7 @@ function deterministicBrief(spot: ApiSpot, dateKey: string | null, best: Workben
     provider: "deterministic",
     fallbackReason: null,
     availableRevisions: null,
-    headline: `${formatClock(best.forecastAt, spot.timezone)} is the clearest daylight window`,
+    headline: `${formatClock(best.forecastAt, spot.timezone)} is the leading daylight window`,
     setup: `${formatModeledHeight(best.modeledHeightFt)} with ${best.condition} surface, ${best.windRelation.toLowerCase()} wind, and ${best.confidenceLabel.toLowerCase()} confidence.`,
     picks: [{
       windowId: best.forecastAt,
@@ -181,7 +184,7 @@ function deterministicBrief(spot: ApiSpot, dateKey: string | null, best: Workben
       text: "Hs describes modeled wave energy near the coast. It is not automatically the height of the breaking wave you will surf."
     },
     revision: null,
-    generatedAt: null
+    generatedAt
   };
 }
 
@@ -249,51 +252,82 @@ function ForecastLearningGuide() {
 }
 
 function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: boolean; spot: ApiSpot }) {
-  const isAi = brief.status === "model" && brief.provider === "google";
+  const [bestPick, ...alternatePicks] = brief.picks;
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={loading}>
       <span className="srOnly" role="status" aria-live="polite">
-        {loading ? "Refreshing the daily outlook." : "Daily outlook is ready."}
+        {loading ? "Updating the daily outlook." : "Daily outlook updated."}
       </span>
-      <div className="dailyBriefIcon" aria-hidden="true">
-        {isAi ? <BrainCircuit size={22} /> : <Sparkles size={22} />}
-      </div>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
-          <p className="kicker">Daily forecaster</p>
-          {isAi && <Badge className="aiBadge">AI-assisted</Badge>}
-          {isAi && brief.generatedAt && (
-            <time dateTime={brief.generatedAt}>Updated {formatTimestamp(brief.generatedAt, spot.timezone)}</time>
+          <p className="kicker">Daily outlook</p>
+          {brief.generatedAt && (
+            <time dateTime={brief.generatedAt}>Outlook updated {formatTimestamp(brief.generatedAt, spot.timezone)}</time>
           )}
-          {loading && <span className="briefLoading">Refreshing outlook…</span>}
         </div>
         <h2 id="daily-brief-heading">{presentBriefCopy(brief.headline)}</h2>
         <p className="dailyBriefSetup">{presentBriefCopy(brief.setup)}</p>
-        {brief.picks.length > 0 && (
-          <div className="briefPicks">
-            {brief.picks.map((pick, index) => (
-              <div key={`${pick.windowId ?? "pick"}-${index}`}>
-                <strong>{pick.label ?? (index === 0 ? "Recommended window" : `Option ${index + 1}`)}</strong>
-                <p>{presentBriefCopy(pick.why)}</p>
-                {pick.tradeoff && <small>Tradeoff: {presentBriefCopy(pick.tradeoff)}</small>}
+        {bestPick && (
+          <div className="briefRecommendations">
+            <article className="briefPrimaryPick">
+              <p className="briefSectionLabel">Best window</p>
+              <h3>{bestPick.label ?? "Recommended window"}</h3>
+              <dl className="briefPickDetails">
+                <div>
+                  <dt>Why</dt>
+                  <dd>{presentBriefCopy(bestPick.why)}</dd>
+                </div>
+                {bestPick.tradeoff && (
+                  <div>
+                    <dt>Watch for</dt>
+                    <dd>{presentBriefCopy(bestPick.tradeoff)}</dd>
+                  </div>
+                )}
+              </dl>
+            </article>
+            {alternatePicks.length > 0 && (
+              <div className="briefAlternateList" aria-label="Other worthwhile forecast windows">
+                <p className="briefSectionLabel">Also worth a look</p>
+                {alternatePicks.map((pick, index) => (
+                  <article className="briefAlternatePick" key={`${pick.windowId ?? "pick"}-${index}`}>
+                    <h3>{pick.label ?? `Option ${index + 2}`}</h3>
+                    <dl className="briefPickDetails">
+                      <div>
+                        <dt>Why</dt>
+                        <dd>{presentBriefCopy(pick.why)}</dd>
+                      </div>
+                      {pick.tradeoff && (
+                        <div>
+                          <dt>Watch for</dt>
+                          <dd>{presentBriefCopy(pick.tradeoff)}</dd>
+                        </div>
+                      )}
+                    </dl>
+                  </article>
+                ))}
               </div>
-            ))}
+            )}
           </div>
         )}
-        <div className="briefFooter">
-          {brief.lesson && (
-            <div className="lessonCallout">
-              <span>{brief.lesson.topic ? presentBriefCopy(brief.lesson.topic) : "Learn from this report"}</span>
-              <p>{presentBriefCopy(brief.lesson.text)}</p>
-            </div>
-          )}
-          {brief.bustFactors.length > 0 && (
-            <details className="bustFactors">
-              <summary>What could change the call</summary>
-              <ul>{brief.bustFactors.map((factor) => <li key={factor}>{presentBriefCopy(factor)}</li>)}</ul>
-            </details>
-          )}
-        </div>
+        {(brief.lesson || brief.bustFactors.length > 0) && (
+          <div className="briefFooter">
+            {brief.lesson && (
+              <details className="lessonCallout">
+                <summary>
+                  <span>What this teaches you</span>
+                  {brief.lesson.topic && <small>{presentBriefCopy(brief.lesson.topic)}</small>}
+                </summary>
+                <p>{presentBriefCopy(brief.lesson.text)}</p>
+              </details>
+            )}
+            {brief.bustFactors.length > 0 && (
+              <details className="bustFactors">
+                <summary>What could change the call</summary>
+                <ul>{brief.bustFactors.map((factor, index) => <li key={`${factor}-${index}`}>{presentBriefCopy(factor)}</li>)}</ul>
+              </details>
+            )}
+          </div>
+        )}
       </div>
     </section>
   );
@@ -317,9 +351,8 @@ class DailyBriefErrorBoundary extends Component<
 function DailyBriefRecoveryCard({ brief }: { brief: DailyBrief }) {
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-recovery-heading">
-      <div className="dailyBriefIcon" aria-hidden="true"><Sparkles size={22} /></div>
       <div className="dailyBriefBody">
-        <div className="dailyBriefMeta"><p className="kicker">Daily forecaster</p></div>
+        <div className="dailyBriefMeta"><p className="kicker">Daily outlook</p></div>
         <h2 id="daily-brief-recovery-heading">{presentBriefCopy(brief.headline)}</h2>
         <p className="dailyBriefSetup">{presentBriefCopy(brief.setup)}</p>
       </div>
@@ -843,8 +876,13 @@ export function ForecastWorkbench({
 
   const selected = dayWindows.find((window) => window.forecastAt === selectedAt) ?? dayBest ?? dayWindows[0];
   const fallbackBrief = useMemo(
-    () => deterministicBrief(spot, selectedDate, canonicalDayBest),
-    [canonicalDayBest, selectedDate, spot]
+    () => deterministicBrief(
+      spot,
+      selectedDate,
+      canonicalDayBest,
+      canonicalForecast?.generatedAt ?? null
+    ),
+    [canonicalDayBest, canonicalForecast?.generatedAt, selectedDate, spot]
   );
 
   useEffect(() => {

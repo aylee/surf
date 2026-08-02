@@ -13,9 +13,12 @@ export {
   type ForecastBriefResponse
 };
 
-export const FORECAST_BRIEF_SCHEMA_VERSION = 1 as const;
-export const FORECAST_BRIEF_PROMPT_VERSION = "surf-brief-v1" as const;
+export const FORECAST_FACT_BUNDLE_SCHEMA_VERSION = 1 as const;
+export const FORECAST_BRIEF_SCHEMA_VERSION = 2 as const;
+export const FORECAST_BRIEF_PROMPT_VERSION = "surf-brief-v2" as const;
+export const FORECAST_BRIEF_QUALITY_POLICY_VERSION = "surf-brief-quality-v2" as const;
 export const FORECAST_BRIEF_MODEL_ID = "gemini-3.6-flash" as const;
+export const FORECAST_BRIEF_THINKING_LEVEL = "low" as const;
 
 const IsoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD");
 const IsoTimestampSchema = z.string().datetime({ offset: true });
@@ -25,34 +28,35 @@ const FactIdSchema = z
   .max(160)
   .regex(/^[a-z0-9][a-z0-9:._-]*$/i, "Fact IDs must be stable identifiers");
 
+export const ForecastBriefReferencedProseSchema = z
+  .object({
+    text: z.string().min(1).max(420),
+    factRefs: z.array(FactIdSchema).min(1).max(12)
+  })
+  .strict();
+
+export type ForecastBriefReferencedProse = z.infer<typeof ForecastBriefReferencedProseSchema>;
+
 export const ForecastBriefDraftSchema = z
   .object({
-    headline: z.string().min(1).max(220),
-    setup: z.string().min(1).max(500),
+    summary: ForecastBriefReferencedProseSchema,
     picks: z
       .array(
         z
           .object({
             windowId: z.string().min(1).max(160),
-            label: z.string().min(1).max(100),
-            why: z.string().min(1).max(420),
-            tradeoff: z.string().min(1).max(420),
-            factRefs: z.array(FactIdSchema).min(1).max(12)
+            why: ForecastBriefReferencedProseSchema,
+            tradeoff: ForecastBriefReferencedProseSchema
           })
           .strict()
       )
       .max(3),
     bustFactors: z
       .array(
-        z
-          .object({
-            text: z.string().min(1).max(420),
-            factRefs: z.array(FactIdSchema).min(1).max(12)
-          })
-          .strict()
+        ForecastBriefReferencedProseSchema
       )
       .min(1)
-      .max(4),
+      .max(3),
     lesson: z
       .object({
         topic: z.string().min(1).max(80),
@@ -172,6 +176,7 @@ export const ForecastFactSchema = z
       "observation",
       "caveat"
     ]),
+    role: z.enum(["support", "tradeoff", "context", "locked"]).default("context"),
     statement: z.string().min(1).max(600),
     windowId: z.string().min(1).max(160).nullable(),
     material: z.boolean()
@@ -182,7 +187,7 @@ export type ForecastFact = z.infer<typeof ForecastFactSchema>;
 
 export const ForecastFactBundleSchema = z
   .object({
-    schemaVersion: z.literal(FORECAST_BRIEF_SCHEMA_VERSION),
+    schemaVersion: z.literal(FORECAST_FACT_BUNDLE_SCHEMA_VERSION),
     input: ForecastBriefInputSchema,
     facts: z.array(ForecastFactSchema).min(1).max(320),
     inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
@@ -196,7 +201,18 @@ export const ForecastBriefValidationSchema = z
   .object({
     valid: z.literal(true),
     checkedAt: IsoTimestampSchema,
-    referencedFactIds: z.array(FactIdSchema)
+    referencedFactIds: z.array(FactIdSchema),
+    claimRefs: z
+      .array(
+        z
+          .object({
+            path: z.string().min(1).max(160),
+            factRefs: z.array(FactIdSchema).min(1).max(24)
+          })
+          .strict()
+      )
+      .max(16)
+      .optional()
   })
   .strict();
 

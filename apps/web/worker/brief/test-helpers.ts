@@ -1,6 +1,5 @@
 import type { ForecastResponse } from "@surf/contracts";
 import { buildFixtureForecast } from "@surf/forecast-core/test-support";
-import { forecastBriefFrame, forecastBriefWindowLabel } from "./facts";
 import type { ForecastBriefDraft, ForecastFactBundle } from "./types";
 
 export function briefForecastFixture(): ForecastResponse {
@@ -10,6 +9,7 @@ export function briefForecastFixture(): ForecastResponse {
     interval: "3h",
     windows: forecast.windows.map((window) => ({
       ...window,
+      caveats: ["A wind shift could weaken the surface-quality read."],
       windGustKt: (window.windSpeedKt ?? 0) + 2,
       surfaceCondition: "clean" as const,
       waveState: {
@@ -57,31 +57,63 @@ export function briefForecastFixture(): ForecastResponse {
 }
 
 export function validDraftFor(bundle: ForecastFactBundle): ForecastBriefDraft {
-  const frame = forecastBriefFrame(bundle);
+  const firstWindowId = bundle.input.recommendationWindowIds[0]!;
+  const recommendation = bundle.facts.find(
+    (fact) => fact.windowId === firstWindowId && fact.kind === "recommendation"
+  )!;
+  const condition = bundle.facts.find(
+    (fact) => fact.windowId === firstWindowId && fact.kind === "condition"
+  )!;
+  const wind = bundle.facts.find(
+    (fact) => fact.windowId === firstWindowId && fact.kind === "wind"
+  )!;
+  const firstTradeoff = bundle.facts.find(
+    (fact) => fact.windowId === firstWindowId && fact.role === "tradeoff"
+  )!;
   return {
-    headline: frame.headline,
-    setup: frame.setup,
-    picks: bundle.input.recommendationWindowIds.map((windowId) => {
-      const condition = bundle.facts.find(
+    summary: {
+      text: "Clean surface conditions and offshore wind favor the leading daylight window, while a possible wind shift tempers the call.",
+      factRefs: [recommendation.id, condition.id, wind.id, firstTradeoff.id]
+    },
+    picks: bundle.input.recommendationWindowIds.map((windowId, index) => {
+      const windowRecommendation = bundle.facts.find(
+        (fact) => fact.windowId === windowId && fact.kind === "recommendation"
+      )!;
+      const windowCondition = bundle.facts.find(
         (fact) => fact.windowId === windowId && fact.kind === "condition"
       )!;
-      const wave = bundle.facts.find((fact) => fact.windowId === windowId && fact.kind === "wave")!;
+      const windowWind = bundle.facts.find(
+        (fact) => fact.windowId === windowId && fact.kind === "wind"
+      )!;
+      const tradeoff = bundle.facts.find(
+        (fact) => fact.windowId === windowId && fact.role === "tradeoff"
+      )!;
       return {
         windowId,
-        label: forecastBriefWindowLabel(bundle, windowId),
-        why: condition.statement,
-        tradeoff: wave.statement,
-        factRefs: [condition.id, wave.id]
+        why: {
+          text:
+            index === 0
+              ? "Clean surface conditions and offshore wind make this a leading daylight option."
+              : "Clean surface conditions and offshore wind keep this daylight window worth a look.",
+          factRefs: [windowRecommendation.id, windowCondition.id, windowWind.id]
+        },
+        tradeoff: {
+          text:
+            index === 0
+              ? "The surface advantage could fade if the wind shifts."
+              : "A wind shift remains the main threat to the expected surface quality.",
+          factRefs: [tradeoff.id]
+        }
       };
     }),
-    bustFactors: (() => {
-      const caveat = bundle.facts.find((fact) => fact.kind === "caveat")!;
-      return [{ text: caveat.statement, factRefs: [caveat.id] }];
-    })(),
+    bustFactors: [{
+      text: "A wind shift could undercut the expected surface quality.",
+      factRefs: [firstTradeoff.id]
+    }],
     lesson: {
-      topic: "Modeled wave state",
-      text: "This is not an observed breaking-wave face height.",
-      factRefs: [bundle.facts.find((fact) => fact.kind === "wave")!.id]
+      topic: "Wind relationship",
+      text: "Offshore describes how the wind meets this shoreline and why the surface reads cleaner.",
+      factRefs: [wind.id]
     }
   };
 }
