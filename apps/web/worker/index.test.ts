@@ -13,24 +13,29 @@ import { stableThreeHourForecastTimes } from "./time";
 function dbMock() {
   const runs: unknown[][] = [];
   const sqls: string[] = [];
+  const preparedSql: string[] = [];
   const db = {
     prepare: (sql: string) => {
+      preparedSql.push(sql);
       const all = async () => ({ results: [], success: true, meta: {} });
+      const first = async () => null;
       return {
         bind: (...values: unknown[]) => ({
           all,
+          first,
           run: async () => {
             runs.push(values);
             sqls.push(sql);
             return { success: true, results: [], meta: { changes: 1 } };
           }
         }),
-        all
+        all,
+        first
       };
     }
   } as unknown as D1Database;
 
-  return { db, runs, sqls };
+  return { db, runs, sqls, preparedSql };
 }
 
 function env(db: D1Database = dbMock().db): Env {
@@ -59,8 +64,8 @@ describe("worker api", () => {
     const result = await pruneRetainedData(db, now);
 
     expect(result.errors).toEqual([]);
-    expect(sqls).toHaveLength(11);
-    for (const table of ["wave_forecasts", "tide_forecasts", "wind_forecasts"]) {
+    expect(sqls).toHaveLength(12);
+    for (const table of ["wave_forecasts", "tide_forecasts", "tide_events", "wind_forecasts"]) {
       const index = sqls.findIndex((sql) => sql.includes(`delete from ${table}`));
       expect(index).toBeGreaterThanOrEqual(0);
       expect(runs[index]?.[0]).toBe(
@@ -89,6 +94,9 @@ describe("worker api", () => {
     expect(sqls.some((sql) => sql.includes("delete from forecast_configs"))).toBe(true);
     expect(sqls.find((sql) => sql.includes("delete from source_runs"))).toContain(
       "not exists (select 1 from wave_forecasts"
+    );
+    expect(sqls.find((sql) => sql.includes("delete from source_runs"))).toContain(
+      "not exists (select 1 from tide_events"
     );
   });
 
@@ -146,6 +154,76 @@ describe("worker api", () => {
     expect(body.windows[0]).toMatchObject({ ratingStatus: "unknown", waveHeightFt: null, sourceRunIds: [] });
   });
 
+  it("supports explicit hourly forecast responses without changing the default interval", async () => {
+    const hourly = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central?interval=1h") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      env(),
+      {} as ExecutionContext
+    );
+    const defaulted = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      env(),
+      {} as ExecutionContext
+    );
+
+    expect(hourly.status).toBe(200);
+    expect(await hourly.json()).toMatchObject({ interval: "1h" });
+    expect(defaulted.status).toBe(200);
+    expect(await defaulted.json()).toMatchObject({ interval: "3h" });
+  });
+
+  it("rejects unsupported forecast intervals", async () => {
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central?interval=2h") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      env(),
+      {} as ExecutionContext
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("returns a typed deterministic brief when no model revision exists", async () => {
+    const { db, preparedSql } = dbMock();
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central/brief") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      env(db),
+      {} as ExecutionContext
+    );
+    const body = (await response.json()) as {
+      status: string;
+      brief: { provider: string; spotId: string };
+      fallbackReason: string;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      status: "deterministic_fallback",
+      brief: { provider: "deterministic", spotId: "obsf-central" },
+      fallbackReason: "AI forecast briefs are disabled for this Worker version."
+    });
+    expect(preparedSql.some((sql) => /forecast_brief_revisions/i.test(sql))).toBe(false);
+  });
+
+  it("validates forecast brief dates before reading storage", async () => {
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central/brief?date=August-2") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      env(),
+      {} as ExecutionContext
+    );
+
+    expect(response.status).toBe(400);
+  });
+
   it("runs manual ingest and records source-run-like D1 rows", async () => {
     const now = new Date("2026-07-08T15:00:00.000Z");
     vi.useFakeTimers();
@@ -200,6 +278,14 @@ describe("worker api", () => {
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes("api.tidesandcurrents.noaa.gov")) {
+        if (url.includes("interval=hilo")) {
+          return Response.json({
+            predictions: [
+              { t: "2026-07-08 18:00", v: "4.1", type: "H" },
+              { t: "2026-07-09 00:00", v: "0.2", type: "L" }
+            ]
+          });
+        }
         return Response.json({
           predictions: [
             { t: "2026-07-08 12:00", v: "1.2" },

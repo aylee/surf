@@ -62,6 +62,22 @@ const worktreeFiles = execFileSync(
   .split("\n")
   .filter(Boolean);
 
+assert(
+  !trackedFiles.some(
+    (file) => file.endsWith(".dev.vars") || (/\.dev\.vars/.test(file) && !file.endsWith(".dev.vars.example"))
+  ),
+  "Local .dev.vars files must remain ignored; only .dev.vars.example may be tracked."
+);
+const devVarsExample = readFileSync(resolve(root, "apps/web/.dev.vars.example"), "utf8");
+assert(
+  devVarsExample.includes("GEMINI_API_KEY=replace_with_your_google_ai_studio_key"),
+  "apps/web/.dev.vars.example must contain only the documented Gemini placeholder."
+);
+assert(
+  !/GEMINI_API_KEY=AIza[0-9A-Za-z_-]+/.test(devVarsExample),
+  "apps/web/.dev.vars.example must never contain a real Gemini key."
+);
+
 for (const file of worktreeFiles.filter(
   (candidate) =>
     candidate.endsWith(".md") &&

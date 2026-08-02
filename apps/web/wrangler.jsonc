@@ -22,7 +22,24 @@
   "vars": {
     "ENVIRONMENT": "production",
     "SURF_REGION": "norcal",
-    "SURF_USER_AGENT": "surf-self-hosted/1.0 (+https://github.com/aylee/surf)"
+    "SURF_USER_AGENT": "surf-self-hosted/1.0 (+https://github.com/aylee/surf)",
+    // The first Durable Object lifecycle deploy stays deterministic-only.
+    // Enable the brief in a later deploy after GEMINI_API_KEY is set.
+    "FORECAST_BRIEF_ENABLED": "false"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "FORECAST_BRIEF_AGENT",
+        "class_name": "ForecastBriefAgent"
+      }
+    ]
+  },
+  "exports": {
+    "ForecastBriefAgent": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
   },
   "d1_databases": [
     {

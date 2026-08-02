@@ -4,22 +4,36 @@ import {
   isNorcalSpotId,
   NORCAL_SPOTS
 } from "@surf/forecast-core";
-import { SpotIdSchema, SpotsResponseSchema } from "@surf/contracts";
+import { ForecastIntervalSchema, SpotIdSchema, SpotsResponseSchema } from "@surf/contracts";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
+import type { ForecastBriefAgent } from "./agents";
 import { bearerTokenMatches } from "./auth";
+import {
+  buildDisabledForecastBriefResponse,
+  buildForecastBriefResponse,
+  buildForecastFactBundle
+} from "./brief";
 import { buildForecastResponse } from "./forecast";
 import { ingestRequiresRetry, normalizeIngestMessage, runNorcalIngest } from "./ingest";
 
 export type Env = Omit<
   CloudflareBindings,
-  "ENVIRONMENT" | "SURF_REGION" | "SURF_USER_AGENT"
+  | "ENVIRONMENT"
+  | "SURF_REGION"
+  | "SURF_USER_AGENT"
+  | "FORECAST_BRIEF_AGENT"
+  | "FORECAST_BRIEF_ENABLED"
+  | "GEMINI_API_KEY"
 > & {
   ENVIRONMENT: string;
   SURF_REGION: "norcal";
   SURF_USER_AGENT: string;
   INGEST_TOKEN?: string;
+  FORECAST_BRIEF_AGENT?: DurableObjectNamespace<ForecastBriefAgent>;
+  FORECAST_BRIEF_ENABLED?: string;
+  GEMINI_API_KEY?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -50,6 +64,80 @@ app.get("/api/health", (c) =>
 
 app.get("/api/spots", (c) => c.json(spotsResponse));
 
+function forecastBriefEnabled(env: Env): boolean {
+  return (
+    env.FORECAST_BRIEF_ENABLED?.trim().toLowerCase() === "true" &&
+    Boolean(env.GEMINI_API_KEY?.trim())
+  );
+}
+
+async function signalForecastBriefAgents(env: Env): Promise<void> {
+  const namespace = env.FORECAST_BRIEF_AGENT;
+  if (!namespace || !forecastBriefEnabled(env)) return;
+  const generatedAt = new Date();
+  const results = await Promise.allSettled(
+    NORCAL_SPOTS.map(async (spot) => {
+      const forecast = await buildForecastResponse(env, spot.id, generatedAt, "3h");
+      const bundle = await buildForecastFactBundle(forecast);
+      return namespace.getByName(spot.id).signal(bundle);
+    })
+  );
+  const failures = results.flatMap((result, index) =>
+    result.status === "rejected"
+      ? [
+          {
+            spotId: NORCAL_SPOTS[index]!.id,
+            error: result.reason instanceof Error ? result.reason.message : String(result.reason)
+          }
+        ]
+      : []
+  );
+  if (failures.length > 0) {
+    console.error(
+      JSON.stringify({
+        message: "forecast brief agent signaling completed with failures",
+        failures
+      })
+    );
+  }
+}
+
+app.get(
+  "/api/forecast/:spotId/brief",
+  zValidator(
+    "param",
+    z.object({
+      spotId: SpotIdSchema.refine(isNorcalSpotId, "Spot is not present in the NorCal reference config")
+    })
+  ),
+  zValidator(
+    "query",
+    z.object({
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD").optional()
+    })
+  ),
+  async (c) => {
+    const { spotId } = c.req.valid("param");
+    const { date } = c.req.valid("query");
+    const now = new Date();
+    const forecast = await buildForecastResponse(c.env, spotId, now, "3h");
+    try {
+      const bundle = await buildForecastFactBundle(forecast, { localDate: date });
+      if (!forecastBriefEnabled(c.env)) {
+        return c.json(buildDisabledForecastBriefResponse(bundle));
+      }
+      return c.json(await buildForecastBriefResponse(c.env.DB, bundle, now));
+    } catch (error) {
+      return c.json(
+        {
+          error: error instanceof Error ? error.message : "Forecast brief is unavailable for this date."
+        },
+        404
+      );
+    }
+  }
+);
+
 app.get(
   "/api/forecast/:spotId",
   zValidator(
@@ -58,9 +146,16 @@ app.get(
       spotId: SpotIdSchema.refine(isNorcalSpotId, "Spot is not present in the NorCal reference config")
     })
   ),
+  zValidator(
+    "query",
+    z.object({
+      interval: ForecastIntervalSchema.default("3h")
+    })
+  ),
   async (c) => {
     const { spotId } = c.req.valid("param");
-    return c.json(await buildForecastResponse(c.env, spotId));
+    const { interval } = c.req.valid("query");
+    return c.json(await buildForecastResponse(c.env, spotId, new Date(), interval));
   }
 );
 
@@ -81,6 +176,10 @@ app.post("/api/ingest/once", async (c) => {
     requestedAt,
     region: c.env.SURF_REGION
   });
+
+  if (!ingestRequiresRetry(summary)) {
+    await signalForecastBriefAgents(c.env);
+  }
 
   return c.json(summary);
 });
@@ -120,6 +219,7 @@ export default {
             })
           );
         }
+        await signalForecastBriefAgents(env);
         message.ack();
       } catch (error) {
         console.error(
@@ -134,3 +234,5 @@ export default {
     }
   }
 } satisfies ExportedHandler<Env>;
+
+export { ForecastBriefAgent } from "./agents";
