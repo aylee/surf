@@ -21,6 +21,8 @@ each break.
   clean/fair/choppy surface calls.
 - Spot detail for swell, wind, tide, buoy observations, hazards, confidence,
   and source provenance.
+- A phone-first Table/Graph workbench with an optional, fact-validated daily
+  Gemini-curated, fact-locked brief and deterministic fallback.
 - Hourly ingestion on Cloudflare Workers using D1, R2, and Queues.
 - Deterministic forecast facts: no LLM computes wave height, condition, or
   score.
@@ -51,6 +53,12 @@ pnpm ingest:local
 
 Local ingestion calls live NOAA/CDIP endpoints and can take a moment. No paid
 data key or Cloudflare account is required for local development.
+
+Gemini is optional. To exercise the daily brief, copy
+`apps/web/.dev.vars.example` to the ignored `apps/web/.dev.vars`, keep it mode
+`0600`, and add a Google AI Studio key from an unbilled project. Without a key,
+or when quota/provider validation fails, the brief endpoint returns a
+deterministic explanation of the same sourced facts.
 
 ## Deploy your own
 

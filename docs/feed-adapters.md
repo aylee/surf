@@ -45,12 +45,17 @@ needed for audit/backtesting.
 | Adapter | Runtime | Status | Notes |
 |---|---|---|---|
 | NOAA GFSwave inventory/artifact planning | Python | research tooling | Validates `wcoast.0p16` `.idx` inventories for f000-f072 and plans R2 keys. It is not a deployed v1 input; numeric extraction requires `wgrib2` or `cfgrib` + `xarray`. |
-| NOAA CO-OPS tide predictions | Worker | live ingest | Fetches hourly MLLW predictions for mapped v1 stations and writes `tide_forecasts`. |
+| NOAA CO-OPS tide predictions | Worker | live ingest | Fetches hourly MLLW predictions plus official `hilo` extrema for mapped v1 stations. Hourly samples write to `tide_forecasts`; source-provided high/low events write additively to `tide_events`. |
 | NWS point forecast and alerts | Worker | live ingest | Resolves spot point forecasts, hourly wind periods, and active alerts; writes `wind_forecasts` and `hazard_events`. |
 | NWS MTR coastal grid waves | Worker | live ingest | Reads official `forecastGridData` wave/swell layers at six verified PZZ545 marine cells, expands ISO-8601 value intervals onto five days of local-clock 3-hour slots, preserves raw significant height, and writes a separately identified cold-start breaking-height estimate to `wave_forecasts`. |
 | CDIP/MOP nearshore forecast | Worker | live preferred ingest | Reads only `waveTime`, `waveHs`, `waveTp`, `waveDp`, and `waveDm` from constrained public per-point OPeNDAP ASCII responses. Exact mappings are SF043/SF029/SF015 for Ocean Beach, SM371 for Linda Mar, and MA122 for Stinson. Bolinas intentionally has no MOP mapping. |
 | NDBC realtime observations | Worker | live ingest | Parses bounded `realtime2` standard-meteorological feeds for 46237, 46026, 46013, and 46012; stores the newest valid wave/period/direction/water-temperature rows in `wave_observations` and exposes the preferred fresh buoy per spot. |
 | NDBC history backtest | Python | harness | Parses public historical stdmet files and reports observation-summary metrics for calibration. |
+
+CO-OPS extrema are kept distinct from sampled hourly predictions. The API uses
+the official high/low event rows for labels and keeps the hourly series for the
+tide curve and per-window trend. It does not infer every extremum from sparse
+samples, and both products retain their station, source run, and validity time.
 
 ## CDIP MOP Forecast Semantics
 
