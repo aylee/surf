@@ -61,24 +61,19 @@ export function runPnpm(args, options = {}) {
   return output;
 }
 
-export function runWrangler(args, options = {}) {
+function wranglerPnpmArgs(args) {
   const configArgs = configuredWranglerPath
     ? ["--config", activeWranglerConfigPath]
     : [];
-  return runPnpm(
-    ["--filter", "@surf/web", "exec", "wrangler", ...configArgs, ...args],
-    options
-  );
+  return ["--filter", "@surf/web", "exec", "wrangler", ...args, ...configArgs];
+}
+
+export function runWrangler(args, options = {}) {
+  return runPnpm(wranglerPnpmArgs(args), options);
 }
 
 export function probeWrangler(args) {
-  const configArgs = configuredWranglerPath
-    ? ["--config", activeWranglerConfigPath]
-    : [];
-  return invokePnpm(
-    ["--filter", "@surf/web", "exec", "wrangler", ...configArgs, ...args],
-    { capture: true }
-  );
+  return invokePnpm(wranglerPnpmArgs(args), { capture: true });
 }
 
 export function readWranglerConfig(path = activeWranglerConfigPath) {

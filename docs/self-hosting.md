@@ -225,12 +225,16 @@ Queue ingest and bounded read-model publication check automatically before
 their strict smoke; rerunning these commands is a safe explicit verification.
 
 `pnpm ingest:remote` returns after every configured spot's 1-hour and 3-hour
-read models were materialized at or after the Worker-issued request timestamp.
-It exits nonzero on an invalid Queue acknowledgement, an unexpected forecast
-response, or the bounded publication timeout, which names any missing
-spot/interval pairs. The post-ingest smoke checks every configured spot for a
-five-day horizon and at least one scored window backed by wave data; it does
-not accept synthesized unknown windows as a populated deployment.
+read models expose the exact ingest ID acknowledged by the Worker, report a
+generation timestamp at or after that acknowledgement, and were materialized
+after the Worker-issued request. The content digest remains part of the stored
+generation ID, so a retry that changes assembled facts also changes the ETag.
+The command exits nonzero on an invalid Queue acknowledgement, an unexpected
+forecast response, an ingest-ID mismatch, or the bounded publication timeout,
+which names any missing spot/interval pairs. The post-ingest smoke checks every
+configured spot for a five-day horizon and at least one scored window backed by
+wave data; it does not accept synthesized unknown windows as a populated
+deployment.
 
 Then verify:
 

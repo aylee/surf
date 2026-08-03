@@ -9,6 +9,9 @@ rollback commands.
 
 - Cron enqueues one ingest cycle every hour at minute 17.
 - Queue retries isolate public-provider failures from the scheduler.
+- A source-ingest invocation persists public inputs, then fans out one
+  materialization message per configured spot. Queue batch size and concurrency
+  stay at one so every spot receives a fresh Worker CPU budget.
 - Latest normalized rows and validated 1-hour/3-hour forecast read models
   refresh each cycle.
 - Immutable issued history is sampled at 00/06/12/18 UTC and keeps only the
@@ -88,21 +91,36 @@ provider disagreements.
 
 ## Forecast read-model failure
 
-Forecast publication happens after normalized persistence. Both 1-hour and
-3-hour generations must contain a scored window before either can replace the
-active generation. A failed assembly/publish leaves the previous generation in
-place and makes the Queue message retry.
+Forecast publication happens after normalized persistence and is atomic per
+spot. That spot's 1-hour and 3-hour generations must both contain a scored
+window before either can replace its active generation. A failed spot job
+leaves that spot's previous generation in place and retries independently;
+other healthy spots continue advancing. A typed retryable 503 appears only
+when that spot has never published a valid generation.
 
-Inspect the active rows without printing forecast JSON:
+Do not raise the ingest consumer's `max_batch_size` or `max_concurrency` above
+one. Source fetching and normalized persistence run in one invocation. Each
+spot's history capture, synchronized 1-hour/3-hour assembly, and fact generation
+then share a separate child invocation with a fresh Worker CPU budget. Queue
+delivery is at-least-once and unordered; stable ingest IDs, indexed
+logical-generation checks, and idempotent writes make duplicate or superseded
+jobs safe. A normalized-data or source-run persistence failure does not fan out
+children; retained rows cannot be relabeled as a fresh ingest.
+
+Inspect all expected spot/interval pairs without printing forecast JSON:
 
 ```bash
 pnpm wrangler -- d1 execute DB --remote --command \
-  "select spot_id, interval, generated_at, materialized_at, length(forecast_json) as json_chars from forecast_read_models order by spot_id, interval"
+  "with intervals(interval) as (values ('1h'), ('3h')) select s.id as spot_id, i.interval, case when r.spot_id is null then 'missing' else 'ready' end as state, r.generated_at, r.materialized_at, length(r.forecast_json) as json_chars from spots s cross join intervals i left join forecast_read_models r on r.spot_id=s.id and r.interval=i.interval where s.active=1 order by s.id,i.interval"
 ```
 
-If the tables are empty after a migration or deployment, run one authenticated
-manual ingest and then the cloud smoke. Do not insert or hand-edit read-model
-JSON. A Gemini credential, quota, or Agent failure cannot remove these rows.
+The NorCal reference configuration should return 12 `ready` rows. If any pair
+is missing, tail structured Worker logs, run one authenticated
+`pnpm ingest:remote` (it waits and names every missing pair), rerun the query,
+then run `pnpm smoke:cloudflare`. Inspect `forecast materialization failed for
+<spot>` and the configured `<instance>-ingest-dlq` before retrying again. Do not
+insert or hand-edit read-model JSON. A Gemini credential, quota, or Agent
+failure cannot remove these rows.
 
 ## Daily brief failure
 

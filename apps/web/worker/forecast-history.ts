@@ -69,32 +69,32 @@ function iso(label: string, value: string): string {
 }
 
 function issueIdentityWindow(spot: SpotProfile, window: ScoredForecastWindow): unknown {
+  const { sourceRunIds: _sourceRunIds, sourceFreshness, ...facts } = window;
   return {
-    spotId: window.spotId,
-    forecastAt: window.forecastAt,
-    ratingStatus: window.ratingStatus,
-    qualityLabel: window.qualityLabel,
-    score: window.score,
-    confidence: window.confidence,
-    waveScore: window.waveScore,
-    windScore: window.windScore,
-    tideScore: window.tideScore,
-    sourceScore: window.sourceScore,
-    waveHeightFt: window.waveHeightFt,
-    peakPeriodSec: window.peakPeriodSec,
-    primaryDirectionDeg: window.primaryDirectionDeg,
-    tideFt: window.tideFt,
-    tideTrend: window.tideTrend ?? null,
-    windSpeedKt: window.windSpeedKt,
-    windDirectionDeg: window.windDirectionDeg,
-    sourceFreshnessMinutes: window.sourceFreshnessMinutes,
-    activeCapabilities: window.activeCapabilities,
-    primarySwell: window.primarySwell,
-    secondarySwell: window.secondarySwell,
-    waveProvenance: window.waveProvenance,
+    ...facts,
+    sourceFreshness: sourceFreshness?.map(({ sourceRunId: _sourceRunId, ...freshness }) => freshness),
     displayedHeightLabel: snapshotHeightLabel(window.waveHeightFt),
     surfaceCondition: snapshotSurfaceCondition(spot, window)
   };
+}
+
+/**
+ * Hashes the public facts that were actually assembled for a forecast while
+ * excluding operational run identities and the publication clock. The same
+ * facts therefore retain the same content fingerprint across Queue retries.
+ */
+export async function forecastSourceIssueFingerprint(response: ForecastResponse): Promise<string> {
+  return sha256StableJson({
+    spotId: response.spot.id,
+    interval: response.interval ?? null,
+    sourceNote: response.sourceNote,
+    windows: response.windows.map((window) => issueIdentityWindow(response.spot, window)),
+    observation: response.observation ?? null,
+    observations: response.observations ?? [],
+    tideEvents: (response.tideEvents ?? []).map(({ sourceRunId: _sourceRunId, ...event }) => event),
+    sunPhases: response.sunPhases ?? [],
+    issueDelta: response.issueDelta ?? null
+  });
 }
 
 function isDaylightWindow(spot: SpotProfile, forecastAt: string): boolean {
@@ -159,10 +159,7 @@ export async function persistForecastSnapshots(
     isDaylightWindow(response.spot, window.forecastAt)
   );
   const sourceIssueFingerprint =
-    options.sourceIssueFingerprint ??
-    (await sha256StableJson(
-      historyWindows.map((window) => issueIdentityWindow(response.spot, window))
-    ));
+    options.sourceIssueFingerprint ?? (await forecastSourceIssueFingerprint(response));
   const issueId = `sha256:${await sha256StableJson({
     spotId: response.spot.id,
     spotConfigHash,

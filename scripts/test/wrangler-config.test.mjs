@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readWranglerConfig } from "../lib/cloudflare-commands.mjs";
@@ -8,6 +10,27 @@ import { wranglerStructureFailures } from "../lib/validate-wrangler-config.mjs";
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const configPath = resolve(root, "apps/web/wrangler.jsonc");
 const canonical = readWranglerConfig(configPath);
+
+test("Wrangler instance config follows the subcommand arguments", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/wrangler.mjs", "whoami", "--help"],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SURF_WRANGLER_CONFIG: "wrangler.jsonc",
+        WRANGLER_LOG_PATH: resolve(tmpdir(), `surf-wrangler-order-${process.pid}.log`)
+      }
+    }
+  );
+  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+  assert.equal(result.status, 0, output);
+  assert.match(output, /wrangler whoami/);
+  assert.doesNotMatch(output, /Unknown argument/);
+});
 
 test("canonical Wrangler configuration satisfies the supported instance contract", () => {
   assert.deepEqual(wranglerStructureFailures(canonical, configPath), []);

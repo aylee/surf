@@ -117,18 +117,25 @@ fixtures, and an honest confidence posture all travel together.
    normalized rows are written to D1.
 4. Issued forecast history is sampled on the documented cadence and old rows
    are pruned according to the retention policy.
-5. The Queue consumer joins the best available wave, wind, tide, hazard, and
+5. After normalized persistence succeeds, the source-ingest invocation fans
+   out one immutable materialization message per spot. Stable ingest IDs and an
+   indexed logical-generation watermark make duplicate or reordered Queue
+   delivery safe; superseded children exit without publishing.
+6. Each spot invocation joins the best available wave, wind, tide, hazard, and
    observation rows, then `forecast-core` applies deterministic surface and
-   scoring rules.
-6. A synchronized 1-hour/3-hour generation and each forecast-date fact bundle
-   are validated and atomically published as D1 read models. An all-unknown
-   generation never replaces the previous good one.
-7. Forecast GETs perform one indexed D1 lookup and return the pre-serialized
+   scoring rules. History capture reuses that spot's assembled 3-hour response.
+7. A synchronized 1-hour/3-hour generation and each forecast-date fact bundle
+   are validated and atomically published for that spot. Their fingerprint is
+   derived from the facts actually assembled, and queued generations retain
+   their ingest ID for end-to-end rollout correlation. An all-unknown
+   generation never replaces the previous good one, while unrelated spots can
+   continue advancing.
+8. Forecast GETs perform one indexed D1 lookup and return the pre-serialized
    response. Cacheable successes are also protected by Cloudflare's
    version-scoped Worker cache. Brief reads and Agent signals use the matching
    stored fact bundle, so request traffic never reruns forecast physics or
    scoring.
-8. The UI exposes the result, source freshness, and caveats, and retains its
+9. The UI exposes the result, source freshness, and caveats, and retains its
    last good response through a retryable read-model refresh failure.
 
 See [feed adapters](feed-adapters.md) for provider details and
