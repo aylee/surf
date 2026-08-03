@@ -14,10 +14,11 @@ rollback commands.
   6 AM–6 PM local planning horizon.
 - The report layer reads the best available normalized rows; it never replaces
   stale inputs with fixture data.
-- The optional per-spot daily brief lets Gemini select and order allowlisted
-  public fact sentences. Published prose must match those cited sentences
-  exactly; missing keys, quota, or rejected output falls back to deterministic
-  copy without delaying ingest.
+- The optional per-spot daily brief lets Gemini synthesize natural prose from
+  role-tagged public facts. Recommendation order, measurements, and hard
+  caveats stay code-owned; model prose must pass citation, policy, and quality
+  validation. Missing keys, quota, or rejected output falls back to local
+  fact-based copy without delaying ingest.
 
 ## Health checks
 
@@ -72,7 +73,26 @@ the brief response status first: `deterministic_fallback` is expected when the
 feature flag/key is absent, quota is exhausted, or output fails validation.
 Inspect structured Worker logs by spot, fingerprint, attempt, and failure code;
 the implementation never logs the API key or full provider request. Retry is
-bounded and material fingerprints prevent freshness-only regeneration.
+bounded and material fingerprints prevent freshness-only regeneration. The UI
+does not expose these internal provider/fallback labels.
+
+The Agent retries network failures, rate limits, and server errors after 5
+minutes, 30 minutes, and 2 hours, then marks the transient budget exhausted.
+Policy or structured-output rejection receives one delayed regeneration. Bad
+credentials, corrupt stored input, unknown defects, and retry-scheduling
+failure become terminal instead of looping. The exact failed input stays
+suppressed. After a five-minute cooldown, a later ingest with a new full-input
+fingerprint may reclaim the same material forecast—this is the recovery path
+after fixing credentials or provider configuration without forcing a physical
+forecast change.
+
+`generating` is a ten-minute lease rather than a permanent lock. A later
+signal reclaims an interrupted generation after that lease and rotates the
+generation token, so a delayed callback from the old claim cannot publish.
+Each delayed retry carries its attempt number; this keeps the 5m/30m/2h
+schedules distinct while still using idempotent callback submission. Queue and
+schedule callbacks each have one framework attempt; Surf's explicit state
+machine owns recovery and backoff.
 
 ## Backup and restore
 
@@ -108,6 +128,13 @@ Operational tide, wind, and wave tables keep a two-day past troubleshooting
 tail plus the current future horizon. Issued history, observations, hazards,
 source runs, and artifact metadata keep 400 days. Unreferenced content-addressed
 spot configurations are removed.
+
+Daily-brief retention is intentionally unpruned at the current bounded personal
+scale: D1 keeps every published validated brief revision, while each per-spot
+Durable Object keeps one coordination job row per local date. Treat pruning,
+archival, and retention metrics as follow-up work before materially expanding
+the spot catalog or usage; any cleanup must ship with the same D1 backup and
+rollback discipline as other retention changes.
 
 R2 objects are not deleted by the D1 retention job. This is deliberate: D1
 metadata retention must not silently destroy raw evidence.

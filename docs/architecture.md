@@ -14,8 +14,9 @@ flowchart LR
   api --> core["Deterministic transforms + scoring"]
   core --> ui["React daily report + spot detail"]
   rows --> facts["Allowlisted public fact bundle"]
-  facts --> agent["Per-spot ForecastBriefAgent"]
-  agent --> validate["Schema + claim validator"]
+  facts --> agent["ForecastBriefAgent · Agents SDK / Durable Object"]
+  agent --> model["Surf harness · structured Gemini call"]
+  model --> validate["Policy + quality validators"]
   validate --> rows
   python["Python GRIB/netCDF evaluation"] -. validates .-> ingest
 ```
@@ -29,7 +30,8 @@ flowchart LR
 | `packages/contracts` | Validate API and forecast data at package boundaries |
 | `packages/forecast-core` | Own the reference spot catalog, wave transforms, surface classification, and scoring |
 | `packages/db` | Own the SQL migration history, generated reference seed, and migration checks |
-| `ForecastBriefAgent` | Coordinate one brief per spot/day, material revisions, bounded retries, and Gemini calls without owning forecast facts |
+| `ForecastBriefAgent` | Use the Cloudflare Agents SDK and Durable Object SQLite to coordinate one brief per spot/day, material revisions, and bounded retries |
+| Surf forecast harness | Build role-tagged public facts, call Gemini through AI SDK, validate sentence-level evidence, insert locked caveats, and publish accepted prose |
 | `services/extractor` | Decode/evaluate GRIB2 and netCDF data that is too heavy or specialized for a Worker |
 
 ## Data ownership
@@ -44,6 +46,21 @@ flowchart LR
 Bindings are the only runtime path to these Cloudflare resources. Account IDs,
 database IDs, namespace IDs, and secrets are instance state and do not belong
 in Git.
+
+## What “Agent” means here
+
+Surf uses the open-source Cloudflare Agents SDK inside its existing Worker. A
+named `ForecastBriefAgent` is a SQLite-backed Durable Object that deduplicates
+spot/date signals, coordinates generation, schedules bounded retries, and
+records job state. It is not a hosted agent configured at
+`agents.cloudflare.com`.
+
+Surf supplies the agent harness itself. The harness assembles public facts,
+invokes Gemini directly through AI SDK's Google provider, validates the result,
+and writes accepted revisions to D1. There is no `AIChatAgent`, Think harness,
+public Agent route, chat session, WebSocket, MCP server, user-authored prompt,
+or model tool loop in this feature. Durable Object SQLite holds coordination
+state only; D1 remains the product-visible brief/history store.
 
 ## Forecast ownership
 
@@ -65,13 +82,19 @@ forecast window retains source run IDs and caveats so missing or stale data
 cannot be silently converted into certainty.
 
 LLMs do not own any numeric step. The optional daily forecaster receives only
-an allowlisted public-data fact bundle and deterministic picks. Its structured
-response is rejected if it references an unknown fact/window, introduces a
-numeric claim absent from the bundle, or emits links, HTML, or safety
-imperatives. D1 remains the published brief/history authority; per-spot Agent
-SQLite stores coordination state only.
-Gemini selects and orders exact allowlisted fact sentences rather than authoring
-free-form forecast prose.
+role-tagged public-data facts and deterministic picks. Gemini may write concise
+connective prose, but every model-authored sentence carries fact references.
+The result is rejected if it changes a recommendation, cites the wrong window,
+introduces an unsupported measurement or qualitative claim, weakens modeled
+versus observed semantics, emits links/HTML/safety imperatives, or misses the
+deterministic usefulness and naturalness floor.
+
+Measurement, proxy, fallback, calibration, hazard, and observation caveats are
+locked and inserted by code rather than paraphrased by the model. When model,
+policy, quality, or storage work fails, the read endpoint serves the local
+fact-based summary and the core forecast remains available. See
+[forecast brief evaluation](forecast-brief-evaluation.md) for the secretless
+checks, optional live evaluation, and rollout contract.
 
 ## Configuration boundary
 

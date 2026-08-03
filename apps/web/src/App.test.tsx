@@ -107,7 +107,8 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Test Break" })).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Forecast workbench" })).toBeTruthy();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
-    expect(screen.getByText("Daily forecaster")).toBeTruthy();
+    expect(screen.getByText("Daily outlook")).toBeTruthy();
+    expect(screen.queryByText(/AI-assisted|Gemini|Google/i)).toBeNull();
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.getByRole("link", { name: /Daily report/ }).getAttribute("href")).toBe("/");
   });

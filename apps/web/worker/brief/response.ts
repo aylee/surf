@@ -1,7 +1,8 @@
 import { buildDeterministicForecastBrief } from "./brief";
 import {
   countValidatedForecastBriefRevisions,
-  getLatestValidatedForecastBrief
+  getLatestValidatedForecastBrief,
+  getLatestValidatedForecastBriefForMaterialFingerprint
 } from "./repository";
 import {
   ForecastBriefResponseSchema,
@@ -15,11 +16,17 @@ export async function buildForecastBriefResponse(
   now = new Date()
 ): Promise<ForecastBriefResponse> {
   try {
-    const [latest, availableRevisions] = await Promise.all([
+    const [current, latest, availableRevisions] = await Promise.all([
+      getLatestValidatedForecastBriefForMaterialFingerprint(
+        db,
+        bundle.input.spotId,
+        bundle.input.localDate,
+        bundle.materialFingerprint
+      ),
       getLatestValidatedForecastBrief(db, bundle.input.spotId, bundle.input.localDate),
       countValidatedForecastBriefRevisions(db, bundle.input.spotId, bundle.input.localDate)
     ]);
-    if (!latest) {
+    if (!latest && !current) {
       return ForecastBriefResponseSchema.parse({
         status: "deterministic_fallback",
         brief: buildDeterministicForecastBrief(bundle),
@@ -27,23 +34,25 @@ export async function buildForecastBriefResponse(
         availableRevisions
       });
     }
-    const expired =
-      latest.expiresAt !== null && new Date(latest.expiresAt).getTime() <= now.getTime();
-    const materiallyCurrent = latest.materialFingerprint === bundle.materialFingerprint;
-    if (!expired && materiallyCurrent) {
+    const currentExpired =
+      current?.expiresAt !== null &&
+      current?.expiresAt !== undefined &&
+      new Date(current.expiresAt).getTime() <= now.getTime();
+    if (current && !currentExpired) {
       return ForecastBriefResponseSchema.parse({
         status: "model",
-        brief: latest.brief,
+        brief: current.brief,
         fallbackReason: null,
         availableRevisions
       });
     }
+    const fallbackRevision = current?.brief.revision ?? latest?.brief.revision ?? 1;
     return ForecastBriefResponseSchema.parse({
       status: "stale",
-      brief: buildDeterministicForecastBrief(bundle, latest.brief.revision),
-      fallbackReason: expired
+      brief: buildDeterministicForecastBrief(bundle, fallbackRevision),
+      fallbackReason: currentExpired
         ? "The latest validated model brief has expired."
-        : "Forecast inputs changed materially after the latest validated model brief.",
+        : "No validated model brief matches the current forecast inputs.",
       availableRevisions
     });
   } catch (error) {

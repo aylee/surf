@@ -7,6 +7,10 @@ import { ForecastResponseSchema, type ApiSpot, type ForecastResponse } from "@su
 import { getSpotProfile, selectCanonicalRecommendationIds } from "@surf/forecast-core";
 import { buildFixtureForecast } from "@surf/forecast-core/test-support";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { assembleModelForecastBrief } from "../../../worker/brief/brief";
+import { buildForecastFactBundle } from "../../../worker/brief/facts";
+import { briefForecastFixture, validDraftFor } from "../../../worker/brief/test-helpers";
+import { validateForecastBriefDraft } from "../../../worker/brief/validator";
 import { adaptForecastResponse } from "./forecast-adapter";
 import { ForecastWorkbench } from "./ForecastWorkbench";
 
@@ -174,7 +178,7 @@ describe("ForecastWorkbench", () => {
 
     render(<ForecastWorkbench spot={spot} initialForecast={threeHour} now={now} />);
 
-    expect(await screen.findByRole("heading", { name: "9:00 AM is the clearest daylight window" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "9:00 AM is the leading daylight window" })).toBeTruthy();
     await waitFor(() => {
       expect(new URLSearchParams(window.location.search).get("at")).toBe(canonicalThreeHourAt);
     });
@@ -189,7 +193,7 @@ describe("ForecastWorkbench", () => {
       expect(params.get("interval")).toBe("1h");
       expect(params.get("at")).toBe(canonicalThreeHourAt);
     });
-    expect(screen.getByRole("heading", { name: "9:00 AM is the clearest daylight window" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "9:00 AM is the leading daylight window" })).toBeTruthy();
   });
 
   it("hides stale-brief internals, shows selected-source states, and lets a phone row collapse", async () => {
@@ -249,14 +253,69 @@ describe("ForecastWorkbench", () => {
   it("keeps the local outlook and workbench usable when the brief request fails", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "provider unavailable" }, 503)));
+    const choppyForecast = fixtureForecast();
+    choppyForecast.windows = choppyForecast.windows.map((window) => ({
+      ...window,
+      surfaceCondition: "choppy" as const,
+      qualityLabel: "poor" as const
+    }));
 
-    render(<ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />);
+    render(<ForecastWorkbench spot={spot} initialForecast={choppyForecast} now={now} />);
 
-    expect(await screen.findByRole("heading", { name: /clearest daylight window/ })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: /leading daylight window/ })).toBeTruthy();
+    expect(screen.queryByText(/clearest daylight window/i)).toBeNull();
+    expect(screen.getByText(/Outlook updated Aug 2/)).toBeTruthy();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.queryByText(/provider unavailable/i)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("presents one best window, quieter alternatives, and no provider-specific chrome", async () => {
+    const modelForecast = briefForecastFixture();
+    modelForecast.spot = {
+      ...modelForecast.spot,
+      id: spot.id,
+      name: spot.name,
+      timezone: spot.timezone
+    };
+    const bundle = await buildForecastFactBundle(modelForecast);
+    const { draft } = validateForecastBriefDraft(validDraftFor(bundle), bundle);
+    const modelBrief = assembleModelForecastBrief({
+      bundle,
+      draft,
+      revision: 1,
+      generatedAt: "2026-08-02T19:23:58.459Z"
+    });
+    const [bestPick, alternatePick] = modelBrief.picks;
+    expect(bestPick).toBeDefined();
+    expect(alternatePick).toBeDefined();
+    window.history.replaceState({}, "", "/?spot=bolinas");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({
+      status: "model",
+      brief: modelBrief
+    })));
+
+    const { container } = render(
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />
+    );
+
+    expect(await screen.findByRole("heading", { name: modelBrief.headline })).toBeTruthy();
+    expect(screen.getByText("Best window")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: bestPick!.label })).toBeTruthy();
+    expect(screen.getByText("Also worth a look")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 3, name: alternatePick!.label })).toBeTruthy();
+    expect(screen.getAllByText("Why")).toHaveLength(2);
+    expect(screen.getAllByText("Watch for")).toHaveLength(2);
+    expect(screen.queryByText("AI-assisted")).toBeNull();
+    expect(container.querySelector(".dailyBriefIcon")).toBeNull();
+
+    const lessonSummary = screen.getByText("What this teaches you").closest("summary");
+    const lesson = lessonSummary?.closest("details") as HTMLDetailsElement | null;
+    expect(lesson?.open).toBe(false);
+    fireEvent.click(lessonSummary!);
+    expect(lesson?.open).toBe(true);
+    expect(screen.getByText(modelBrief.lesson.text)).toBeTruthy();
   });
 
   it("ignores malformed brief timestamps without collapsing forecast detail", async () => {
@@ -276,7 +335,7 @@ describe("ForecastWorkbench", () => {
     render(<ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />);
 
     expect(await screen.findByRole("heading", { name: "A validated daily read" })).toBeTruthy();
-    expect(screen.getByText("AI-assisted")).toBeTruthy();
+    expect(screen.queryByText("AI-assisted")).toBeNull();
     expect(screen.queryByText(/time unavailable/i)).toBeNull();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
   });
@@ -370,7 +429,7 @@ describe("ForecastWorkbench", () => {
     expect(canonicalRequests).toBe(1);
     releaseCanonical();
 
-    await waitFor(() => expect(screen.getByRole("heading", { name: /clearest daylight window/ })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("heading", { name: /leading daylight window/ })).toBeTruthy());
     expect(canonicalRequests).toBe(1);
     expect(screen.getByRole("table", { name: /One-hour surf-planning inputs/ })).toBeTruthy();
     expect(new URLSearchParams(window.location.search).get("interval")).toBe("1h");

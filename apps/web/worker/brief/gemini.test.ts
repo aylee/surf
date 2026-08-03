@@ -18,11 +18,25 @@ describe("Gemini brief generator", () => {
     expect(invoke).toHaveBeenCalledOnce();
     const request = invoke.mock.calls[0]![0];
     expect(request.system).toBe(forecastBriefSystemPrompt);
-    expect(request.system).toContain("Copy every why, tradeoff, bust-factor, and lesson-text sentence verbatim");
+    expect(request.system).toContain("Write natural, concise prose in your own words");
+    expect(request.system).toContain("Do not write any number, time, rank, measurement, or unit");
+    expect(request.system).toContain("summary must cite and synthesize at least one of each");
+    expect(request.system).toContain("prefer wind relationship, tide context, confidence, or source freshness");
     expect(request.prompt).toContain(bundle.facts[0]!.id);
     expect(request.prompt).toContain(bundle.input.recommendationWindowIds[0]!);
+    const nonRecommendedFact = bundle.facts.find(
+      (fact) =>
+        fact.windowId !== null &&
+        !bundle.input.recommendationWindowIds.includes(fact.windowId)
+    );
+    expect(nonRecommendedFact).toBeDefined();
+    expect(request.prompt).not.toContain(nonRecommendedFact!.id);
+    expect(request.prompt).not.toContain("requiredHeadline");
+    expect(request.prompt).not.toContain("requiredSetup");
+    expect(request.prompt).not.toContain("not an observed breaking-wave face height");
     expect(request.prompt).not.toContain("exact modeled nearshore height");
     expect(request.prompt).not.toContain("observation age");
+    expect(request.prompt).not.toContain("nearby public buoy observation");
     expect(request.prompt).not.toContain("test-key");
   });
 

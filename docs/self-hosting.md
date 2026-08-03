@@ -65,14 +65,17 @@ fixture, or tracked file. `FORECAST_BRIEF_ENABLED=true` enables local model
 generation; an invalid/missing key fails closed to deterministic copy.
 
 An opt-in evaluation makes exactly one provider call, validates the structured
-result against the same fact policy used by the Worker, and prints only the
-validated public prose (never the request or key):
+result against the same fact policy used by the Worker, and prints a safe
+record containing either validated public prose plus quality metadata or a
+sanitized rejection category (never the request, key, fact IDs, or provider
+payload):
 
-Gemini curates which allowlisted facts explain each deterministic pick; it does
-not write unrestricted forecast prose. Every published explanatory sentence is
-required to match a cited fact sentence exactly. This deliberately trades some
-voice for a validator that can independently reject label swaps, negation, new
-measurements, and uncited claims.
+Gemini synthesizes natural explanatory prose from role-tagged public facts; it
+does not calculate forecast values, choose new windows, or write unrestricted
+marine claims. Every model-authored field carries sentence-scoped fact
+references and must pass independent policy and quality validation. Code adds
+the authoritative time labels, measurements, recommendation order, and hard
+measurement or hazard caveats after validation.
 
 ```bash
 cd apps/web

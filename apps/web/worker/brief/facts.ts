@@ -4,7 +4,12 @@ import {
   surfaceConditionForWind
 } from "@surf/forecast-core";
 import {
+  FORECAST_BRIEF_PROMPT_VERSION,
+  FORECAST_BRIEF_QUALITY_POLICY_VERSION,
   FORECAST_BRIEF_SCHEMA_VERSION,
+  FORECAST_BRIEF_MODEL_ID,
+  FORECAST_BRIEF_THINKING_LEVEL,
+  FORECAST_FACT_BUNDLE_SCHEMA_VERSION,
   ForecastFactBundleSchema,
   ForecastBriefInputSchema,
   type ForecastBriefInput,
@@ -12,6 +17,14 @@ import {
   type ForecastFact,
   type ForecastFactBundle
 } from "./types";
+
+export const FORECAST_BRIEF_GENERATION_CONTRACT = {
+  briefSchemaVersion: FORECAST_BRIEF_SCHEMA_VERSION,
+  promptVersion: FORECAST_BRIEF_PROMPT_VERSION,
+  qualityPolicyVersion: FORECAST_BRIEF_QUALITY_POLICY_VERSION,
+  modelId: FORECAST_BRIEF_MODEL_ID,
+  thinkingLevel: FORECAST_BRIEF_THINKING_LEVEL
+} as const;
 
 export type BuildForecastFactBundleOptions = {
   localDate?: string;
@@ -201,14 +214,6 @@ function toWindowInput(
   };
 }
 
-function formatLocalTime(value: string, timeZone: string): string {
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hour: "numeric",
-    minute: "2-digit"
-  }).format(new Date(value));
-}
-
 export function forecastBriefWindowLabel(
   bundle: Pick<ForecastFactBundle, "input">,
   windowId: string
@@ -227,10 +232,11 @@ export function forecastBriefFrame(bundle: Pick<ForecastFactBundle, "input">): {
   headline: string;
   setup: string;
 } {
-  return bundle.input.recommendationWindowIds.length > 0
+  const leadingWindowId = bundle.input.recommendationWindowIds[0];
+  return leadingWindowId
     ? {
-        headline: `${bundle.input.spotName} daylight outlook`,
-        setup: "Compare the cited wind, tide, modeled wave state, confidence, and source caveats before making the call."
+        headline: `${forecastBriefWindowLabel(bundle, leadingWindowId)} leads at ${bundle.input.spotName}`,
+        setup: "The leading daylight window comes from the current condition, wind, wave, confidence, and source read."
       }
     : {
         headline: `${bundle.input.spotName} has no scored daylight recommendation`,
@@ -238,18 +244,95 @@ export function forecastBriefFrame(bundle: Pick<ForecastFactBundle, "input">): {
       };
 }
 
+function conditionRole(
+  window: ForecastBriefWindowInput
+): ForecastFact["role"] {
+  if (window.surfaceCondition === "choppy" || window.qualityLabel === "poor") return "tradeoff";
+  if (
+    window.surfaceCondition === "clean" ||
+    window.qualityLabel === "fun" ||
+    window.qualityLabel === "good" ||
+    window.qualityLabel === "excellent"
+  ) {
+    return "support";
+  }
+  return "context";
+}
+
+function confidenceRole(
+  window: ForecastBriefWindowInput
+): ForecastFact["role"] {
+  return window.confidenceBand === "high" ? "support" : "tradeoff";
+}
+
+function windRole(window: ForecastBriefWindowInput): ForecastFact["role"] {
+  if (window.windRelation === "offshore") return "support";
+  if (window.windRelation === "onshore" || window.windRelation === "cross-shore") {
+    return "tradeoff";
+  }
+  return "context";
+}
+
+function lockedWaveCaveats(
+  window: ForecastBriefWindowInput
+): Array<{ suffix: string; statement: string }> {
+  if (window.waveSemantics === "unavailable") return [];
+  const caveats = [
+    {
+      suffix: "measurement",
+      statement:
+        "The size shown is modeled nearshore wave state, not an observed breaking-wave face height."
+    }
+  ];
+  if (window.waveSemantics === "cove_proxy") {
+    caveats.push({
+      suffix: "proxy",
+      statement: "The wave state is a nearby cove proxy rather than a direct value for this spot."
+    });
+  } else if (window.waveSemantics === "nws_fallback") {
+    caveats.push({
+      suffix: "fallback",
+      statement: "The wave state uses an NWS fallback rather than direct nearshore model output."
+    });
+  }
+  if (window.calibrationStatus !== "unavailable") {
+    caveats.push({
+      suffix: "calibration",
+      statement: "The modeled wave state has not been calibrated against breaking waves at this spot."
+    });
+  }
+  return caveats;
+}
+
+const CODE_OWNED_RAW_CAVEAT_PATTERN =
+  /\b(?:active nws hazard|breaking|wave[- ]face|significant wave height|calibrat|proxy|fallback|cold[- ]start|coastal[- ]grid|cdip|model point|source model cycle|height scale|bulk[- ]hs|buoy|observation)\b/i;
+
+function modelEligibleRawCaveat(caveat: string): boolean {
+  return !CODE_OWNED_RAW_CAVEAT_PATTERN.test(caveat);
+}
+
 function addWindowFacts(
   facts: ForecastFact[],
   window: ForecastBriefWindowInput,
-  index: number,
-  timeZone: string
+  index: number
 ): void {
   const prefix = `window:w${index}`;
-  const localTime = formatLocalTime(window.forecastAt, timeZone);
   facts.push({
     id: `${prefix}:condition`,
     kind: "condition",
-    statement: `${localTime}: deterministic surface condition ${window.surfaceCondition}; quality band ${window.qualityLabel}; confidence band ${window.confidenceBand}.`,
+    role: conditionRole(window),
+    statement: `Surface conditions are ${window.surfaceCondition}, and the overall quality read is ${window.qualityLabel}.`,
+    windowId: window.windowId,
+    material: true
+  });
+  facts.push({
+    id: `${prefix}:confidence`,
+    kind: "confidence",
+    role: confidenceRole(window),
+    statement:
+      window.confidenceBand === "high"
+        ? "Confidence is high, which strengthens the forecast call."
+        : `Confidence is ${window.confidenceBand}, leaving meaningful uncertainty around the forecast call.`,
     windowId: window.windowId,
     material: true
   });
@@ -257,7 +340,8 @@ function addWindowFacts(
     facts.push({
       id: `${prefix}:wave`,
       kind: "wave",
-      statement: `${localTime}: ${window.modeledHeightLabel}; ${periodBand(window.peakPeriodSec)}-period modeled wave state from the ${directionSector(window.primaryDirectionDeg)}; semantics ${window.waveSemantics}; calibration ${window.calibrationStatus}. This is not an observed breaking-wave face height.`,
+      role: "context",
+      statement: `The modeled nearshore wave state is ${periodBand(window.peakPeriodSec)}-period from the ${directionSector(window.primaryDirectionDeg)}.`,
       windowId: window.windowId,
       material: true
     });
@@ -265,7 +349,8 @@ function addWindowFacts(
     facts.push({
       id: `${prefix}:wave`,
       kind: "wave",
-      statement: `${localTime}: modeled wave height is unavailable; calibration ${window.calibrationStatus}.`,
+      role: "tradeoff",
+      statement: "The modeled wave state is unavailable for this window.",
       windowId: window.windowId,
       material: true
     });
@@ -273,28 +358,64 @@ function addWindowFacts(
   facts.push({
     id: `${prefix}:wind`,
     kind: "wind",
-    statement: `${localTime}: wind input is ${window.windSpeedKt === null ? "unavailable" : "available"}; shoreline relationship ${window.windRelation}.`,
+    role: window.windSpeedKt === null ? "tradeoff" : windRole(window),
+    statement:
+      window.windSpeedKt === null
+        ? "The wind relationship is unavailable for this window."
+        : window.windRelation === "offshore"
+          ? "Offshore wind supports the cleaner surface read at this shoreline."
+          : window.windRelation === "onshore"
+            ? "Onshore wind is a surface-quality limiter at this shoreline."
+            : window.windRelation === "cross-shore"
+              ? "Cross-shore wind is a surface-quality tradeoff at this shoreline."
+              : `The wind relationship is ${window.windRelation} at this shoreline.`,
     windowId: window.windowId,
     material: true
   });
   facts.push({
     id: `${prefix}:tide`,
     kind: "tide",
-    statement: `${localTime}: tide input is ${window.tideFt === null ? "unavailable" : "available"}; trend ${window.tideTrend ?? "unknown"}.`,
+    role: "context",
+    statement:
+      window.tideFt === null
+        ? "Tide context is unavailable for this window."
+        : `The tide is ${window.tideTrend ?? "unknown"}. Surf has no validated spot-specific tide preference here, so the trend is context rather than a quality signal.`,
     windowId: window.windowId,
     material: true
   });
   facts.push({
     id: `${prefix}:freshness`,
     kind: "source",
-    statement: `${localTime}: required-source status ${window.requiredSourceStatus}.`,
+    role:
+      window.requiredSourceStatus === "stale" || window.requiredSourceStatus === "missing"
+        ? "tradeoff"
+        : "context",
+    statement:
+      window.requiredSourceStatus === "fresh"
+        ? "The required forecast sources are fresh for this window."
+        : window.requiredSourceStatus === "stale"
+          ? "A required forecast source is stale, limiting confidence in this window."
+          : window.requiredSourceStatus === "missing"
+            ? "A required forecast source is missing, limiting confidence in this window."
+            : "Required forecast source health is unknown for this window.",
     windowId: window.windowId,
     material: true
   });
-  window.caveats.slice(0, 2).forEach((caveat, caveatIndex) => {
+  lockedWaveCaveats(window).forEach((caveat) => {
+    facts.push({
+      id: `${prefix}:locked:${caveat.suffix}`,
+      kind: "caveat",
+      role: "locked",
+      statement: caveat.statement,
+      windowId: window.windowId,
+      material: true
+    });
+  });
+  window.caveats.filter(modelEligibleRawCaveat).slice(0, 2).forEach((caveat, caveatIndex) => {
     facts.push({
       id: `${prefix}:caveat:${caveatIndex}`,
       kind: "caveat",
+      role: "tradeoff",
       statement: caveat,
       windowId: window.windowId,
       material: true
@@ -378,7 +499,10 @@ function activeHazards(windows: ForecastBriefWindowInput[]): string[] {
 
 function materialSnapshot(input: ForecastBriefInput) {
   return {
+    generationContract: FORECAST_BRIEF_GENERATION_CONTRACT,
     spotId: input.spotId,
+    spotName: input.spotName,
+    timezone: input.timezone,
     localDate: input.localDate,
     recommendationWindowIds: input.recommendationWindowIds,
     windows: input.windows.map((window) => ({
@@ -459,26 +583,31 @@ export async function buildForecastFactBundle(
     {
       id: "spot:identity",
       kind: "spot",
+      role: "context",
       statement: `${input.spotName} forecast for ${input.localDate}.`,
       windowId: null,
       material: true
     }
   ];
   input.recommendationWindowIds.forEach((windowId, rank) => {
-    const window = input.windows.find((candidate) => candidate.windowId === windowId)!;
     facts.push({
       id: `recommendation:r${rank + 1}`,
       kind: "recommendation",
-      statement: `Deterministic recommendation rank ${rank + 1} is ${formatLocalTime(window.forecastAt, input.timezone)} with window ID ${window.windowId}.`,
+      role: "support",
+      statement:
+        rank === 0
+          ? "This window is the leading daylight recommendation."
+          : "This window is also worth a look among the daylight recommendations.",
       windowId,
       material: true
     });
   });
-  input.windows.forEach((window, index) => addWindowFacts(facts, window, index, input.timezone));
+  input.windows.forEach((window, index) => addWindowFacts(facts, window, index));
   input.activeHazards.forEach((hazard, index) => {
     facts.push({
       id: `hazard:h${index}`,
       kind: "hazard",
+      role: "locked",
       statement: hazard,
       windowId: null,
       material: true
@@ -488,7 +617,13 @@ export async function buildForecastFactBundle(
     facts.push({
       id: `source:s${index}`,
       kind: "source",
-      statement: `${source.sourceId} status ${source.status}.`,
+      role: source.status === "fresh" ? "context" : "tradeoff",
+      statement:
+        source.status === "fresh"
+          ? "This public forecast source is fresh."
+          : source.status === "stale"
+            ? "This public forecast source is stale and limits confidence."
+            : "This public forecast source is missing and limits confidence.",
       windowId: null,
       material: true
     });
@@ -497,21 +632,38 @@ export async function buildForecastFactBundle(
     facts.push({
       id: "observation:latest",
       kind: "observation",
-      statement: `A public buoy observation is available for context. Its freshness is represented by source status. It is not a spot forecast.`,
+      role: "context",
+      statement:
+        "A nearby public buoy observation provides regional context; it is not a forecast for this surf spot.",
       windowId: null,
       material: true
     });
   }
 
-  const inputFingerprint = await sha256({ input, facts });
+  const inputFingerprint = await sha256({
+    generationContract: FORECAST_BRIEF_GENERATION_CONTRACT,
+    input,
+    facts
+  });
   const materialFingerprint = await sha256(materialSnapshot(input));
   return ForecastFactBundleSchema.parse({
-    schemaVersion: FORECAST_BRIEF_SCHEMA_VERSION,
+    schemaVersion: FORECAST_FACT_BUNDLE_SCHEMA_VERSION,
     input,
     facts,
     inputFingerprint,
     materialFingerprint
   });
+}
+
+export function forecastBriefLockedFacts(
+  bundle: Pick<ForecastFactBundle, "facts" | "input">
+): ForecastFact[] {
+  const recommended = new Set(bundle.input.recommendationWindowIds);
+  return bundle.facts.filter(
+    (fact) =>
+      fact.role === "locked" &&
+      (fact.windowId === null || recommended.has(fact.windowId))
+  );
 }
 
 export function isMaterialBriefChange(

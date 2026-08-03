@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildForecastFactBundle, isMaterialBriefChange } from "./facts";
+import {
+  FORECAST_BRIEF_GENERATION_CONTRACT,
+  buildForecastFactBundle,
+  forecastBriefLockedFacts,
+  isMaterialBriefChange
+} from "./facts";
 import { briefForecastFixture } from "./test-helpers";
 
 describe("forecast brief fact bundle", () => {
@@ -12,6 +17,21 @@ describe("forecast brief fact bundle", () => {
       expect(bundle.input.windows.find((window) => window.windowId === windowId)?.isDaylight).toBe(true);
     }
     expect(bundle.facts.some((fact) => fact.statement.includes("not an observed breaking-wave face height"))).toBe(true);
+    expect(bundle.schemaVersion).toBe(1);
+    expect(FORECAST_BRIEF_GENERATION_CONTRACT).toEqual({
+      briefSchemaVersion: 2,
+      promptVersion: "surf-brief-v2",
+      qualityPolicyVersion: "surf-brief-quality-v2",
+      modelId: "gemini-3.6-flash",
+      thinkingLevel: "low"
+    });
+    expect(bundle.facts.some((fact) => fact.role === "support")).toBe(true);
+    expect(bundle.facts.some((fact) => fact.role === "tradeoff")).toBe(true);
+    expect(forecastBriefLockedFacts(bundle).length).toBeGreaterThan(0);
+    expect(bundle.facts.find((fact) => fact.id === "observation:latest")?.role).toBe("context");
+    expect(forecastBriefLockedFacts(bundle).some((fact) => fact.kind === "observation")).toBe(
+      false
+    );
     expect(bundle.inputFingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(bundle.materialFingerprint).toMatch(/^[a-f0-9]{64}$/);
   });
@@ -91,7 +111,7 @@ describe("forecast brief fact bundle", () => {
       expect(
         bundle.facts
           .filter((fact) => fact.id.endsWith(":freshness"))
-          .every((fact) => fact.statement.includes("required-source status fresh"))
+          .every((fact) => fact.statement.includes("required forecast sources are fresh"))
       ).toBe(true);
     }
   );
@@ -109,6 +129,41 @@ describe("forecast brief fact bundle", () => {
     expect(isMaterialBriefChange(before, after)).toBe(true);
   });
 
+  it("treats presentation metadata as material to code-owned labels", async () => {
+    const original = briefForecastFixture();
+    const renamed = structuredClone(original);
+    renamed.spot = { ...renamed.spot, name: "Linda Mar renamed" };
+
+    const [before, after] = await Promise.all([
+      buildForecastFactBundle(original),
+      buildForecastFactBundle(renamed)
+    ]);
+    expect(after.materialFingerprint).not.toBe(before.materialFingerprint);
+  });
+
+  it("keeps provider and measurement caveats out of model-authored tradeoffs", async () => {
+    const forecast = briefForecastFixture();
+    forecast.windows = forecast.windows.map((window) => ({
+      ...window,
+      caveats: [
+        "CDIP model point is not observed breaking-wave face height.",
+        "A wind shift could weaken the surface-quality read."
+      ]
+    }));
+
+    const bundle = await buildForecastFactBundle(forecast);
+    expect(
+      bundle.facts.some(
+        (fact) => fact.role === "tradeoff" && /cdip|breaking-wave/i.test(fact.statement)
+      )
+    ).toBe(false);
+    expect(
+      bundle.facts.some(
+        (fact) => fact.role === "tradeoff" && /wind shift/i.test(fact.statement)
+      )
+    ).toBe(true);
+  });
+
   it("treats the actual surface condition as material instead of calling a score label a condition", async () => {
     const original = briefForecastFixture();
     const changed = structuredClone(original);
@@ -119,7 +174,7 @@ describe("forecast brief fact bundle", () => {
       buildForecastFactBundle(changed)
     ]);
     expect(before.facts.find((fact) => fact.id === "window:w0:condition")?.statement).toContain(
-      "surface condition clean"
+      "Surface conditions are clean"
     );
     expect(after.materialFingerprint).not.toBe(before.materialFingerprint);
   });
