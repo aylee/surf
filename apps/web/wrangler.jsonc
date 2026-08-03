@@ -6,6 +6,12 @@
   "compatibility_date": "2026-07-08",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  // Workers Cache checks cacheable forecast/brief responses before invoking
+  // the 10 ms HTTP Worker. Version-scoped keys prevent stale cross-deploy data.
+  "cache": {
+    "enabled": true,
+    "cross_version_cache": false
+  },
   "observability": {
     "enabled": true,
     "logs": {
@@ -63,8 +69,12 @@
     "consumers": [
       {
         "queue": "surf-ingest",
-        "max_batch_size": 10,
+        // Forecast generations read several normalized tables. Serialize
+        // ingest consumers so one generation cannot observe another ingest's
+        // partially-written inputs or publish out of order.
+        "max_batch_size": 1,
         "max_batch_timeout": 30,
+        "max_concurrency": 1,
         "max_retries": 3,
         "dead_letter_queue": "surf-ingest-dlq"
       }

@@ -174,6 +174,10 @@ Enter a long random value at the hidden prompt. When invoking the endpoint from
 your shell, provide the same value through the ignored environment variable
 `SURF_INGEST_TOKEN`; never paste it into a script or GitHub issue.
 
+Keep that variable available for later `pnpm deploy` runs. An update deploy
+performs one authenticated ingest after the new Worker is active so any newly
+migrated forecast read-model tables are populated before strict smoke testing.
+
 ### 5. Optional Gemini production rollout
 
 The tracked configuration deliberately sets `FORECAST_BRIEF_ENABLED=false`.
@@ -215,12 +219,18 @@ pnpm ingest:remote
 pnpm smoke:cloudflare
 ```
 
-`pnpm ingest:remote` exits nonzero on a failed/persistence-error result or when
-core wave, wind, or tide inputs are absent. It reports non-fatal partial-source
-caveats (for example, a buoy omitting an optional metric) without hiding them.
-The post-ingest smoke checks every configured spot for a five-day horizon and
-at least one scored window backed by wave data; it does not accept synthesized
-unknown windows as a populated deployment.
+The first `pnpm setup:cloudflare` remains structure-only and needs this manual
+population step. Subsequent `pnpm deploy` runs perform the same authenticated
+Queue ingest and bounded read-model publication check automatically before
+their strict smoke; rerunning these commands is a safe explicit verification.
+
+`pnpm ingest:remote` returns after every configured spot's 1-hour and 3-hour
+read models were materialized at or after the Worker-issued request timestamp.
+It exits nonzero on an invalid Queue acknowledgement, an unexpected forecast
+response, or the bounded publication timeout, which names any missing
+spot/interval pairs. The post-ingest smoke checks every configured spot for a
+five-day horizon and at least one scored window backed by wave data; it does
+not accept synthesized unknown windows as a populated deployment.
 
 Then verify:
 
@@ -254,11 +264,15 @@ low-confidence mapping is more honest.
 git pull --ff-only
 pnpm install --frozen-lockfile
 pnpm verify
+export SURF_INGEST_TOKEN=<matching-secret-in-your-shell>
 pnpm deploy
 ```
 
-The deploy command runs the strict remote smoke after rollout and fails if any
-configured spot lacks a five-day horizon with sourced, scored wave data.
+The deploy command applies migrations, deploys, refreshes the materialized
+forecast generation, and then runs the strict remote smoke. If bootstrap or
+smoke fails, it automatically rolls the Worker version back while leaving the
+additive D1 schema intact. It fails if any configured spot lacks a five-day
+horizon with sourced, scored wave data.
 
 Back up D1 before a migration that changes or removes data. See
 [runtime operations](runtime-operations.md) for export, rollback, retention,

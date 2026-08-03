@@ -57,6 +57,9 @@ export function wranglerStructureFailures(config, configPath) {
   ) {
     failures.push(`Queue consumer must read ${ingestQueue} and dead-letter to ${deadLetterQueue}.`);
   }
+  if (consumers[0]?.max_batch_size !== 1 || consumers[0]?.max_concurrency !== 1) {
+    failures.push("Ingest queue consumption must be serialized one message at a time.");
+  }
 
   if (config?.assets?.binding !== "ASSETS") failures.push("Static assets binding must be ASSETS.");
   const briefBindings = config?.durable_objects?.bindings ?? [];
@@ -103,6 +106,9 @@ export function wranglerStructureFailures(config, configPath) {
   }
   if (config?.observability?.logs?.enabled !== true) {
     failures.push("Worker observability logs must be enabled.");
+  }
+  if (config?.cache?.enabled !== true || config?.cache?.cross_version_cache !== false) {
+    failures.push("Worker response caching must be enabled with version-scoped cache keys.");
   }
 
   return failures;

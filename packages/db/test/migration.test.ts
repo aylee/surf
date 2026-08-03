@@ -12,12 +12,17 @@ const trustWorkbenchMigrationSql = readFileSync(
   new URL("../migrations/0002_trust_workbench.sql", import.meta.url),
   "utf8"
 );
-const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}`;
+const readModelMigrationSql = readFileSync(
+  new URL("../migrations/0003_forecast_read_models.sql", import.meta.url),
+  "utf8"
+);
+const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}\n${readModelMigrationSql}`;
 const seedSql = readFileSync(new URL("../seeds/0000_v1_norcal.sql", import.meta.url), "utf8");
 
 const appliedMigrationHashes = {
   "0000_initial.sql": "f020c33694ac21a922820ed50b50588f6dfe6f2afca842ed53c091239860c482",
-  "0001_forecast_history.sql": "4648120b46a8991a8b734a7546501461a16b2db37654eeeca629e471725293eb"
+  "0001_forecast_history.sql": "4648120b46a8991a8b734a7546501461a16b2db37654eeeca629e471725293eb",
+  "0002_trust_workbench.sql": "eb5b67858eba74687d29abf032d07b1e97beaa53bba4bc7f5126ae6fc4c0a04f"
 };
 
 function tableBody(tableName: string): string {
@@ -90,6 +95,22 @@ describe("D1 migration", () => {
       "brief_json text not null",
       "fact_refs_json text not null",
       "validation_json text not null"
+    ],
+    forecast_read_models: [
+      "interval text not null",
+      "generation_id text not null",
+      "source_issue_fingerprint text not null",
+      "schema_version integer not null",
+      "forecast_json text not null",
+      "materialized_at text not null"
+    ],
+    forecast_fact_bundles: [
+      "local_date text not null",
+      "generation_id text not null",
+      "input_fingerprint text not null",
+      "material_fingerprint text not null",
+      "schema_version integer not null",
+      "fact_bundle_json text not null"
     ]
   };
 
@@ -99,6 +120,9 @@ describe("D1 migration", () => {
     );
     expect(createHash("sha256").update(historyMigrationSql).digest("hex")).toBe(
       appliedMigrationHashes["0001_forecast_history.sql"]
+    );
+    expect(createHash("sha256").update(trustWorkbenchMigrationSql).digest("hex")).toBe(
+      appliedMigrationHashes["0002_trust_workbench.sql"]
     );
   });
 
@@ -132,6 +156,8 @@ describe("D1 migration", () => {
     expect(normalizedSql).toContain("create index if not exists tide_events_spot_event_at_idx on tide_events (spot_id, event_at)");
     expect(normalizedSql).toContain("create unique index if not exists forecast_brief_revisions_input_idx on forecast_brief_revisions (spot_id, local_date, input_fingerprint)");
     expect(normalizedSql).toContain("create index if not exists forecast_brief_revisions_latest_idx on forecast_brief_revisions (spot_id, local_date, revision desc)");
+    expect(normalizedSql).toContain("create index if not exists forecast_read_models_materialized_at_idx on forecast_read_models (materialized_at)");
+    expect(normalizedSql).toContain("create index if not exists forecast_fact_bundles_generation_idx on forecast_fact_bundles (spot_id, generation_id, local_date)");
   });
 
   it("adds forecast history without altering or dropping the live read-model tables", () => {
@@ -158,6 +184,16 @@ describe("D1 migration", () => {
     expect(normalizedTrust).toContain("primary key (spot_id, station_id, event_at)");
     expect(normalizedTrust).toContain("primary key (spot_id, local_date, revision)");
     expect(normalizedTrust).toContain("status text not null check (status in ('validated'))");
+  });
+
+  it("adds request-time read models without altering operational or history tables", () => {
+    const normalizedReadModel = readModelMigrationSql.replace(/\s+/g, " ").toLowerCase();
+
+    expect(normalizedReadModel).not.toContain("alter table");
+    expect(normalizedReadModel).not.toContain("drop table");
+    expect(normalizedReadModel).toContain("primary key (spot_id, interval)");
+    expect(normalizedReadModel).toContain("primary key (spot_id, local_date)");
+    expect(normalizedReadModel).toContain("check (interval in ('1h', '3h'))");
   });
 });
 

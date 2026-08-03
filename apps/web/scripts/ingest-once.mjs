@@ -2,10 +2,18 @@
 
 import { loadRootEnv } from "../../../scripts/lib/root-env.mjs";
 import { resolveIngestTarget } from "../../../scripts/lib/ingest-target.mjs";
+import { enqueueAndWaitForRemoteIngest } from "../../../scripts/lib/remote-ingest.mjs";
 
 const mode = process.argv[2];
 if (mode === "--remote") loadRootEnv();
 const { baseUrl, token } = resolveIngestTarget(mode, process.env);
+
+if (mode === "--remote") {
+  const result = await enqueueAndWaitForRemoteIngest({ baseUrl, token });
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(0);
+}
+
 const response = await fetch(`${baseUrl}/api/ingest/once`, {
   method: "POST",
   headers: token ? { Authorization: `Bearer ${token}` } : undefined
@@ -19,14 +27,29 @@ const hasCoreForecastInputs =
   (Number(counts.nwsWaveForecastRows) > 0 || Number(counts.cdipMopWaveForecastRows) > 0) &&
   Number(counts.nwsWindForecastRows) > 0 &&
   Number(counts.tidePredictionRows) > 0;
+const hasPublishedReadModels =
+  Number(counts.forecastReadModelRows) > 0 &&
+  Number(counts.forecastFactBundleRows) > 0;
 const persistenceFailed =
   (summary?.errors?.length ?? 0) > 0 ||
   (summary?.sourceRuns ?? []).some(
     (run) => run?.recorded !== true || Number(run?.errorCount) > 0
   );
-if (summary?.status === "failure" || persistenceFailed || !hasCoreForecastInputs) {
+if (
+  summary?.status === "failure" ||
+  persistenceFailed ||
+  !hasCoreForecastInputs ||
+  !hasPublishedReadModels
+) {
+  const validationFailures = [
+    ...(!hasCoreForecastInputs ? ["core forecast inputs were empty"] : []),
+    ...(!hasPublishedReadModels ? ["forecast read models were not published"] : [])
+  ];
   throw new Error(
-    `ingest completed with ${summary?.status ?? "an unknown status"}: ${JSON.stringify(summary?.errors ?? [])}`
+    `ingest completed with ${summary?.status ?? "an unknown status"}: ${JSON.stringify([
+      ...(summary?.errors ?? []),
+      ...validationFailures
+    ])}`
   );
 }
 if (summary.status === "partial") {

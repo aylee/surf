@@ -8,6 +8,7 @@ import { withPublicFeedUserAgent } from "../adapters/http";
 import type { SourceCaveat, SourceFetch } from "../adapters/types";
 import { combineStatus } from "../adapters/types";
 import { sha256StableJson } from "../forecast-history";
+import { materializeForecastReadModels } from "../forecast-read-model";
 import type { Env } from "../index";
 import {
   persistCdipMopForecasts,
@@ -221,7 +222,8 @@ export async function runNorcalIngest(
     : { rowsWritten: 0, errors: [] };
 
   const dbErrors = finalizedRuns.flatMap((run) => (run.recorded ? [] : [`${run.sourceId}: ${run.error}`]));
-  const persistenceErrors = [
+  const adapterErrors = outcomes.flatMap((outcome) => outcome.errors);
+  const preMaterializationErrors = [
     ...tidePersistence.errors,
     ...tideEventPersistence.errors,
     ...nwsPersistence.errors,
@@ -232,7 +234,18 @@ export async function runNorcalIngest(
     ...snapshotPersistence.errors,
     ...retentionPersistence.errors
   ];
-  const adapterErrors = outcomes.flatMap((outcome) => outcome.errors);
+  // Publication is evaluated per spot from the normalized rows that are
+  // actually readable. Optional observations, raw-artifact archival,
+  // history, retention, or another spot's provider error must not freeze all
+  // healthy forecasts. Each spot materialization independently refuses an
+  // unscored generation and preserves its prior row.
+  const readModelPersistence = await materializeForecastReadModels(
+    env,
+    now,
+    sourceIssueFingerprint,
+    completedAt
+  );
+  const persistenceErrors = [...preMaterializationErrors, ...readModelPersistence.errors];
   const dbCaveats = finalizedRuns.flatMap((run): SourceCaveat[] =>
     run.recorded
       ? []
@@ -269,7 +282,9 @@ export async function runNorcalIngest(
       nwsWaveForecastRows: nwsWave.rows.length,
       cdipMopWaveForecastRows: cdipMop.rows.length,
       ndbcObservationRows: ndbc.rows.length,
-      forecastSnapshotRows: snapshotPersistence.rowsWritten
+      forecastSnapshotRows: snapshotPersistence.rowsWritten,
+      forecastReadModelRows: readModelPersistence.forecastRowsWritten,
+      forecastFactBundleRows: readModelPersistence.factBundleRowsWritten
     },
     caveats: [
       ...caveats,

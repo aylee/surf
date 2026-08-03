@@ -63,6 +63,8 @@ export type IngestSummary = {
     cdipMopWaveForecastRows: number;
     ndbcObservationRows: number;
     forecastSnapshotRows: number;
+    forecastReadModelRows: number;
+    forecastFactBundleRows: number;
   };
   caveats: SourceCaveat[];
   errors: string[];

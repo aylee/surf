@@ -162,21 +162,76 @@ async function queryRows<T>(db: D1Database, sql: string, ...bindings: unknown[])
   return asRows(await bound.all<T>());
 }
 
-function closestByTime<T>(rows: T[], forecastAt: string, timeOf: (row: T) => string, maxDistanceMs: number): T | null {
-  const target = new Date(forecastAt).getTime();
-  let best: { row: T; distance: number } | null = null;
-  for (const row of rows) {
-    const distance = Math.abs(new Date(timeOf(row)).getTime() - target);
-    if (!Number.isFinite(distance) || distance > maxDistanceMs) continue;
-    if (!best || distance < best.distance) best = { row, distance };
+const HOUR_MS = 60 * 60 * 1000;
+
+type TimedRow<T> = {
+  row: T;
+  timeMs: number;
+  order: number;
+};
+
+type TimeIndex<T> = {
+  /** All valid rows, ordered by timestamp and then original query order. */
+  rows: TimedRow<T>[];
+  /** The first row at each timestamp, preserving Array.find/nearest tie semantics. */
+  uniqueRows: TimedRow<T>[];
+  exact: Map<number, T>;
+  timeByRow: Map<T, number>;
+};
+
+function lowerBoundByTime<T>(rows: ArrayLike<TimedRow<T>>, targetMs: number): number {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (rows[middle]!.timeMs < targetMs) low = middle + 1;
+    else high = middle;
   }
-  return best?.row ?? null;
+  return low;
 }
 
-function exactByTime<T>(rows: T[], forecastAt: string, timeOf: (row: T) => string): T | null {
-  const target = new Date(forecastAt).getTime();
-  if (!Number.isFinite(target)) return null;
-  return rows.find((row) => new Date(timeOf(row)).getTime() === target) ?? null;
+function createTimeIndex<T>(rows: T[], timeOf: (row: T) => string): TimeIndex<T> {
+  const timedRows: TimedRow<T>[] = [];
+  const exact = new Map<number, T>();
+  const timeByRow = new Map<T, number>();
+  rows.forEach((row, order) => {
+    const timeMs = Date.parse(timeOf(row));
+    if (!Number.isFinite(timeMs)) return;
+    timedRows.push({ row, timeMs, order });
+    timeByRow.set(row, timeMs);
+    if (!exact.has(timeMs)) exact.set(timeMs, row);
+  });
+  timedRows.sort((left, right) => left.timeMs - right.timeMs || left.order - right.order);
+
+  const uniqueRows: TimedRow<T>[] = [];
+  for (const timedRow of timedRows) {
+    if (uniqueRows.at(-1)?.timeMs !== timedRow.timeMs) uniqueRows.push(timedRow);
+  }
+  return { rows: timedRows, uniqueRows, exact, timeByRow };
+}
+
+function closestByTimeIndex<T>(
+  index: TimeIndex<T>,
+  targetMs: number,
+  maxDistanceMs: number
+): T | null {
+  if (!Number.isFinite(targetMs) || index.uniqueRows.length === 0) return null;
+  const insertion = lowerBoundByTime(index.uniqueRows, targetMs);
+  let best: { timedRow: TimedRow<T>; distance: number } | null = null;
+  for (const candidateIndex of [insertion - 1, insertion]) {
+    const timedRow = index.uniqueRows[candidateIndex];
+    if (!timedRow) continue;
+    const distance = Math.abs(timedRow.timeMs - targetMs);
+    if (distance > maxDistanceMs) continue;
+    if (
+      !best ||
+      distance < best.distance ||
+      (distance === best.distance && timedRow.order < best.timedRow.order)
+    ) {
+      best = { timedRow, distance };
+    }
+  }
+  return best?.timedRow.row ?? null;
 }
 
 function waveSourcePriority(sourceId: string): number {
@@ -190,6 +245,12 @@ type WaveSelection = {
   validFrom: string;
   validTo: string;
   sourceResolutionMinutes: number;
+};
+
+type IndexedWaveSelection = WaveSelection & {
+  validFromMs: number;
+  validToMs: number;
+  order: number;
 };
 
 function waveValidityForRow(
@@ -213,39 +274,68 @@ function waveValidityForRow(
   };
 }
 
-function preferredWaveSelectionAt(
+function compareWaveSelections(
+  left: IndexedWaveSelection,
+  right: IndexedWaveSelection
+): number {
+  const leftComplete =
+    left.row.nearshore_height_m !== null &&
+    left.row.peak_period_s !== null &&
+    left.row.primary_direction_deg !== null;
+  const rightComplete =
+    right.row.nearshore_height_m !== null &&
+    right.row.peak_period_s !== null &&
+    right.row.primary_direction_deg !== null;
+  if (leftComplete !== rightComplete) return Number(rightComplete) - Number(leftComplete);
+  const sourceDelta = waveSourcePriority(left.row.source_id) - waveSourcePriority(right.row.source_id);
+  if (sourceDelta !== 0) return sourceDelta;
+  const cycleDelta = right.row.model_cycle_at.localeCompare(left.row.model_cycle_at);
+  if (cycleDelta !== 0) return cycleDelta;
+  const forecastDelta = right.row.forecast_at.localeCompare(left.row.forecast_at);
+  if (forecastDelta !== 0) return forecastDelta;
+  return left.order - right.order;
+}
+
+function preferredWaveSelectionsAt(
   rows: WaveRow[],
-  forecastAt: string,
+  forecastTimes: Array<{ forecastAt: string; timeMs: number }>,
   timeZone: string
-): WaveSelection | null {
-  const target = new Date(forecastAt).getTime();
-  if (!Number.isFinite(target)) return null;
-  return (
-    rows
-      .flatMap((row) => {
-        const validity = waveValidityForRow(row, timeZone);
-        if (!validity) return [];
-        const validFrom = new Date(validity.validFrom).getTime();
-        const validTo = new Date(validity.validTo).getTime();
-        return target >= validFrom && target < validTo ? [{ row, ...validity }] : [];
-      })
-      .sort((left, right) => {
-        const leftComplete =
-          left.row.nearshore_height_m !== null &&
-          left.row.peak_period_s !== null &&
-          left.row.primary_direction_deg !== null;
-        const rightComplete =
-          right.row.nearshore_height_m !== null &&
-          right.row.peak_period_s !== null &&
-          right.row.primary_direction_deg !== null;
-        if (leftComplete !== rightComplete) return Number(rightComplete) - Number(leftComplete);
-        const sourceDelta = waveSourcePriority(left.row.source_id) - waveSourcePriority(right.row.source_id);
-        if (sourceDelta !== 0) return sourceDelta;
-        const cycleDelta = right.row.model_cycle_at.localeCompare(left.row.model_cycle_at);
-        if (cycleDelta !== 0) return cycleDelta;
-        return right.row.forecast_at.localeCompare(left.row.forecast_at);
-      })[0] ?? null
-  );
+): Map<number, WaveSelection> {
+  const sortedForecastTimes = [...forecastTimes]
+    .filter((entry) => Number.isFinite(entry.timeMs))
+    .sort((left, right) => left.timeMs - right.timeMs);
+  const indexedTimes = sortedForecastTimes.map((entry, order) => ({
+    row: entry,
+    timeMs: entry.timeMs,
+    order
+  }));
+  const selectedByTime = new Map<number, IndexedWaveSelection>();
+
+  rows.forEach((row, order) => {
+    const validity = waveValidityForRow(row, timeZone);
+    if (!validity) return;
+    const validFromMs = Date.parse(validity.validFrom);
+    const validToMs = Date.parse(validity.validTo);
+    if (!Number.isFinite(validFromMs) || !Number.isFinite(validToMs)) return;
+    const candidate: IndexedWaveSelection = {
+      row,
+      ...validity,
+      validFromMs,
+      validToMs,
+      order
+    };
+    const firstTarget = lowerBoundByTime(indexedTimes, validFromMs);
+    for (let index = firstTarget; index < indexedTimes.length; index += 1) {
+      const targetMs = indexedTimes[index]!.timeMs;
+      if (targetMs >= validToMs) break;
+      const current = selectedByTime.get(targetMs);
+      if (!current || compareWaveSelections(candidate, current) < 0) {
+        selectedByTime.set(targetMs, candidate);
+      }
+    }
+  });
+
+  return selectedByTime;
 }
 
 export function preferredWaveAt(
@@ -253,64 +343,98 @@ export function preferredWaveAt(
   forecastAt: string,
   timeZone = "America/Los_Angeles"
 ): WaveRow | null {
-  return preferredWaveSelectionAt(rows, forecastAt, timeZone)?.row ?? null;
+  const timeMs = Date.parse(forecastAt);
+  if (!Number.isFinite(timeMs)) return null;
+  return preferredWaveSelectionsAt(rows, [{ forecastAt, timeMs }], timeZone).get(timeMs)?.row ?? null;
 }
 
-function worstWindInWindow(
-  rows: WindRow[],
-  forecastAt: string,
+function worstWindInWindowFromIndex(
+  index: TimeIndex<WindRow>,
+  startMs: number,
   spot: NorcalSpotProfile
 ): WindRow | null {
-  const start = new Date(forecastAt).getTime();
-  const end = start + 3 * 60 * 60 * 1000;
-  const inWindow = rows.filter((row) => {
-    const time = new Date(row.forecast_at).getTime();
-    return Number.isFinite(time) && time >= start && time < end;
-  });
-  const complete = inWindow.filter(
-    (row) => row.wind_speed_ms !== null && row.wind_direction_deg !== null
-  );
+  if (!Number.isFinite(startMs)) return null;
+  const endMs = startMs + 3 * HOUR_MS;
+  const first = lowerBoundByTime(index.rows, startMs);
   const severity = { unknown: -1, clean: 0, fair: 1, choppy: 2 } as const;
-  const worstComplete = complete.sort((left, right) => {
-    const leftSurface = surfaceConditionForWind(spot, {
-      windSpeedKt: left.wind_speed_ms! * 1.94384,
-      windDirectionDeg: left.wind_direction_deg
+  let worstComplete: { timedRow: TimedRow<WindRow>; severity: number; speedMs: number } | null = null;
+  let fastest: { timedRow: TimedRow<WindRow>; speedMs: number } | null = null;
+
+  for (let rowIndex = first; rowIndex < index.rows.length; rowIndex += 1) {
+    const timedRow = index.rows[rowIndex]!;
+    if (timedRow.timeMs >= endMs) break;
+    const speedMs = timedRow.row.wind_speed_ms ?? Number.NEGATIVE_INFINITY;
+    if (
+      !fastest ||
+      speedMs > fastest.speedMs ||
+      (speedMs === fastest.speedMs && timedRow.order < fastest.timedRow.order)
+    ) {
+      fastest = { timedRow, speedMs };
+    }
+    if (timedRow.row.wind_speed_ms === null || timedRow.row.wind_direction_deg === null) continue;
+    const surface = surfaceConditionForWind(spot, {
+      windSpeedKt: timedRow.row.wind_speed_ms * 1.94384,
+      windDirectionDeg: timedRow.row.wind_direction_deg
     });
-    const rightSurface = surfaceConditionForWind(spot, {
-      windSpeedKt: right.wind_speed_ms! * 1.94384,
-      windDirectionDeg: right.wind_direction_deg
-    });
-    const surfaceDelta = severity[rightSurface] - severity[leftSurface];
-    if (surfaceDelta !== 0) return surfaceDelta;
-    return right.wind_speed_ms! - left.wind_speed_ms!;
-  })[0];
-  return (
-    worstComplete ?? inWindow.sort(
-      (left, right) =>
-        (right.wind_speed_ms ?? Number.NEGATIVE_INFINITY) -
-        (left.wind_speed_ms ?? Number.NEGATIVE_INFINITY)
-    )[0] ?? closestByTime(rows, forecastAt, (row) => row.forecast_at, 90 * 60 * 1000)
-  );
+    const surfaceSeverity = severity[surface];
+    if (
+      !worstComplete ||
+      surfaceSeverity > worstComplete.severity ||
+      (surfaceSeverity === worstComplete.severity && speedMs > worstComplete.speedMs) ||
+      (surfaceSeverity === worstComplete.severity &&
+        speedMs === worstComplete.speedMs &&
+        timedRow.order < worstComplete.timedRow.order)
+    ) {
+      worstComplete = { timedRow, severity: surfaceSeverity, speedMs };
+    }
+  }
+
+  return worstComplete?.timedRow.row ??
+    fastest?.timedRow.row ??
+    closestByTimeIndex(index, startMs, 90 * 60 * 1000);
 }
 
-function freshnessMinutes(sourceRuns: SourceRunRow[], runIds: string[], now: Date): number {
-  const completedTimes = sourceRuns.flatMap((run) => {
-    if (!runIds.includes(run.id) || !run.completed_at || run.status === "failure") return [];
-    const time = new Date(run.completed_at).getTime();
-    return Number.isFinite(time) ? [time] : [];
-  });
-  if (completedTimes.length === 0) return 24 * 60;
-  return Math.max(0, Math.round((now.getTime() - Math.min(...completedTimes)) / 60000));
+type SourceRunIndex = {
+  updatedAtById: Map<string, string | null>;
+  oldestCompletedAtMsById: Map<string, number>;
+};
+
+function createSourceRunIndex(sourceRuns: SourceRunRow[]): SourceRunIndex {
+  const updatedAtById = new Map<string, string | null>();
+  const oldestCompletedAtMsById = new Map<string, number>();
+  for (const run of sourceRuns) {
+    const completedAtMs = run.completed_at ? Date.parse(run.completed_at) : Number.NaN;
+    const usable = run.status !== "failure" && Number.isFinite(completedAtMs);
+    if (!updatedAtById.has(run.id)) {
+      updatedAtById.set(run.id, usable ? run.completed_at : null);
+    }
+    if (!usable) continue;
+    const currentOldest = oldestCompletedAtMsById.get(run.id);
+    if (currentOldest === undefined || completedAtMs < currentOldest) {
+      oldestCompletedAtMsById.set(run.id, completedAtMs);
+    }
+  }
+  return { updatedAtById, oldestCompletedAtMsById };
+}
+
+function freshnessMinutes(sourceRuns: SourceRunIndex, runIds: string[], now: Date): number {
+  let oldestCompletedAtMs: number | null = null;
+  for (const runId of runIds) {
+    const completedAtMs = sourceRuns.oldestCompletedAtMsById.get(runId);
+    if (completedAtMs === undefined) continue;
+    oldestCompletedAtMs = oldestCompletedAtMs === null
+      ? completedAtMs
+      : Math.min(oldestCompletedAtMs, completedAtMs);
+  }
+  if (oldestCompletedAtMs === null) return 24 * 60;
+  return Math.max(0, Math.round((now.getTime() - oldestCompletedAtMs) / 60000));
 }
 
 function sourceRunUpdatedAt(
-  sourceRuns: SourceRunRow[],
+  sourceRuns: SourceRunIndex,
   sourceRunId: string | null | undefined
 ): string | null {
-  if (!sourceRunId) return null;
-  const run = sourceRuns.find((candidate) => candidate.id === sourceRunId);
-  if (!run?.completed_at || run.status === "failure") return null;
-  return Number.isFinite(new Date(run.completed_at).getTime()) ? run.completed_at : null;
+  return sourceRunId ? sourceRuns.updatedAtById.get(sourceRunId) ?? null : null;
 }
 
 function sourceFreshnessEntry(input: {
@@ -398,15 +522,63 @@ function swellComponent(heightM: unknown, periodS: unknown, directionDeg: unknow
   return { heightFt, periodSec: parsedPeriod, directionDeg: parsedDirection };
 }
 
-function activeHazardAt(rows: HazardRow[], forecastAt: string): HazardRow | null {
-  const target = new Date(forecastAt).getTime();
-  return (
-    rows.find((row) => {
-      const startsAt = row.starts_at ? new Date(row.starts_at).getTime() : Number.NEGATIVE_INFINITY;
-      const endsAt = row.ends_at ? new Date(row.ends_at).getTime() : Number.POSITIVE_INFINITY;
-      return Number.isFinite(target) && target >= startsAt && target < endsAt;
-    }) ?? null
-  );
+function activeHazardsAt(
+  rows: HazardRow[],
+  forecastTimes: Array<{ forecastAt: string; timeMs: number }>
+): Map<number, HazardRow> {
+  const sortedForecastTimes = [...forecastTimes]
+    .filter((entry) => Number.isFinite(entry.timeMs))
+    .sort((left, right) => left.timeMs - right.timeMs);
+  const indexedTimes = sortedForecastTimes.map((entry, order) => ({
+    row: entry,
+    timeMs: entry.timeMs,
+    order
+  }));
+  const hazardsByTime = new Map<number, HazardRow>();
+
+  for (const row of rows) {
+    const startsAtMs = row.starts_at ? Date.parse(row.starts_at) : Number.NEGATIVE_INFINITY;
+    const endsAtMs = row.ends_at ? Date.parse(row.ends_at) : Number.POSITIVE_INFINITY;
+    if (Number.isNaN(startsAtMs) || Number.isNaN(endsAtMs)) continue;
+    const firstTarget = lowerBoundByTime(indexedTimes, startsAtMs);
+    for (let index = firstTarget; index < indexedTimes.length; index += 1) {
+      const targetMs = indexedTimes[index]!.timeMs;
+      if (targetMs >= endsAtMs) break;
+      if (!hazardsByTime.has(targetMs)) hazardsByTime.set(targetMs, row);
+    }
+  }
+
+  return hazardsByTime;
+}
+
+type WaveRowDetails = {
+  payload: WavePayload;
+  classification: ReturnType<typeof classifyWave>;
+  sourceUpdatedAt: string | null;
+  modelCycleMs: number;
+};
+
+function createWaveDetailsLookup(): (row: WaveRow) => WaveRowDetails {
+  const detailsByRow = new Map<WaveRow, WaveRowDetails>();
+  return (row) => {
+    const cached = detailsByRow.get(row);
+    if (cached) return cached;
+    const payload = parseWavePayload(row.payload_json);
+    const payloadSourceUpdatedAtMs = typeof payload.sourceUpdatedAt === "string"
+      ? Date.parse(payload.sourceUpdatedAt)
+      : Number.NaN;
+    const sourceUpdatedAt = Number.isFinite(payloadSourceUpdatedAtMs)
+      ? new Date(payloadSourceUpdatedAtMs).toISOString()
+      : null;
+    const details = {
+      payload,
+      classification: classifyWave(row, payload),
+      sourceUpdatedAt,
+      modelCycleMs: Date.parse(row.model_cycle_at)
+    };
+    detailsByRow.set(row, details);
+    return details;
+  };
 }
 
 function observationSummary(row: ObservationRow, now: Date): WaveObservationSummary {
@@ -609,13 +781,190 @@ function unavailableForecast(
   });
 }
 
+type ForecastSourceRows = {
+  tideRows: TideRow[];
+  tideEventRows: TideEventRow[];
+  windRows: WindRow[];
+  waveRows: WaveRow[];
+  observationRows: ObservationRow[];
+  hazardRows: HazardRow[];
+  sourceRuns: SourceRunRow[];
+  forecastIssues: ForecastIssueRow[];
+  forecastSnapshotRows: ForecastSnapshotRow[];
+};
+
+type BuildForecastOptions = {
+  failOnReadError?: boolean;
+  sourceRows?: ForecastSourceRows;
+};
+
+function preparedQuery(
+  db: D1Database,
+  sql: string,
+  ...bindings: unknown[]
+): D1PreparedStatement {
+  const statement = db.prepare(sql);
+  return bindings.length > 0 ? statement.bind(...bindings) : statement;
+}
+
+async function loadForecastSourceRows(
+  db: D1Database,
+  spotId: SpotId,
+  now: Date,
+  forecastTimes: string[]
+): Promise<ForecastSourceRows> {
+  const horizonStart = forecastTimes[0]!;
+  const horizonEnd = forecastTimes.at(-1)!;
+  const waveHorizonStart = new Date(
+    new Date(horizonStart).getTime() - 3 * 60 * 60 * 1000
+  ).toISOString();
+  const waveHorizonEnd = new Date(new Date(horizonEnd).getTime() + 90 * 60 * 1000).toISOString();
+  const statements = [
+    preparedQuery(
+      db,
+      `select forecast_at, tide_ft_mllw, tide_trend, source_run_id
+       from tide_forecasts
+       where spot_id = ? and forecast_at >= ? and forecast_at <= ?
+       order by forecast_at asc`,
+      spotId,
+      horizonStart,
+      horizonEnd
+    ),
+    preparedQuery(
+      db,
+      `select station_id, event_at, tide_ft_mllw, event_type, source_run_id
+       from tide_events
+       where spot_id = ? and event_at >= ? and event_at <= ?
+       order by event_at asc`,
+      spotId,
+      horizonStart,
+      horizonEnd
+    ),
+    preparedQuery(
+      db,
+      `select forecast_at, model_cycle_at, wind_speed_ms, wind_direction_deg, gust_ms, weather_summary, source_run_id
+       from wind_forecasts
+       where spot_id = ? and forecast_at >= ? and forecast_at <= ?
+       order by forecast_at asc`,
+      spotId,
+      horizonStart,
+      horizonEnd
+    ),
+    preparedQuery(
+      db,
+      `select source_id, forecast_at, model_cycle_at, nearshore_height_m, offshore_height_m,
+              significant_height_m, peak_period_s, primary_direction_deg, swell_height_m,
+              swell_period_s, swell_direction_deg, payload_json, source_run_id
+       from (
+         select source_id, forecast_at, model_cycle_at, nearshore_height_m, offshore_height_m,
+                significant_height_m, peak_period_s, primary_direction_deg, swell_height_m,
+                swell_period_s, swell_direction_deg, payload_json, source_run_id, created_at,
+                row_number() over (
+                  partition by source_id, forecast_at
+                  order by case when nearshore_height_m is not null then 0 else 1 end,
+                           model_cycle_at desc, created_at desc
+                ) as source_rank
+         from wave_forecasts
+         where spot_id = ? and forecast_at >= ? and forecast_at <= ?
+      )
+       where source_rank = 1
+       order by forecast_at asc`,
+      spotId,
+      waveHorizonStart,
+      waveHorizonEnd
+    ),
+    preparedQuery(
+      db,
+      `select source_id, source_run_id, observed_at, wave_height_m, peak_period_s,
+              mean_period_s, primary_direction_deg, water_temp_c
+       from wave_observations
+       where spot_id = ? and observed_at >= ?
+       order by observed_at desc`,
+      spotId,
+      new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()
+    ),
+    preparedQuery(
+      db,
+      `select starts_at, ends_at, headline, source_run_id
+       from hazard_events
+       where spot_id = ?
+         and (ends_at is null or ends_at >= ?)
+         and (starts_at is null or starts_at <= ?)
+       order by starts_at asc`,
+      spotId,
+      horizonStart,
+      horizonEnd
+    ),
+    preparedQuery(
+      db,
+      `select id, source_id, status, completed_at
+       from source_runs
+       order by completed_at desc
+       limit 100`
+    ),
+    preparedQuery(
+      db,
+      `select issue_id, issued_at
+       from forecast_issues
+       where spot_id = ?
+       order by issued_at desc
+       limit 2`,
+      spotId
+    )
+  ];
+
+  const results = typeof db.batch === "function"
+    ? await db.batch(statements)
+    : await Promise.all(statements.map((statement) => statement.all()));
+  if (results.length !== statements.length) {
+    throw new Error(
+      `Forecast source read returned ${results.length} results for ${statements.length} statements`
+    );
+  }
+  const tideRows = asRows(results[0] as D1Result<TideRow>);
+  const tideEventRows = asRows(results[1] as D1Result<TideEventRow>);
+  const windRows = asRows(results[2] as D1Result<WindRow>);
+  const waveRows = asRows(results[3] as D1Result<WaveRow>);
+  const observationRows = asRows(results[4] as D1Result<ObservationRow>);
+  const hazardRows = asRows(results[5] as D1Result<HazardRow>);
+  const sourceRuns = asRows(results[6] as D1Result<SourceRunRow>);
+  const forecastIssues = asRows(results[7] as D1Result<ForecastIssueRow>);
+  const forecastSnapshotRows = forecastIssues.length >= 2
+    ? await queryRows<ForecastSnapshotRow>(
+        db,
+        `select issue_id, valid_at, raw_facts_json
+         from forecast_snapshots
+         where spot_id = ? and issue_id in (?, ?)`,
+        spotId,
+        forecastIssues[0]!.issue_id,
+        forecastIssues[1]!.issue_id
+      )
+    : [];
+
+  return {
+    tideRows,
+    tideEventRows,
+    windRows,
+    waveRows,
+    observationRows,
+    hazardRows,
+    sourceRuns,
+    forecastIssues,
+    forecastSnapshotRows
+  };
+}
+
 export async function buildForecastResponse(
   env: Env,
   spotId: SpotId,
   now = new Date(),
-  interval: ForecastInterval = "3h"
+  interval: ForecastInterval = "3h",
+  options: BuildForecastOptions = {}
 ): Promise<ForecastResponse> {
   if (typeof env.DB?.prepare !== "function") {
+    if (options.failOnReadError) {
+      throw new Error("D1 binding does not expose prepare() for forecast assembly");
+    }
     return unavailableForecast(
       spotId,
       now,
@@ -630,151 +979,94 @@ export async function buildForecastResponse(
     const forecastTimes = interval === "1h"
       ? stableHourlyForecastTimes(now, 120)
       : stableThreeHourForecastTimes(now, 120, spot.timezone);
-    const horizonStart = forecastTimes[0]!;
-    const horizonEnd = forecastTimes.at(-1)!;
-    const waveHorizonStart = new Date(
-      new Date(horizonStart).getTime() - 3 * 60 * 60 * 1000
-    ).toISOString();
-    const waveHorizonEnd = new Date(new Date(horizonEnd).getTime() + 90 * 60 * 1000).toISOString();
-    const [
-      tideRows,
-      tideEventRows,
-      windRows,
-      waveRows,
+    const {
+      tideRows: loadedTideRows,
+      tideEventRows: loadedTideEventRows,
+      windRows: loadedWindRows,
+      waveRows: loadedWaveRows,
       observationRows,
       hazardRows,
       sourceRuns,
-      forecastIssues
-    ] = await Promise.all([
-      queryRows<TideRow>(
-        env.DB,
-        `select forecast_at, tide_ft_mllw, tide_trend, source_run_id
-         from tide_forecasts
-         where spot_id = ? and forecast_at >= ? and forecast_at <= ?
-         order by forecast_at asc`,
-        spotId,
-        horizonStart,
-        horizonEnd
-      ),
-      queryRows<TideEventRow>(
-        env.DB,
-        `select station_id, event_at, tide_ft_mllw, event_type, source_run_id
-         from tide_events
-         where spot_id = ? and event_at >= ? and event_at <= ?
-         order by event_at asc`,
-        spotId,
-        horizonStart,
-        horizonEnd
-      ),
-      queryRows<WindRow>(
-        env.DB,
-        `select forecast_at, model_cycle_at, wind_speed_ms, wind_direction_deg, gust_ms, weather_summary, source_run_id
-         from wind_forecasts
-         where spot_id = ? and forecast_at >= ? and forecast_at <= ?
-         order by forecast_at asc`,
-        spotId,
-        horizonStart,
-        horizonEnd
-      ),
-      queryRows<WaveRow>(
-        env.DB,
-        `select source_id, forecast_at, model_cycle_at, nearshore_height_m, offshore_height_m,
-                significant_height_m, peak_period_s, primary_direction_deg, swell_height_m,
-                swell_period_s, swell_direction_deg, payload_json, source_run_id
-         from (
-           select source_id, forecast_at, model_cycle_at, nearshore_height_m, offshore_height_m,
-                  significant_height_m, peak_period_s, primary_direction_deg, swell_height_m,
-                  swell_period_s, swell_direction_deg, payload_json, source_run_id, created_at,
-                  row_number() over (
-                    partition by source_id, forecast_at
-                    order by case when nearshore_height_m is not null then 0 else 1 end,
-                             model_cycle_at desc, created_at desc
-                  ) as source_rank
-           from wave_forecasts
-           where spot_id = ? and forecast_at >= ? and forecast_at <= ?
-        )
-         where source_rank = 1
-         order by forecast_at asc`,
-        spotId,
-        waveHorizonStart,
-        waveHorizonEnd
-      ),
-      queryRows<ObservationRow>(
-        env.DB,
-        `select source_id, source_run_id, observed_at, wave_height_m, peak_period_s,
-                mean_period_s, primary_direction_deg, water_temp_c
-         from wave_observations
-         where spot_id = ? and observed_at >= ?
-         order by observed_at desc`,
-        spotId,
-        new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()
-      ),
-      queryRows<HazardRow>(
-        env.DB,
-        `select starts_at, ends_at, headline, source_run_id
-         from hazard_events
-         where spot_id = ?
-           and (ends_at is null or ends_at >= ?)
-           and (starts_at is null or starts_at <= ?)
-         order by starts_at asc`,
-        spotId,
-        horizonStart,
-        horizonEnd
-      ),
-      queryRows<SourceRunRow>(
-        env.DB,
-        `select id, source_id, status, completed_at
-         from source_runs
-         order by completed_at desc
-         limit 100`
-      ),
-      queryRows<ForecastIssueRow>(
-        env.DB,
-        `select issue_id, issued_at
-         from forecast_issues
-         where spot_id = ?
-         order by issued_at desc
-         limit 2`,
-        spotId
-      )
-    ]);
-
-    const forecastSnapshotRows = forecastIssues.length >= 2
-      ? await queryRows<ForecastSnapshotRow>(
-          env.DB,
-          `select issue_id, valid_at, raw_facts_json
-           from forecast_snapshots
-           where spot_id = ? and issue_id in (?, ?)`,
-          spotId,
-          forecastIssues[0]!.issue_id,
-          forecastIssues[1]!.issue_id
-        )
-      : [];
+      forecastIssues,
+      forecastSnapshotRows
+    } = options.sourceRows ?? await loadForecastSourceRows(env.DB, spotId, now, forecastTimes);
+    const horizonStartMs = Date.parse(forecastTimes[0]!);
+    const horizonEndMs = Date.parse(forecastTimes.at(-1)!);
+    const waveHorizonStartMs = horizonStartMs - 3 * HOUR_MS;
+    const waveHorizonEndMs = horizonEndMs + 90 * 60 * 1000;
+    const within = (timestamp: string, startMs: number, endMs: number): boolean => {
+      const timestampMs = Date.parse(timestamp);
+      return Number.isFinite(timestampMs) && timestampMs >= startMs && timestampMs <= endMs;
+    };
+    // A synchronized build loads the union horizon once, then restores each
+    // interval's original query bounds before deterministic assembly.
+    const tideRows = loadedTideRows.filter((row) =>
+      within(row.forecast_at, horizonStartMs, horizonEndMs)
+    );
+    const tideEventRows = loadedTideEventRows.filter((row) =>
+      within(row.event_at, horizonStartMs, horizonEndMs)
+    );
+    const windRows = loadedWindRows.filter((row) =>
+      within(row.forecast_at, horizonStartMs, horizonEndMs)
+    );
+    const waveRows = loadedWaveRows.filter((row) =>
+      within(row.forecast_at, waveHorizonStartMs, waveHorizonEndMs)
+    );
 
     const observedSources = getOperationalObservedWaveSources(spot);
     const observation = preferredObservation(observedSources, observationRows, now);
     const observations = recentObservationSummaries(observedSources, observationRows, now);
+    const displayIntervalMinutes = interval === "1h" ? 60 : 180;
+    const forecastSlots = forecastTimes.map((forecastAt) => {
+      const timeMs = Date.parse(forecastAt);
+      return {
+        forecastAt,
+        timeMs,
+        displayValidTo: new Date(timeMs + displayIntervalMinutes * 60_000).toISOString()
+      };
+    });
+    const tideIndex = createTimeIndex(tideRows, (row) => row.forecast_at);
+    const windIndex = createTimeIndex(windRows, (row) => row.forecast_at);
+    const waveSelectionsByTime = preferredWaveSelectionsAt(waveRows, forecastSlots, spot.timezone);
+    const waveDetailsFor = createWaveDetailsLookup();
+    const hazardsByTime = activeHazardsAt(hazardRows, forecastSlots);
+    const sourceRunIndex = createSourceRunIndex(sourceRuns);
+    const observationTimeMs = observation ? Date.parse(observation.row.observed_at) : Number.NaN;
+    const sourceFreshnessCache = new Map<string, SourceFreshness>();
+    const cachedSourceFreshness = (
+      input: Omit<Parameters<typeof sourceFreshnessEntry>[0], "now">
+    ): SourceFreshness => {
+      const key = [
+        input.capability,
+        input.sourceId,
+        input.sourceRunId ?? "",
+        input.updatedAt ?? "",
+        input.staleAfterMinutes
+      ].join("\u0000");
+      const cached = sourceFreshnessCache.get(key);
+      if (cached) return cached;
+      const entry = sourceFreshnessEntry({ ...input, now });
+      sourceFreshnessCache.set(key, entry);
+      return entry;
+    };
     const sunPhases = solarPhasesForDates(
       forecastTimes.map((forecastAt) => localDateForTime(forecastAt, spot.timezone)),
       { lat: spot.lat, lon: spot.lon, timeZone: spot.timezone }
     );
 
-    const windows: ScoredForecastWindow[] = forecastTimes.map((forecastAt) => {
-      const displayIntervalMinutes = interval === "1h" ? 60 : 180;
-      const displayValidTo = new Date(
-        new Date(forecastAt).getTime() + displayIntervalMinutes * 60_000
-      ).toISOString();
+    const windows: ScoredForecastWindow[] = forecastSlots.map(({ forecastAt, timeMs, displayValidTo }) => {
       const tide = interval === "1h"
-        ? exactByTime(tideRows, forecastAt, (row) => row.forecast_at)
-        : closestByTime(tideRows, forecastAt, (row) => row.forecast_at, 90 * 60 * 1000);
+        ? tideIndex.exact.get(timeMs) ?? null
+        : closestByTimeIndex(tideIndex, timeMs, 90 * 60 * 1000);
       const wind = interval === "1h"
-        ? exactByTime(windRows, forecastAt, (row) => row.forecast_at)
-        : worstWindInWindow(windRows, forecastAt, spot);
-      const waveSelection = preferredWaveSelectionAt(waveRows, forecastAt, spot.timezone);
+        ? windIndex.exact.get(timeMs) ?? null
+        : worstWindInWindowFromIndex(windIndex, timeMs, spot);
+      const waveSelection = waveSelectionsByTime.get(timeMs) ?? null;
       const selectedWave = waveSelection?.row ?? null;
-      const hazard = activeHazardAt(hazardRows, forecastAt);
-      const payload = parseWavePayload(selectedWave?.payload_json ?? null);
-      const waveClassification = classifyWave(selectedWave, payload);
+      const hazard = hazardsByTime.get(timeMs) ?? null;
+      const waveDetails = selectedWave ? waveDetailsFor(selectedWave) : null;
+      const payload = waveDetails?.payload ?? {};
+      const waveClassification = waveDetails?.classification ?? null;
       // Unknown or malformed semantics fail closed: the raw row remains visible
       // through freshness/caveats, but it cannot produce a numeric surf call.
       const wave = waveClassification ? selectedWave : null;
@@ -783,12 +1075,7 @@ export async function buildForecastResponse(
         payload.pointRelationship === "outside_cove_approach_proxy"
           ? payload.pointRelationship
           : null;
-      const payloadSourceUpdatedAt =
-        typeof payload.sourceUpdatedAt === "string" &&
-        Number.isFinite(new Date(payload.sourceUpdatedAt).getTime())
-          ? new Date(payload.sourceUpdatedAt).toISOString()
-          : null;
-      const waveSourceUpdatedAt = payloadSourceUpdatedAt ?? selectedWave?.model_cycle_at ?? null;
+      const waveSourceUpdatedAt = waveDetails?.sourceUpdatedAt ?? selectedWave?.model_cycle_at ?? null;
       const waveHeightFt = metersToFeet(wave?.nearshore_height_m ?? null);
       const peakPeriodSec = wave?.swell_period_s ?? wave?.peak_period_s ?? null;
       const primaryDirectionDeg = wave?.swell_direction_deg ?? wave?.primary_direction_deg ?? null;
@@ -814,7 +1101,7 @@ export async function buildForecastResponse(
       else caveats.push("NWS wind row missing or incomplete near this window.");
       const observationSupportsWindow = Boolean(
         observation?.isFresh &&
-          Math.abs(new Date(forecastAt).getTime() - new Date(observation.row.observed_at).getTime()) <=
+          Math.abs(timeMs - observationTimeMs) <=
             3 * 60 * 60 * 1000
       );
       if (observationSupportsWindow) activeCapabilities.push("observed_wave");
@@ -834,7 +1121,7 @@ export async function buildForecastResponse(
         hazard?.source_run_id
       );
       const sourceFreshness: SourceFreshness[] = [
-        sourceFreshnessEntry({
+        cachedSourceFreshness({
           capability:
             selectedWave && selectedWave.nearshore_height_m !== null
               ? "forecast_wave_nearshore"
@@ -844,33 +1131,29 @@ export async function buildForecastResponse(
           sourceId: selectedWave?.source_id ?? "wave:unavailable",
           sourceRunId: selectedWave?.source_run_id,
           updatedAt:
-            waveSourceUpdatedAt ?? sourceRunUpdatedAt(sourceRuns, selectedWave?.source_run_id),
-          now,
+            waveSourceUpdatedAt ?? sourceRunUpdatedAt(sourceRunIndex, selectedWave?.source_run_id),
           staleAfterMinutes: 12 * 60
         }),
-        sourceFreshnessEntry({
+        cachedSourceFreshness({
           capability: "wind",
           sourceId: "nws:point-forecast-alerts",
           sourceRunId: wind?.source_run_id,
           updatedAt:
-            wind?.model_cycle_at ?? sourceRunUpdatedAt(sourceRuns, wind?.source_run_id),
-          now,
+            wind?.model_cycle_at ?? sourceRunUpdatedAt(sourceRunIndex, wind?.source_run_id),
           staleAfterMinutes: 6 * 60
         }),
-        sourceFreshnessEntry({
+        cachedSourceFreshness({
           capability: "tide",
           sourceId: "coops:tide-predictions",
           sourceRunId: tide?.source_run_id,
-          updatedAt: sourceRunUpdatedAt(sourceRuns, tide?.source_run_id),
-          now,
+          updatedAt: sourceRunUpdatedAt(sourceRunIndex, tide?.source_run_id),
           staleAfterMinutes: 12 * 60
         }),
-        sourceFreshnessEntry({
+        cachedSourceFreshness({
           capability: "observed_wave",
           sourceId: observation ? `ndbc-${observation.summary.stationId}` : "ndbc:preferred",
           sourceRunId: observation?.row.source_run_id,
           updatedAt: observation?.row.observed_at,
-          now,
           staleAfterMinutes: NDBC_STALE_AFTER_MINUTES
         })
       ];
@@ -882,15 +1165,15 @@ export async function buildForecastResponse(
       );
       const sourceFreshnessMinutes = availableFreshness.length > 0
         ? Math.max(...availableFreshness)
-        : freshnessMinutes(sourceRuns, runIds, now);
+        : freshnessMinutes(sourceRunIndex, runIds, now);
       const cdipNearshoreHeightScale = finiteNumber(payload.nearshoreHeightScale);
       const usesColdStartTransform =
         waveClassification?.calibrationStatus === "cold_start_uncalibrated" ||
         waveClassification?.calibrationStatus === "proxy_uncalibrated";
-      const modelCycleMs = wave ? new Date(wave.model_cycle_at).getTime() : Number.NaN;
+      const modelCycleMs = wave ? waveDetails?.modelCycleMs ?? Number.NaN : Number.NaN;
       const forecastLeadHours = Number.isFinite(modelCycleMs)
-        ? Math.max(0, (new Date(forecastAt).getTime() - modelCycleMs) / (60 * 60 * 1000))
-        : Math.max(0, (new Date(forecastAt).getTime() - now.getTime()) / (60 * 60 * 1000));
+        ? Math.max(0, (timeMs - modelCycleMs) / HOUR_MS)
+        : Math.max(0, (timeMs - now.getTime()) / HOUR_MS);
       if (waveClassification?.calibrationStatus === "modeled_uncalibrated") {
         caveats.push(
           "Direct CDIP confidence uses the source model cycle and an uncalibrated-model cap of 89; it does not use the NWS cold-start penalty."
@@ -1047,9 +1330,10 @@ export async function buildForecastResponse(
             payload.secondarySwellDirectionDeg
           );
       const tideValidFrom = tide?.forecast_at ?? forecastAt;
-      const tideValidTo = new Date(
-        new Date(tideValidFrom).getTime() + 60 * 60_000
-      ).toISOString();
+      const tideValidFromMs = tide
+        ? tideIndex.timeByRow.get(tide) ?? Date.parse(tideValidFrom)
+        : timeMs;
+      const tideValidTo = new Date(tideValidFromMs + HOUR_MS).toISOString();
 
       return {
         ...score,
@@ -1146,6 +1430,7 @@ export async function buildForecastResponse(
         error: error instanceof Error ? error.message : String(error)
       })
     );
+    if (options.failOnReadError) throw error;
     return unavailableForecast(
       spotId,
       now,
@@ -1153,5 +1438,66 @@ export async function buildForecastResponse(
       "Source read failed; no synthetic forecast was substituted and surf rating is unknown.",
       interval
     );
+  }
+}
+
+export async function buildSynchronizedForecastResponses(
+  env: Env,
+  spotId: SpotId,
+  now = new Date(),
+  options: { failOnReadError?: boolean } = {}
+): Promise<{ threeHour: ForecastResponse; hourly: ForecastResponse }> {
+  const unavailable = () => ({
+    threeHour: unavailableForecast(
+      spotId,
+      now,
+      "Forecast unavailable because normalized source rows could not be read.",
+      "Source read failed; no synthetic forecast was substituted and surf rating is unknown.",
+      "3h"
+    ),
+    hourly: unavailableForecast(
+      spotId,
+      now,
+      "Forecast unavailable because normalized source rows could not be read.",
+      "Source read failed; no synthetic forecast was substituted and surf rating is unknown.",
+      "1h"
+    )
+  });
+  if (typeof env.DB?.prepare !== "function") {
+    if (options.failOnReadError) {
+      throw new Error("D1 binding does not expose prepare() for forecast assembly");
+    }
+    return unavailable();
+  }
+
+  try {
+    const spot = getSpotProfile(spotId);
+    const forecastTimes = [
+      ...new Set([
+        ...stableHourlyForecastTimes(now, 120),
+        ...stableThreeHourForecastTimes(now, 120, spot.timezone)
+      ])
+    ].sort();
+    const sourceRows = await loadForecastSourceRows(env.DB, spotId, now, forecastTimes);
+    // Assembly is deterministic and read-free once the shared source snapshot
+    // is loaded. Fail the pair together so 1h and 3h can never publish from
+    // different D1 reads or generation times.
+    const buildOptions: BuildForecastOptions = {
+      failOnReadError: true,
+      sourceRows
+    };
+    const threeHour = await buildForecastResponse(env, spotId, now, "3h", buildOptions);
+    const hourly = await buildForecastResponse(env, spotId, now, "1h", buildOptions);
+    return { threeHour, hourly };
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        message: "synchronized forecast assembly failed",
+        spotId,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    );
+    if (options.failOnReadError) throw error;
+    return unavailable();
   }
 }

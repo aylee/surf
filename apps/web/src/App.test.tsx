@@ -48,6 +48,16 @@ function fixtureForecast(): ForecastResponse {
   });
 }
 
+function unavailableForecast(forecast = fixtureForecast()): ForecastResponse {
+  return ForecastResponseSchema.parse({
+    ...forecast,
+    windows: forecast.windows.map((window) => ({
+      ...window,
+      ratingStatus: "unknown"
+    }))
+  });
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return {
     ok: status >= 200 && status < 300,
@@ -98,6 +108,24 @@ describe("App", () => {
     ]);
   });
 
+  it("uses nontechnical delayed-update copy when a forecast is unavailable on first load", async () => {
+    window.history.replaceState({}, "", "/");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) {
+        return jsonResponse({ error: "forecast_temporarily_unavailable" }, 503);
+      }
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Forecast update delayed. Open for available details.")).toBeTruthy();
+    expect(screen.queryByText(/forecast service error/i)).toBeNull();
+    expect(screen.queryByText(/forecast_temporarily_unavailable/i)).toBeNull();
+  });
+
   it("opens a query-string-selected spot returned by the API", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     installSuccessfulApi();
@@ -143,6 +171,32 @@ describe("App", () => {
     expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
   });
 
+  it("keeps the last good forecast visible when a successful response has no usable windows", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    let forecastRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) {
+        forecastRequests += 1;
+        return jsonResponse(forecastRequests === 1 ? forecast : unavailableForecast(forecast));
+      }
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(await screen.findByText("Some forecast updates are delayed. Showing the last forecast we loaded.")).toBeTruthy();
+    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+    expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
+  });
+
   it("keeps the table, graph, interval, and selected timestamp in the URL", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     const fetchMock = installSuccessfulApi();
@@ -172,7 +226,7 @@ describe("App", () => {
     expect(screen.getAllByLabelText(/^Why .* looks this way$/).length).toBeGreaterThan(0);
   });
 
-  it("shares a recovered canonical workbench forecast with the hero", async () => {
+  it("shares a recovered canonical workbench forecast with the hero after an unusable initial response", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     const forecast = fixtureForecast();
     let releaseRecovery!: () => void;
@@ -182,7 +236,7 @@ describe("App", () => {
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
       const path = requestPath(input);
       if (path === "/api/spots") return jsonResponse(spotsResponse);
-      if (path === `/api/forecast/${spot.id}`) return jsonResponse({ error: "temporarily unavailable" }, 503);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(unavailableForecast(forecast));
       if (path === `/api/forecast/${spot.id}?interval=3h`) {
         await recoveryGate;
         return jsonResponse({ ...forecast, interval: "3h" });

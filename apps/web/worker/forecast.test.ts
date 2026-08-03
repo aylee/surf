@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ForecastResponseSchema } from "@surf/contracts";
 import { estimateBreakingWaveHeight } from "@surf/forecast-core";
-import { buildForecastResponse } from "./forecast";
+import { buildForecastResponse, buildSynchronizedForecastResponses } from "./forecast";
 import type { Env } from "./index";
 
 type QueryRows = Record<
@@ -9,26 +9,32 @@ type QueryRows = Record<
   unknown[]
 >;
 
+type QueryKey = keyof QueryRows;
+
+function queryKey(sql: string): QueryKey {
+  return sql.includes("from tide_events")
+    ? "tideEvent"
+    : sql.includes("from tide_forecasts")
+    ? "tide"
+    : sql.includes("from wind_forecasts")
+      ? "wind"
+      : sql.includes("from wave_forecasts")
+        ? "wave"
+        : sql.includes("from wave_observations")
+          ? "observation"
+          : sql.includes("from hazard_events")
+            ? "hazard"
+            : sql.includes("from forecast_issues")
+              ? "issue"
+              : sql.includes("from forecast_snapshots")
+                ? "snapshot"
+                : "source";
+}
+
 function queryDb(rows: QueryRows): D1Database {
   return {
     prepare(sql: string) {
-      const key = sql.includes("from tide_events")
-        ? "tideEvent"
-        : sql.includes("from tide_forecasts")
-        ? "tide"
-        : sql.includes("from wind_forecasts")
-          ? "wind"
-          : sql.includes("from wave_forecasts")
-            ? "wave"
-            : sql.includes("from wave_observations")
-              ? "observation"
-              : sql.includes("from hazard_events")
-                ? "hazard"
-                : sql.includes("from forecast_issues")
-                  ? "issue"
-                  : sql.includes("from forecast_snapshots")
-                    ? "snapshot"
-                    : "source";
+      const key = queryKey(sql);
       const all = async () => ({ results: rows[key], success: true, meta: {} });
       return {
         bind() {
@@ -38,6 +44,43 @@ function queryDb(rows: QueryRows): D1Database {
       };
     }
   } as unknown as D1Database;
+}
+
+function batchingQueryDb(rows: QueryRows) {
+  let batchCalls = 0;
+  let batchedStatements = 0;
+  let individualAllCalls = 0;
+
+  const statement = (key: QueryKey): D1PreparedStatement => ({
+    __queryKey: key,
+    bind() {
+      return statement(key);
+    },
+    async all() {
+      individualAllCalls += 1;
+      throw new Error("Initial forecast reads must use D1 batch when it is available");
+    }
+  } as unknown as D1PreparedStatement);
+  const db = {
+    prepare(sql: string) {
+      return statement(queryKey(sql));
+    },
+    async batch(statements: D1PreparedStatement[]) {
+      batchCalls += 1;
+      batchedStatements += statements.length;
+      return statements.map((prepared) => ({
+        results: rows[(prepared as D1PreparedStatement & { __queryKey: QueryKey }).__queryKey],
+        success: true,
+        meta: {}
+      }));
+    }
+  } as unknown as D1Database;
+  return {
+    db,
+    batchCalls: () => batchCalls,
+    batchedStatements: () => batchedStatements,
+    individualAllCalls: () => individualAllCalls
+  };
 }
 
 function env(db: D1Database): Env {
@@ -50,6 +93,17 @@ function env(db: D1Database): Env {
     RAW_ARTIFACTS: {} as R2Bucket,
     INGEST_QUEUE: {} as Queue
   };
+}
+
+function trackIndexedReads<T>(values: T[]): { values: T[]; reads: () => number } {
+  let readCount = 0;
+  const valuesProxy = new Proxy(values, {
+    get(target, property, receiver) {
+      if (typeof property === "string" && /^(0|[1-9]\d*)$/.test(property)) readCount += 1;
+      return Reflect.get(target, property, receiver);
+    }
+  });
+  return { values: valuesProxy, reads: () => readCount };
 }
 
 const forecastAt = "2026-07-10T04:00:00.000Z";
@@ -144,6 +198,39 @@ function liveRows(): QueryRows {
 }
 
 describe("forecast assembly", () => {
+  it("loads one batched source snapshot for synchronized 1h/3h assembly", async () => {
+    const rows = liveRows();
+    const batched = batchingQueryDb(rows);
+    const now = new Date("2026-07-10T02:53:07.000Z");
+
+    const synchronized = await buildSynchronizedForecastResponses(
+      env(batched.db),
+      "bolinas",
+      now,
+      { failOnReadError: true }
+    );
+    const expectedThreeHour = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      now,
+      "3h",
+      { failOnReadError: true }
+    );
+    const expectedHourly = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      now,
+      "1h",
+      { failOnReadError: true }
+    );
+
+    expect(batched.batchCalls()).toBe(1);
+    expect(batched.batchedStatements()).toBe(8);
+    expect(batched.individualAllCalls()).toBe(0);
+    expect(synchronized.threeHour).toEqual(expectedThreeHour);
+    expect(synchronized.hourly).toEqual(expectedHourly);
+  });
+
   it("returns sourced, scaled NWS waves on stable local-clock slots with provenance", async () => {
     const response = await buildForecastResponse(
       env(queryDb(liveRows())),
@@ -466,6 +553,96 @@ describe("forecast assembly", () => {
     expect(response.windows[0]?.windSpeedKt).toBeCloseTo(12, 8);
   });
 
+  it("preserves first-row tie behavior while using indexed tide, wind, wave, hazard, and source-run lookups", async () => {
+    const rows = liveRows();
+    rows.tide = [
+      {
+        forecast_at: "2026-07-10T05:00:00.000Z",
+        tide_ft_mllw: 5,
+        tide_trend: "falling",
+        source_run_id: "tide-run"
+      },
+      {
+        forecast_at: "2026-07-10T03:00:00.000Z",
+        tide_ft_mllw: 3,
+        tide_trend: "rising",
+        source_run_id: "tide-run"
+      }
+    ];
+    rows.wind = [
+      {
+        forecast_at: "2026-07-10T05:00:00.000Z",
+        model_cycle_at: null,
+        wind_speed_ms: 4,
+        wind_direction_deg: 300,
+        gust_ms: 5,
+        weather_summary: "first input row",
+        source_run_id: "wind-run"
+      },
+      {
+        forecast_at: forecastAt,
+        model_cycle_at: null,
+        wind_speed_ms: 4,
+        wind_direction_deg: 300,
+        gust_ms: 5,
+        weather_summary: "earlier timestamp",
+        source_run_id: "wind-run"
+      }
+    ];
+    rows.wave = [
+      { ...rows.wave[0] as object, nearshore_height_m: 0.5 },
+      { ...rows.wave[0] as object, nearshore_height_m: 1.5 }
+    ];
+    rows.hazard = [
+      {
+        starts_at: "2026-07-10T03:30:00.000Z",
+        ends_at: "2026-07-10T06:00:00.000Z",
+        headline: "First input hazard",
+        source_run_id: "hazard-run"
+      },
+      {
+        starts_at: "2026-07-10T03:00:00.000Z",
+        ends_at: "2026-07-10T06:00:00.000Z",
+        headline: "Earlier-starting hazard",
+        source_run_id: "hazard-run"
+      }
+    ];
+    rows.source = [
+      {
+        id: "tide-run",
+        source_id: "tide",
+        status: "success",
+        completed_at: "2026-07-10T02:00:00.000Z"
+      },
+      {
+        id: "tide-run",
+        source_id: "tide-duplicate",
+        status: "success",
+        completed_at: "2026-07-10T02:30:00.000Z"
+      },
+      ...rows.source.filter((row) => (row as { id?: string }).id !== "tide-run")
+    ];
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      new Date("2026-07-10T02:53:07.000Z")
+    );
+
+    expect(response.windows[0]).toMatchObject({
+      tideFt: 5,
+      tideTrend: "falling",
+      windSpeedKt: 4 * 1.94384,
+      weatherSummary: "first input row",
+      waveHeightFt: 0.5 * 3.28084
+    });
+    expect(response.windows[0]?.caveats).toContain("Active NWS hazard: First input hazard");
+    expect(response.windows[0]?.sourceFreshness?.find((entry) => entry.capability === "tide")).toMatchObject({
+      updatedAt: "2026-07-10T02:00:00.000Z",
+      freshnessMinutes: 53
+    });
+  });
+
   it("uses exact hourly wind and tide while holding one declared three-hour wave state", async () => {
     const rows = liveRows();
     rows.tide.push(
@@ -539,6 +716,66 @@ describe("forecast assembly", () => {
       }
     });
     expect(response.windows[1]?.windGustKt).toBeCloseTo(8, 8);
+  });
+
+  it("keeps dense 1-hour assembly linear in normalized input rows", async () => {
+    const rows = liveRows();
+    const startMs = Date.parse(forecastAt);
+    const hourlyTimes = Array.from({ length: 121 }, (_, index) =>
+      new Date(startMs + index * 60 * 60_000).toISOString()
+    );
+    rows.tide = hourlyTimes.map((forecastAtValue, index) => ({
+      forecast_at: forecastAtValue,
+      tide_ft_mllw: 2 + index / 100,
+      tide_trend: index % 2 === 0 ? "rising" : "falling",
+      source_run_id: "tide-run"
+    }));
+    rows.wind = hourlyTimes.map((forecastAtValue, index) => ({
+      forecast_at: forecastAtValue,
+      model_cycle_at: "2026-07-10T01:00:00.000Z",
+      wind_speed_ms: 2 + index / 100,
+      wind_direction_deg: 280,
+      gust_ms: 3 + index / 100,
+      weather_summary: "Clear",
+      source_run_id: "wind-run"
+    }));
+    rows.wave = Array.from({ length: 41 }, (_, index) => ({
+      ...rows.wave[0] as object,
+      forecast_at: new Date(startMs + index * 3 * 60 * 60_000).toISOString(),
+      nearshore_height_m: 0.7 + index / 100
+    }));
+    rows.observation = [];
+    rows.hazard = [];
+
+    const tideReads = trackIndexedReads(rows.tide);
+    const windReads = trackIndexedReads(rows.wind);
+    const waveReads = trackIndexedReads(rows.wave);
+    const sourceReads = trackIndexedReads(rows.source);
+    rows.tide = tideReads.values;
+    rows.wind = windReads.values;
+    rows.wave = waveReads.values;
+    rows.source = sourceReads.values;
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      new Date("2026-07-10T03:01:00.000Z"),
+      "1h"
+    );
+
+    expect(response.windows).toHaveLength(121);
+    expect(response.windows.every((window) => window.ratingStatus === "scored")).toBe(true);
+    expect(response.windows.slice(0, 3).map((window) => window.waveHeightFt)).toEqual([
+      0.7 * 3.28084,
+      0.7 * 3.28084,
+      0.7 * 3.28084
+    ]);
+    // These deterministic access counts reject a return to per-window full-array scans
+    // without relying on machine-dependent wall-clock thresholds.
+    expect(tideReads.reads()).toBeLessThanOrEqual(2 * 121);
+    expect(windReads.reads()).toBeLessThanOrEqual(2 * 121);
+    expect(waveReads.reads()).toBeLessThanOrEqual(3 * 41);
+    expect(sourceReads.reads()).toBeLessThanOrEqual(2 * rows.source.length);
   });
 
   it("holds CDIP rows by their actual source timestamps and switches without interpolation", async () => {

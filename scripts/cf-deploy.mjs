@@ -67,12 +67,52 @@ function smoke(output, requireForecastData) {
   });
 }
 
+function refreshForecastReadModels(output) {
+  const url = deployedUrl(output);
+  if (!url) {
+    throw new Error(
+      "Deployment completed, but its URL could not be inferred. Set SURF_BASE_URL before deployment so forecast read models can be published."
+    );
+  }
+  runPnpm(["ingest:remote"], {
+    env: { SURF_BASE_URL: url }
+  });
+}
+
+function rollbackFailedDeployment(cause) {
+  try {
+    runWrangler([
+      "rollback",
+      "--message",
+      "Automatic rollback: forecast read-model bootstrap failed",
+      "--yes"
+    ], {
+      env: { CI: "true" }
+    });
+  } catch (rollbackError) {
+    throw new AggregateError(
+      [cause, rollbackError],
+      "Forecast read-model bootstrap failed after deployment, and the automatic Worker rollback also failed."
+    );
+  }
+  throw new Error(
+    "Forecast read-model bootstrap or strict smoke failed after deployment; the Worker was automatically rolled back.",
+    { cause }
+  );
+}
+
 assertActiveWranglerConfig();
 buildAndValidate();
 
 if (dryRun) {
   console.log("Cloudflare dry run passed. No remote resources were changed.");
   process.exit(0);
+}
+
+if (mode === "deploy" && !process.env.SURF_INGEST_TOKEN?.trim()) {
+  throw new Error(
+    "Deployment requires SURF_INGEST_TOKEN in the shell or root .env so forecast read models can be refreshed after rollout."
+  );
 }
 
 runWrangler(["whoami"]);
@@ -89,6 +129,7 @@ if (mode === "setup") {
       { cause: error }
     );
   }
+  smoke(output, false);
 } else {
   try {
     migrateAndSeed();
@@ -99,6 +140,12 @@ if (mode === "setup") {
     );
   }
   output = deployWorker();
+  try {
+    // Forecast GETs intentionally serve precomputed D1 read models. Queue the
+    // first generation and wait for publication before strict post-deploy smoke.
+    refreshForecastReadModels(output);
+    smoke(output, true);
+  } catch (error) {
+    rollbackFailedDeployment(error);
+  }
 }
-
-smoke(output, mode === "deploy");

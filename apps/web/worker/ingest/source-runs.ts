@@ -8,7 +8,7 @@ import type {
 } from "./types";
 
 export const SOURCE_RUNS_CONTRACT =
-  "D1 binding DB must expose source_runs with run_key/run_kind plus normalized wave_forecasts, wave_observations, tide_forecasts, tide_events, wind_forecasts, wind_forecast_issues, hazard_events, forecast_configs, forecast_issues, and forecast_snapshots tables.";
+  "D1 binding DB must expose source_runs with run_key/run_kind plus normalized wave_forecasts, wave_observations, tide_forecasts, tide_events, wind_forecasts, wind_forecast_issues, hazard_events, forecast_configs, forecast_issues, forecast_snapshots, forecast_read_models, and forecast_fact_bundles tables.";
 
 export function defaultRunIdSuffix(): string {
   return crypto.randomUUID();

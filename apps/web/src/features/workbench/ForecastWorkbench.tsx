@@ -29,7 +29,7 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../components/ui/tabs";
 import { InfoTooltip, TooltipProvider } from "../../components/ui/tooltip";
 import { ToggleGroup, ToggleGroupItem } from "../../components/ui/toggle-group";
-import { cardinalDirection, formatDay } from "../../forecast-view";
+import { cardinalDirection, formatDay, localDateParts } from "../../forecast-view";
 import {
   adaptForecastResponse,
   availableWorkbenchDates,
@@ -45,6 +45,10 @@ import {
   type WorkbenchWindow
 } from "./forecast-adapter";
 import { expectedForecastSlotCount } from "./workbench-time";
+import {
+  isUsableForecastResponse,
+  parseUsableForecastResponse
+} from "./forecast-health";
 
 const ForecastGraph = lazy(() => import("./ForecastGraph"));
 
@@ -194,7 +198,7 @@ async function fetchForecast(spotId: string, interval: ForecastInterval, signal:
     signal
   });
   if (!response.ok) throw new Error(`${interval === "1h" ? "Hourly" : "Three-hour"} forecast returned ${response.status}`);
-  return (await response.json()) as ForecastResponse;
+  return parseUsableForecastResponse(await response.json());
 }
 
 function ConditionBadge({ window }: { window: WorkbenchWindow }) {
@@ -693,7 +697,9 @@ export function ForecastWorkbench({
   const [view, setView] = useState<WorkbenchView>(initialUrl.view);
   const [selectedDate, setSelectedDate] = useState<string | null>(initialUrl.date);
   const [selectedAt, setSelectedAt] = useState<string | null>(initialUrl.at);
-  const [cache, setCache] = useState<ForecastCache>(() => initialForecast ? { "3h": initialForecast } : {});
+  const [cache, setCache] = useState<ForecastCache>(() => (
+    isUsableForecastResponse(initialForecast) ? { "3h": initialForecast } : {}
+  ));
   const [intervalLoading, setIntervalLoading] = useState(initialUrl.interval === "1h");
   const [intervalError, setIntervalError] = useState<string | null>(null);
   const [intervalNotice, setIntervalNotice] = useState<string | null>(null);
@@ -703,7 +709,7 @@ export function ForecastWorkbench({
   const cacheRef = useRef(cache);
   const hourlyFailurePending = useRef(false);
   const canonicalRecoveryState = useRef<"idle" | "pending" | "ready" | "failed">(
-    cache["3h"] ? "ready" : "idle"
+    isUsableForecastResponse(initialForecast) ? "ready" : "idle"
   );
   const explicitTimestampSelection = useRef(Boolean(initialUrl.at));
   const previousInitialForecast = useRef(initialForecast);
@@ -711,11 +717,12 @@ export function ForecastWorkbench({
   useEffect(() => {
     if (previousInitialForecast.current === initialForecast) return;
     previousInitialForecast.current = initialForecast;
+    if (!isUsableForecastResponse(initialForecast)) return;
     fetchController.current?.abort();
-    const nextCache: ForecastCache = initialForecast ? { "3h": initialForecast } : {};
+    const nextCache: ForecastCache = { "3h": initialForecast };
     cacheRef.current = nextCache;
     hourlyFailurePending.current = false;
-    canonicalRecoveryState.current = initialForecast ? "ready" : "idle";
+    canonicalRecoveryState.current = "ready";
     setCache(nextCache);
   }, [initialForecast]);
 
@@ -941,10 +948,17 @@ export function ForecastWorkbench({
     replaceWorkbenchUrl({ view: value });
   }, []);
 
+  const currentDateKey = localDateParts(now, spot.timezone).key;
+  const coverageFloor = selectedDate === currentDateKey
+    ? now.getTime()
+    : undefined;
   const expectedRows = selectedDate
-    ? expectedForecastSlotCount(selectedDate, interval, spot.timezone)
+    ? expectedForecastSlotCount(selectedDate, interval, spot.timezone, coverageFloor)
     : interval === "1h" ? 24 : 8;
-  const hasCoverageGap = dayWindows.length > 0 && dayWindows.length < expectedRows;
+  const coveredRows = coverageFloor === undefined
+    ? dayWindows.length
+    : dayWindows.filter((window) => new Date(window.forecastAt).getTime() >= coverageFloor).length;
+  const hasCoverageGap = expectedRows > 0 && coveredRows < expectedRows;
 
   return (
     <TooltipProvider delayDuration={180}>
@@ -1013,7 +1027,7 @@ export function ForecastWorkbench({
           ) : (
             <>
               {hasCoverageGap && (
-                <div className="coverageNotice" role="status"><Info size={15} aria-hidden="true" /> {dayWindows.length} of {expectedRows} expected {interval} windows are available. Gaps remain visible and are not filled.</div>
+                <div className="coverageNotice" role="status"><Info size={15} aria-hidden="true" /> {coveredRows} of {expectedRows} expected {interval} windows are available. Gaps remain visible and are not filled.</div>
               )}
               <TabsContent value="table">
                 <DesktopForecastTable windows={dayWindows} selectedAt={selectedAt} spot={spot} interval={interval} onSelect={selectAt} />

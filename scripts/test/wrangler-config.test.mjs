@@ -43,6 +43,25 @@ test("instance validation protects the Agent lifecycle and secret boundary", () 
   ]);
 });
 
+test("instance validation preserves serialized ingest generations", () => {
+  const config = structuredClone(canonical);
+  config.queues.consumers[0].max_batch_size = 10;
+  delete config.queues.consumers[0].max_concurrency;
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "Ingest queue consumption must be serialized one message at a time."
+  ]);
+});
+
+test("instance validation preserves version-scoped Worker response caching", () => {
+  const config = structuredClone(canonical);
+  config.cache.cross_version_cache = true;
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "Worker response caching must be enabled with version-scoped cache keys."
+  ]);
+});
+
 test("an ignored instance config may enable the brief after the lifecycle deploy", () => {
   const config = structuredClone(canonical);
   config.vars.FORECAST_BRIEF_ENABLED = "true";

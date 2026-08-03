@@ -13,10 +13,12 @@ import { bearerTokenMatches } from "./auth";
 import {
   buildDisabledForecastBriefResponse,
   buildForecastBriefResponse,
-  buildForecastFactBundle,
   buildUnavailableForecastBriefResponse
 } from "./brief";
-import { buildForecastResponse } from "./forecast";
+import {
+  getMaterializedForecastFactBundle,
+  getMaterializedForecastJson
+} from "./forecast-read-model";
 import { ingestRequiresRetry, normalizeIngestMessage, runNorcalIngest } from "./ingest";
 import { localDateForTime } from "./time";
 
@@ -53,6 +55,17 @@ const spotsResponse = SpotsResponseSchema.parse({
 });
 
 app.use("/api/*", cors());
+app.use("/api/*", async (c, next) => {
+  await next();
+  if (c.res.headers.has("Cache-Control")) return;
+  const isBrief = /^\/api\/forecast\/[^/]+\/brief$/.test(new URL(c.req.url).pathname);
+  c.res.headers.set(
+    "Cache-Control",
+    isBrief && c.res.status === 200
+      ? "public, max-age=60, stale-while-revalidate=300"
+      : "no-store"
+  );
+});
 
 app.get("/api/health", (c) =>
   c.json({
@@ -64,7 +77,11 @@ app.get("/api/health", (c) =>
   })
 );
 
-app.get("/api/spots", (c) => c.json(spotsResponse));
+app.get("/api/spots", (c) =>
+  c.json(spotsResponse, 200, {
+    "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400"
+  })
+);
 
 function forecastBriefEnabled(env: Env): boolean {
   return (
@@ -88,8 +105,11 @@ async function signalForecastBriefAgents(env: Env): Promise<void> {
   const generatedAt = new Date();
   const results = await Promise.allSettled(
     NORCAL_SPOTS.map(async (spot) => {
-      const forecast = await buildForecastResponse(env, spot.id, generatedAt, "3h");
-      const bundle = await buildForecastFactBundle(forecast);
+      const localDate = localDateForTime(generatedAt.toISOString(), spot.timezone);
+      const bundle = await getMaterializedForecastFactBundle(env.DB, spot.id, localDate);
+      if (!bundle) {
+        throw new Error(`Materialized forecast facts are unavailable for ${spot.id} on ${localDate}`);
+      }
       return namespace.getByName(spot.id).signal(bundle);
     })
   );
@@ -141,8 +161,25 @@ app.get(
       if (!spot) throw new Error("Validated spot metadata is unavailable");
       spotName = spot.name;
       localDate = date ?? localDateForTime(now.toISOString(), spot.timezone);
-      const forecast = await buildForecastResponse(c.env, spotId, now, "3h");
-      const bundle = await buildForecastFactBundle(forecast, { localDate: date });
+      const bundle = await getMaterializedForecastFactBundle(c.env.DB, spotId, localDate);
+      if (!bundle) {
+        console.warn(
+          JSON.stringify({
+            message: "forecast brief response used the safe summary",
+            spotId,
+            localDate,
+            reason: "requested_date_unavailable"
+          })
+        );
+        return c.json(
+          buildUnavailableForecastBriefResponse({
+            spotId,
+            spotName,
+            localDate,
+            generatedAt: now.toISOString()
+          })
+        );
+      }
       if (!forecastBriefEnabled(c.env)) {
         return c.json(buildDisabledForecastBriefResponse(bundle));
       }
@@ -190,7 +227,56 @@ app.get(
   async (c) => {
     const { spotId } = c.req.valid("param");
     const { interval } = c.req.valid("query");
-    return c.json(await buildForecastResponse(c.env, spotId, new Date(), interval));
+    try {
+      const materialized = await getMaterializedForecastJson(c.env.DB, spotId, interval);
+      if (!materialized) {
+        return c.json(
+          {
+            error: "forecast_temporarily_unavailable",
+            message: "Forecast data is being refreshed. Please retry shortly.",
+            retryable: true,
+            spotId,
+            interval
+          },
+          503,
+          { "Retry-After": "300" }
+        );
+      }
+      const etag = `"${materialized.generationId}"`;
+      const responseHeaders = {
+        "Cache-Control": "public, max-age=60, stale-while-revalidate=300",
+        ETag: etag,
+        "X-Surf-Forecast-Generated-At": materialized.generatedAt,
+        "X-Surf-Forecast-Materialized-At": materialized.materializedAt
+      };
+      if (c.req.header("If-None-Match") === etag) {
+        return c.body(null, 304, responseHeaders);
+      }
+      return c.body(materialized.forecastJson, 200, {
+        "Content-Type": "application/json; charset=UTF-8",
+        ...responseHeaders
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          message: "forecast read model lookup failed",
+          spotId,
+          interval,
+          ...briefAssemblyDiagnostic(error)
+        })
+      );
+      return c.json(
+        {
+          error: "forecast_temporarily_unavailable",
+          message: "Forecast data is being refreshed. Please retry shortly.",
+          retryable: true,
+          spotId,
+          interval
+        },
+        503,
+        { "Retry-After": "300" }
+      );
+    }
   }
 );
 
@@ -206,6 +292,22 @@ app.post("/api/ingest/once", async (c) => {
   }
 
   const requestedAt = new Date().toISOString();
+  if (!isLocalRequest) {
+    await c.env.INGEST_QUEUE.send({
+      kind: "manual-ingest",
+      requestedAt,
+      region: c.env.SURF_REGION
+    });
+    return c.json(
+      {
+        status: "accepted",
+        requestedAt,
+        region: c.env.SURF_REGION
+      },
+      202
+    );
+  }
+
   const summary = await runNorcalIngest(c.env, {
     kind: "manual-ingest",
     requestedAt,
@@ -235,7 +337,7 @@ export default {
       try {
         const body = normalizeIngestMessage(message.body, env.SURF_REGION);
         const summary = await runNorcalIngest(env, {
-          kind: "queued-ingest",
+          kind: body.kind === "manual-ingest" ? "manual-ingest" : "queued-ingest",
           requestedAt: body.requestedAt,
           region: body.region
         });

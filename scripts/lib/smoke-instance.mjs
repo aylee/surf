@@ -22,9 +22,41 @@ async function getJson(baseUrl, path, label) {
   return response.json();
 }
 
-function validateForecast(spot, forecast, requireForecastData) {
+function isRetryableForecastUnavailable(value, spotId, interval) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      value.error === "forecast_temporarily_unavailable" &&
+      value.retryable === true &&
+      value.spotId === spotId &&
+      value.interval === interval
+  );
+}
+
+async function getForecastReadModel(baseUrl, spot, interval, label, requireForecastData) {
+  const path = `/api/forecast/${encodeURIComponent(spot.id)}?interval=${interval}`;
+  const response = await fetch(`${baseUrl}${path}`);
+  if (response.status === 503 && !requireForecastData) {
+    const body = await response.json().catch(() => null);
+    if (isRetryableForecastUnavailable(body, spot.id, interval)) {
+      return { status: "pending", forecast: null };
+    }
+    throw new Error(
+      `${label} ${path} returned an invalid setup-time unavailable response: ${JSON.stringify(body)}`
+    );
+  }
+  if (!response.ok) {
+    throw new Error(`${label} ${path} failed: ${response.status} ${await response.text()}`);
+  }
+  return { status: "ready", forecast: await response.json() };
+}
+
+function validateForecast(spot, interval, forecast, requireForecastData) {
   if (forecast?.spot?.id !== spot.id) {
     throw new Error(`Forecast identity mismatch for ${spot.id}.`);
+  }
+  if (forecast?.interval !== interval) {
+    throw new Error(`Forecast interval mismatch for ${spot.id}: expected ${interval}.`);
   }
   if (!Array.isArray(forecast.windows) || forecast.windows.length === 0) {
     throw new Error(`Expected forecast windows for ${spot.id}.`);
@@ -73,19 +105,34 @@ export async function smokeForecastInstance(
     spotIds.add(spot.id);
   }
 
-  const forecasts = await Promise.all(
-    spots.spots.map((spot) =>
-      getJson(baseUrl, `/api/forecast/${encodeURIComponent(spot.id)}`, label)
+  const requests = spots.spots.flatMap((spot) =>
+    ["3h", "1h"].map((interval) => ({ spot, interval }))
+  );
+  const results = await Promise.all(
+    requests.map(({ spot, interval }) =>
+      getForecastReadModel(
+        baseUrl,
+        spot,
+        interval,
+        label,
+        requireForecastData
+      )
     )
   );
-  forecasts.forEach((forecast, index) =>
-    validateForecast(spots.spots[index], forecast, requireForecastData)
-  );
+  results.forEach((result, index) => {
+    if (result.status === "pending") return;
+    const request = requests[index];
+    validateForecast(request.spot, request.interval, result.forecast, requireForecastData);
+  });
+  const readyForecasts = results.filter((result) => result.status === "ready").length;
+  const pendingForecasts = results.length - readyForecasts;
 
   return {
     status: "ok",
     baseUrl,
     spots: spots.spots.length,
+    forecastReadModels: readyForecasts,
+    pendingForecastReadModels: pendingForecasts,
     dataCheck: requireForecastData ? "scored forecasts present" : "API structure only",
     generatedAt: new Date().toISOString()
   };
