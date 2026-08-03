@@ -79,7 +79,10 @@ export function forecastSlotTimestamps(
 export function expectedForecastSlotCount(
   dateKey: string,
   interval: ForecastInterval,
-  timezone: string
+  timezone: string,
+  notBefore?: number
 ): number {
-  return forecastSlotTimestamps(dateKey, interval, timezone).length;
+  return forecastSlotTimestamps(dateKey, interval, timezone)
+    .filter((timestamp) => notBefore === undefined || timestamp >= notBefore)
+    .length;
 }

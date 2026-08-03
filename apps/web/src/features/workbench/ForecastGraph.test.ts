@@ -102,6 +102,13 @@ describe("forecast graph normalization", () => {
     expect(data[4]?.confidence).toBe(72);
   });
 
+  it("counts only current-day slots at or after the live forecast horizon", () => {
+    const fiveThirtyPm = new Date("2026-08-03T00:30:00.000Z").getTime();
+
+    expect(expectedForecastSlotCount("2026-08-02", "3h", spot.timezone, fiveThirtyPm)).toBe(2);
+    expect(expectedForecastSlotCount("2026-08-02", "1h", spot.timezone, fiveThirtyPm)).toBe(6);
+  });
+
   it("uses 23 real instants on the Los Angeles spring-forward day without fabricating 2 AM", () => {
     const rows = rowsForUtcRange(
       "2026-03-08T08:00:00.000Z",

@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ForecastBriefResponseSchema, ForecastResponseSchema } from "@surf/contracts";
+import {
+  ForecastBriefResponseSchema,
+  ForecastResponseSchema,
+  type ForecastInterval,
+  type ForecastResponse
+} from "@surf/contracts";
 import { NORCAL_SPOTS } from "@surf/forecast-core";
+import { buildFixtureForecast } from "@surf/forecast-core/test-support";
+import { buildForecastFactBundle, type ForecastFactBundle } from "./brief";
+import { FORECAST_READ_MODEL_SCHEMA_VERSION } from "./forecast-read-model";
 import type { Env } from "./index";
 import worker from "./index";
 import {
@@ -9,20 +17,98 @@ import {
   pruneRetainedData,
   shouldCaptureForecastHistory
 } from "./ingest";
-import { stableThreeHourForecastTimes } from "./time";
+import { localDateForTime, stableThreeHourForecastTimes } from "./time";
 
-function dbMock() {
+function dbMock(options: { forecastAssemblyRows?: boolean } = {}) {
   const runs: unknown[][] = [];
   const sqls: string[] = [];
   const preparedSql: string[] = [];
   const db = {
     prepare: (sql: string) => {
       preparedSql.push(sql);
-      const all = async () => ({ results: [], success: true, meta: {} });
+      const allFor = async (values: unknown[]) => {
+        if (!options.forecastAssemblyRows) return { results: [], success: true, meta: {} };
+        const horizonStart = typeof values[1] === "string" ? values[1] : null;
+        const waveStart = horizonStart ? new Date(horizonStart).getTime() : Number.NaN;
+        const waveForecastAt = Number.isFinite(waveStart)
+          ? new Date(waveStart + 3 * 60 * 60 * 1000).toISOString()
+          : null;
+        if (sql.includes("from tide_forecasts") && horizonStart) {
+          return {
+            results: [{
+              forecast_at: horizonStart,
+              tide_ft_mllw: 2.5,
+              tide_trend: "rising",
+              source_run_id: "tide-run"
+            }],
+            success: true,
+            meta: {}
+          };
+        }
+        if (sql.includes("from wind_forecasts") && horizonStart) {
+          return {
+            results: [{
+              forecast_at: horizonStart,
+              model_cycle_at: new Date(
+                new Date(horizonStart).getTime() - 60 * 60 * 1000
+              ).toISOString(),
+              wind_speed_ms: 3,
+              wind_direction_deg: 90,
+              gust_ms: 5,
+              weather_summary: "Clear",
+              source_run_id: "wind-run"
+            }],
+            success: true,
+            meta: {}
+          };
+        }
+        if (sql.includes("from wave_forecasts") && waveForecastAt) {
+          return {
+            results: [{
+              source_id: "nws:mtr-grid-wave",
+              forecast_at: waveForecastAt,
+              model_cycle_at: new Date(
+                new Date(waveForecastAt).getTime() - 3 * 60 * 60 * 1000
+              ).toISOString(),
+              nearshore_height_m: 1,
+              offshore_height_m: null,
+              significant_height_m: 1.3,
+              peak_period_s: 10,
+              primary_direction_deg: 290,
+              swell_height_m: 1,
+              swell_period_s: 10,
+              swell_direction_deg: 290,
+              payload_json: JSON.stringify({
+                sourceUrl: "https://api.weather.gov/gridpoints/MTR/fixture",
+                breakingHeightScale: 0.75,
+                significantHeightM: 1.3,
+                estimatedBreakingHeightM: 1
+              }),
+              source_run_id: "wave-run"
+            }],
+            success: true,
+            meta: {}
+          };
+        }
+        if (sql.includes("from source_runs")) {
+          return {
+            results: ["tide-run", "wind-run", "wave-run"].map((id) => ({
+              id,
+              source_id: id,
+              status: "success",
+              completed_at: "2026-07-08T15:00:00.000Z"
+            })),
+            success: true,
+            meta: {}
+          };
+        }
+        return { results: [], success: true, meta: {} };
+      };
+      const all = async () => allFor([]);
       const first = async () => null;
       return {
         bind: (...values: unknown[]) => ({
-          all,
+          all: async () => allFor(values),
           first,
           run: async () => {
             runs.push(values);
@@ -51,6 +137,68 @@ function env(db: D1Database = dbMock().db): Env {
   };
 }
 
+function fixtureForecast(interval: ForecastInterval): ForecastResponse {
+  return {
+    ...buildFixtureForecast("obsf-central", new Date("2026-08-02T13:00:00.000Z")),
+    interval
+  };
+}
+
+function withMaterializedRows(
+  fallback: D1Database,
+  forecasts: ForecastResponse[],
+  factBundles: ForecastFactBundle[] = []
+): D1Database {
+  return {
+    prepare(sql: string) {
+      if (sql.includes("from forecast_fact_bundles")) {
+        return {
+          bind(spotId: string, localDate: string) {
+            return {
+              async first() {
+                const bundle = factBundles.find(
+                  (candidate) =>
+                    candidate.input.spotId === spotId && candidate.input.localDate === localDate
+                );
+                return bundle
+                  ? {
+                      generation_id: "sha256:test-generation",
+                      schema_version: FORECAST_READ_MODEL_SCHEMA_VERSION,
+                      fact_bundle_json: JSON.stringify(bundle)
+                    }
+                  : null;
+              }
+            };
+          }
+        } as unknown as D1PreparedStatement;
+      }
+      if (sql.includes("from forecast_read_models")) {
+        return {
+          bind(spotId: string, interval: ForecastInterval) {
+            return {
+              async first() {
+                const forecast = forecasts.find(
+                  (candidate) => candidate.spot.id === spotId && candidate.interval === interval
+                );
+                return forecast
+                  ? {
+                      generation_id: "sha256:test-generation",
+                      generated_at: forecast.generatedAt,
+                      schema_version: FORECAST_READ_MODEL_SCHEMA_VERSION,
+                      forecast_json: JSON.stringify(forecast),
+                      materialized_at: "2026-08-02T13:05:00.000Z"
+                    }
+                  : null;
+              }
+            };
+          }
+        } as unknown as D1PreparedStatement;
+      }
+      return fallback.prepare(sql);
+    }
+  } as unknown as D1Database;
+}
+
 describe("worker api", () => {
   it("samples scheduled history every six hours while preserving manual captures", () => {
     expect(shouldCaptureForecastHistory("queued-ingest", "2026-07-10T00:17:00Z")).toBe(true);
@@ -65,7 +213,7 @@ describe("worker api", () => {
     const result = await pruneRetainedData(db, now);
 
     expect(result.errors).toEqual([]);
-    expect(sqls).toHaveLength(12);
+    expect(sqls).toHaveLength(13);
     for (const table of ["wave_forecasts", "tide_forecasts", "tide_events", "wind_forecasts"]) {
       const index = sqls.findIndex((sql) => sql.includes(`delete from ${table}`));
       expect(index).toBeGreaterThanOrEqual(0);
@@ -99,6 +247,14 @@ describe("worker api", () => {
     expect(sqls.find((sql) => sql.includes("delete from source_runs"))).toContain(
       "not exists (select 1 from tide_events"
     );
+    const factBundleIndex = sqls.findIndex((sql) => sql.includes("delete from forecast_fact_bundles"));
+    expect(factBundleIndex).toBeGreaterThanOrEqual(0);
+    expect(runs[factBundleIndex]?.[0]).toBe(
+      new Date(
+        now.getTime() - OPERATIONAL_FORECAST_RETENTION_DAYS * 24 * 60 * 60 * 1000
+      ).toISOString()
+    );
+    expect(sqls[factBundleIndex]).toContain("forecast_read_models.generation_id");
   });
 
   afterEach(() => {
@@ -110,12 +266,16 @@ describe("worker api", () => {
     const request = new Request("http://surf.test/api/health") as unknown as Parameters<typeof worker.fetch>[0];
     const response = await worker.fetch(request, env(), {} as ExecutionContext);
     expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(await response.json()).toMatchObject({ status: "ok", service: "surf" });
   });
 
   it("returns v1 spots", async () => {
     const request = new Request("http://surf.test/api/spots") as unknown as Parameters<typeof worker.fetch>[0];
     const response = await worker.fetch(request, env(), {} as ExecutionContext);
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=3600, stale-while-revalidate=86400"
+    );
     const body = (await response.json()) as {
       spots: Array<{
         id: string;
@@ -139,42 +299,63 @@ describe("worker api", () => {
     expect(response.status).toBe(400);
   });
 
-  it("fails closed with unknown windows when normalized forecast rows cannot be read", async () => {
+  it("returns a recoverable 503 when no materialized forecast is available", async () => {
     const request = new Request("http://surf.test/api/forecast/obsf-central") as unknown as Parameters<
       typeof worker.fetch
     >[0];
     const response = await worker.fetch(request, env(), {} as ExecutionContext);
-    const body = (await response.json()) as {
-      windows: Array<{ ratingStatus: string; waveHeightFt: number | null; sourceRunIds: string[] }>;
-      spot: { id: string };
-    };
-    expect(response.status).toBe(200);
-    expect(body.spot.id).toBe("obsf-central");
-    expect(body.spot).not.toHaveProperty("sourceMap");
-    expect(body.windows.length).toBeGreaterThan(0);
-    expect(body.windows[0]).toMatchObject({ ratingStatus: "unknown", waveHeightFt: null, sourceRunIds: [] });
+    const body = (await response.json()) as { error: string; retryable: boolean; spotId: string };
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Retry-After")).toBe("300");
+    expect(body).toEqual({
+      error: "forecast_temporarily_unavailable",
+      message: "Forecast data is being refreshed. Please retry shortly.",
+      retryable: true,
+      spotId: "obsf-central",
+      interval: "3h"
+    });
   });
 
   it("supports explicit hourly forecast responses without changing the default interval", async () => {
+    const materializedDb = withMaterializedRows(
+      dbMock().db,
+      [fixtureForecast("1h"), fixtureForecast("3h")]
+    );
     const hourly = await worker.fetch(
       new Request("http://surf.test/api/forecast/obsf-central?interval=1h") as unknown as Parameters<
         typeof worker.fetch
       >[0],
-      env(),
+      env(materializedDb),
       {} as ExecutionContext
     );
     const defaulted = await worker.fetch(
       new Request("http://surf.test/api/forecast/obsf-central") as unknown as Parameters<
         typeof worker.fetch
       >[0],
-      env(),
+      env(materializedDb),
       {} as ExecutionContext
     );
 
     expect(hourly.status).toBe(200);
     expect(await hourly.json()).toMatchObject({ interval: "1h" });
     expect(defaulted.status).toBe(200);
+    expect(defaulted.headers.get("Cache-Control")).toBe(
+      "public, max-age=60, stale-while-revalidate=300"
+    );
+    const etag = defaulted.headers.get("ETag");
+    expect(etag).toBe('"sha256:test-generation"');
     expect(await defaulted.json()).toMatchObject({ interval: "3h" });
+
+    const unchanged = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central", {
+        headers: { "If-None-Match": etag! }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      env(materializedDb),
+      {} as ExecutionContext
+    );
+    expect(unchanged.status).toBe(304);
+    expect(await unchanged.text()).toBe("");
   });
 
   it("rejects unsupported forecast intervals", async () => {
@@ -191,11 +372,13 @@ describe("worker api", () => {
 
   it("returns a typed deterministic brief when no model revision exists", async () => {
     const { db, preparedSql } = dbMock();
+    const forecast = fixtureForecast("3h");
+    const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-08-02" });
     const response = await worker.fetch(
-      new Request("http://surf.test/api/forecast/obsf-central/brief") as unknown as Parameters<
+      new Request("http://surf.test/api/forecast/obsf-central/brief?date=2026-08-02") as unknown as Parameters<
         typeof worker.fetch
       >[0],
-      env(db),
+      env(withMaterializedRows(db, [forecast], [bundle])),
       {} as ExecutionContext
     );
     const body = (await response.json()) as {
@@ -205,6 +388,9 @@ describe("worker api", () => {
     };
 
     expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=60, stale-while-revalidate=300"
+    );
     expect(body).toMatchObject({
       status: "deterministic_fallback",
       brief: { provider: "deterministic", spotId: "obsf-central" },
@@ -223,6 +409,30 @@ describe("worker api", () => {
     );
 
     expect(response.status).toBe(400);
+  });
+
+  it("serves deterministic briefs for future dates from materialized fact bundles", async () => {
+    const forecast = fixtureForecast("3h");
+    const futureDate = localDateForTime(
+      forecast.windows.at(-1)!.forecastAt,
+      forecast.spot.timezone
+    );
+    const bundle = await buildForecastFactBundle(forecast, { localDate: futureDate });
+    const db = withMaterializedRows(dbMock().db, [forecast], [bundle]);
+
+    const response = await worker.fetch(
+      new Request(
+        `http://surf.test/api/forecast/obsf-central/brief?date=${futureDate}`
+      ) as unknown as Parameters<typeof worker.fetch>[0],
+      env(db),
+      {} as ExecutionContext
+    );
+    const body = ForecastBriefResponseSchema.parse(await response.json());
+
+    expect(response.status).toBe(200);
+    expect(body.brief.localDate).toBe(futureDate);
+    expect(body.brief.picks.length).toBeGreaterThan(0);
+    expect(body.fallbackReason).toBe("AI forecast briefs are disabled for this Worker version.");
   });
 
   it("returns a typed safe summary for a valid date outside the forecast horizon", async () => {
@@ -261,15 +471,18 @@ describe("worker api", () => {
         throw new Error("Agent GET access is forbidden");
       }
     } as unknown as NonNullable<Env["FORECAST_BRIEF_AGENT"]>;
+    const forecast = fixtureForecast("3h");
+    const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-08-02" });
+    const readDb = withMaterializedRows(dbMock().db, [forecast], [bundle]);
     const agentEnv: Env = {
-      ...env(),
+      ...env(readDb),
       FORECAST_BRIEF_ENABLED: "true",
       GEMINI_API_KEY: "test-key-never-sent",
       FORECAST_BRIEF_AGENT: poisonAgent
     };
 
     const briefResponse = await worker.fetch(
-      new Request("http://surf.test/api/forecast/obsf-central/brief") as unknown as Parameters<
+      new Request("http://surf.test/api/forecast/obsf-central/brief?date=2026-08-02") as unknown as Parameters<
         typeof worker.fetch
       >[0],
       agentEnv,
@@ -291,7 +504,7 @@ describe("worker api", () => {
   });
 
   it("returns a nontechnical typed brief when D1 reads fail", async () => {
-    const failureLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const failureLog = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const failingDb = {
       prepare() {
         throw new Error("internal D1 failure details");
@@ -327,7 +540,7 @@ describe("worker api", () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
 
-    const { db, runs, sqls } = dbMock();
+    const { db, runs, sqls } = dbMock({ forecastAssemblyRows: true });
     const forecastUrl = "https://api.weather.gov/gridpoints/MTR/85,105/forecast/hourly";
     const observedAt = new Date(Date.now() - 30 * 60 * 1000);
     const ndbcTimestamp = [
@@ -474,6 +687,8 @@ describe("worker api", () => {
         cdipMopWaveForecastRows: number;
         ndbcObservationRows: number;
         forecastSnapshotRows: number;
+        forecastReadModelRows: number;
+        forecastFactBundleRows: number;
       };
       sourceRuns: Array<{ recorded: boolean; sourceId: string }>;
       errors: string[];
@@ -486,6 +701,8 @@ describe("worker api", () => {
     expect(body.counts.nwsWaveForecastRows).toBe(246);
     expect(body.counts.cdipMopWaveForecastRows).toBe(10);
     expect(body.counts.ndbcObservationRows).toBe(4);
+    expect(body.counts.forecastReadModelRows).toBe(NORCAL_SPOTS.length * 2);
+    expect(body.counts.forecastFactBundleRows).toBeGreaterThanOrEqual(NORCAL_SPOTS.length * 5);
     const expectedSnapshotRows = NORCAL_SPOTS.reduce(
       (total, spot) =>
         total +
@@ -522,6 +739,12 @@ describe("worker api", () => {
     expect(sqls.filter((sql) => sql.includes("insert into forecast_issues"))).toHaveLength(6);
     expect(sqls.filter((sql) => sql.includes("insert into forecast_snapshots"))).toHaveLength(
       expectedSnapshotRows
+    );
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_read_models"))).toHaveLength(
+      body.counts.forecastReadModelRows
+    );
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_fact_bundles"))).toHaveLength(
+      body.counts.forecastFactBundleRows
     );
     expect(sqls.filter((sql) => sql.includes("delete from forecast_snapshots"))).toHaveLength(1);
     expect(sqls.filter((sql) => sql.includes("delete from wave_forecasts"))).toHaveLength(1);
@@ -560,5 +783,55 @@ describe("worker api", () => {
 
     expect(response.status).toBe(401);
     expect(response.headers.get("WWW-Authenticate")).toBe("Bearer");
+  });
+
+  it("queues authenticated production ingest without running it on the HTTP request", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-03T01:02:03.456Z"));
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    vi.stubGlobal("crypto", {
+      subtle: {
+        digest,
+        timingSafeEqual(left: ArrayBuffer, right: ArrayBuffer) {
+          const leftBytes = new Uint8Array(left);
+          const rightBytes = new Uint8Array(right);
+          if (leftBytes.length !== rightBytes.length) return false;
+          return leftBytes.every((byte, index) => byte === rightBytes[index]);
+        }
+      }
+    });
+    const messages: unknown[] = [];
+    const productionEnv = {
+      ...env(),
+      ENVIRONMENT: "production",
+      INGEST_TOKEN: "ingest-test-token",
+      INGEST_QUEUE: {
+        send: async (message: unknown) => {
+          messages.push(message);
+        }
+      } as unknown as Queue
+    };
+    const response = await worker.fetch(
+      new Request("https://surf.test/api/ingest/once", {
+        method: "POST",
+        headers: { Authorization: "Bearer ingest-test-token" }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      productionEnv,
+      {} as ExecutionContext
+    );
+
+    expect(response.status).toBe(202);
+    expect(await response.json()).toEqual({
+      status: "accepted",
+      requestedAt: "2026-08-03T01:02:03.456Z",
+      region: "norcal"
+    });
+    expect(messages).toEqual([
+      {
+        kind: "manual-ingest",
+        requestedAt: "2026-08-03T01:02:03.456Z",
+        region: "norcal"
+      }
+    ]);
   });
 });

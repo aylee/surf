@@ -61,6 +61,21 @@ export async function pruneRetainedData(
         .bind(operationalCutoff)
     },
     {
+      label: "prune inactive forecast_fact_bundles",
+      statement: db
+        .prepare(
+          `delete from forecast_fact_bundles
+           where materialized_at < ?
+             and not exists (
+               select 1 from forecast_read_models
+               where forecast_read_models.spot_id = forecast_fact_bundles.spot_id
+                 and forecast_read_models.interval = '3h'
+                 and forecast_read_models.generation_id = forecast_fact_bundles.generation_id
+             )`
+        )
+        .bind(operationalCutoff)
+    },
+    {
       label: "prune wave_observations",
       statement: db
         .prepare("delete from wave_observations where observed_at < ?")

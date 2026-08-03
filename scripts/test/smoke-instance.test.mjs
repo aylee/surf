@@ -11,11 +11,40 @@ const windows = Array.from({ length: 5 }, (_, day) => ({
 
 function fetchFixture(forecastWindows) {
   return async (input) => {
-    const path = new URL(String(input)).pathname;
+    const url = new URL(String(input));
+    const path = url.pathname;
     if (path === "/api/health") return Response.json({ status: "ok" });
     if (path === "/api/spots") return Response.json({ spots: [spot] });
     if (path === "/api/forecast/test-break") {
-      return Response.json({ spot, windows: forecastWindows });
+      return Response.json({
+        spot,
+        interval: url.searchParams.get("interval") ?? "3h",
+        windows: forecastWindows
+      });
+    }
+    return new Response("not found", { status: 404 });
+  };
+}
+
+function pendingFixture(valid = true) {
+  return async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/health") return Response.json({ status: "ok" });
+    if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
+    if (url.pathname === "/api/forecast/test-break") {
+      const interval = url.searchParams.get("interval") ?? "3h";
+      return Response.json(
+        valid
+          ? {
+              error: "forecast_temporarily_unavailable",
+              message: "Forecast data is being refreshed. Please retry shortly.",
+              retryable: true,
+              spotId: spot.id,
+              interval
+            }
+          : { error: "unavailable" },
+        { status: 503 }
+      );
     }
     return new Response("not found", { status: 404 });
   };
@@ -30,7 +59,41 @@ test("strict smoke verifies every spot has a five-day sourced forecast", async (
       requireForecastData: true
     });
     assert.equal(result.spots, 1);
+    assert.equal(result.forecastReadModels, 2);
+    assert.equal(result.pendingForecastReadModels, 0);
     assert.equal(result.dataCheck, "scored forecasts present");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("setup smoke accepts typed retryable read-model publication gaps", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = pendingFixture();
+  try {
+    const result = await smokeForecastInstance("https://surf.example", {
+      label: "test",
+      requireForecastData: false
+    });
+    assert.equal(result.forecastReadModels, 0);
+    assert.equal(result.pendingForecastReadModels, 2);
+    assert.equal(result.dataCheck, "API structure only");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("setup smoke rejects untyped forecast failures", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = pendingFixture(false);
+  try {
+    await assert.rejects(
+      smokeForecastInstance("https://surf.example", {
+        label: "test",
+        requireForecastData: false
+      }),
+      /invalid setup-time unavailable response/
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

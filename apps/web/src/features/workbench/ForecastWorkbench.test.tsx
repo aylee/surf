@@ -61,6 +61,16 @@ function fixtureForecast(): ForecastResponse {
   });
 }
 
+function unavailableForecast(forecast = fixtureForecast()): ForecastResponse {
+  return ForecastResponseSchema.parse({
+    ...forecast,
+    windows: forecast.windows.map((window) => ({
+      ...window,
+      ratingStatus: "unknown"
+    }))
+  });
+}
+
 function canonicalThreeHourForecast(): ForecastResponse {
   const fixture = fixtureForecast();
   return ForecastResponseSchema.parse({
@@ -340,7 +350,7 @@ describe("ForecastWorkbench", () => {
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
   });
 
-  it("returns to the last good three-hour view when hourly detail cannot load", async () => {
+  it("returns to the last good three-hour view when hourly detail has no usable windows", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas");
     const threeHour = fixtureForecast();
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
@@ -349,7 +359,7 @@ describe("ForecastWorkbench", () => {
         : input instanceof URL
           ? input.href
           : input.url;
-      if (url.includes("interval=1h")) return jsonResponse({ error: "unavailable" }, 503);
+      if (url.includes("interval=1h")) return jsonResponse(unavailableForecast(threeHour));
       return jsonResponse({}, 503);
     }));
 
@@ -361,6 +371,49 @@ describe("ForecastWorkbench", () => {
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     expect(new URLSearchParams(window.location.search).get("interval")).toBe("3h");
     expect(screen.queryByText("No forecast detail is available for this day.")).toBeNull();
+  });
+
+  it("does not report elapsed current-day slots as missing coverage", async () => {
+    const lateNow = new Date("2026-08-03T00:30:00.000Z");
+    const currentDay = "2026-08-02";
+    const completeForecast = fixtureForecast();
+    const retainedWindowIds = new Set(
+      adaptForecastResponse(completeForecast, spot, "3h").windows
+        .filter((window) => window.localDateKey === currentDay && window.localHour >= 18)
+        .map((window) => window.forecastAt)
+    );
+    const lateForecast = ForecastResponseSchema.parse({
+      ...completeForecast,
+      windows: completeForecast.windows.filter((window) => retainedWindowIds.has(window.forecastAt))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "not generated" }, 404)));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={lateForecast} now={lateNow} />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(screen.queryByText(/2 of 8 expected 3h windows/i)).toBeNull();
+    expect(screen.queryByText(/expected 3h windows are available/i)).toBeNull();
+  });
+
+  it("reports a missing leading slot in the remaining current-day coverage", async () => {
+    const lateNow = new Date("2026-08-03T00:30:00.000Z");
+    const currentDay = "2026-08-02";
+    const completeForecast = fixtureForecast();
+    const retainedWindowIds = new Set(
+      adaptForecastResponse(completeForecast, spot, "3h").windows
+        .filter((window) => window.localDateKey === currentDay && window.localHour === 21)
+        .map((window) => window.forecastAt)
+    );
+    const lateForecast = ForecastResponseSchema.parse({
+      ...completeForecast,
+      windows: completeForecast.windows.filter((window) => retainedWindowIds.has(window.forecastAt))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "not generated" }, 404)));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={lateForecast} now={lateNow} />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(screen.getByText(/1 of 2 expected 3h windows are available/i)).toBeTruthy();
   });
 
   it("uses one hourly request while a cold three-hour fallback arrives", async () => {

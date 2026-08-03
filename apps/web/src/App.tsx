@@ -30,6 +30,10 @@ import {
   type SurfaceCondition
 } from "./forecast-view";
 import { ForecastWorkbench } from "./features/workbench/ForecastWorkbench";
+import {
+  isUsableForecastResponse,
+  parseUsableForecastResponse
+} from "./features/workbench/forecast-health";
 
 type ForecastResult =
   | { status: "ready"; data: ForecastResponse }
@@ -76,6 +80,10 @@ async function fetchJson<T>(path: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(path, { headers: { Accept: "application/json" }, signal });
   if (!response.ok) throw new Error(`${path} returned ${response.status}`);
   return (await response.json()) as T;
+}
+
+async function fetchForecastJson(path: string, signal: AbortSignal): Promise<ForecastResponse> {
+  return parseUsableForecastResponse(await fetchJson<unknown>(path, signal));
 }
 
 function errorMessage(error: unknown): string {
@@ -330,7 +338,7 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
               ) : (
                 <span className="noCallRow">
                   {row.forecast?.status === "error"
-                    ? "Forecast service error. Try refresh."
+                    ? "Forecast update delayed. Open for available details."
                     : "Wave inputs are incomplete. Open for wind and tide."}
                 </span>
               )}
@@ -454,7 +462,7 @@ export function App() {
       const forecastEntries = await Promise.all(
         spotsPayload.spots.map(async (spot) => {
           try {
-            const data = await fetchJson<ForecastResponse>(`/api/forecast/${spot.id}`, controller.signal);
+            const data = await fetchForecastJson(`/api/forecast/${spot.id}`, controller.signal);
             return [spot.id, { status: "ready", data } satisfies ForecastResult] as const;
           } catch (error) {
             return [spot.id, { status: "error", error: errorMessage(error) } satisfies ForecastResult] as const;
@@ -518,6 +526,7 @@ export function App() {
   }, []);
 
   const acceptRecoveredForecast = useCallback((spotId: SpotId, forecast: ForecastResponse) => {
+    if (!isUsableForecastResponse(forecast)) return;
     setState((current) => {
       const wasDelayed = current.delayedSpotIds.includes(spotId);
       const delayedSpotIds = current.delayedSpotIds.filter((candidate) => candidate !== spotId);

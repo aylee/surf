@@ -10,10 +10,11 @@ flowchart LR
   ingest --> raw["R2 raw artifacts"]
   ingest --> rows["D1 normalized + issued history"]
   queue["Cron + Queue retries"] --> ingest
-  rows --> api["Hono forecast API"]
-  api --> core["Deterministic transforms + scoring"]
-  core --> ui["React daily report + spot detail"]
-  rows --> facts["Allowlisted public fact bundle"]
+  rows --> core["Deterministic transforms + scoring"]
+  core --> readmodels["D1 forecast read models"]
+  readmodels --> api["Hono forecast API"]
+  api --> ui["React daily report + spot detail"]
+  readmodels --> facts["Allowlisted public fact bundles"]
   facts --> agent["ForecastBriefAgent · Agents SDK / Durable Object"]
   agent --> model["Surf harness · structured Gemini call"]
   model --> validate["Policy + quality validators"]
@@ -39,7 +40,8 @@ flowchart LR
 - **R2** stores checksum-addressed raw provider responses and future large model
   subsets. Raw artifacts are evidence, not the operational read model.
 - **D1** stores normalized forecast/observation rows, source runs, immutable
-  issued history, and the spot/source reference seed.
+  issued history, the spot/source reference seed, and the latest validated
+  1-hour/3-hour API read models plus per-date brief fact bundles.
 - **Queues** isolate scheduled ingestion from the cron trigger and provide
   retries/dead-letter handling.
 
@@ -115,10 +117,19 @@ fixtures, and an honest confidence posture all travel together.
    normalized rows are written to D1.
 4. Issued forecast history is sampled on the documented cadence and old rows
    are pruned according to the retention policy.
-5. API requests join the best available wave, wind, tide, hazard, and
-   observation rows into daylight forecast windows.
-6. `forecast-core` applies deterministic surface/scoring rules and the UI
-   exposes the result, source freshness, and caveats.
+5. The Queue consumer joins the best available wave, wind, tide, hazard, and
+   observation rows, then `forecast-core` applies deterministic surface and
+   scoring rules.
+6. A synchronized 1-hour/3-hour generation and each forecast-date fact bundle
+   are validated and atomically published as D1 read models. An all-unknown
+   generation never replaces the previous good one.
+7. Forecast GETs perform one indexed D1 lookup and return the pre-serialized
+   response. Cacheable successes are also protected by Cloudflare's
+   version-scoped Worker cache. Brief reads and Agent signals use the matching
+   stored fact bundle, so request traffic never reruns forecast physics or
+   scoring.
+8. The UI exposes the result, source freshness, and caveats, and retains its
+   last good response through a retryable read-model refresh failure.
 
 See [feed adapters](feed-adapters.md) for provider details and
 [runtime operations](runtime-operations.md) for failure and recovery behavior.

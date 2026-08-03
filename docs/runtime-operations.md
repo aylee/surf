@@ -9,7 +9,8 @@ rollback commands.
 
 - Cron enqueues one ingest cycle every hour at minute 17.
 - Queue retries isolate public-provider failures from the scheduler.
-- Latest forecast rows refresh each cycle.
+- Latest normalized rows and validated 1-hour/3-hour forecast read models
+  refresh each cycle.
 - Immutable issued history is sampled at 00/06/12/18 UTC and keeps only the
   6 AM–6 PM local planning horizon.
 - The report layer reads the best available normalized rows; it never replaces
@@ -38,6 +39,20 @@ pnpm wrangler -- d1 execute DB --remote --command \
 Check the newest run, not only HTTP availability. A healthy dashboard with
 stale source rows is a degraded forecast.
 
+The core forecast endpoint is intentionally a cheap read-model lookup. A
+retryable `503 forecast_temporarily_unavailable` means no valid materialized
+generation is active; it does not mean the spot or provider data is inherently
+unavailable. Cloudflare `1102` or an invocation outcome of `exceededCpu` means
+request-time work has regressed past the Worker CPU budget and should be fixed
+in the read path rather than translated into an unknown surf call.
+
+Successful forecast and brief responses use a one-minute shared-cache TTL with
+five minutes of stale-while-revalidate. The Worker cache is version-scoped, so
+a deployment cannot serve a response produced by the version it replaced.
+Health, errors, ingest responses, and other API responses are explicitly
+uncacheable. Treat the cache as request-load protection, not as the source of
+truth; D1 read models remain the durable last-good generation.
+
 ## Manual ingest
 
 Production manual ingest requires the Worker `INGEST_TOKEN` secret and a
@@ -51,6 +66,11 @@ pnpm ingest:remote
 
 Loopback development does not require the token. Do not disable production
 authentication to simplify automation; use the scheduled Queue path instead.
+In production the endpoint acknowledges the request with `202`, then the
+command polls every configured spot's 1-hour and 3-hour read models until they
+were materialized at or after the Worker-issued request timestamp. It does not
+hold the HTTP request open for ingest. The polling deadline is bounded and a
+timeout reports the exact spot/interval pairs that did not publish.
 
 ## Provider failure
 
@@ -65,6 +85,24 @@ authentication to simplify automation; use the scheduled Queue path instead.
 
 Raw R2 artifacts and source hashes are the evidence trail for parser and
 provider disagreements.
+
+## Forecast read-model failure
+
+Forecast publication happens after normalized persistence. Both 1-hour and
+3-hour generations must contain a scored window before either can replace the
+active generation. A failed assembly/publish leaves the previous generation in
+place and makes the Queue message retry.
+
+Inspect the active rows without printing forecast JSON:
+
+```bash
+pnpm wrangler -- d1 execute DB --remote --command \
+  "select spot_id, interval, generated_at, materialized_at, length(forecast_json) as json_chars from forecast_read_models order by spot_id, interval"
+```
+
+If the tables are empty after a migration or deployment, run one authenticated
+manual ingest and then the cloud smoke. Do not insert or hand-edit read-model
+JSON. A Gemini credential, quota, or Agent failure cannot remove these rows.
 
 ## Daily brief failure
 
@@ -127,7 +165,9 @@ own explicit lifecycle and recovery plan.
 Operational tide, wind, and wave tables keep a two-day past troubleshooting
 tail plus the current future horizon. Issued history, observations, hazards,
 source runs, and artifact metadata keep 400 days. Unreferenced content-addressed
-spot configurations are removed.
+spot configurations are removed. The active forecast read models are replaced
+in place; obsolete per-date fact bundles are removed after the same two-day
+operational tail once no active 3-hour generation references them.
 
 Daily-brief retention is intentionally unpruned at the current bounded personal
 scale: D1 keeps every published validated brief revision, while each per-spot
@@ -168,9 +208,14 @@ generated artifact checks, TypeScript and Python tests, production build, and
 a secretless Wrangler dry-run. It leaves the normal local development database
 untouched.
 
-For additive changes, back up D1, use the supported `pnpm deploy` path, then
-run the cloud smoke. If the Worker code is bad but the schema remains backward
-compatible, use Wrangler's version rollback:
+For additive changes, back up D1 and export the required
+`SURF_INGEST_TOKEN`, then use the supported `pnpm deploy` path. Deployment
+applies migrations, deploys the Worker, queues one authenticated ingest, waits
+for every compatible read-model generation to publish, and finally runs the
+strict cloud smoke. A read-model bootstrap or strict-smoke failure triggers an
+automatic rollback of the Worker version; additive D1 tables remain in place.
+If a later problem is found while the schema remains backward compatible, use
+Wrangler's version rollback:
 
 ```bash
 pnpm wrangler -- versions list
