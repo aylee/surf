@@ -69,6 +69,11 @@ const initialState: DashboardState = {
   fetchedAt: null
 };
 
+const NORMAL_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+const DELAYED_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const CATALOG_REFRESH_DELAY_NOTICE =
+  "The latest update is delayed. Showing the last forecast we loaded.";
+
 const surfaceRank: Record<SurfaceCondition, number> = {
   clean: 3,
   fair: 2,
@@ -512,8 +517,7 @@ export function App() {
             ...current,
             loading: false,
             error: null,
-            notice: "The latest update is delayed. Showing the last forecast we loaded.",
-            delayedSpotIds: []
+            notice: CATALOG_REFRESH_DELAY_NOTICE
           }
         : {
             ...current,
@@ -530,13 +534,17 @@ export function App() {
     setState((current) => {
       const wasDelayed = current.delayedSpotIds.includes(spotId);
       const delayedSpotIds = current.delayedSpotIds.filter((candidate) => candidate !== spotId);
+      const shouldClearForecastNotice =
+        wasDelayed &&
+        delayedSpotIds.length === 0 &&
+        current.notice !== CATALOG_REFRESH_DELAY_NOTICE;
       return {
         ...current,
         forecasts: {
           ...current.forecasts,
           [spotId]: { status: "ready", data: forecast }
         },
-        notice: wasDelayed && delayedSpotIds.length === 0 ? null : current.notice,
+        notice: shouldClearForecastNotice ? null : current.notice,
         delayedSpotIds,
         fetchedAt: new Date().toISOString()
       };
@@ -545,7 +553,6 @@ export function App() {
 
   useEffect(() => {
     void loadDashboard();
-    const interval = window.setInterval(() => void loadDashboard(), 15 * 60 * 1000);
     const onVisibility = () => {
       if (document.visibilityState !== "visible") return;
       const age = lastFetchedAt.current === null ? Number.POSITIVE_INFINITY : Date.now() - lastFetchedAt.current;
@@ -553,11 +560,19 @@ export function App() {
     };
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      window.clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisibility);
       activeController.current?.abort();
     };
   }, [loadDashboard]);
+
+  const refreshIntervalMs = state.delayedSpotIds.length > 0
+    ? DELAYED_REFRESH_INTERVAL_MS
+    : NORMAL_REFRESH_INTERVAL_MS;
+
+  useEffect(() => {
+    const interval = window.setInterval(() => void loadDashboard(), refreshIntervalMs);
+    return () => window.clearInterval(interval);
+  }, [loadDashboard, refreshIntervalMs]);
 
   const summaries = useMemo<SpotSummary[]>(
     () =>

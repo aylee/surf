@@ -1,4 +1,8 @@
-import { getOperationalObservedWaveSources, NORCAL_SPOTS } from "@surf/forecast-core";
+import {
+  getOperationalObservedWaveSources,
+  isNorcalSpotId,
+  NORCAL_SPOTS
+} from "@surf/forecast-core";
 import { fetchCdipMopForecastsForSpots } from "../adapters/cdip-mop";
 import { fetchCoopsTidePredictionsForSpots } from "../adapters/coops";
 import { fetchNdbcRealtimeObservationsForStations } from "../adapters/ndbc";
@@ -57,19 +61,73 @@ function bodyString(value: unknown): string | null {
 }
 
 export function normalizeIngestMessage(value: unknown, fallbackRegion: string): IngestQueueMessage {
-  if (!value || typeof value !== "object") {
-    return {
-      kind: "scheduled-ingest",
-      requestedAt: new Date().toISOString(),
-      region: fallbackRegion
-    };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Ingest queue message must be an object");
   }
 
   const record = value as Record<string, unknown>;
-  const kind = record.kind === "manual-ingest" || record.kind === "scheduled-ingest" ? record.kind : "scheduled-ingest";
+  if (record.job === "forecast-materialization") {
+    const spotId = bodyString(record.spotId);
+    const ingestId = bodyString(record.ingestId);
+    const requestedAt = bodyString(record.requestedAt);
+    const generatedAt = bodyString(record.generatedAt);
+    const sourceCompletedAt = bodyString(record.sourceCompletedAt);
+    if (
+      !spotId ||
+      !isNorcalSpotId(spotId) ||
+      !ingestId ||
+      !requestedAt ||
+      !generatedAt ||
+      !sourceCompletedAt ||
+      !Number.isFinite(Date.parse(requestedAt)) ||
+      !Number.isFinite(Date.parse(generatedAt)) ||
+      !Number.isFinite(Date.parse(sourceCompletedAt))
+    ) {
+      throw new Error("Forecast materialization queue message is invalid");
+    }
+    return {
+      job: "forecast-materialization",
+      ingestId,
+      spotId,
+      requestedAt,
+      region: bodyString(record.region) ?? fallbackRegion,
+      generatedAt,
+      sourceCompletedAt,
+      captureHistory: record.captureHistory === true
+    };
+  }
+  if (record.job !== undefined && record.job !== "source-ingest") {
+    throw new Error("Ingest queue message has an unknown job type");
+  }
+  const hasValidKind = record.kind === "manual-ingest" || record.kind === "scheduled-ingest";
+  if (record.job === undefined && !hasValidKind) {
+    throw new Error("Legacy ingest queue message is invalid");
+  }
+  const kind: "manual-ingest" | "scheduled-ingest" =
+    record.kind === "manual-ingest" ? "manual-ingest" : "scheduled-ingest";
+  const requestedAt = bodyString(record.requestedAt);
+  const forecastGeneratedAt = bodyString(record.forecastGeneratedAt);
+  const ingestId = bodyString(record.ingestId);
+  if (
+    !requestedAt ||
+    !Number.isFinite(Date.parse(requestedAt)) ||
+    (record.job === "source-ingest" &&
+      (!ingestId ||
+        !forecastGeneratedAt ||
+        !Number.isFinite(Date.parse(forecastGeneratedAt))))
+  ) {
+    throw new Error("Source ingest queue message is invalid");
+  }
+  const legacyIngestId = `legacy-${requestedAt.replace(/[^0-9]/g, "")}`;
   return {
+    job: "source-ingest",
     kind,
-    requestedAt: bodyString(record.requestedAt) ?? new Date().toISOString(),
+    ingestId: ingestId ?? legacyIngestId,
+    requestedAt,
+    forecastGeneratedAt:
+      forecastGeneratedAt && Number.isFinite(Date.parse(forecastGeneratedAt))
+        ? forecastGeneratedAt
+        : requestedAt,
     region: bodyString(record.region) ?? fallbackRegion
   };
 }
@@ -83,13 +141,20 @@ export async function runNorcalIngest(
     fetcher?: SourceFetch;
     now?: Date;
     idSuffix?: string;
+    ingestId?: string;
+    deferForecastMaterialization?: boolean;
   }
 ): Promise<IngestSummary> {
   const startedAt = new Date().toISOString();
   const requestedAt = options.requestedAt ?? startedAt;
   const region = options.region ?? env.SURF_REGION;
   const now = options.now ?? new Date();
-  const idSuffix = options.idSuffix ?? defaultRunIdSuffix();
+  // Queue retries keep this logical generation timestamp stable. Persist it in
+  // source_runs.started_at so the existing time index can fence unordered
+  // source jobs without ordering them by whichever provider fetch finished last.
+  const sourceGenerationAt = now.toISOString();
+  const ingestId = options.ingestId ?? options.idSuffix ?? defaultRunIdSuffix();
+  const idSuffix = options.idSuffix ?? ingestId;
   const captureHistory = shouldCaptureForecastHistory(options.kind, requestedAt);
   const horizonHours = 120;
   const caveats: SourceCaveat[] = [];
@@ -147,27 +212,27 @@ export async function runNorcalIngest(
   });
   const sourceRuns = [
     await recordSourceRun(env.DB, coops, {
-      startedAt,
+      startedAt: sourceGenerationAt,
       completedAt: fetchedAt,
       idSuffix
     }),
     await recordSourceRun(env.DB, nws, {
-      startedAt,
+      startedAt: sourceGenerationAt,
       completedAt: fetchedAt,
       idSuffix
     }),
     await recordSourceRun(env.DB, nwsWave, {
-      startedAt,
+      startedAt: sourceGenerationAt,
       completedAt: fetchedAt,
       idSuffix
     }),
     await recordSourceRun(env.DB, cdipMop, {
-      startedAt,
+      startedAt: sourceGenerationAt,
       completedAt: fetchedAt,
       idSuffix
     }),
     await recordSourceRun(env.DB, ndbc, {
-      startedAt,
+      startedAt: sourceGenerationAt,
       completedAt: fetchedAt,
       idSuffix
     })
@@ -214,14 +279,27 @@ export async function runNorcalIngest(
     await finalizeSourceRun(env.DB, cdipMopRun, cdipMop, cdipMopPersistence, artifactPersistence[3]!, completedAt),
     await finalizeSourceRun(env.DB, ndbcRun, ndbc, observationPersistence, artifactPersistence[4]!, completedAt)
   ];
-  const snapshotPersistence = captureHistory
-    ? await persistIssuedForecasts(env, now, completedAt, sourceIssueFingerprint)
+  const snapshotPersistence = captureHistory && !options.deferForecastMaterialization
+    ? await persistIssuedForecasts(env, now, completedAt)
     : { rowsWritten: 0, errors: [] };
   const retentionPersistence = captureHistory
     ? await pruneRetainedData(env.DB, now)
     : { rowsWritten: 0, errors: [] };
 
   const dbErrors = finalizedRuns.flatMap((run) => (run.recorded ? [] : [`${run.sourceId}: ${run.error}`]));
+  const sourceRunRecordErrors = sourceRuns.flatMap((run) =>
+    run.recorded ? [] : [`${run.sourceId}: ${run.error}`]
+  );
+  const sourcePersistenceErrors = [
+    ...sourceRunRecordErrors,
+    ...dbErrors,
+    ...tidePersistence.errors,
+    ...tideEventPersistence.errors,
+    ...nwsPersistence.errors,
+    ...wavePersistence.errors,
+    ...cdipMopPersistence.errors,
+    ...observationPersistence.errors
+  ];
   const adapterErrors = outcomes.flatMap((outcome) => outcome.errors);
   const preMaterializationErrors = [
     ...tidePersistence.errors,
@@ -239,13 +317,14 @@ export async function runNorcalIngest(
   // history, retention, or another spot's provider error must not freeze all
   // healthy forecasts. Each spot materialization independently refuses an
   // unscored generation and preserves its prior row.
-  const readModelPersistence = await materializeForecastReadModels(
-    env,
-    now,
-    sourceIssueFingerprint,
-    completedAt
-  );
-  const persistenceErrors = [...preMaterializationErrors, ...readModelPersistence.errors];
+  const readModelPersistence = options.deferForecastMaterialization
+    ? { rowsWritten: 0, forecastRowsWritten: 0, factBundleRowsWritten: 0, errors: [] }
+    : await materializeForecastReadModels(env, now, sourceIssueFingerprint, completedAt);
+  const persistenceErrors = [
+    ...sourceRunRecordErrors,
+    ...preMaterializationErrors,
+    ...readModelPersistence.errors
+  ];
   const dbCaveats = finalizedRuns.flatMap((run): SourceCaveat[] =>
     run.recorded
       ? []
@@ -297,6 +376,16 @@ export async function runNorcalIngest(
       ...persistenceCaveats
     ],
     errors: [...adapterErrors, ...dbErrors, ...persistenceErrors],
-    dbContract: SOURCE_RUNS_CONTRACT
+    dbContract: SOURCE_RUNS_CONTRACT,
+    publication: {
+      ingestId,
+      generatedAt: now.toISOString(),
+      sourceCompletedAt: completedAt,
+      sourceIssueFingerprint,
+      sourcePersistenceReady: sourcePersistenceErrors.length === 0,
+      sourcePersistenceErrors,
+      deferred: options.deferForecastMaterialization === true,
+      captureHistory
+    }
   };
 }

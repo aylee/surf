@@ -43,7 +43,15 @@ async function configuredSpotIds(baseUrl, fetcher) {
   return spotIds;
 }
 
-async function inspectForecastReadModel(baseUrl, spotId, interval, requestedAtMs, fetcher) {
+async function inspectForecastReadModel(
+  baseUrl,
+  spotId,
+  interval,
+  expectedIngestId,
+  requestedAtMs,
+  minimumGeneratedAtMs,
+  fetcher
+) {
   const path = `/api/forecast/${encodeURIComponent(spotId)}?interval=${interval}`;
   const response = await fetcher(`${baseUrl}${path}`, {
     headers: { Accept: "application/json" }
@@ -60,13 +68,20 @@ async function inspectForecastReadModel(baseUrl, spotId, interval, requestedAtMs
   }
 
   const materializedAt = response.headers.get("X-Surf-Forecast-Materialized-At");
+  const generatedAt = response.headers.get("X-Surf-Forecast-Generated-At");
+  const ingestId = response.headers.get("X-Surf-Ingest-Id");
   await response.body?.cancel();
   const materializedAtMs = materializedAt ? Date.parse(materializedAt) : Number.NaN;
+  const generatedAtMs = generatedAt ? Date.parse(generatedAt) : Number.NaN;
   return {
     spotId,
     interval,
     status:
-      Number.isFinite(materializedAtMs) && materializedAtMs >= requestedAtMs
+      Number.isFinite(materializedAtMs) &&
+      materializedAtMs >= requestedAtMs &&
+      Number.isFinite(generatedAtMs) &&
+      generatedAtMs >= minimumGeneratedAtMs &&
+      ingestId === expectedIngestId
         ? "ready"
         : "pending",
     materializedAt: Number.isFinite(materializedAtMs) ? materializedAt : null
@@ -76,7 +91,9 @@ async function inspectForecastReadModel(baseUrl, spotId, interval, requestedAtMs
 export async function waitForRemoteForecastReadModels(options) {
   const {
     baseUrl,
+    ingestId,
     requestedAt,
+    forecastGeneratedAt = requestedAt,
     fetcher = globalThis.fetch,
     now = Date.now,
     sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
@@ -84,7 +101,14 @@ export async function waitForRemoteForecastReadModels(options) {
     timeoutMs = REMOTE_INGEST_TIMEOUT_MS
   } = options;
   const requestedAtMs = Date.parse(requestedAt);
+  if (typeof ingestId !== "string" || !ingestId) {
+    throw new Error("queued ingest returned an invalid ingestId");
+  }
   if (!Number.isFinite(requestedAtMs)) throw new Error("queued ingest returned an invalid requestedAt");
+  const minimumGeneratedAtMs = Date.parse(forecastGeneratedAt);
+  if (!Number.isFinite(minimumGeneratedAtMs)) {
+    throw new Error("queued ingest returned an invalid forecastGeneratedAt");
+  }
   if (!(pollIntervalMs > 0) || !(timeoutMs > 0)) {
     throw new Error("remote ingest polling interval and timeout must be positive");
   }
@@ -104,7 +128,15 @@ export async function waitForRemoteForecastReadModels(options) {
     attempts += 1;
     const states = await Promise.all(
       [...pending.values()].map(({ spotId, interval }) =>
-        inspectForecastReadModel(baseUrl, spotId, interval, requestedAtMs, fetcher)
+        inspectForecastReadModel(
+          baseUrl,
+          spotId,
+          interval,
+          ingestId,
+          requestedAtMs,
+          minimumGeneratedAtMs,
+          fetcher
+        )
       )
     );
     for (const state of states) {
@@ -155,11 +187,21 @@ export async function enqueueAndWaitForRemoteIngest(options) {
   if (
     response.status !== 202 ||
     payload?.status !== "accepted" ||
-    !validTimestamp(payload?.requestedAt)
+    typeof payload?.ingestId !== "string" ||
+    !payload.ingestId ||
+    !validTimestamp(payload?.requestedAt) ||
+    !validTimestamp(payload?.forecastGeneratedAt)
   ) {
     throw new Error(
       `remote ingest enqueue failed: ${response.status} ${JSON.stringify(payload)}`
     );
   }
-  return waitForRemoteForecastReadModels({ ...options, requestedAt: payload.requestedAt, fetcher });
+  const result = await waitForRemoteForecastReadModels({
+    ...options,
+    requestedAt: payload.requestedAt,
+    forecastGeneratedAt: payload.forecastGeneratedAt,
+    ingestId: payload.ingestId,
+    fetcher
+  });
+  return { ...result, ingestId: payload.ingestId };
 }

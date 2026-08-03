@@ -15,11 +15,15 @@ import {
   FORECAST_HISTORY_RETENTION_DAYS,
   OPERATIONAL_FORECAST_RETENTION_DAYS,
   pruneRetainedData,
+  runNorcalIngest,
   shouldCaptureForecastHistory
 } from "./ingest";
 import { localDateForTime, stableThreeHourForecastTimes } from "./time";
 
-function dbMock(options: { forecastAssemblyRows?: boolean } = {}) {
+function dbMock(options: {
+  forecastAssemblyRows?: boolean;
+  failRunSqlIncludes?: string;
+} = {}) {
   const runs: unknown[][] = [];
   const sqls: string[] = [];
   const preparedSql: string[] = [];
@@ -111,6 +115,9 @@ function dbMock(options: { forecastAssemblyRows?: boolean } = {}) {
           all: async () => allFor(values),
           first,
           run: async () => {
+            if (options.failRunSqlIncludes && sql.includes(options.failRunSqlIncludes)) {
+              throw new Error(`simulated D1 failure for ${options.failRunSqlIncludes}`);
+            }
             runs.push(values);
             sqls.push(sql);
             return { success: true, results: [], meta: { changes: 1 } };
@@ -147,7 +154,8 @@ function fixtureForecast(interval: ForecastInterval): ForecastResponse {
 function withMaterializedRows(
   fallback: D1Database,
   forecasts: ForecastResponse[],
-  factBundles: ForecastFactBundle[] = []
+  factBundles: ForecastFactBundle[] = [],
+  ingestId?: string
 ): D1Database {
   return {
     prepare(sql: string) {
@@ -162,7 +170,9 @@ function withMaterializedRows(
                 );
                 return bundle
                   ? {
-                      generation_id: "sha256:test-generation",
+                      generation_id: ingestId
+                        ? `sha256:${"a".repeat(64)}:ingest:${ingestId}`
+                        : "sha256:test-generation",
                       schema_version: FORECAST_READ_MODEL_SCHEMA_VERSION,
                       fact_bundle_json: JSON.stringify(bundle)
                     }
@@ -182,7 +192,9 @@ function withMaterializedRows(
                 );
                 return forecast
                   ? {
-                      generation_id: "sha256:test-generation",
+                      generation_id: ingestId
+                        ? `sha256:${"a".repeat(64)}:ingest:${ingestId}`
+                        : "sha256:test-generation",
                       generated_at: forecast.generatedAt,
                       schema_version: FORECAST_READ_MODEL_SCHEMA_VERSION,
                       forecast_json: JSON.stringify(forecast),
@@ -343,6 +355,7 @@ describe("worker api", () => {
     expect(defaulted.headers.get("Cache-Control")).toBe(
       "public, max-age=60, stale-while-revalidate=300"
     );
+    expect(defaulted.headers.get("X-Surf-Ingest-Id")).toBeNull();
     const etag = defaulted.headers.get("ETag");
     expect(etag).toBe('"sha256:test-generation"');
     expect(await defaulted.json()).toMatchObject({ interval: "3h" });
@@ -356,6 +369,27 @@ describe("worker api", () => {
     );
     expect(unchanged.status).toBe(304);
     expect(await unchanged.text()).toBe("");
+  });
+
+  it("exposes exact queued ingest correlation on forecast responses", async () => {
+    const ingestId = "ingest-test-id";
+    const materializedDb = withMaterializedRows(
+      dbMock().db,
+      [fixtureForecast("1h"), fixtureForecast("3h")],
+      [],
+      ingestId
+    );
+    const request = new Request(
+      "http://surf.test/api/forecast/obsf-central"
+    ) as unknown as Parameters<typeof worker.fetch>[0];
+
+    const response = await worker.fetch(request, env(materializedDb), {} as ExecutionContext);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Surf-Ingest-Id")).toBe(ingestId);
+    expect(response.headers.get("ETag")).toBe(
+      `"sha256:${"a".repeat(64)}:ingest:${ingestId}"`
+    );
   });
 
   it("rejects unsupported forecast intervals", async () => {
@@ -768,6 +802,24 @@ describe("worker api", () => {
       9: 9,
       11: 290
     });
+
+    const failedPersistence = dbMock({
+      forecastAssemblyRows: true,
+      failRunSqlIncludes: "insert into tide_forecasts"
+    });
+    const failedSummary = await runNorcalIngest(env(failedPersistence.db), {
+      kind: "manual-ingest",
+      requestedAt: now.toISOString(),
+      now,
+      ingestId: "failed-persistence-ingest",
+      idSuffix: "failed-persistence-ingest",
+      deferForecastMaterialization: true
+    });
+    expect(failedSummary.publication.sourcePersistenceReady).toBe(false);
+    expect(failedSummary.publication.sourcePersistenceErrors).toEqual(
+      expect.arrayContaining([expect.stringContaining("simulated D1 failure")])
+    );
+    expect(failedSummary.counts.forecastReadModelRows).toBe(0);
   });
 
   it("protects manual ingest in production", async () => {
@@ -790,6 +842,7 @@ describe("worker api", () => {
     vi.setSystemTime(new Date("2026-08-03T01:02:03.456Z"));
     const digest = crypto.subtle.digest.bind(crypto.subtle);
     vi.stubGlobal("crypto", {
+      randomUUID: () => "ingest-test-id",
       subtle: {
         digest,
         timingSafeEqual(left: ArrayBuffer, right: ArrayBuffer) {
@@ -823,15 +876,78 @@ describe("worker api", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toEqual({
       status: "accepted",
+      ingestId: "ingest-test-id",
       requestedAt: "2026-08-03T01:02:03.456Z",
+      forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
       region: "norcal"
     });
     expect(messages).toEqual([
       {
+        job: "source-ingest",
         kind: "manual-ingest",
+        ingestId: "ingest-test-id",
         requestedAt: "2026-08-03T01:02:03.456Z",
+        forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
         region: "norcal"
       }
     ]);
+  });
+
+  it("materializes exactly one spot from each forecast queue job", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { db, runs, sqls } = dbMock({ forecastAssemblyRows: true });
+    const ack = vi.fn();
+    const retry = vi.fn();
+    const invalidAck = vi.fn();
+    const invalidRetry = vi.fn();
+
+    await worker.queue(
+      {
+        queue: "surf-ingest",
+        messages: [
+          {
+            id: "invalid-materialization",
+            timestamp: new Date("2026-07-08T15:05:00.000Z"),
+            attempts: 1,
+            body: { job: "forecast-materialization", spotId: "obsf-north" },
+            ack: invalidAck,
+            retry: invalidRetry
+          },
+          {
+            id: "materialize-obsf-north",
+            timestamp: new Date("2026-07-08T15:05:00.000Z"),
+            attempts: 1,
+            body: {
+              job: "forecast-materialization",
+              ingestId: "ingest-test-id",
+              spotId: "obsf-north",
+              requestedAt: "2026-07-08T15:00:00.000Z",
+              region: "norcal",
+              generatedAt: "2026-07-08T15:00:00.000Z",
+              sourceCompletedAt: "2026-07-08T15:05:00.000Z",
+              captureHistory: false
+            },
+            ack,
+            retry
+          }
+        ]
+      } as unknown as MessageBatch,
+      env(db)
+    );
+
+    expect(invalidRetry).toHaveBeenCalledOnce();
+    expect(invalidRetry).toHaveBeenCalledWith({ delaySeconds: 15 });
+    expect(invalidAck).not.toHaveBeenCalled();
+    expect(ack).toHaveBeenCalledOnce();
+    expect(retry).not.toHaveBeenCalled();
+    const forecastWrites = runs.filter((_values, index) =>
+      sqls[index]?.includes("insert into forecast_read_models")
+    );
+    expect(forecastWrites).toHaveLength(2);
+    expect(new Set(forecastWrites.map((values) => values[0]))).toEqual(
+      new Set(["obsf-north"])
+    );
+    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("ingest queue message failed"));
+    errorLog.mockRestore();
   });
 });

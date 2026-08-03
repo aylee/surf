@@ -1,12 +1,31 @@
+import type { SpotId } from "@surf/contracts";
 import type { AdapterStatus, SourceCaveat } from "../adapters/types";
 
 export type IngestKind = "manual-ingest" | "scheduled-ingest" | "queued-ingest";
 
-export type IngestQueueMessage = {
+export type SourceIngestQueueMessage = {
+  job: "source-ingest";
   kind: "manual-ingest" | "scheduled-ingest";
+  ingestId: string;
   requestedAt: string;
+  forecastGeneratedAt: string;
   region: string;
 };
+
+export type ForecastMaterializationQueueMessage = {
+  job: "forecast-materialization";
+  ingestId: string;
+  spotId: SpotId;
+  requestedAt: string;
+  region: string;
+  generatedAt: string;
+  sourceCompletedAt: string;
+  captureHistory: boolean;
+};
+
+export type IngestQueueMessage =
+  | SourceIngestQueueMessage
+  | ForecastMaterializationQueueMessage;
 
 export type SourceRunRecord = {
   id: string;
@@ -69,6 +88,16 @@ export type IngestSummary = {
   caveats: SourceCaveat[];
   errors: string[];
   dbContract: string;
+  publication: {
+    ingestId: string;
+    generatedAt: string;
+    sourceCompletedAt: string;
+    sourceIssueFingerprint: string;
+    sourcePersistenceReady: boolean;
+    sourcePersistenceErrors: string[];
+    deferred: boolean;
+    captureHistory: boolean;
+  };
 };
 
 export function ingestRequiresRetry(

@@ -12,11 +12,12 @@ import {
   getMaterializedForecastJson,
   MAX_FORECAST_FACT_BUNDLE_BYTES,
   MAX_FORECAST_READ_MODEL_BYTES,
+  materializeForecastReadModelForSpot,
   materializeForecastReadModels,
   persistForecastMaterialization
 } from "./forecast-read-model";
 import { buildSynchronizedForecastResponses } from "./forecast";
-import { stableJson } from "./forecast-history";
+import { forecastSourceIssueFingerprint, stableJson } from "./forecast-history";
 import { localDateForTime } from "./time";
 
 vi.mock("./forecast", () => ({
@@ -151,6 +152,12 @@ describe("forecast read model repository", () => {
       .filter((write) => /insert into forecast_read_models/i.test(write.sql))
       .map((write) => write.values[1]);
     expect(forecastIntervals).toEqual(["3h", "1h"]);
+    const generationIds = writes
+      .filter((write) => /insert into forecast_read_models/i.test(write.sql))
+      .map((write) => write.values[2]);
+    expect(generationIds).toHaveLength(2);
+    expect(new Set(generationIds).size).toBe(1);
+    expect(generationIds[0]).toMatch(/^sha256:[a-f0-9]{64}$/);
     const persistedDates = writes
       .filter((write) => /insert into forecast_fact_bundles/i.test(write.sql))
       .map((write) => write.values[1]);
@@ -283,6 +290,7 @@ describe("forecast read model repository", () => {
 
     await expect(getMaterializedForecastJson(db, "obsf-north", "3h")).resolves.toEqual({
       generationId: "sha256:generation",
+      ingestId: null,
       generatedAt: "2026-08-02T13:00:00.000Z",
       materializedAt: "2026-08-02T13:05:00.000Z",
       forecastJson
@@ -368,6 +376,62 @@ describe("forecast read model repository", () => {
     );
     expect(publishedSpotIds.has(rejectedSpotId)).toBe(false);
     expect(publishedSpotIds.size).toBe(NORCAL_SPOTS.length - 1);
+  });
+
+  it("materializes one spot per queue-sized job", async () => {
+    const generatedAt = new Date("2026-08-02T13:00:00.000Z");
+    const spotId = "obsf-north";
+    vi.mocked(buildSynchronizedForecastResponses).mockClear();
+    vi.mocked(buildSynchronizedForecastResponses).mockImplementation(async (_env, requestedSpotId) => {
+      const fixture = buildFixtureForecast(requestedSpotId, generatedAt);
+      return {
+        threeHour: { ...fixture, interval: "3h" },
+        hourly: { ...fixture, interval: "1h" }
+      };
+    });
+    const { db, writes } = writeDb();
+
+    const result = await materializeForecastReadModelForSpot(
+      { DB: db } as never,
+      spotId,
+      generatedAt,
+      {
+        materializedAt: "2026-08-02T13:05:00.000Z",
+        ingestId: "ingest-test-id"
+      }
+    );
+
+    expect(result.errors).toEqual([]);
+    expect(result.forecastRowsWritten).toBe(2);
+    expect(result.factBundleRowsWritten).toBeGreaterThan(0);
+    expect(buildSynchronizedForecastResponses).toHaveBeenCalledOnce();
+    expect(buildSynchronizedForecastResponses).toHaveBeenCalledWith(
+      expect.anything(),
+      spotId,
+      generatedAt,
+      { failOnReadError: true }
+    );
+    expect(
+      new Set(
+        writes
+          .filter((write) => /insert into forecast_read_models/i.test(write.sql))
+          .map((write) => write.values[0])
+      )
+    ).toEqual(new Set([spotId]));
+    const forecastWrites = writes.filter((write) =>
+      /insert into forecast_read_models/i.test(write.sql)
+    );
+    expect(new Set(forecastWrites.map((write) => write.values[2])).size).toBe(1);
+    expect(forecastWrites[0]!.values[2]).toMatch(
+      /^sha256:[a-f0-9]{64}:ingest:ingest-test-id$/
+    );
+    const expectedThreeHour = {
+      ...buildFixtureForecast(spotId, generatedAt),
+      interval: "3h" as const
+    };
+    await expect(forecastSourceIssueFingerprint(expectedThreeHour)).resolves.toBe(
+      forecastWrites[0]!.values[4]
+    );
   });
 
   it("reads a future local-date brief bundle tied to the active 3h generation", async () => {

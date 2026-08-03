@@ -19,7 +19,12 @@ import {
   getMaterializedForecastFactBundle,
   getMaterializedForecastJson
 } from "./forecast-read-model";
-import { ingestRequiresRetry, normalizeIngestMessage, runNorcalIngest } from "./ingest";
+import {
+  ingestRequiresRetry,
+  runNorcalIngest,
+  type ForecastMaterializationQueueMessage
+} from "./ingest";
+import { processIngestQueueMessage } from "./ingest/queue";
 import { localDateForTime } from "./time";
 
 export type Env = Omit<
@@ -41,6 +46,7 @@ export type Env = Omit<
 };
 
 const app = new Hono<{ Bindings: Env }>();
+const INGEST_RETRY_DELAYS_SECONDS = [15, 30, 60, 300] as const;
 
 const spotsResponse = SpotsResponseSchema.parse({
   spots: NORCAL_SPOTS.map((spot) => ({
@@ -99,38 +105,37 @@ function briefAssemblyDiagnostic(error: unknown): { errorName: string; errorMess
   };
 }
 
-async function signalForecastBriefAgents(env: Env): Promise<void> {
+async function signalForecastBriefAgent(
+  env: Env,
+  spotId: ForecastMaterializationQueueMessage["spotId"],
+  generatedAt = new Date()
+): Promise<void> {
   const namespace = env.FORECAST_BRIEF_AGENT;
   if (!namespace || !forecastBriefEnabled(env)) return;
-  const generatedAt = new Date();
-  const results = await Promise.allSettled(
-    NORCAL_SPOTS.map(async (spot) => {
-      const localDate = localDateForTime(generatedAt.toISOString(), spot.timezone);
-      const bundle = await getMaterializedForecastFactBundle(env.DB, spot.id, localDate);
-      if (!bundle) {
-        throw new Error(`Materialized forecast facts are unavailable for ${spot.id} on ${localDate}`);
-      }
-      return namespace.getByName(spot.id).signal(bundle);
-    })
-  );
-  const failures = results.flatMap((result, index) =>
-    result.status === "rejected"
-      ? [
-          {
-            spotId: NORCAL_SPOTS[index]!.id,
-            error: result.reason instanceof Error ? result.reason.message : String(result.reason)
-          }
-        ]
-      : []
-  );
-  if (failures.length > 0) {
+  const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
+  if (!spot) return;
+  try {
+    const localDate = localDateForTime(generatedAt.toISOString(), spot.timezone);
+    const bundle = await getMaterializedForecastFactBundle(env.DB, spot.id, localDate);
+    if (!bundle) {
+      throw new Error(`Materialized forecast facts are unavailable for ${spot.id} on ${localDate}`);
+    }
+    await namespace.getByName(spot.id).signal(bundle);
+  } catch (error) {
     console.error(
       JSON.stringify({
-        message: "forecast brief agent signaling completed with failures",
-        failures
+        message: "forecast brief agent signaling failed",
+        spotId,
+        error: error instanceof Error ? error.message : String(error)
       })
     );
   }
+}
+
+async function signalForecastBriefAgents(env: Env, generatedAt = new Date()): Promise<void> {
+  await Promise.all(
+    NORCAL_SPOTS.map((spot) => signalForecastBriefAgent(env, spot.id, generatedAt))
+  );
 }
 
 app.get(
@@ -247,7 +252,10 @@ app.get(
         "Cache-Control": "public, max-age=60, stale-while-revalidate=300",
         ETag: etag,
         "X-Surf-Forecast-Generated-At": materialized.generatedAt,
-        "X-Surf-Forecast-Materialized-At": materialized.materializedAt
+        "X-Surf-Forecast-Materialized-At": materialized.materializedAt,
+        ...(materialized.ingestId
+          ? { "X-Surf-Ingest-Id": materialized.ingestId }
+          : {})
       };
       if (c.req.header("If-None-Match") === etag) {
         return c.body(null, 304, responseHeaders);
@@ -292,16 +300,22 @@ app.post("/api/ingest/once", async (c) => {
   }
 
   const requestedAt = new Date().toISOString();
+  const ingestId = crypto.randomUUID();
   if (!isLocalRequest) {
     await c.env.INGEST_QUEUE.send({
+      job: "source-ingest",
       kind: "manual-ingest",
+      ingestId,
       requestedAt,
+      forecastGeneratedAt: requestedAt,
       region: c.env.SURF_REGION
     });
     return c.json(
       {
         status: "accepted",
+        ingestId,
         requestedAt,
+        forecastGeneratedAt: requestedAt,
         region: c.env.SURF_REGION
       },
       202
@@ -310,12 +324,14 @@ app.post("/api/ingest/once", async (c) => {
 
   const summary = await runNorcalIngest(c.env, {
     kind: "manual-ingest",
+    ingestId,
+    idSuffix: ingestId,
     requestedAt,
     region: c.env.SURF_REGION
   });
 
   if (!ingestRequiresRetry(summary)) {
-    await signalForecastBriefAgents(c.env);
+    await signalForecastBriefAgents(c.env, new Date(summary.publication.generatedAt));
   }
 
   return c.json(summary);
@@ -326,37 +342,20 @@ export default {
     return app.fetch(request, env, ctx);
   },
   async scheduled(_controller, env) {
+    const requestedAt = new Date().toISOString();
     await env.INGEST_QUEUE.send({
+      job: "source-ingest",
       kind: "scheduled-ingest",
-      requestedAt: new Date().toISOString(),
+      ingestId: crypto.randomUUID(),
+      requestedAt,
+      forecastGeneratedAt: requestedAt,
       region: env.SURF_REGION
     });
   },
   async queue(batch, env) {
     for (const message of batch.messages) {
       try {
-        const body = normalizeIngestMessage(message.body, env.SURF_REGION);
-        const summary = await runNorcalIngest(env, {
-          kind: body.kind === "manual-ingest" ? "manual-ingest" : "queued-ingest",
-          requestedAt: body.requestedAt,
-          region: body.region
-        });
-        if (ingestRequiresRetry(summary)) {
-          throw new Error(`ingest completed with ${summary.status}: ${summary.errors.join("; ")}`);
-        }
-        if (summary.status === "partial") {
-          console.warn(
-            JSON.stringify({
-              message: "ingest queue message completed with source caveats",
-              messageId: message.id,
-              caveatCount: summary.caveats.length,
-              partialSources: summary.sourceRuns
-                .filter((run) => run.status === "partial")
-                .map((run) => run.sourceId)
-            })
-          );
-        }
-        await signalForecastBriefAgents(env);
+        await processIngestQueueMessage(env, message.body, signalForecastBriefAgent);
         message.ack();
       } catch (error) {
         console.error(
@@ -366,7 +365,12 @@ export default {
             error: error instanceof Error ? error.message : String(error)
           })
         );
-        message.retry();
+        message.retry({
+          delaySeconds:
+            INGEST_RETRY_DELAYS_SECONDS[
+              Math.min(Math.max(message.attempts - 1, 0), INGEST_RETRY_DELAYS_SECONDS.length - 1)
+            ]
+        });
       }
     }
   }

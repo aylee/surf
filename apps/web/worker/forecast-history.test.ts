@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   FORECAST_ENGINE_VERSION,
   FORECAST_PRESENTATION_VERSION,
+  forecastSourceIssueFingerprint,
   persistForecastSnapshots,
   snapshotHeightLabel,
   stableJson
@@ -243,6 +244,61 @@ describe("forecast-as-issued snapshots", () => {
   it("canonicalizes objects before hashing or storing them", () => {
     expect(stableJson({ z: 1, nested: { b: 2, a: 1 }, a: 0 })).toBe(
       '{"a":0,"nested":{"a":1,"b":2},"z":1}'
+    );
+  });
+
+  it("fingerprints assembled facts without volatile publication or run identities", async () => {
+    const fixture = oneWindowFixture();
+    const first = {
+      ...fixture,
+      windows: fixture.windows.map((window) => ({
+        ...window,
+        sourceFreshness: [{
+          capability: "wind" as const,
+          sourceId: "nws:test",
+          sourceRunId: "first-run",
+          updatedAt: "2026-07-10T12:00:00.000Z",
+          freshnessMinutes: 60,
+          status: "fresh" as const
+        }]
+      })),
+      tideEvents: [{
+        stationId: "9414290",
+        eventAt: fixture.windows[0]!.forecastAt,
+        type: "high" as const,
+        heightFtMllw: 4.2,
+        sourceRunId: "first-run"
+      }]
+    };
+    const retried = {
+      ...first,
+      generatedAt: "2026-07-10T13:05:00.000Z",
+      windows: first.windows.map((window) => ({
+        ...window,
+        sourceRunIds: ["retry-run"],
+        sourceFreshness: window.sourceFreshness?.map((freshness) => ({
+          ...freshness,
+          sourceRunId: "retry-run"
+        }))
+      })),
+      tideEvents: first.tideEvents?.map((event) => ({
+        ...event,
+        sourceRunId: "retry-run"
+      }))
+    };
+    const changed = {
+      ...retried,
+      windows: retried.windows.map((window) => ({
+        ...window,
+        windGustKt: (window.windGustKt ?? 0) + 1
+      }))
+    };
+
+    await expect(forecastSourceIssueFingerprint(retried)).resolves.toBe(
+      await forecastSourceIssueFingerprint(first)
+    );
+    await expect(forecastSourceIssueFingerprint(changed)).resolves.not.toBe(
+      await forecastSourceIssueFingerprint(first)
     );
   });
 });

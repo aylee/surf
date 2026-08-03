@@ -7,7 +7,12 @@ import {
   type ForecastFactBundle
 } from "./brief";
 import { buildSynchronizedForecastResponses } from "./forecast";
-import { sha256StableJson, stableJson } from "./forecast-history";
+import {
+  forecastSourceIssueFingerprint,
+  persistForecastSnapshots,
+  sha256StableJson,
+  stableJson
+} from "./forecast-history";
 import type { Env } from "./index";
 import { localDateForTime } from "./time";
 
@@ -37,9 +42,16 @@ type ForecastFactBundleRow = {
 
 export type MaterializedForecastJson = {
   generationId: string;
+  ingestId: string | null;
   generatedAt: string;
   materializedAt: string;
   forecastJson: string;
+};
+
+export type ForecastSpotMaterializationOptions = {
+  materializedAt?: string;
+  captureHistory?: boolean;
+  ingestId?: string;
 };
 
 export type ForecastReadModelPersistenceResult = {
@@ -47,6 +59,8 @@ export type ForecastReadModelPersistenceResult = {
   forecastRowsWritten: number;
   factBundleRowsWritten: number;
   errors: string[];
+  snapshotRowsWritten?: number;
+  historyErrors?: string[];
 };
 
 function validIso(value: string): boolean {
@@ -55,6 +69,28 @@ function validIso(value: string): boolean {
 
 function serializedBytes(value: string): number {
   return textEncoder.encode(value).byteLength;
+}
+
+const INGEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const INGEST_GENERATION_PATTERN = /^sha256:[a-f0-9]{64}:ingest:([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/;
+
+export function ingestIdFromGenerationId(generationId: string): string | null {
+  return INGEST_GENERATION_PATTERN.exec(generationId)?.[1] ?? null;
+}
+
+async function forecastGenerationId(options: {
+  threeHour: ForecastResponse;
+  sourceIssueFingerprint: string;
+  ingestId?: string;
+}): Promise<string> {
+  const digest = await sha256StableJson({
+    spotId: options.threeHour.spot.id,
+    generatedAt: options.threeHour.generatedAt,
+    sourceIssueFingerprint: options.sourceIssueFingerprint
+  });
+  return options.ingestId
+    ? `sha256:${digest}:ingest:${options.ingestId}`
+    : `sha256:${digest}`;
 }
 
 function oversizedPayloadError(options: {
@@ -96,6 +132,7 @@ export async function getMaterializedForecastJson(
   assertReadModelRow(row);
   return {
     generationId: row.generation_id,
+    ingestId: ingestIdFromGenerationId(row.generation_id),
     generatedAt: row.generated_at,
     materializedAt: row.materialized_at,
     forecastJson: row.forecast_json
@@ -149,6 +186,7 @@ export async function persistForecastMaterialization(options: {
   factBundles: ForecastFactBundle[];
   sourceIssueFingerprint: string;
   materializedAt: string;
+  ingestId?: string;
 }): Promise<ForecastReadModelPersistenceResult> {
   const { threeHour, hourly } = options;
   if (
@@ -179,7 +217,11 @@ export async function persistForecastMaterialization(options: {
       ]
     };
   }
-  if (!validIso(options.materializedAt) || !options.sourceIssueFingerprint) {
+  if (
+    !validIso(options.materializedAt) ||
+    !options.sourceIssueFingerprint ||
+    (options.ingestId !== undefined && !INGEST_ID_PATTERN.test(options.ingestId))
+  ) {
     return {
       rowsWritten: 0,
       forecastRowsWritten: 0,
@@ -243,11 +285,11 @@ export async function persistForecastMaterialization(options: {
     };
   }
 
-  const generationId = `sha256:${await sha256StableJson({
-    spotId: threeHour.spot.id,
-    generatedAt: threeHour.generatedAt,
-    sourceIssueFingerprint: options.sourceIssueFingerprint
-  })}`;
+  const generationId = await forecastGenerationId({
+    threeHour,
+    sourceIssueFingerprint: options.sourceIssueFingerprint,
+    ingestId: options.ingestId
+  });
   const forecastStatement = options.db.prepare(
     `insert into forecast_read_models (
        spot_id, interval, generation_id, generated_at, source_issue_fingerprint,
@@ -324,7 +366,7 @@ export async function persistForecastMaterialization(options: {
 export async function materializeForecastReadModels(
   env: Env,
   now: Date,
-  sourceIssueFingerprint: string,
+  _sourceIssueFingerprint: string,
   materializedAt = new Date().toISOString()
 ): Promise<ForecastReadModelPersistenceResult> {
   let rowsWritten = 0;
@@ -333,36 +375,71 @@ export async function materializeForecastReadModels(
   const errors: string[] = [];
 
   for (const spot of NORCAL_SPOTS) {
-    try {
-      const { threeHour, hourly } = await buildSynchronizedForecastResponses(env, spot.id, now, {
-        failOnReadError: true
-      });
-      const localDates = [
-        ...new Set(
-          threeHour.windows.map((window) =>
-            localDateForTime(window.forecastAt, threeHour.spot.timezone)
-          )
-        )
-      ];
-      const factBundles = await Promise.all(
-        localDates.map((localDate) => buildForecastFactBundle(threeHour, { localDate }))
-      );
-      const result = await persistForecastMaterialization({
-        db: env.DB,
-        threeHour,
-        hourly,
-        factBundles,
-        sourceIssueFingerprint,
+    const result = await materializeForecastReadModelForSpot(
+      env,
+      spot.id,
+      now,
+      {
         materializedAt
-      });
-      rowsWritten += result.rowsWritten;
-      forecastRowsWritten += result.forecastRowsWritten;
-      factBundleRowsWritten += result.factBundleRowsWritten;
-      errors.push(...result.errors);
-    } catch (error) {
-      errors.push(`${spot.id}: forecast read model assembly failed: ${errorMessage(error)}`);
-    }
+      }
+    );
+    rowsWritten += result.rowsWritten;
+    forecastRowsWritten += result.forecastRowsWritten;
+    factBundleRowsWritten += result.factBundleRowsWritten;
+    errors.push(...result.errors);
   }
 
   return { rowsWritten, forecastRowsWritten, factBundleRowsWritten, errors };
+}
+
+export async function materializeForecastReadModelForSpot(
+  env: Env,
+  spotId: SpotId,
+  now: Date,
+  options: ForecastSpotMaterializationOptions = {}
+): Promise<ForecastReadModelPersistenceResult> {
+  try {
+    const materializedAt = options.materializedAt ?? new Date().toISOString();
+    const { threeHour, hourly } = await buildSynchronizedForecastResponses(env, spotId, now, {
+      failOnReadError: true
+    });
+    const sourceIssueFingerprint = await forecastSourceIssueFingerprint(threeHour);
+    const localDates = [
+      ...new Set(
+        threeHour.windows.map((window) =>
+          localDateForTime(window.forecastAt, threeHour.spot.timezone)
+        )
+      )
+    ];
+    const factBundles = await Promise.all(
+      localDates.map((localDate) => buildForecastFactBundle(threeHour, { localDate }))
+    );
+    const materialization = await persistForecastMaterialization({
+      db: env.DB,
+      threeHour,
+      hourly,
+      factBundles,
+      sourceIssueFingerprint,
+      materializedAt,
+      ingestId: options.ingestId
+    });
+    if (!options.captureHistory || materialization.errors.length > 0) return materialization;
+    const history = await persistForecastSnapshots(env.DB, threeHour, {
+      capturedAt: materializedAt,
+      issuedAt: now.toISOString(),
+      sourceIssueFingerprint
+    });
+    return {
+      ...materialization,
+      snapshotRowsWritten: history.rowsWritten,
+      historyErrors: history.errors.map((error) => `${spotId}: ${error}`)
+    };
+  } catch (error) {
+    return {
+      rowsWritten: 0,
+      forecastRowsWritten: 0,
+      factBundleRowsWritten: 0,
+      errors: [`${spotId}: forecast read model assembly failed: ${errorMessage(error)}`]
+    };
+  }
 }

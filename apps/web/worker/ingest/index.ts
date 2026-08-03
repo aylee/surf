@@ -9,4 +9,10 @@ export {
   pruneRetainedData
 } from "./retention";
 export { ingestRequiresRetry } from "./types";
-export type { IngestKind, IngestQueueMessage, IngestSummary } from "./types";
+export type {
+  ForecastMaterializationQueueMessage,
+  IngestKind,
+  IngestQueueMessage,
+  IngestSummary,
+  SourceIngestQueueMessage
+} from "./types";

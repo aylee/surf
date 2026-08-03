@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ForecastResponseSchema,
@@ -39,12 +39,12 @@ const spotsResponse = {
   sourceNote: "DOM-test catalog."
 } satisfies SpotsResponse;
 
-function fixtureForecast(): ForecastResponse {
+function fixtureForecast(forecastSpot: ApiSpot = spot): ForecastResponse {
   const fixture = buildFixtureForecast("bolinas");
   return ForecastResponseSchema.parse({
     ...fixture,
-    spot,
-    windows: fixture.windows.map((window) => ({ ...window, spotId: spot.id }))
+    spot: forecastSpot,
+    windows: fixture.windows.map((window) => ({ ...window, spotId: forecastSpot.id }))
   });
 }
 
@@ -88,6 +88,7 @@ function installSuccessfulApi() {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   window.history.replaceState({}, "", "/");
 });
@@ -124,6 +125,73 @@ describe("App", () => {
     expect(await screen.findByText("Forecast update delayed. Open for available details.")).toBeTruthy();
     expect(screen.queryByText(/forecast service error/i)).toBeNull();
     expect(screen.queryByText(/forecast_temporarily_unavailable/i)).toBeNull();
+  });
+
+  it("retries an initially unavailable forecast after five minutes", async () => {
+    const intervals: Array<{ callback: () => void; delay: number | undefined }> = [];
+    vi.spyOn(window, "setInterval").mockImplementation((handler, delay) => {
+      if (typeof handler === "function") intervals.push({ callback: handler, delay });
+      return globalThis.setTimeout(() => undefined, 0);
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
+    const forecast = fixtureForecast();
+    let forecastRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) {
+        forecastRequests += 1;
+        return forecastRequests === 1
+          ? jsonResponse({ error: "forecast_temporarily_unavailable" }, 503)
+          : jsonResponse(forecast);
+      }
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Forecast update delayed. Open for available details.")).toBeTruthy();
+    await waitFor(() => {
+      expect(intervals.some(({ delay }) => delay === 5 * 60 * 1000)).toBe(true);
+    });
+    const delayedRetry = [...intervals].reverse().find(({ delay }) => delay === 5 * 60 * 1000);
+    expect(delayedRetry).toBeTruthy();
+    const normalIntervalCount = intervals.filter(({ delay }) => delay === 15 * 60 * 1000).length;
+
+    await act(async () => delayedRetry!.callback());
+
+    await waitFor(() => expect(forecastRequests).toBe(2));
+    expect(screen.queryByText("Forecast update delayed. Open for available details.")).toBeNull();
+    expect(screen.queryByText("Some forecasts are temporarily unavailable. We'll try again automatically.")).toBeNull();
+    await waitFor(() => {
+      expect(intervals.filter(({ delay }) => delay === 15 * 60 * 1000).length).toBeGreaterThan(normalIntervalCount);
+    });
+  });
+
+  it("keeps a healthy spot usable when another spot is unavailable", async () => {
+    const healthySpot = { ...spot, id: "healthy-break", name: "Healthy Break" } satisfies ApiSpot;
+    const delayedSpot = { ...spot, id: "delayed-break", name: "Delayed Break" } satisfies ApiSpot;
+    const catalog = {
+      spots: [healthySpot, delayedSpot],
+      sourceNote: "DOM-test mixed availability catalog."
+    } satisfies SpotsResponse;
+    const healthyForecast = fixtureForecast(healthySpot);
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(catalog);
+      if (path === `/api/forecast/${healthySpot.id}`) return jsonResponse(healthyForecast);
+      if (path === `/api/forecast/${delayedSpot.id}`) {
+        return jsonResponse({ error: "forecast_temporarily_unavailable" }, 503);
+      }
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText(/The calmest surface forecast is Healthy Break/)).toBeTruthy();
+    expect(screen.queryByText("No reliable regional call yet")).toBeNull();
+    expect(screen.getAllByText("Healthy Break").length).toBeGreaterThan(0);
+    expect(screen.getByText("Forecast update delayed. Open for available details.")).toBeTruthy();
   });
 
   it("opens a query-string-selected spot returned by the API", async () => {
@@ -261,6 +329,12 @@ describe("App", () => {
 
   it("does not clear a catalog-refresh warning when a forecast retry recovers", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
+    const refreshIntervals: Array<number | undefined> = [];
+    vi.spyOn(window, "setInterval").mockImplementation((_handler, delay) => {
+      refreshIntervals.push(delay);
+      return globalThis.setTimeout(() => undefined, 0);
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
     const forecast = fixtureForecast();
     let spotRequests = 0;
     let releaseRecovery!: () => void;
@@ -286,9 +360,18 @@ describe("App", () => {
 
     const { container } = render(<App />);
     expect(await screen.findByText("Some forecasts are temporarily unavailable. We'll try again automatically.")).toBeTruthy();
+    await waitFor(() => {
+      expect(refreshIntervals).toContain(5 * 60 * 1000);
+    });
+    const normalIntervalCount = refreshIntervals.filter(
+      (delay) => delay === 15 * 60 * 1000
+    ).length;
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(await screen.findByText("The latest update is delayed. Showing the last forecast we loaded.")).toBeTruthy();
+    expect(
+      refreshIntervals.filter((delay) => delay === 15 * 60 * 1000)
+    ).toHaveLength(normalIntervalCount);
 
     releaseRecovery();
     await waitFor(() => {

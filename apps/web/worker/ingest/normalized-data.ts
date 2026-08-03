@@ -520,8 +520,7 @@ export async function persistNwsRows(
 export async function persistIssuedForecasts(
   env: Env,
   now: Date,
-  capturedAt: string,
-  sourceIssueFingerprint: string
+  capturedAt: string
 ): Promise<PersistenceResult> {
   let rowsWritten = 0;
   const errors: string[] = [];
@@ -531,8 +530,7 @@ export async function persistIssuedForecasts(
       const response = await buildForecastResponse(env, spot.id, now);
       const result = await persistForecastSnapshots(env.DB, response, {
         capturedAt,
-        issuedAt: now.toISOString(),
-        sourceIssueFingerprint
+        issuedAt: now.toISOString()
       });
       rowsWritten += result.rowsWritten;
       errors.push(...result.errors.map((error) => `${spot.id}: ${error}`));
