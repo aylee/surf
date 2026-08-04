@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CLOUDFLARE_WORKERS_VERSION_KEY_HEADER,
+  CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
   SURF_WORKER_VERSION_HEADER,
   responseWorkerVersion,
   waitForWorkerVersion,
@@ -10,6 +10,7 @@ import {
 
 const expectedVersionId = "11111111-2222-4333-8444-555555555555";
 const otherVersionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const expectedWorkerName = "surf";
 
 function versionResponse(versionId = expectedVersionId, status = 200) {
   return new Response(status === 200 ? '{"status":"ok"}' : "unavailable", {
@@ -28,19 +29,52 @@ function fakeTime() {
   };
 }
 
-test("version request headers preserve caller headers and add Cloudflare affinity", () => {
+test("version request headers preserve caller headers and select the exact Worker version", () => {
   const baseHeaders = new Headers({ Accept: "application/json" });
-  const headers = workerVersionRequestHeaders(expectedVersionId, baseHeaders);
+  const headers = workerVersionRequestHeaders({
+    expectedVersionId,
+    expectedWorkerName,
+    headers: baseHeaders
+  });
 
   assert.equal(headers.get("Accept"), "application/json");
   assert.equal(
-    headers.get(CLOUDFLARE_WORKERS_VERSION_KEY_HEADER),
-    expectedVersionId
+    headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+    `${expectedWorkerName}="${expectedVersionId}"`
   );
-  assert.equal(baseHeaders.get(CLOUDFLARE_WORKERS_VERSION_KEY_HEADER), null);
+  assert.equal(baseHeaders.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER), null);
   assert.throws(
-    () => workerVersionRequestHeaders("not-a-version-id"),
+    () => workerVersionRequestHeaders({
+      expectedVersionId: "not-a-version-id",
+      expectedWorkerName
+    }),
     /must be a UUID/
+  );
+  assert.throws(
+    () => workerVersionRequestHeaders({
+      expectedVersionId,
+      expectedWorkerName: "Not Structured"
+    }),
+    /must start with a lowercase letter/
+  );
+  assert.throws(
+    () => workerVersionRequestHeaders({ expectedVersionId }),
+    /must be provided together/
+  );
+  assert.throws(
+    () => workerVersionRequestHeaders({ expectedWorkerName }),
+    /must be provided together/
+  );
+});
+
+test("exact override preserves an active instance Worker name", () => {
+  const headers = workerVersionRequestHeaders({
+    expectedVersionId,
+    expectedWorkerName: "friends-surf2"
+  });
+  assert.equal(
+    headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+    `friends-surf2="${expectedVersionId}"`
   );
 });
 
@@ -56,7 +90,7 @@ test("response version extraction trims the Worker-owned response header", () =>
   assert.equal(responseWorkerVersion(new Response()), null);
 });
 
-test("readiness requires three consecutive exact-version health responses", async () => {
+test("readiness requires exact override reachability then three unpinned responses", async () => {
   const { now, sleep } = fakeTime();
   const responses = [
     versionResponse(expectedVersionId),
@@ -69,6 +103,7 @@ test("readiness requires three consecutive exact-version health responses", asyn
   const result = await waitForWorkerVersion({
     baseUrl: "https://surf.example/",
     expectedVersionId,
+    expectedWorkerName,
     fetcher: async (input, init) => {
       requests.push({ input: String(input), init });
       return responses.shift();
@@ -82,17 +117,23 @@ test("readiness requires three consecutive exact-version health responses", asyn
 
   assert.equal(result.status, "ready");
   assert.equal(result.workerVersion, expectedVersionId);
+  assert.equal(result.workerName, expectedWorkerName);
   assert.equal(result.attempts, 5);
+  assert.equal(result.overrideReachable, true);
   assert.equal(result.consecutiveReady, 3);
   assert.equal(requests.length, 5);
-  for (const request of requests) {
-    assert.equal(request.input, "https://surf.example/api/health");
+  for (const [index, request] of requests.entries()) {
+    const url = new URL(request.input);
+    assert.equal(url.origin + url.pathname, "https://surf.example/api/health");
+    assert.equal(url.searchParams.get("surf_rollout_probe"), expectedVersionId);
+    assert.equal(url.searchParams.get("phase"), index === 0 ? "override" : "default");
+    assert.equal(url.searchParams.get("attempt"), String(index + 1));
     assert.equal(request.init.method, "GET");
     assert.equal(request.init.cache, "no-store");
     assert.equal(request.init.headers.get("Cache-Control"), "no-store");
     assert.equal(
-      request.init.headers.get(CLOUDFLARE_WORKERS_VERSION_KEY_HEADER),
-      expectedVersionId
+      request.init.headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+      index === 0 ? `${expectedWorkerName}="${expectedVersionId}"` : null
     );
     assert.equal(request.init.signal instanceof AbortSignal, true);
   }
@@ -107,11 +148,13 @@ test("readiness retries bounded transient statuses and network failures", async 
     versionResponse(null, 503),
     versionResponse(),
     versionResponse(),
+    versionResponse(),
     versionResponse()
   ];
   const result = await waitForWorkerVersion({
     baseUrl: "https://surf.example",
     expectedVersionId,
+    expectedWorkerName,
     fetcher: async () => {
       const outcome = outcomes.shift();
       if (outcome instanceof Error) throw outcome;
@@ -124,7 +167,7 @@ test("readiness retries bounded transient statuses and network failures", async 
     requestTimeoutMs: 5
   });
 
-  assert.equal(result.attempts, 7);
+  assert.equal(result.attempts, 8);
 });
 
 test("readiness times out individual requests and keeps polling", async () => {
@@ -134,6 +177,7 @@ test("readiness times out individual requests and keeps polling", async () => {
   const result = await waitForWorkerVersion({
     baseUrl: "https://surf.example",
     expectedVersionId,
+    expectedWorkerName,
     fetcher: async (_input, init) => {
       requests += 1;
       signals.push(init.signal);
@@ -147,7 +191,7 @@ test("readiness times out individual requests and keeps polling", async () => {
     requestTimeoutMs: 1
   });
 
-  assert.equal(result.attempts, 4);
+  assert.equal(result.attempts, 5);
   assert.equal(signals[0].aborted, true);
 });
 
@@ -168,8 +212,10 @@ test("readiness never waits for response-body cancellation", async () => {
     waitForWorkerVersion({
       baseUrl: "https://surf.example",
       expectedVersionId,
+      expectedWorkerName,
       fetcher: async () => stalledCancellation(),
       consecutiveReady: 1,
+      pollIntervalMs: 1,
       timeoutMs: 10,
       requestTimeoutMs: 5
     }),
@@ -178,7 +224,7 @@ test("readiness never waits for response-body cancellation", async () => {
 
   assert.notEqual(result, "stalled");
   assert.equal(result.status, "ready");
-  assert.equal(cancellationCalls, 1);
+  assert.equal(cancellationCalls, 2);
 });
 
 test("readiness fails fast for non-retryable health statuses", async () => {
@@ -188,6 +234,7 @@ test("readiness fails fast for non-retryable health statuses", async () => {
     waitForWorkerVersion({
       baseUrl: "https://surf.example",
       expectedVersionId,
+      expectedWorkerName,
       fetcher: async () => {
         attempts += 1;
         return new Response("unauthorized", { status: 401 });
@@ -208,6 +255,7 @@ test("readiness rejects an ambiguous non-origin deployment target", async () => 
     waitForWorkerVersion({
       baseUrl: "https://surf.example/unrelated-path",
       expectedVersionId,
+      expectedWorkerName,
       fetcher: async () => versionResponse()
     }),
     /must be a bare HTTP\(S\) origin/
@@ -220,6 +268,7 @@ test("readiness timeout reports the last observed version state", async () => {
     waitForWorkerVersion({
       baseUrl: "https://surf.example",
       expectedVersionId,
+      expectedWorkerName,
       fetcher: async () => versionResponse(otherVersionId),
       now,
       sleep,
@@ -234,4 +283,38 @@ test("readiness timeout reports the last observed version state", async () => {
       return true;
     }
   );
+});
+
+test("readiness rejects a callable version that default traffic has not adopted", async () => {
+  const { now, sleep } = fakeTime();
+  const requests = [];
+  await assert.rejects(
+    waitForWorkerVersion({
+      baseUrl: "https://surf.example",
+      expectedVersionId,
+      expectedWorkerName,
+      fetcher: async (input, init) => {
+        requests.push({ input: String(input), headers: new Headers(init.headers) });
+        return versionResponse(requests.length === 1 ? expectedVersionId : otherVersionId);
+      },
+      now,
+      sleep,
+      pollIntervalMs: 2,
+      timeoutMs: 7,
+      requestTimeoutMs: 3
+    }),
+    /default route returned Worker version/
+  );
+
+  assert.ok(requests.length >= 2);
+  assert.equal(
+    requests[0].headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+    `${expectedWorkerName}="${expectedVersionId}"`
+  );
+  for (const request of requests.slice(1)) {
+    assert.equal(
+      request.headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+      null
+    );
+  }
 });

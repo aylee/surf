@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { smokeForecastInstance } from "../lib/smoke-instance.mjs";
 import {
-  CLOUDFLARE_WORKERS_VERSION_KEY_HEADER,
+  CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
   SURF_WORKER_VERSION_HEADER
 } from "../lib/worker-version.mjs";
 
 const spot = { id: "test-break", timezone: "America/Los_Angeles" };
 const expectedVersionId = "11111111-2222-4333-8444-555555555555";
+const expectedWorkerName = "surf";
 const otherVersionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const windows = Array.from({ length: 5 }, (_, day) => ({
   forecastAt: new Date(Date.UTC(2026, 6, 10 + day, 16)).toISOString(),
@@ -160,6 +161,7 @@ test("version-pinned smoke checks health, spots, and every forecast on one Worke
     label: "version smoke",
     requireForecastData: true,
     expectedVersionId,
+    expectedWorkerName,
     fetcher: fixture.fetcher
   });
 
@@ -176,10 +178,47 @@ test("version-pinned smoke checks health, spots, and every forecast on one Worke
   );
   for (const request of fixture.requests) {
     assert.equal(
-      request.headers.get(CLOUDFLARE_WORKERS_VERSION_KEY_HEADER),
-      expectedVersionId
+      request.headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+      `${expectedWorkerName}="${expectedVersionId}"`
     );
   }
+});
+
+test("version-pinned smoke requires the Worker name and version as a fail-closed pair", async () => {
+  for (const versionOptions of [
+    { expectedVersionId },
+    { expectedWorkerName }
+  ]) {
+    let requests = 0;
+    await assert.rejects(
+      smokeForecastInstance("https://surf.example", {
+        label: "version smoke",
+        ...versionOptions,
+        fetcher: async () => {
+          requests += 1;
+          return new Response("unexpected request");
+        }
+      }),
+      /Worker version ID and Worker name must be provided together/
+    );
+    assert.equal(requests, 0);
+  }
+});
+
+test("version-pinned smoke rejects a mismatched health response", async () => {
+  const fixture = versionedFixture({
+    versionForPath: (url) =>
+      url.pathname === "/api/health" ? otherVersionId : expectedVersionId
+  });
+  await assert.rejects(
+    smokeForecastInstance("https://surf.example", {
+      label: "version smoke",
+      expectedVersionId,
+      expectedWorkerName,
+      fetcher: fixture.fetcher
+    }),
+    new RegExp(`/api/health was served by Worker version ${otherVersionId}`)
+  );
 });
 
 test("version-pinned smoke rejects a mismatched catalog response", async () => {
@@ -191,6 +230,7 @@ test("version-pinned smoke rejects a mismatched catalog response", async () => {
     smokeForecastInstance("https://surf.example", {
       label: "version smoke",
       expectedVersionId,
+      expectedWorkerName,
       fetcher: fixture.fetcher
     }),
     new RegExp(`/api/spots was served by Worker version ${otherVersionId}`)
@@ -209,6 +249,7 @@ test("version-pinned smoke rejects any mismatched forecast response", async () =
     smokeForecastInstance("https://surf.example", {
       label: "version smoke",
       expectedVersionId,
+      expectedWorkerName,
       fetcher: fixture.fetcher
     }),
     new RegExp(`interval=1h was served by Worker version ${otherVersionId}`)

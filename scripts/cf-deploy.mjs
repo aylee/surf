@@ -56,7 +56,12 @@ function deployedUrl(output) {
   return resolveDeployedUrl(output, process.env.SURF_BASE_URL);
 }
 
-function smoke(output, requireForecastData, expectedVersionId) {
+function smoke(
+  output,
+  requireForecastData,
+  expectedVersionId,
+  expectedWorkerName
+) {
   const url = deployedUrl(output);
   if (!url) {
     throw new Error(
@@ -69,13 +74,20 @@ function smoke(output, requireForecastData, expectedVersionId) {
       SURF_BASE_URL: url,
       SURF_REQUIRE_FORECAST_DATA: requireForecastData ? "true" : "false",
       ...(expectedVersionId
-        ? { SURF_EXPECTED_WORKER_VERSION: expectedVersionId }
+        ? {
+            SURF_EXPECTED_WORKER_VERSION: expectedVersionId,
+            SURF_EXPECTED_WORKER_NAME: expectedWorkerName
+          }
         : {})
     }
   });
 }
 
-function refreshForecastReadModels(output, expectedVersionId) {
+function refreshForecastReadModels(
+  output,
+  expectedVersionId,
+  expectedWorkerName
+) {
   const url = deployedUrl(output);
   if (!url) {
     throw new Error(
@@ -85,12 +97,13 @@ function refreshForecastReadModels(output, expectedVersionId) {
   runPnpm(["ingest:remote"], {
     env: {
       SURF_BASE_URL: url,
-      SURF_EXPECTED_WORKER_VERSION: expectedVersionId
+      SURF_EXPECTED_WORKER_VERSION: expectedVersionId,
+      SURF_EXPECTED_WORKER_NAME: expectedWorkerName
     }
   });
 }
 
-async function waitUntilServing(output) {
+async function waitUntilServing(output, expectedWorkerName) {
   const url = deployedUrl(output);
   if (!url) {
     throw new Error(
@@ -100,13 +113,15 @@ async function waitUntilServing(output) {
   const expectedVersionId = resolveDeployedVersionId(output);
   const result = await waitForWorkerVersion({
     baseUrl: url,
-    expectedVersionId
+    expectedVersionId,
+    expectedWorkerName
   });
   console.log(JSON.stringify(result));
-  return expectedVersionId;
+  return { expectedVersionId, expectedWorkerName };
 }
 
-assertActiveWranglerConfig();
+const activeWranglerConfig = assertActiveWranglerConfig();
+const expectedWorkerName = activeWranglerConfig.name;
 buildAndValidate();
 
 if (dryRun) {
@@ -134,8 +149,13 @@ if (mode === "setup") {
       { cause: error }
     );
   }
-  const expectedVersionId = await waitUntilServing(output);
-  smoke(output, false, expectedVersionId);
+  const rollout = await waitUntilServing(output, expectedWorkerName);
+  smoke(
+    output,
+    false,
+    rollout.expectedVersionId,
+    rollout.expectedWorkerName
+  );
 } else {
   try {
     migrateAndSeed();
@@ -146,15 +166,26 @@ if (mode === "setup") {
     );
   }
   output = deployWorker();
-  let expectedVersionId;
+  let rollout;
   await bootstrapDeployedWorker({
     waitUntilServing: async () => {
-      expectedVersionId = await waitUntilServing(output);
+      rollout = await waitUntilServing(output, expectedWorkerName);
     },
     // Forecast GETs intentionally serve precomputed D1 read models. Queue the
     // first generation only after the exact rollout version is stable, then
     // wait for publication before strict post-deploy smoke.
-    enqueueAndWait: () => refreshForecastReadModels(output, expectedVersionId),
-    smoke: () => smoke(output, true, expectedVersionId)
+    enqueueAndWait: () =>
+      refreshForecastReadModels(
+        output,
+        rollout.expectedVersionId,
+        rollout.expectedWorkerName
+      ),
+    smoke: () =>
+      smoke(
+        output,
+        true,
+        rollout.expectedVersionId,
+        rollout.expectedWorkerName
+      )
   });
 }

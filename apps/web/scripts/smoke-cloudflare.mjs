@@ -15,9 +15,12 @@ if (!configuredUrl) {
 const requireForecastData = process.env.SURF_REQUIRE_FORECAST_DATA !== "false";
 const expectedVersionId =
   process.env.SURF_EXPECTED_WORKER_VERSION?.trim() || undefined;
+const expectedWorkerName =
+  process.env.SURF_EXPECTED_WORKER_NAME?.trim() || undefined;
 const result = await smokeForecastInstance(configuredUrl, {
   label: "Cloudflare smoke",
   requireForecastData,
-  expectedVersionId
+  expectedVersionId,
+  expectedWorkerName
 });
 console.log(JSON.stringify(result));

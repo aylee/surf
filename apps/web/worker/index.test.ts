@@ -870,6 +870,11 @@ describe("worker api", () => {
       ...env(),
       ENVIRONMENT: "production",
       INGEST_TOKEN: "ingest-test-token",
+      CF_VERSION_METADATA: {
+        id: "worker-version-test-id",
+        tag: "",
+        timestamp: "2026-08-03T01:00:00.000Z"
+      },
       INGEST_QUEUE: {
         send: async (message: unknown) => {
           messages.push(message);
@@ -879,7 +884,9 @@ describe("worker api", () => {
     const response = await worker.fetch(
       new Request("https://surf.test/api/ingest/once", {
         method: "POST",
-        headers: { Authorization: "Bearer ingest-test-token" }
+        headers: {
+          Authorization: "Bearer ingest-test-token"
+        }
       }) as unknown as Parameters<typeof worker.fetch>[0],
       productionEnv,
       {} as ExecutionContext
@@ -903,6 +910,101 @@ describe("worker api", () => {
         region: "norcal"
       }
     ]);
+
+    messages.length = 0;
+    const deployResponse = await worker.fetch(
+      new Request("https://surf.test/api/ingest/deploy", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer ingest-test-token",
+          "X-Surf-Expected-Worker-Version": "worker-version-test-id"
+        }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      productionEnv,
+      {} as ExecutionContext
+    );
+    expect(deployResponse.status).toBe(202);
+    expect(messages).toHaveLength(1);
+  });
+
+  it("rejects a remote ingest version precondition before Queue.send", async () => {
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    vi.stubGlobal("crypto", {
+      subtle: {
+        digest,
+        timingSafeEqual(left: ArrayBuffer, right: ArrayBuffer) {
+          const leftBytes = new Uint8Array(left);
+          const rightBytes = new Uint8Array(right);
+          if (leftBytes.length !== rightBytes.length) return false;
+          return leftBytes.every((byte, index) => byte === rightBytes[index]);
+        }
+      }
+    });
+    const messages: unknown[] = [];
+    const productionEnv = {
+      ...env(),
+      ENVIRONMENT: "production",
+      INGEST_TOKEN: "ingest-test-token",
+      CF_VERSION_METADATA: {
+        id: "actual-worker-version",
+        tag: "",
+        timestamp: "2026-08-03T01:00:00.000Z"
+      },
+      INGEST_QUEUE: {
+        send: async (message: unknown) => {
+          messages.push(message);
+        }
+      } as unknown as Queue
+    };
+
+    const missing = await worker.fetch(
+      new Request("https://surf.test/api/ingest/deploy", {
+        method: "POST",
+        headers: { Authorization: "Bearer ingest-test-token" }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      productionEnv,
+      {} as ExecutionContext
+    );
+    expect(missing.status).toBe(428);
+    expect(await missing.json()).toEqual({
+      error: "worker_version_precondition_required"
+    });
+
+    const mismatch = await worker.fetch(
+      new Request("https://surf.test/api/ingest/deploy", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer ingest-test-token",
+          "X-Surf-Expected-Worker-Version": "expected-worker-version"
+        }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      productionEnv,
+      {} as ExecutionContext
+    );
+    expect(mismatch.status).toBe(409);
+    expect(await mismatch.json()).toEqual({
+      error: "worker_version_mismatch",
+      expectedWorkerVersion: "expected-worker-version",
+      actualWorkerVersion: "actual-worker-version"
+    });
+
+    const unavailable = await worker.fetch(
+      new Request("https://surf.test/api/ingest/deploy", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer ingest-test-token",
+          "X-Surf-Expected-Worker-Version": "expected-worker-version"
+        }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      { ...productionEnv, CF_VERSION_METADATA: undefined },
+      {} as ExecutionContext
+    );
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toEqual({
+      error: "worker_version_unavailable",
+      expectedWorkerVersion: "expected-worker-version"
+    });
+    expect(messages).toEqual([]);
   });
 
   it("materializes exactly one spot from each forecast queue job", async () => {

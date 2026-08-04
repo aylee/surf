@@ -161,6 +161,16 @@ migrations, seed, deploy, and dry-run validation. Use the documented
 `pnpm wrangler -- ...` wrapper for one-off commands so the same active
 configuration is applied to secrets and diagnostics too.
 
+Keep the active config's `name` override-addressable: it must start with a
+lowercase letter and contain only lowercase letters, digits, and hyphens (for
+example, `friends-surf2`). Deployment uses that name in Cloudflare's exact
+version-override header and fails before any remote mutation if the name is
+not addressable. Do not set `WRANGLER_CI_OVERRIDE_NAME` to a different name;
+the deploy helper rejects name drift before provisioning or migration. Keep
+`CLOUDFLARE_ENV` unset as well: this project selects self-hosted instances with
+`SURF_WRANGLER_CONFIG`, and an ambient Wrangler environment would silently
+suffix the deployment target.
+
 ### 4. Protect manual production ingest
 
 Scheduled ingestion uses the Queue and does not need an HTTP token. The manual
@@ -175,8 +185,9 @@ your shell, provide the same value through the ignored environment variable
 `SURF_INGEST_TOKEN`; never paste it into a script or GitHub issue.
 
 Keep that variable available for later `pnpm deploy` runs. An update deploy
-first proves the exact Wrangler-emitted Worker version is serving consistently,
-then performs one authenticated ingest so any newly migrated forecast
+first proves the exact Wrangler-emitted Worker version is callable and that
+unpinned production routing has converged, then performs one authenticated
+ingest with a Worker-enforced version precondition. Any newly migrated forecast
 read-model tables are populated before version-pinned strict smoke testing.
 
 ### 5. Optional Gemini production rollout

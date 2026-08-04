@@ -1,6 +1,8 @@
 export const SURF_WORKER_VERSION_HEADER = "X-Surf-Worker-Version";
-export const CLOUDFLARE_WORKERS_VERSION_KEY_HEADER =
-  "Cloudflare-Workers-Version-Key";
+export const SURF_EXPECTED_WORKER_VERSION_HEADER =
+  "X-Surf-Expected-Worker-Version";
+export const CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER =
+  "Cloudflare-Workers-Version-Overrides";
 
 export const WORKER_VERSION_POLL_INTERVAL_MS = 1_000;
 export const WORKER_VERSION_TIMEOUT_MS = 60_000;
@@ -9,10 +11,22 @@ export const WORKER_VERSION_CONSECUTIVE_READY = 3;
 
 const VERSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
 
 function assertVersionId(value) {
   if (typeof value !== "string" || !VERSION_ID_PATTERN.test(value)) {
     throw new Error("expected Worker version ID must be a UUID");
+  }
+}
+
+function assertWorkerName(value) {
+  if (
+    typeof value !== "string" ||
+    !OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN.test(value)
+  ) {
+    throw new Error(
+      "expected Worker name must start with a lowercase letter and contain only lowercase letters, digits, and hyphens"
+    );
   }
 }
 
@@ -31,12 +45,33 @@ function normalizedBaseUrl(value) {
   return url.toString().replace(/\/$/, "");
 }
 
-export function workerVersionRequestHeaders(expectedVersionId, baseHeaders) {
+export function workerVersionRequestHeaders(
+  { expectedVersionId, expectedWorkerName, headers: baseHeaders } = {}
+) {
   const headers = new Headers(baseHeaders);
-  if (expectedVersionId === undefined || expectedVersionId === null) return headers;
+  const hasVersion = expectedVersionId !== undefined && expectedVersionId !== null;
+  const hasWorkerName = expectedWorkerName !== undefined && expectedWorkerName !== null;
+  if (hasVersion !== hasWorkerName) {
+    throw new Error(
+      "expected Worker version ID and Worker name must be provided together"
+    );
+  }
+  if (!hasVersion) return headers;
   assertVersionId(expectedVersionId);
-  headers.set(CLOUDFLARE_WORKERS_VERSION_KEY_HEADER, expectedVersionId);
+  assertWorkerName(expectedWorkerName);
+  headers.set(
+    CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
+    `${expectedWorkerName}="${expectedVersionId}"`
+  );
   return headers;
+}
+
+function rolloutProbeUrl(healthUrl, expectedVersionId, phase, attempt) {
+  const url = new URL(healthUrl);
+  url.searchParams.set("surf_rollout_probe", expectedVersionId);
+  url.searchParams.set("phase", phase);
+  url.searchParams.set("attempt", String(attempt));
+  return url.toString();
 }
 
 export function responseWorkerVersion(response) {
@@ -95,6 +130,7 @@ export async function waitForWorkerVersion(options) {
   const {
     baseUrl,
     expectedVersionId,
+    expectedWorkerName,
     fetcher = globalThis.fetch,
     now = Date.now,
     sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
@@ -105,6 +141,7 @@ export async function waitForWorkerVersion(options) {
   } = options;
 
   assertVersionId(expectedVersionId);
+  assertWorkerName(expectedWorkerName);
   if (typeof fetcher !== "function" || typeof now !== "function" || typeof sleep !== "function") {
     throw new Error("Worker readiness requires fetch, clock, and sleep functions");
   }
@@ -118,6 +155,7 @@ export async function waitForWorkerVersion(options) {
   const healthUrl = `${normalizedBaseUrl(baseUrl)}/api/health`;
   const deadlineMs = now() + timeoutMs;
   let attempts = 0;
+  let overrideReachable = false;
   let readyResponses = 0;
   let lastState = "no request completed";
 
@@ -126,55 +164,69 @@ export async function waitForWorkerVersion(options) {
     if (remainingBeforeRequestMs <= 0) break;
 
     attempts += 1;
+    const phase = overrideReachable ? "default" : "override";
     let response;
     try {
       response = await fetchWithTimeout(
         fetcher,
-        healthUrl,
+        rolloutProbeUrl(healthUrl, expectedVersionId, phase, attempts),
         {
           method: "GET",
           cache: "no-store",
-          headers: workerVersionRequestHeaders(expectedVersionId, {
-            Accept: "application/json",
-            "Cache-Control": "no-store"
+          headers: workerVersionRequestHeaders({
+            ...(overrideReachable
+              ? {}
+              : { expectedVersionId, expectedWorkerName }),
+            headers: {
+              Accept: "application/json",
+              "Cache-Control": "no-store"
+            }
           })
         },
         Math.min(requestTimeoutMs, remainingBeforeRequestMs)
       );
     } catch (error) {
       readyResponses = 0;
-      lastState = `request error (${errorLabel(error)})`;
+      lastState = `${phase} request error (${errorLabel(error)})`;
     }
 
     if (response) {
       const actualVersionId = responseWorkerVersion(response);
       if (response.status === 200) {
         if (actualVersionId === expectedVersionId) {
-          readyResponses += 1;
-          lastState = `200 from expected version (${readyResponses}/${consecutiveReady} consecutive)`;
+          if (!overrideReachable) {
+            overrideReachable = true;
+            readyResponses = 0;
+            lastState = "exact override reached the expected version; awaiting default-route convergence";
+          } else {
+            readyResponses += 1;
+            lastState = `default route returned the expected version (${readyResponses}/${consecutiveReady} consecutive)`;
+          }
           cancelBody(response);
-          if (readyResponses >= consecutiveReady) {
+          if (overrideReachable && readyResponses >= consecutiveReady) {
             return {
               status: "ready",
               baseUrl: normalizedBaseUrl(baseUrl),
+              workerName: expectedWorkerName,
               workerVersion: expectedVersionId,
               attempts,
+              overrideReachable: true,
               consecutiveReady: readyResponses
             };
           }
         } else {
           readyResponses = 0;
-          lastState = `200 from Worker version ${actualVersionId ?? "unknown"}; expected ${expectedVersionId}`;
+          lastState = `${phase} route returned Worker version ${actualVersionId ?? "unknown"}; expected ${expectedVersionId}`;
           cancelBody(response);
         }
       } else if (retryableStatus(response.status)) {
         readyResponses = 0;
-        lastState = `retryable HTTP ${response.status}`;
+        lastState = `${phase} route returned retryable HTTP ${response.status}`;
         cancelBody(response);
       } else {
         cancelBody(response);
         throw new Error(
-          `Worker version readiness failed fast: /api/health returned HTTP ${response.status}; expected 200 from ${expectedVersionId}`
+          `Worker version readiness failed fast: ${phase} /api/health probe returned HTTP ${response.status}; expected 200 from ${expectedVersionId}`
         );
       }
     }
