@@ -30,8 +30,9 @@ export async function sourceGenerationIsCurrent(
   db: D1Database,
   generatedAt: string
 ): Promise<boolean> {
-  // source_runs.started_at stores the immutable logical generation timestamp,
-  // not a retry's wall-clock completion time.
+  // source_runs.started_at stores the latest logical generation timestamp for
+  // each lineage, not a retry's wall-clock completion time. Exact retries keep
+  // it stable; a deliberately reused lineage may advance it but never regress.
   const row = await db
     .prepare(
       `select started_at as latest_generation_at

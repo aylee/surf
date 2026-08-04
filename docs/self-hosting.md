@@ -186,9 +186,11 @@ your shell, provide the same value through the ignored environment variable
 
 Keep that variable available for later `pnpm deploy` runs. An update deploy
 first proves the exact Wrangler-emitted Worker version is callable and that
-unpinned production routing has converged, then performs one authenticated
-ingest with a Worker-enforced version precondition. Any newly migrated forecast
-read-model tables are populated before version-pinned strict smoke testing.
+unpinned production routing has converged, verifies the control plane reports
+that one version at 100%, then performs one unpinned authenticated PATCH with a
+Worker-enforced version precondition. Any newly migrated forecast read-model
+tables are populated before unpinned, exact-version strict smoke testing and a
+final 100% control-plane check.
 
 ### 5. Optional Gemini production rollout
 

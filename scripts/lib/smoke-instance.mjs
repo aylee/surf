@@ -94,6 +94,7 @@ async function getJson(
       headers: workerVersionRequestHeaders({
         expectedVersionId,
         expectedWorkerName,
+        override: false,
         headers: { Accept: "application/json" }
       })
     },
@@ -144,6 +145,7 @@ async function getForecastReadModel(
       headers: workerVersionRequestHeaders({
         expectedVersionId,
         expectedWorkerName,
+        override: false,
         headers: { Accept: "application/json" }
       })
     },

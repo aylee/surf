@@ -871,7 +871,7 @@ describe("worker api", () => {
       ENVIRONMENT: "production",
       INGEST_TOKEN: "ingest-test-token",
       CF_VERSION_METADATA: {
-        id: "worker-version-test-id",
+        id: "11111111-2222-4333-8444-555555555555",
         tag: "",
         timestamp: "2026-08-03T01:00:00.000Z"
       },
@@ -913,18 +913,57 @@ describe("worker api", () => {
 
     messages.length = 0;
     const deployResponse = await worker.fetch(
-      new Request("https://surf.test/api/ingest/deploy", {
-        method: "POST",
+      new Request("https://surf.test/api/ingest/once", {
+        method: "PATCH",
         headers: {
           Authorization: "Bearer ingest-test-token",
-          "X-Surf-Expected-Worker-Version": "worker-version-test-id"
+          "X-Surf-Expected-Worker-Version": "11111111-2222-4333-8444-555555555555"
         }
       }) as unknown as Parameters<typeof worker.fetch>[0],
       productionEnv,
       {} as ExecutionContext
     );
     expect(deployResponse.status).toBe(202);
-    expect(messages).toHaveLength(1);
+    expect(await deployResponse.json()).toEqual({
+      status: "accepted",
+      ingestId: "11111111-2222-4333-8444-555555555555",
+      requestedAt: "2026-08-03T01:02:03.456Z",
+      forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
+      region: "norcal"
+    });
+    expect(messages).toEqual([
+      {
+        job: "source-ingest",
+        kind: "manual-ingest",
+        ingestId: "11111111-2222-4333-8444-555555555555",
+        requestedAt: "2026-08-03T01:02:03.456Z",
+        forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
+        region: "norcal"
+      }
+    ]);
+
+    vi.setSystemTime(new Date("2026-08-03T01:02:04.456Z"));
+    const replayResponse = await worker.fetch(
+      new Request("https://surf.test/api/ingest/once", {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer ingest-test-token",
+          "X-Surf-Expected-Worker-Version": "11111111-2222-4333-8444-555555555555"
+        }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      productionEnv,
+      {} as ExecutionContext
+    );
+    expect(replayResponse.status).toBe(202);
+    expect(await replayResponse.json()).toMatchObject({
+      ingestId: "11111111-2222-4333-8444-555555555555",
+      requestedAt: "2026-08-03T01:02:04.456Z"
+    });
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toMatchObject({
+      ingestId: "11111111-2222-4333-8444-555555555555",
+      requestedAt: "2026-08-03T01:02:04.456Z"
+    });
   });
 
   it("rejects a remote ingest version precondition before Queue.send", async () => {
@@ -946,7 +985,7 @@ describe("worker api", () => {
       ENVIRONMENT: "production",
       INGEST_TOKEN: "ingest-test-token",
       CF_VERSION_METADATA: {
-        id: "actual-worker-version",
+        id: "11111111-2222-4333-8444-555555555555",
         tag: "",
         timestamp: "2026-08-03T01:00:00.000Z"
       },
@@ -957,9 +996,23 @@ describe("worker api", () => {
       } as unknown as Queue
     };
 
+    const unauthorized = await worker.fetch(
+      new Request("https://surf.test/api/ingest/once", {
+        method: "PATCH",
+        headers: {
+          "X-Surf-Expected-Worker-Version": "11111111-2222-4333-8444-555555555555"
+        }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      productionEnv,
+      {} as ExecutionContext
+    );
+    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.headers.get("WWW-Authenticate")).toBe("Bearer");
+    expect(messages).toEqual([]);
+
     const missing = await worker.fetch(
-      new Request("https://surf.test/api/ingest/deploy", {
-        method: "POST",
+      new Request("https://surf.test/api/ingest/once", {
+        method: "PATCH",
         headers: { Authorization: "Bearer ingest-test-token" }
       }) as unknown as Parameters<typeof worker.fetch>[0],
       productionEnv,
@@ -970,12 +1023,29 @@ describe("worker api", () => {
       error: "worker_version_precondition_required"
     });
 
-    const mismatch = await worker.fetch(
-      new Request("https://surf.test/api/ingest/deploy", {
-        method: "POST",
+    const malformed = await worker.fetch(
+      new Request("https://surf.test/api/ingest/once", {
+        method: "PATCH",
         headers: {
           Authorization: "Bearer ingest-test-token",
-          "X-Surf-Expected-Worker-Version": "expected-worker-version"
+          "X-Surf-Expected-Worker-Version": "latest"
+        }
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      productionEnv,
+      {} as ExecutionContext
+    );
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toEqual({
+      error: "worker_version_precondition_invalid"
+    });
+    expect(messages).toEqual([]);
+
+    const mismatch = await worker.fetch(
+      new Request("https://surf.test/api/ingest/once", {
+        method: "PATCH",
+        headers: {
+          Authorization: "Bearer ingest-test-token",
+          "X-Surf-Expected-Worker-Version": "66666666-7777-4888-8999-000000000000"
         }
       }) as unknown as Parameters<typeof worker.fetch>[0],
       productionEnv,
@@ -984,16 +1054,16 @@ describe("worker api", () => {
     expect(mismatch.status).toBe(409);
     expect(await mismatch.json()).toEqual({
       error: "worker_version_mismatch",
-      expectedWorkerVersion: "expected-worker-version",
-      actualWorkerVersion: "actual-worker-version"
+      expectedWorkerVersion: "66666666-7777-4888-8999-000000000000",
+      actualWorkerVersion: "11111111-2222-4333-8444-555555555555"
     });
 
     const unavailable = await worker.fetch(
-      new Request("https://surf.test/api/ingest/deploy", {
-        method: "POST",
+      new Request("https://surf.test/api/ingest/once", {
+        method: "PATCH",
         headers: {
           Authorization: "Bearer ingest-test-token",
-          "X-Surf-Expected-Worker-Version": "expected-worker-version"
+          "X-Surf-Expected-Worker-Version": "66666666-7777-4888-8999-000000000000"
         }
       }) as unknown as Parameters<typeof worker.fetch>[0],
       { ...productionEnv, CF_VERSION_METADATA: undefined },
@@ -1002,8 +1072,9 @@ describe("worker api", () => {
     expect(unavailable.status).toBe(503);
     expect(await unavailable.json()).toEqual({
       error: "worker_version_unavailable",
-      expectedWorkerVersion: "expected-worker-version"
+      expectedWorkerVersion: "66666666-7777-4888-8999-000000000000"
     });
+
     expect(messages).toEqual([]);
   });
 

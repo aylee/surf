@@ -110,10 +110,12 @@ export async function recordSourceRun<Row>(
           cycle_at = excluded.cycle_at,
           valid_start_at = excluded.valid_start_at,
           valid_end_at = excluded.valid_end_at,
+          started_at = excluded.started_at,
           completed_at = excluded.completed_at,
           status = excluded.status,
           metadata_json = excluded.metadata_json,
-          error = excluded.error`
+          error = excluded.error
+        where excluded.started_at >= source_runs.started_at`
       )
       .bind(
         id,
