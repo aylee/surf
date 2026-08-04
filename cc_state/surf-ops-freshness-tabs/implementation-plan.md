@@ -1066,3 +1066,89 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
   one supported deploy with the c007 UUID inline. OI-5 closes only on target-only dual-origin
   identity, one source lineage, 12/12, deployment 100%, queue 1/1, and browser proof; otherwise
   leave the activated Worker in queue-safe fix-forward unless rollback safety is positively proven.
+
+### 2026-08-03 — PR #20 live failure and affinity-session rotation OODA
+
+- **Merge/deploy evidence:** PR #20 (`c0c3539`) passed GitHub Verify in 1m12s and merged as
+  `7d7b04209f36895d2ac641e6ef16c13b5918c58f` at `05:34:36Z`. Time Travel info remained
+  unavailable through the local OAuth credential, so recovery retained the 04:52 bookmark plus
+  D1 point-in-time restore; no migration/seed content changed. Idempotent seed completed at
+  bookmark `00000340-00000004-000050bd-e3bd374fc658291057f24d5f5b97b9a7`. Supported deploy
+  activated `ce82bb5d-b9ba-46db-8621-c68fcb8ffbac` in deployment
+  `e4c83439-2632-48c7-a50e-112ab1085e6b`, proved exact override + three ordinary responses,
+  and proved one version at 100% before the handoff.
+- **Failed-closed boundary:** one random version-affinity key then produced 57/57 catalog GETs
+  from predecessor `ce93cdde…` until the shared 60-second deadline. No route probe, token, body,
+  authenticated PATCH, Queue send, or forecast polling occurred. The script reported mutation
+  did not begin and left ce82 active for queue-safe fix-forward. Preflight Queue evidence was
+  exactly 1 producer/1 consumer.
+- **Live hypothesis test:** read-only/no-auth sampling used 12 fresh keys with two adjacent GETs
+  per key on both custom and workers.dev origins. Result: 48/48 ce82, zero within-key split pairs.
+  This distinguishes stale deterministic key assignment from POP-wide rollout failure and agrees
+  with Cloudflare's documented semantics: a key consistently maps within a deployment but does
+  not choose the target version.
+- **Independent design review:** all three reviewers reject same-key extension, affinity removal,
+  override-pinned mutation, manual replay, and rollback. Majority verdict requires a complete
+  candidate session: fresh UUID → exactly one keyed target catalog → exactly one same-key no-auth
+  PATCH →, only after exact target 401/Bearer, exactly one same-key auth PATCH. Stale/missing/
+  transport/body read-only outcomes discard the key and restart at catalog after 1s. Exact-target
+  catalog/auth-contract defects fail fast; unauthenticated 2xx and every authenticated ambiguity
+  remain terminal. Exact typed 409 or allowlisted legacy 404 alone consumes an auth attempt and
+  permits a new candidate. One shared 60s deadline, global 60-session cap, and max three auths.
+- **Tradeoff:** re-fetching the target catalog on every fresh probe session is not strictly needed
+  to know spot IDs, but it gives one coherent per-key catalog→probe→auth chain and makes review
+  evidence simpler. It costs one read-only request per rotated candidate. With the global session
+  and time bounds, that cost is preferable to carrying state from an invalidated key. The c007
+  bootstrap exception was scoped to PR #20 exactly as planned and is retired for the next deploy.
+- **Implementation/test state:** `aylee/surf-affinity-session-rotation` rotates unique UUID
+  sessions, rejects invalid/reused test-factory keys without printing them, retains global
+  catalog/probe/session/auth counters and safe-rejection evidence, and returns keyless
+  `versionAffinitySessions` plus `authenticatedAttempts`. Focused tests are 77/77 and the full
+  script suite is 131/131 after adding
+  deterministic stale/transport catalog rotation, target-catalog→stale-probe full restart,
+  safe-auth full restart, global cap, invalid/duplicate factory, ambiguity, and no-leak coverage.
+  Later finder/refuter rounds also forced header-only terminal handling for unauthenticated 2xx
+  and exact-target defects, token/key redaction across transport causes, retention of prior safe
+  evidence in later failures, exact `authenticatedAttempts` accounting, the deadline-crossing
+  pre-auth boundary, and a full-session assertion for probe-transport recovery. Runbook wording
+  now reflects fresh-session sampling instead of whole-handoff stable-key polling.
+- **OODA — Observe:** write safety held; deterministic affinity liveness failed. **Orient:** the
+  lineage substrate must be both non-duplicating and deployable before freshness/Analysis can be
+  trusted by friends planning a surf session. **Decide:** rotate only while zero-mutation evidence
+  is positive, and freeze one winning key across the three-step candidate. **Act:** finish full
+  suite, adversarial diff review, canonical/local browser gates, ready PR, GitHub Verify, merge,
+  and one supported deploy without the legacy UUID. OI-5 remains open until target-only identity,
+  one accepted lineage, 12/12, deployment 100%, Queue 1/1, and browser proof all pass.
+
+### 2026-08-03 — Fifth recovery ready-PR checkpoint
+
+- **Review gate:** two independent frozen-snapshot reviewers returned DRY after approximately
+  three finder/refuter rounds. Closed findings cover the stable-key liveness trap, header-only
+  unauthenticated 2xx and target-defect termination, exact-target catalog fail-fast behavior,
+  token/key redaction across response and transport causes, retention of prior safe evidence,
+  actual rather than prospective auth-attempt diagnostics, catch-path full-session continuity,
+  and the deadline-crossing-before-fetch counter edge. Accepted residual risk: fresh affinity
+  keys sample but cannot select the target Worker, so the 60-session/60-second bound may still
+  fail closed and require another fix-forward.
+- **Automated gates:** focused remote-ingest 77/77; full scripts 131/131; `git diff --check`
+  clean. Fresh canonical `pnpm verify` passed 131 Node, 21 core, 10 DB, 226 web unit (+1
+  skipped), 14 Worker, 45 Python, isolated D1 migration/seed, production build, and secretless
+  Wrangler bundle dry-run.
+- **Local e2e/browser:** `pnpm ingest:local` published 12 forecast read models from public feeds
+  with the known non-fatal NDBC partial caveat. `pnpm smoke:local` returned 6 spots, 12 ready,
+  0 pending. The code browser rendered the full report at 1280px with no alerts, no console
+  warnings/errors, and `scrollWidth === clientWidth` (no horizontal overflow). Optional Gemini
+  brief generation independently hit quota/schema and prior-local-date failures; it did not
+  affect deterministic read-model publication and remains a PR-C Analysis-path test note.
+- **Tradeoffs:** retain one target catalog per candidate even though spot IDs are stable, because
+  it proves one coherent catalog→probe→auth assignment and prevents state from crossing a
+  discarded key. Count an authenticated attempt immediately before the fetch call and freeze a
+  positive request budget first, so diagnostics neither understate a sent credentialed request
+  nor overstate one blocked by the shared deadline. The consumed c007 legacy shell exception is
+  documented as historical and will not be supplied to the next deploy.
+- **OODA:** Observe — code, tests, runbook, and diagnostics now encode the same mutation boundary.
+  Orient — deployability is a prerequisite for honest freshness and a teachable forecast UI, not
+  incidental tooling. Decide — preserve bounded fail-closed liveness risk rather than permit a
+  blind or ambiguous replay. Act — ready PR → GitHub Verify → merge → exactly one supported
+  deploy; close OI-5 only on target-only dual-origin identity, one lineage, 12/12, deployment
+  100%, Queue 1/1, and production code-browser proof. PR-A remains blocked until then.

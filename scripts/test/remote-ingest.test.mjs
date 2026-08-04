@@ -18,6 +18,15 @@ const legacyWorkerVersion = "69ae1d6c-4f4a-4e24-9167-2ee2a17244a8";
 const workerVersionKeyHeader = "Cloudflare-Workers-Version-Key";
 const silentLogger = { warn() {} };
 
+function affinityKey(index) {
+  return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+}
+
+function sequentialAffinityKeyFactory() {
+  let index = 0;
+  return () => affinityKey(++index);
+}
+
 function versionedJson(value, init = {}) {
   const headers = new Headers(init.headers);
   headers.set(SURF_WORKER_VERSION_HEADER, workerVersion);
@@ -295,6 +304,8 @@ test("version-checked remote ingest proves the ordinary route before and after i
   assert.equal(patchCount, 2);
   assert.equal(result.workerVersion, workerVersion);
   assert.equal(result.ingestId, workerVersion);
+  assert.equal(result.versionAffinitySessions, 1);
+  assert.equal(result.authenticatedAttempts, 1);
   assert.equal(result.forecastReadModels, 2);
   assert.deepEqual(
     requests.map(({ path, method }) => ({ path, method })),
@@ -350,7 +361,7 @@ test("version-checked remote ingest proves the ordinary route before and after i
   );
 });
 
-test("versioned catalog polling survives stale routing and transport with the same handoff key", async () => {
+test("versioned catalog rotates stale and failed affinity sessions before freezing the target key", async () => {
   let clock = Date.parse(requestedAt);
   let catalogRequests = 0;
   let authenticatedPatches = 0;
@@ -389,6 +400,7 @@ test("versioned catalog polling survives stale routing and transport with the sa
     fetcher,
     expectedVersionId: workerVersion,
     expectedWorkerName: workerName,
+    versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
     now: () => clock,
     sleep: async (delayMs) => {
       delays.push(delayMs);
@@ -397,14 +409,21 @@ test("versioned catalog polling survives stale routing and transport with the sa
   });
 
   assert.equal(result.status, "published");
+  assert.equal(result.versionAffinitySessions, 3);
+  assert.equal(result.authenticatedAttempts, 1);
   assert.equal(catalogRequests, 3);
   assert.equal(authenticatedPatches, 1);
   assert.deepEqual(delays, [1_000, 1_000]);
-  assert.equal(new Set(handoffKeys).size, 1);
-  assert.ok(handoffKeys[0]);
+  assert.deepEqual(handoffKeys, [
+    affinityKey(1),
+    affinityKey(2),
+    affinityKey(3),
+    affinityKey(3),
+    affinityKey(3)
+  ]);
 });
 
-test("a stalled versioned catalog body aborts and consumes the shared handoff clock before PATCH", async () => {
+test("a stalled stale-version catalog body rotates within the shared handoff clock", async () => {
   const startedAt = Date.parse(requestedAt);
   let clock = startedAt;
   let catalogRequests = 0;
@@ -418,6 +437,7 @@ test("a stalled versioned catalog body aborts and consumes the shared handoff cl
     token: "secret-token",
     expectedVersionId: workerVersion,
     expectedWorkerName: workerName,
+    versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
     requestTimeoutMs: 5,
     now: () => clock,
     sleep: async (delayMs) => {
@@ -433,7 +453,7 @@ test("a stalled versioned catalog body aborts and consumes the shared handoff cl
         if (catalogRequests === 1) {
           stalledCatalogSignal = init.signal;
           return hangingBodyResponse({
-            headers: { [SURF_WORKER_VERSION_HEADER]: workerVersion }
+            headers: { [SURF_WORKER_VERSION_HEADER]: staleWorkerVersion }
           });
         }
         return versionedJson({ spots: [spot] });
@@ -453,12 +473,81 @@ test("a stalled versioned catalog body aborts and consumes the shared handoff cl
   });
 
   assert.equal(result.status, "published");
+  assert.equal(result.versionAffinitySessions, 2);
+  assert.equal(result.authenticatedAttempts, 1);
   assert.equal(stalledCatalogSignal.aborted, true);
   assert.equal(catalogRequests, 2);
   assert.equal(authenticatedPatches, 1);
   assert.equal(clockAtAuthenticatedPatch, startedAt + 1_000);
   assert.deepEqual(delays, [1_000]);
-  assert.equal(new Set(handoffKeys).size, 1);
+  assert.deepEqual(handoffKeys, [
+    affinityKey(1),
+    affinityKey(2),
+    affinityKey(2),
+    affinityKey(2)
+  ]);
+});
+
+test("a stale route probe discards its target-catalog session before authentication", async () => {
+  let clock = Date.parse(requestedAt);
+  let catalogRequests = 0;
+  let probeRequests = 0;
+  let authenticatedRequests = 0;
+  const handoff = [];
+  const delays = [];
+  const result = await enqueueAndWaitForRemoteIngest({
+    baseUrl,
+    token: "secret-token",
+    expectedVersionId: workerVersion,
+    expectedWorkerName: workerName,
+    versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
+    now: () => clock,
+    sleep: async (delayMs) => {
+      delays.push(delayMs);
+      clock += delayMs;
+    },
+    fetcher: async (input, init = {}) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init.headers);
+      const key = headers.get(workerVersionKeyHeader);
+      if (url.pathname === "/api/spots") {
+        catalogRequests += 1;
+        handoff.push(["catalog", key]);
+        return versionedJson({ spots: [spot] });
+      }
+      if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+        if (!headers.has("Authorization")) {
+          probeRequests += 1;
+          handoff.push(["probe", key]);
+          return probeRequests === 1
+            ? typedStaleVersionResponse({ status: 404, payload: "stale route" })
+            : versionedUnauthorized();
+        }
+        authenticatedRequests += 1;
+        handoff.push(["auth", key]);
+        return acceptedDeployResponse();
+      }
+      if (url.pathname === `/api/forecast/${spot.id}`) {
+        return versionedForecast(workerVersion);
+      }
+      return new Response("unexpected request", { status: 500 });
+    }
+  });
+
+  assert.equal(result.status, "published");
+  assert.equal(result.versionAffinitySessions, 2);
+  assert.equal(result.authenticatedAttempts, 1);
+  assert.equal(catalogRequests, 2);
+  assert.equal(probeRequests, 2);
+  assert.equal(authenticatedRequests, 1);
+  assert.deepEqual(delays, [1_000]);
+  assert.deepEqual(handoff, [
+    ["catalog", affinityKey(1)],
+    ["probe", affinityKey(1)],
+    ["catalog", affinityKey(2)],
+    ["probe", affinityKey(2)],
+    ["auth", affinityKey(2)]
+  ]);
 });
 
 test("the exact target catalog fails fast on non-2xx or invalid schema", async (t) => {
@@ -513,16 +602,69 @@ test("the exact target catalog fails fast on non-2xx or invalid schema", async (
   }
 });
 
+test("target catalog HTTP and body defects never rotate to another affinity session", async (t) => {
+  for (const [name, status] of [
+    ["HTTP defect", 503],
+    ["stalled success body", 200]
+  ]) {
+    await t.test(name, async () => {
+      let affinitySessions = 0;
+      let catalogRequests = 0;
+      let patchRequests = 0;
+      let sleeps = 0;
+      await assert.rejects(
+        enqueueAndWaitForRemoteIngest({
+          baseUrl,
+          token: "secret-token",
+          expectedVersionId: workerVersion,
+          expectedWorkerName: workerName,
+          requestTimeoutMs: 5,
+          versionAffinityKeyFactory: () => affinityKey(++affinitySessions),
+          sleep: async () => {
+            sleeps += 1;
+          },
+          fetcher: async (input) => {
+            const url = new URL(String(input));
+            if (url.pathname === "/api/spots") {
+              catalogRequests += 1;
+              return hangingBodyResponse({
+                status,
+                headers: { [SURF_WORKER_VERSION_HEADER]: workerVersion }
+              });
+            }
+            if (url.pathname === "/api/ingest/once") patchRequests += 1;
+            return new Response("unexpected request", { status: 500 });
+          }
+        }),
+        (error) => {
+          assert.match(error.message, /remote ingest catalog failed: GET \/api\/spots/);
+          assert.match(error.message, /expected Worker returned an (invalid|unreadable) spot catalog/);
+          assert.match(error.message, /mutation did not begin/);
+          return true;
+        }
+      );
+      assert.equal(affinitySessions, 1);
+      assert.equal(catalogRequests, 1);
+      assert.equal(patchRequests, 0);
+      assert.equal(sleeps, 0);
+    });
+  }
+});
+
 test("typed stale-version rejection retries one fresh probe/auth pair with fixed backoff", async () => {
   let clock = Date.parse(requestedAt);
   let authenticatedPatches = 0;
   const patchKinds = [];
   const patchKeys = [];
+  const catalogKeys = [];
   const delays = [];
   const warnings = [];
   const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
-    if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+    if (url.pathname === "/api/spots") {
+      catalogKeys.push(new Headers(init.headers).get(workerVersionKeyHeader));
+      return versionedJson({ spots: [spot] });
+    }
     if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
       const headers = new Headers(init.headers);
       const authenticated = headers.has("Authorization");
@@ -546,6 +688,7 @@ test("typed stale-version rejection retries one fresh probe/auth pair with fixed
     fetcher,
     expectedVersionId: workerVersion,
     expectedWorkerName: workerName,
+    versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
     logger: { warn: (message) => warnings.push(message) },
     now: () => clock,
     sleep: async (delayMs) => {
@@ -555,14 +698,21 @@ test("typed stale-version rejection retries one fresh probe/auth pair with fixed
   });
 
   assert.equal(result.status, "published");
+  assert.equal(result.versionAffinitySessions, 2);
+  assert.equal(result.authenticatedAttempts, 2);
   assert.deepEqual(patchKinds, ["probe", "auth", "probe", "auth"]);
   assert.deepEqual(delays, [1_000]);
-  assert.equal(new Set(patchKeys).size, 1);
-  assert.ok(patchKeys[0]);
+  assert.deepEqual(patchKeys, [
+    affinityKey(1),
+    affinityKey(1),
+    affinityKey(2),
+    affinityKey(2)
+  ]);
+  assert.deepEqual(catalogKeys, [affinityKey(1), affinityKey(2)]);
   assert.equal(warnings.length, 1);
   assert.deepEqual(JSON.parse(warnings[0]), {
     event: "remote_ingest_safe_rejection",
-    attempt: 1,
+    authenticatedAttempt: 1,
     kind: "typed-stale-409",
     status: 409,
     workerVersion: staleWorkerVersion,
@@ -615,6 +765,7 @@ test("an explicitly named legacy PATCH-less version retries only its exact Hono 
     fetcher,
     expectedVersionId: workerVersion,
     expectedWorkerName: workerName,
+    versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
     legacyPatchlessVersionId: legacyWorkerVersion,
     logger: silentLogger,
     now: () => clock,
@@ -631,7 +782,14 @@ test("an explicitly named legacy PATCH-less version retries only its exact Hono 
   );
   assert.equal(authenticatedPatches, 2);
   assert.deepEqual(delays, [1_000, 1_000, 1_000]);
-  assert.equal(new Set(patchKeys).size, 1);
+  assert.deepEqual(patchKeys, [
+    affinityKey(1),
+    affinityKey(1),
+    affinityKey(2),
+    affinityKey(3),
+    affinityKey(4),
+    affinityKey(4)
+  ]);
 });
 
 test("handoff exhausts after three safe paired attempts and preserves bounded rejection evidence", async () => {
@@ -664,6 +822,7 @@ test("handoff exhausts after three safe paired attempts and preserves bounded re
       fetcher,
       expectedVersionId: workerVersion,
       expectedWorkerName: workerName,
+      versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
       logger: silentLogger,
       now: () => clock,
       sleep: async (delayMs) => {
@@ -673,7 +832,7 @@ test("handoff exhausts after three safe paired attempts and preserves bounded re
     }),
     (error) => {
       assert.match(error.message, /remote ingest handoff exhausted/);
-      assert.match(error.message, /attempt=3\/3/);
+      assert.match(error.message, /authenticatedAttempts=3\/3/);
       assert.match(error.message, /handoffElapsedMs=3000/);
       assert.match(error.message, /stale-ray-1/);
       assert.match(error.message, /stale-ray-2/);
@@ -688,7 +847,11 @@ test("handoff exhausts after three safe paired attempts and preserves bounded re
   assert.equal(authenticatedPatches, 3);
   assert.deepEqual(patchKinds, ["probe", "auth", "probe", "auth", "probe", "auth"]);
   assert.deepEqual(delays, [1_000, 2_000]);
-  assert.equal(new Set(patchKeys).size, 1);
+  assert.deepEqual(patchKeys, [
+    affinityKey(1), affinityKey(1),
+    affinityKey(2), affinityKey(2),
+    affinityKey(3), affinityKey(3)
+  ]);
   assert.equal(forecastRequests, 0);
 });
 
@@ -726,7 +889,7 @@ test("one handoff deadline bounds retries and refuses a backoff that cannot fit"
     }),
     (error) => {
       assert.match(error.message, /remote ingest handoff deadline reached/);
-      assert.match(error.message, /attempt=2\/3/);
+      assert.match(error.message, /authenticatedAttempts=2\/3/);
       assert.match(error.message, /handoffElapsedMs=1000/);
       assert.match(error.message, /handoffRemainingMs=1500/);
       assert.match(error.message, /handoffDeadlineMs=2500/);
@@ -735,6 +898,61 @@ test("one handoff deadline bounds retries and refuses a backoff that cannot fit"
   );
   assert.equal(authenticatedPatches, 2);
   assert.deepEqual(delays, [1_000]);
+});
+
+test("a later stale-catalog deadline retains prior probe and safe-auth evidence without leaking session keys", async () => {
+  let clock = Date.parse(requestedAt);
+  let catalogRequests = 0;
+  let authenticatedPatches = 0;
+  const keys = [];
+  const delays = [];
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
+      logger: silentLogger,
+      handoffTimeoutMs: 2_500,
+      now: () => clock,
+      sleep: async (delayMs) => {
+        delays.push(delayMs);
+        clock += delayMs;
+      },
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        const headers = new Headers(init.headers);
+        const key = headers.get(workerVersionKeyHeader);
+        if (url.pathname === "/api/spots") {
+          catalogRequests += 1;
+          keys.push(key);
+          if (catalogRequests === 1) return versionedJson({ spots: [spot] });
+          return new Response(`stale catalog reflected ${key}`, {
+            status: 503,
+            headers: { [SURF_WORKER_VERSION_HEADER]: staleWorkerVersion }
+          });
+        }
+        if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+          if (!headers.has("Authorization")) return versionedUnauthorized();
+          authenticatedPatches += 1;
+          return typedStaleVersionResponse({ cfRay: "safe-before-catalog-ray" });
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    (error) => {
+      assert.match(error.message, /authenticatedAttempts=1\/3/);
+      assert.match(error.message, /sessionCount=3 catalogCount=3 probeCount=1/);
+      assert.match(error.message, /latestProbe=probe=1 status=401/);
+      assert.match(error.message, /safe-before-catalog-ray/);
+      assert.match(error.message, /body=stale catalog reflected \[REDACTED\]/);
+      for (const key of keys) assert.doesNotMatch(error.message, new RegExp(key));
+      return true;
+    }
+  );
+  assert.equal(authenticatedPatches, 1);
+  assert.deepEqual(delays, [1_000, 1_000]);
 });
 
 test("persistent stale probes consume the deadline without a second authenticated attempt", async () => {
@@ -776,7 +994,7 @@ test("persistent stale probes consume the deadline without a second authenticate
     }),
     (error) => {
       assert.match(error.message, /remote ingest handoff deadline reached/);
-      assert.match(error.message, /attempt=2\/3/);
+      assert.match(error.message, /authenticatedAttempts=1\/3/);
       assert.match(error.message, /probeCount=4/);
       assert.match(error.message, /latestProbe=probe=4 status=404/);
       assert.match(error.message, /probe-ray-4/);
@@ -794,16 +1012,22 @@ test("stale probes can exhaust the shared deadline before any authenticated atte
   let authenticatedPatches = 0;
   let probePatches = 0;
   const delays = [];
+  const probeKeys = [];
   const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
     if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
-      if (new Headers(init.headers).has("Authorization")) {
+      const headers = new Headers(init.headers);
+      if (headers.has("Authorization")) {
         authenticatedPatches += 1;
       } else {
         probePatches += 1;
+        probeKeys.push(headers.get(workerVersionKeyHeader));
       }
-      return typedStaleVersionResponse({ status: 404, payload: "stale route" });
+      return typedStaleVersionResponse({
+        status: 404,
+        payload: `stale route ${headers.get(workerVersionKeyHeader)}`
+      });
     }
     return new Response("unexpected request", { status: 500 });
   };
@@ -823,14 +1047,24 @@ test("stale probes can exhaust the shared deadline before any authenticated atte
         clock += delayMs;
       }
     }),
-    /remote ingest handoff deadline reached: attempt=1\/3 probeCount=3/
+    (error) => {
+      assert.match(
+        error.message,
+        /remote ingest handoff deadline reached: authenticatedAttempts=0\/3 sessionCount=3 catalogCount=3 probeCount=3/
+      );
+      assert.match(error.message, /body=stale route \[REDACTED\]/);
+      for (const key of probeKeys) {
+        assert.doesNotMatch(error.message, new RegExp(key));
+      }
+      return true;
+    }
   );
   assert.equal(authenticatedPatches, 0);
   assert.equal(probePatches, 3);
   assert.deepEqual(delays, [1_000, 1_000]);
 });
 
-test("probe count is explicitly bounded even when an injected clock does not advance", async () => {
+test("affinity session count is explicitly bounded even when an injected clock does not advance", async () => {
   let probePatches = 0;
   let authenticatedPatches = 0;
   const fetcher = async (input, init = {}) => {
@@ -854,7 +1088,7 @@ test("probe count is explicitly bounded even when an injected clock does not adv
       now: () => 0,
       sleep: async () => {}
     }),
-    /remote ingest handoff probe budget exhausted: attempt=1\/3 probeCount=60/
+    /remote ingest affinity session budget exhausted: authenticatedAttempts=0\/3 sessionCount=60 catalogCount=60 probeCount=60/
   );
   assert.equal(probePatches, 60);
   assert.equal(authenticatedPatches, 0);
@@ -1055,13 +1289,20 @@ test("every 202 is terminal even when its body is malformed after a safe retry",
         /remote ingest enqueue failed: PATCH \/api\/ingest\/once status=202/
       );
       assert.match(error.message, /mutation may have occurred; do not retry/);
-      assert.match(error.message, /safeRejections=attempt=1 kind=typed-stale-409/);
+      assert.match(
+        error.message,
+        /safeRejections=authenticatedAttempt=1 kind=typed-stale-409/
+      );
       assert.match(error.message, /cfRay=stale-ray/);
       return true;
     }
   );
   assert.equal(authenticatedPatches, 2);
-  assert.equal(totalRequests, 5, "catalog plus exactly two probe/auth pairs");
+  assert.equal(
+    totalRequests,
+    6,
+    "each safe authenticated rejection must start a fresh catalog/probe/auth session"
+  );
   assert.deepEqual(delays, [1_000]);
   assert.equal(forecastRequests, 0);
 });
@@ -1085,6 +1326,78 @@ test("legacy runtime input is validated before any request", async () => {
     );
     assert.equal(requests, 0);
   }
+});
+
+test("affinity session factory failures are terminal before authentication and never leak keys", async (t) => {
+  await t.test("non-function", async () => {
+    let requests = 0;
+    await assert.rejects(
+      enqueueAndWaitForRemoteIngest({
+        baseUrl,
+        token: "secret-token",
+        expectedVersionId: workerVersion,
+        expectedWorkerName: workerName,
+        versionAffinityKeyFactory: "not-a-function",
+        fetcher: async () => {
+          requests += 1;
+          return new Response("unexpected request");
+        }
+      }),
+      /version affinity key factory must be a function/
+    );
+    assert.equal(requests, 0);
+  });
+
+  await t.test("invalid key", async () => {
+    let requests = 0;
+    await assert.rejects(
+      enqueueAndWaitForRemoteIngest({
+        baseUrl,
+        token: "secret-token",
+        expectedVersionId: workerVersion,
+        expectedWorkerName: workerName,
+        versionAffinityKeyFactory: () => "invalid-affinity-key",
+        fetcher: async () => {
+          requests += 1;
+          return new Response("unexpected request");
+        }
+      }),
+      (error) => {
+        assert.match(error.message, /factory must return a UUID/);
+        assert.doesNotMatch(error.message, /invalid-affinity-key|secret-token/);
+        return true;
+      }
+    );
+    assert.equal(requests, 0);
+  });
+
+  await t.test("reused key", async () => {
+    let requests = 0;
+    const reusedKey = affinityKey(1);
+    await assert.rejects(
+      enqueueAndWaitForRemoteIngest({
+        baseUrl,
+        token: "secret-token",
+        expectedVersionId: workerVersion,
+        expectedWorkerName: workerName,
+        versionAffinityKeyFactory: () => reusedKey,
+        sleep: async () => {},
+        fetcher: async () => {
+          requests += 1;
+          return Response.json(
+            { spots: [spot] },
+            { headers: { [SURF_WORKER_VERSION_HEADER]: staleWorkerVersion } }
+          );
+        }
+      }),
+      (error) => {
+        assert.match(error.message, /reused a discarded session key/);
+        assert.doesNotMatch(error.message, new RegExp(`${reusedKey}|secret-token`));
+        return true;
+      }
+    );
+    assert.equal(requests, 1);
+  });
 });
 
 test("deploy route probe requires exact unauthorized method-path identity before enqueue", async () => {
@@ -1132,16 +1445,221 @@ test("deploy route probe requires exact unauthorized method-path identity before
   }
 });
 
+test("unauthenticated 2xx is terminal from headers even when its body never settles", async (t) => {
+  for (const [name, responseVersion] of [
+    ["target", workerVersion],
+    ["stale", staleWorkerVersion],
+    ["missing", null]
+  ]) {
+    await t.test(name, async () => {
+      let affinitySessions = 0;
+      let catalogRequests = 0;
+      let probeRequests = 0;
+      let authenticatedRequests = 0;
+      let sleeps = 0;
+      await assert.rejects(
+        enqueueAndWaitForRemoteIngest({
+          baseUrl,
+          token: "secret-token",
+          expectedVersionId: workerVersion,
+          expectedWorkerName: workerName,
+          requestTimeoutMs: 5,
+          versionAffinityKeyFactory: () => affinityKey(++affinitySessions),
+          sleep: async () => {
+            sleeps += 1;
+          },
+          fetcher: async (input, init = {}) => {
+            const url = new URL(String(input));
+            if (url.pathname === "/api/spots") {
+              catalogRequests += 1;
+              return versionedJson({ spots: [spot] });
+            }
+            if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+              if (new Headers(init.headers).has("Authorization")) {
+                authenticatedRequests += 1;
+                return acceptedDeployResponse();
+              }
+              probeRequests += 1;
+              const headers = new Headers();
+              if (responseVersion) {
+                headers.set(SURF_WORKER_VERSION_HEADER, responseVersion);
+              }
+              return hangingBodyResponse({ status: 200, headers });
+            }
+            return new Response("unexpected request", { status: 500 });
+          }
+        }),
+        (error) => {
+          assert.match(
+            error.message,
+            /remote ingest route probe failed: PATCH \/api\/ingest\/once status=200/
+          );
+          assert.match(error.message, /body=<unread unauthenticated 2xx>/);
+          assert.match(error.message, /mutation may have occurred; do not retry/);
+          return true;
+        }
+      );
+      assert.equal(affinitySessions, 1);
+      assert.equal(catalogRequests, 1);
+      assert.equal(probeRequests, 1);
+      assert.equal(authenticatedRequests, 0);
+      assert.equal(sleeps, 0);
+    });
+  }
+});
+
+test("the exact 401 Bearer probe advances from headers without awaiting its body", async () => {
+  let probeRequests = 0;
+  let authenticatedRequests = 0;
+  const result = await enqueueAndWaitForRemoteIngest({
+    baseUrl,
+    token: "secret-token",
+    expectedVersionId: workerVersion,
+    expectedWorkerName: workerName,
+    requestTimeoutMs: 5,
+    versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
+    fetcher: async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+      if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+        if (!new Headers(init.headers).has("Authorization")) {
+          probeRequests += 1;
+          return hangingBodyResponse({
+            status: 401,
+            headers: {
+              [SURF_WORKER_VERSION_HEADER]: workerVersion,
+              "WWW-Authenticate": "Bearer"
+            }
+          });
+        }
+        authenticatedRequests += 1;
+        return acceptedDeployResponse();
+      }
+      if (url.pathname === `/api/forecast/${spot.id}`) {
+        return versionedForecast(workerVersion);
+      }
+      return new Response("unexpected request", { status: 500 });
+    }
+  });
+
+  assert.equal(result.status, "published");
+  assert.equal(result.versionAffinitySessions, 1);
+  assert.equal(probeRequests, 1);
+  assert.equal(authenticatedRequests, 1);
+});
+
+test("target auth-contract defects fail from headers without rotating on a stalled body", async (t) => {
+  for (const [name, status, authenticate] of [
+    ["401 without Bearer", 401, null],
+    ["target 503", 503, "Bearer"]
+  ]) {
+    await t.test(name, async () => {
+      let affinitySessions = 0;
+      let probeRequests = 0;
+      let authenticatedRequests = 0;
+      let sleeps = 0;
+      await assert.rejects(
+        enqueueAndWaitForRemoteIngest({
+          baseUrl,
+          token: "secret-token",
+          expectedVersionId: workerVersion,
+          expectedWorkerName: workerName,
+          requestTimeoutMs: 5,
+          versionAffinityKeyFactory: () => affinityKey(++affinitySessions),
+          sleep: async () => {
+            sleeps += 1;
+          },
+          fetcher: async (input, init = {}) => {
+            const url = new URL(String(input));
+            if (url.pathname === "/api/spots") {
+              return versionedJson({ spots: [spot] });
+            }
+            if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+              if (new Headers(init.headers).has("Authorization")) {
+                authenticatedRequests += 1;
+                return acceptedDeployResponse();
+              }
+              probeRequests += 1;
+              const headers = new Headers({
+                [SURF_WORKER_VERSION_HEADER]: workerVersion
+              });
+              if (authenticate) headers.set("WWW-Authenticate", authenticate);
+              return hangingBodyResponse({ status, headers });
+            }
+            return new Response("unexpected request", { status: 500 });
+          }
+        }),
+        (error) => {
+          assert.match(
+            error.message,
+            new RegExp(`route probe failed: PATCH /api/ingest/once status=${status}`)
+          );
+          assert.match(error.message, /body=<unread target auth-contract defect>/);
+          assert.match(error.message, /mutation did not begin/);
+          return true;
+        }
+      );
+      assert.equal(affinitySessions, 1);
+      assert.equal(probeRequests, 1);
+      assert.equal(authenticatedRequests, 0);
+      assert.equal(sleeps, 0);
+    });
+  }
+});
+
+test("a deadline crossing before auth leaves the authenticated-attempt count at zero", async () => {
+  let probeReturned = false;
+  let postProbeClockReads = 0;
+  let authenticatedRequests = 0;
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      now: () => {
+        if (!probeReturned) return 0;
+        postProbeClockReads += 1;
+        return postProbeClockReads >= 3 ? 60_000 : 0;
+      },
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+        if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+          if (new Headers(init.headers).has("Authorization")) {
+            authenticatedRequests += 1;
+            return acceptedDeployResponse();
+          }
+          probeReturned = true;
+          return versionedUnauthorized();
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    (error) => {
+      assert.match(error.message, /remote ingest handoff deadline reached/);
+      assert.match(error.message, /authenticatedAttempts=0\/3/);
+      assert.match(error.message, /no request-attributable Queue mutation was accepted/);
+      return true;
+    }
+  );
+  assert.equal(authenticatedRequests, 0);
+  assert.equal(postProbeClockReads, 3);
+});
+
 test("probe transport failures poll safely while authenticated transport remains terminal", async () => {
   let clock = Date.parse(requestedAt);
+  let recoveredCatalogRequests = 0;
   let probePatchRequests = 0;
   let authenticatedPatchRequests = 0;
+  const recoveredHandoff = [];
   const delays = [];
   const recovered = await enqueueAndWaitForRemoteIngest({
     baseUrl,
     token: "secret-token",
     expectedVersionId: workerVersion,
     expectedWorkerName: workerName,
+    versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
     now: () => clock,
     sleep: async (delayMs) => {
       delays.push(delayMs);
@@ -1149,14 +1667,22 @@ test("probe transport failures poll safely while authenticated transport remains
     },
     fetcher: async (input, init = {}) => {
       const url = new URL(String(input));
-      if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+      const headers = new Headers(init.headers);
+      const key = headers.get(workerVersionKeyHeader);
+      if (url.pathname === "/api/spots") {
+        recoveredCatalogRequests += 1;
+        recoveredHandoff.push(["catalog", key]);
+        return versionedJson({ spots: [spot] });
+      }
       if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
-        if (!new Headers(init.headers).has("Authorization")) {
+        if (!headers.has("Authorization")) {
           probePatchRequests += 1;
+          recoveredHandoff.push(["probe", key]);
           if (probePatchRequests === 1) throw new TypeError("redirect rejected");
           return versionedUnauthorized();
         }
         authenticatedPatchRequests += 1;
+        recoveredHandoff.push(["auth", key]);
         return acceptedDeployResponse();
       }
       if (url.pathname === `/api/forecast/${spot.id}`) {
@@ -1166,13 +1692,23 @@ test("probe transport failures poll safely while authenticated transport remains
     }
   });
   assert.equal(recovered.status, "published");
+  assert.equal(recovered.versionAffinitySessions, 2);
+  assert.equal(recoveredCatalogRequests, 2);
   assert.equal(probePatchRequests, 2);
   assert.equal(authenticatedPatchRequests, 1);
   assert.deepEqual(delays, [1_000]);
+  assert.deepEqual(recoveredHandoff, [
+    ["catalog", affinityKey(1)],
+    ["probe", affinityKey(1)],
+    ["catalog", affinityKey(2)],
+    ["probe", affinityKey(2)],
+    ["auth", affinityKey(2)]
+  ]);
 
   authenticatedPatchRequests = 0;
   let failureClock = Date.parse(requestedAt);
   const failureDelays = [];
+  let failedAffinityKey;
   await assert.rejects(
     enqueueAndWaitForRemoteIngest({
       baseUrl,
@@ -1189,14 +1725,18 @@ test("probe transport failures poll safely while authenticated transport remains
         const url = new URL(String(input));
         if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
         if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
-          if (!new Headers(init.headers).has("Authorization")) {
+          const headers = new Headers(init.headers);
+          if (!headers.has("Authorization")) {
             return versionedUnauthorized();
           }
           authenticatedPatchRequests += 1;
           if (authenticatedPatchRequests === 1) {
             return typedStaleVersionResponse();
           }
-          throw new TypeError("connection reset after send");
+          failedAffinityKey = headers.get(workerVersionKeyHeader);
+          throw new TypeError(
+            `connection reset after send secret-token ${failedAffinityKey}`
+          );
         }
         return new Response("unexpected request", { status: 500 });
       }
@@ -1207,8 +1747,18 @@ test("probe transport failures poll safely while authenticated transport remains
         error.message,
         /remote ingest enqueue request failed: PATCH \/api\/ingest\/once; mutation may have occurred; do not retry/
       );
-      assert.match(error.message, /safeRejections=attempt=1 kind=typed-stale-409/);
+      assert.match(
+        error.message,
+        /safeRejections=authenticatedAttempt=1 kind=typed-stale-409/
+      );
       assert.match(error.message, /cfRay=stale-ray/);
+      assert.doesNotMatch(error.message, /secret-token/);
+      assert.doesNotMatch(error.message, new RegExp(failedAffinityKey));
+      assert.doesNotMatch(error.cause?.message ?? "", /secret-token/);
+      assert.doesNotMatch(
+        error.cause?.message ?? "",
+        new RegExp(failedAffinityKey)
+      );
       assert.equal(error.cause?.name, "TransportError");
       return true;
     }
@@ -1267,18 +1817,23 @@ test("a stalled probe body is aborted and polled without consuming an authentica
 });
 
 test("deploy enqueue diagnostics preserve bounded text evidence without leaking the token", async () => {
+  let reflectedAffinityKey;
   const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
     if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
       if (!new Headers(init.headers).has("Authorization")) return versionedUnauthorized();
-      return new Response("upstream reflected secret-token\nwith control\u0000bytes", {
+      reflectedAffinityKey = new Headers(init.headers).get(workerVersionKeyHeader);
+      return new Response(
+        `upstream reflected secret-token ${reflectedAffinityKey}\nwith control\u0000bytes`,
+        {
         status: 502,
         headers: {
           [SURF_WORKER_VERSION_HEADER]: workerVersion,
           "CF-Ray": "diagnostic-ray"
         }
-      });
+        }
+      );
     }
     return new Response("unexpected request", { status: 500 });
   };
@@ -1294,9 +1849,10 @@ test("deploy enqueue diagnostics preserve bounded text evidence without leaking 
     (error) => {
       assert.match(
         error.message,
-        /status=502 workerVersion=9fdf8329-662b-4665-bc74-9b153dc3fc40 cfRay=diagnostic-ray body=upstream reflected \[REDACTED\] with control bytes/
+        /status=502 workerVersion=9fdf8329-662b-4665-bc74-9b153dc3fc40 cfRay=diagnostic-ray body=upstream reflected \[REDACTED\] \[REDACTED\] with control bytes/
       );
       assert.doesNotMatch(error.message, /secret-token/);
+      assert.doesNotMatch(error.message, new RegExp(reflectedAffinityKey));
       return true;
     }
   );
@@ -1412,10 +1968,14 @@ test("persistent stale catalog routing reaches the shared deadline with zero PAT
   let clock = Date.parse(requestedAt);
   let catalogCount = 0;
   let patchCount = 0;
-  const fetcher = async (input) => {
+  const catalogKeys = [];
+  const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/ingest/once") patchCount += 1;
-    if (url.pathname === "/api/spots") catalogCount += 1;
+    if (url.pathname === "/api/spots") {
+      catalogCount += 1;
+      catalogKeys.push(new Headers(init.headers).get(workerVersionKeyHeader));
+    }
     return Response.json(
       { spots: [spot] },
       {
@@ -1434,6 +1994,7 @@ test("persistent stale catalog routing reaches the shared deadline with zero PAT
       fetcher,
       expectedVersionId: workerVersion,
       expectedWorkerName: workerName,
+      versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
       handoffTimeoutMs: 2_500,
       now: () => clock,
       sleep: async (delayMs) => {
@@ -1442,18 +2003,62 @@ test("persistent stale catalog routing reaches the shared deadline with zero PAT
     }),
     (error) => {
       assert.match(error.message, /remote ingest catalog handoff deadline reached/);
-      assert.match(error.message, /attempt=0\/3 catalogCount=3/);
+      assert.match(
+        error.message,
+        /authenticatedAttempts=0\/3 sessionCount=3 catalogCount=3/
+      );
       assert.match(error.message, /handoffElapsedMs=2000/);
       assert.match(error.message, /handoffRemainingMs=500/);
       assert.match(error.message, /handoffDeadlineMs=2500/);
       assert.match(error.message, /latestCatalog=catalog=3 status=200/);
       assert.match(error.message, /catalog-ray-3/);
-      assert.match(error.message, /mutation did not begin/);
+      assert.match(
+        error.message,
+        /no request-attributable Queue mutation was accepted/
+      );
       return true;
     }
   );
   assert.equal(catalogCount, 3);
+  assert.deepEqual(catalogKeys, [affinityKey(1), affinityKey(2), affinityKey(3)]);
   assert.equal(patchCount, 0);
+});
+
+test("catalog transport diagnostics redact every discarded affinity key", async () => {
+  let clock = Date.parse(requestedAt);
+  const keys = [];
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      versionAffinityKeyFactory: sequentialAffinityKeyFactory(),
+      handoffTimeoutMs: 2_500,
+      now: () => clock,
+      sleep: async (delayMs) => {
+        clock += delayMs;
+      },
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/spots") {
+          const key = new Headers(init.headers).get(workerVersionKeyHeader);
+          keys.push(key);
+          throw new TypeError(`catalog transport reflected ${key}`);
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    (error) => {
+      assert.match(
+        error.message,
+        /requestError=TransportError: forecast transport failed: catalog transport reflected \[REDACTED\]/
+      );
+      for (const key of keys) assert.doesNotMatch(error.message, new RegExp(key));
+      return true;
+    }
+  );
+  assert.equal(keys.length, 3);
 });
 
 test("exact Cloudflare 1102 responses are bounded pending while near-misses fail closed", async () => {
