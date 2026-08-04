@@ -12,7 +12,8 @@ if (mode === "--remote") {
   const result = await enqueueAndWaitForRemoteIngest({
     baseUrl,
     token,
-    expectedVersionId: process.env.SURF_EXPECTED_WORKER_VERSION?.trim() || undefined
+    expectedVersionId: process.env.SURF_EXPECTED_WORKER_VERSION?.trim() || undefined,
+    expectedWorkerName: process.env.SURF_EXPECTED_WORKER_NAME?.trim() || undefined
   });
   console.log(JSON.stringify(result, null, 2));
   process.exit(0);

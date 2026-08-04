@@ -5,11 +5,22 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readWranglerConfig } from "../lib/cloudflare-commands.mjs";
-import { wranglerStructureFailures } from "../lib/validate-wrangler-config.mjs";
+import {
+  wranglerEnvironmentFailures,
+  wranglerStructureFailures
+} from "../lib/validate-wrangler-config.mjs";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const configPath = resolve(root, "apps/web/wrangler.jsonc");
 const canonical = readWranglerConfig(configPath);
+
+function renameInstance(config, name) {
+  config.name = name;
+  config.d1_databases[0].database_name = name;
+  config.queues.producers[0].queue = `${name}-ingest`;
+  config.queues.consumers[0].queue = `${name}-ingest`;
+  config.queues.consumers[0].dead_letter_queue = `${name}-ingest-dlq`;
+}
 
 test("Wrangler instance config follows the subcommand arguments", () => {
   const result = spawnSync(
@@ -34,6 +45,45 @@ test("Wrangler instance config follows the subcommand arguments", () => {
 
 test("canonical Wrangler configuration satisfies the supported instance contract", () => {
   assert.deepEqual(wranglerStructureFailures(canonical, configPath), []);
+});
+
+test("instance Worker names remain addressable by exact version overrides", () => {
+  for (const invalidName of ["Surf-Dev", "1surf", "surf_dev", "surf.dev"]) {
+    const config = structuredClone(canonical);
+    renameInstance(config, invalidName);
+    assert.deepEqual(wranglerStructureFailures(config, configPath), [
+      "Worker name must start with a lowercase letter and contain only lowercase letters, digits, and hyphens so exact version overrides remain addressable."
+    ]);
+  }
+
+  const validOverlay = structuredClone(canonical);
+  renameInstance(validOverlay, "friends-surf2");
+  assert.deepEqual(wranglerStructureFailures(validOverlay, configPath), []);
+});
+
+test("CI cannot silently deploy under a different Worker name", () => {
+  assert.deepEqual(
+    wranglerEnvironmentFailures(canonical, {
+      WRANGLER_CI_OVERRIDE_NAME: "different-surf"
+    }),
+    [
+      "WRANGLER_CI_OVERRIDE_NAME (different-surf) must match the active config Worker name (surf) so exact version overrides target the deployed Worker."
+    ]
+  );
+  assert.deepEqual(
+    wranglerEnvironmentFailures(canonical, {
+      WRANGLER_CI_OVERRIDE_NAME: "surf"
+    }),
+    []
+  );
+  assert.deepEqual(
+    wranglerEnvironmentFailures(canonical, {
+      CLOUDFLARE_ENV: "reviewtest"
+    }),
+    [
+      "CLOUDFLARE_ENV must be unset; the supported deploy path selects instances with SURF_WRANGLER_CONFIG and rejects ambient Wrangler environment suffixes."
+    ]
+  );
 });
 
 test("instance validation rejects namespace, region, and contact drift", () => {

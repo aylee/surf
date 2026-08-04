@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 
+const OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
+
 function exactlyOne(collection, binding, kind, failures) {
   const matches = (collection ?? []).filter((entry) => entry.binding === binding);
   if (matches.length !== 1) failures.push(`Expected exactly one ${kind} binding named ${binding}.`);
@@ -12,7 +14,13 @@ export function wranglerStructureFailures(config, configPath) {
   const configDirectory = dirname(configPath);
   const name = config?.name;
 
-  if (typeof name !== "string" || name.length === 0) failures.push("Worker name is required.");
+  if (typeof name !== "string" || name.length === 0) {
+    failures.push("Worker name is required.");
+  } else if (!OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN.test(name)) {
+    failures.push(
+      "Worker name must start with a lowercase letter and contain only lowercase letters, digits, and hyphens so exact version overrides remain addressable."
+    );
+  }
   if (typeof config?.main !== "string" || !existsSync(resolve(configDirectory, config.main))) {
     failures.push("Worker main entry must resolve to an existing file.");
   }
@@ -118,5 +126,22 @@ export function wranglerStructureFailures(config, configPath) {
     failures.push("Worker response caching must be enabled with version-scoped cache keys.");
   }
 
+  return failures;
+}
+
+export function wranglerEnvironmentFailures(config, environment = process.env) {
+  const failures = [];
+  const configuredName = config?.name;
+  const ciOverrideName = environment.WRANGLER_CI_OVERRIDE_NAME?.trim();
+  if (ciOverrideName && ciOverrideName !== configuredName) {
+    failures.push(
+      `WRANGLER_CI_OVERRIDE_NAME (${ciOverrideName}) must match the active config Worker name (${configuredName}) so exact version overrides target the deployed Worker.`
+    );
+  }
+  if (environment.CLOUDFLARE_ENV?.trim()) {
+    failures.push(
+      "CLOUDFLARE_ENV must be unset; the supported deploy path selects instances with SURF_WRANGLER_CONFIG and rejects ambient Wrangler environment suffixes."
+    );
+  }
   return failures;
 }

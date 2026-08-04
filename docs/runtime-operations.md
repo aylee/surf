@@ -74,12 +74,19 @@ command polls every configured spot's 1-hour and 3-hour read models until they
 were materialized at or after the Worker-issued request timestamp. It does not
 hold the HTTP request open for ingest. The polling deadline is bounded and a
 timeout reports the exact spot/interval pairs that did not publish. During a
-deployment, the command also sends Cloudflare version affinity and requires
-`X-Surf-Worker-Version` to match the exact version emitted by Wrangler before
-and after the one-and-only-one enqueue. Forecast polling is sequential so the
-verification client cannot recreate a burst of expensive requests. Affinity
-stabilizes routing; it does not select a version, so the response-owned version
-header is the proof and a mismatch never counts as ready.
+deployment, the command sends Cloudflare's exact version override, addressed
+with the active config's Worker name, and requires `X-Surf-Worker-Version` to
+match the exact version emitted by Wrangler on every request. The authenticated
+POST also sends `X-Surf-Expected-Worker-Version`; the Worker compares it with
+its own `CF_VERSION_METADATA.id` before `INGEST_QUEUE.send`, so a silently
+ignored override cannot enqueue on the wrong version. Deploys use the protected
+`/api/ingest/deploy` route, which is intentionally absent from predecessors;
+fallback during the first rollout therefore returns 404 before Queue mutation.
+The legacy `/api/ingest/once` route remains the manual/local operator path.
+Forecast polling is sequential so the verification client cannot recreate a
+burst of expensive requests. Exact override reachability and unpinned production
+convergence are separate deploy gates because Cloudflare may ignore an
+unavailable override.
 
 ## Provider failure
 
@@ -235,9 +242,11 @@ untouched.
 For additive changes, back up D1 and export the required
 `SURF_INGEST_TOKEN`, then use the supported `pnpm deploy` path. Deployment
 applies migrations, deploys the Worker, parses Wrangler's exact version ID,
-and requires three consecutive version-matched health responses before it
-queues one authenticated ingest. It then waits for every read model from that
-ingest lineage to publish and runs a version-pinned strict cloud smoke.
+proves that version is reachable with an exact override, and then requires
+three consecutive cache-busted, unpinned version-matched health responses
+before it queues one authenticated ingest. It then waits for every read model
+from that ingest lineage to publish and runs a version-pinned strict cloud
+smoke. A callable 0%-traffic version therefore cannot cross the mutation gate.
 
 Worker activation is the rollback safety boundary, not the deploy command's
 own ingest handoff. Cron, authenticated traffic, or an existing backlog can

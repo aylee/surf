@@ -5,7 +5,7 @@ import {
   NORCAL_SPOTS
 } from "@surf/forecast-core";
 import { ForecastIntervalSchema, SpotIdSchema, SpotsResponseSchema } from "@surf/contracts";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import type { ForecastBriefAgent } from "./agents";
@@ -48,7 +48,9 @@ export type Env = Omit<
 };
 
 const app = new Hono<{ Bindings: Env }>();
+type AppContext = Context<{ Bindings: Env }>;
 const INGEST_RETRY_DELAYS_SECONDS = [15, 30, 60, 300] as const;
+const EXPECTED_WORKER_VERSION_HEADER = "X-Surf-Expected-Worker-Version";
 
 const spotsResponse = SpotsResponseSchema.parse({
   spots: NORCAL_SPOTS.map((spot) => ({
@@ -295,39 +297,82 @@ app.get(
   }
 );
 
-app.post("/api/ingest/once", async (c) => {
-  const hostname = new URL(c.req.url).hostname;
-  const isLocalRequest = hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]";
-  if (!isLocalRequest) {
-    if (!(await bearerTokenMatches(c.req.header("Authorization"), c.env.INGEST_TOKEN))) {
-      return c.json({ error: "Unauthorized" }, 401, {
-        "WWW-Authenticate": "Bearer"
-      });
-    }
-  }
-
+async function queueRemoteIngest(c: AppContext) {
   const requestedAt = new Date().toISOString();
   const ingestId = crypto.randomUUID();
-  if (!isLocalRequest) {
-    await c.env.INGEST_QUEUE.send({
-      job: "source-ingest",
-      kind: "manual-ingest",
+  await c.env.INGEST_QUEUE.send({
+    job: "source-ingest",
+    kind: "manual-ingest",
+    ingestId,
+    requestedAt,
+    forecastGeneratedAt: requestedAt,
+    region: c.env.SURF_REGION
+  });
+  return c.json(
+    {
+      status: "accepted",
       ingestId,
       requestedAt,
       forecastGeneratedAt: requestedAt,
       region: c.env.SURF_REGION
-    });
+    },
+    202
+  );
+}
+
+async function requireIngestAuthorization(c: AppContext) {
+  if (await bearerTokenMatches(c.req.header("Authorization"), c.env.INGEST_TOKEN)) {
+    return null;
+  }
+  return c.json({ error: "Unauthorized" }, 401, {
+    "WWW-Authenticate": "Bearer"
+  });
+}
+
+app.post("/api/ingest/deploy", async (c) => {
+  const authorizationFailure = await requireIngestAuthorization(c);
+  if (authorizationFailure) return authorizationFailure;
+
+  const expectedWorkerVersion = c.req
+    .header(EXPECTED_WORKER_VERSION_HEADER)
+    ?.trim();
+  if (!expectedWorkerVersion) {
+    return c.json({ error: "worker_version_precondition_required" }, 428);
+  }
+  const actualWorkerVersion = c.env.CF_VERSION_METADATA?.id?.trim();
+  if (!actualWorkerVersion) {
     return c.json(
       {
-        status: "accepted",
-        ingestId,
-        requestedAt,
-        forecastGeneratedAt: requestedAt,
-        region: c.env.SURF_REGION
+        error: "worker_version_unavailable",
+        expectedWorkerVersion
       },
-      202
+      503
     );
   }
+  if (actualWorkerVersion !== expectedWorkerVersion) {
+    return c.json(
+      {
+        error: "worker_version_mismatch",
+        expectedWorkerVersion,
+        actualWorkerVersion
+      },
+      409
+    );
+  }
+  return queueRemoteIngest(c);
+});
+
+app.post("/api/ingest/once", async (c) => {
+  const hostname = new URL(c.req.url).hostname;
+  const isLocalRequest = ["127.0.0.1", "localhost", "[::1]"].includes(hostname);
+  if (!isLocalRequest) {
+    const authorizationFailure = await requireIngestAuthorization(c);
+    if (authorizationFailure) return authorizationFailure;
+    return queueRemoteIngest(c);
+  }
+
+  const requestedAt = new Date().toISOString();
+  const ingestId = crypto.randomUUID();
 
   const summary = await runNorcalIngest(c.env, {
     kind: "manual-ingest",

@@ -1,5 +1,6 @@
 import {
   responseWorkerVersion,
+  SURF_EXPECTED_WORKER_VERSION_HEADER,
   workerVersionRequestHeaders
 } from "./worker-version.mjs";
 
@@ -111,13 +112,21 @@ async function cancelBody(response) {
   }
 }
 
-async function configuredSpotIds(baseUrl, fetcher, expectedVersionId, requestTimeoutMs) {
+async function configuredSpotIds(
+  baseUrl,
+  fetcher,
+  expectedVersionId,
+  expectedWorkerName,
+  requestTimeoutMs
+) {
   return requestWithTimeout(
     fetcher,
     `${baseUrl}/api/spots`,
     {
-      headers: workerVersionRequestHeaders(expectedVersionId, {
-        Accept: "application/json"
+      headers: workerVersionRequestHeaders({
+        expectedVersionId,
+        expectedWorkerName,
+        headers: { Accept: "application/json" }
       })
     },
     requestTimeoutMs,
@@ -157,6 +166,7 @@ async function inspectForecastReadModel(
   minimumGeneratedAtMs,
   fetcher,
   expectedVersionId,
+  expectedWorkerName,
   requestTimeoutMs
 ) {
   const path = `/api/forecast/${encodeURIComponent(spotId)}?interval=${interval}`;
@@ -165,8 +175,10 @@ async function inspectForecastReadModel(
       fetcher,
       `${baseUrl}${path}`,
       {
-        headers: workerVersionRequestHeaders(expectedVersionId, {
-          Accept: "application/json"
+        headers: workerVersionRequestHeaders({
+          expectedVersionId,
+          expectedWorkerName,
+          headers: { Accept: "application/json" }
         })
       },
       requestTimeoutMs,
@@ -235,6 +247,7 @@ export async function waitForRemoteForecastReadModels(options) {
     timeoutMs = REMOTE_INGEST_TIMEOUT_MS,
     requestTimeoutMs = REMOTE_INGEST_REQUEST_TIMEOUT_MS,
     expectedVersionId,
+    expectedWorkerName,
     spotIds: configuredSpotIdsOption
   } = options;
   const requestedAtMs = Date.parse(requestedAt);
@@ -254,6 +267,7 @@ export async function waitForRemoteForecastReadModels(options) {
     baseUrl,
     fetcher,
     expectedVersionId,
+    expectedWorkerName,
     requestTimeoutMs
   );
   const targets = spotIds.flatMap((spotId) =>
@@ -280,6 +294,7 @@ export async function waitForRemoteForecastReadModels(options) {
         minimumGeneratedAtMs,
         fetcher,
         expectedVersionId,
+        expectedWorkerName,
         Math.min(requestTimeoutMs, remainingBeforeRequestMs)
       );
       if (state.status !== "ready") continue;
@@ -322,23 +337,33 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     token,
     fetcher = globalThis.fetch,
     expectedVersionId,
+    expectedWorkerName,
     requestTimeoutMs = REMOTE_INGEST_REQUEST_TIMEOUT_MS
   } = options;
   const spotIds = await configuredSpotIds(
     baseUrl,
     fetcher,
     expectedVersionId,
+    expectedWorkerName,
     requestTimeoutMs
   );
+  const enqueueHeaders = workerVersionRequestHeaders({
+    expectedVersionId,
+    expectedWorkerName,
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`
+    }
+  });
+  if (expectedVersionId) {
+    enqueueHeaders.set(SURF_EXPECTED_WORKER_VERSION_HEADER, expectedVersionId);
+  }
   const enqueue = await requestWithTimeout(
     fetcher,
-    `${baseUrl}/api/ingest/once`,
+    `${baseUrl}${expectedVersionId ? "/api/ingest/deploy" : "/api/ingest/once"}`,
     {
       method: "POST",
-      headers: workerVersionRequestHeaders(expectedVersionId, {
-        Accept: "application/json",
-        Authorization: `Bearer ${token}`
-      })
+      headers: enqueueHeaders
     },
     requestTimeoutMs,
     async (response) => ({

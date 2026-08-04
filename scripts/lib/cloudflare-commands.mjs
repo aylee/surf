@@ -4,7 +4,10 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse, printParseErrorCode } from "jsonc-parser";
 import { loadRootEnv, repoRoot } from "./root-env.mjs";
-import { wranglerStructureFailures } from "./validate-wrangler-config.mjs";
+import {
+  wranglerEnvironmentFailures,
+  wranglerStructureFailures
+} from "./validate-wrangler-config.mjs";
 
 loadRootEnv();
 
@@ -106,12 +109,16 @@ export function configuredQueueNames(config = readWranglerConfig()) {
 
 export function assertActiveWranglerConfig() {
   const config = readWranglerConfig(activeWranglerConfigPath);
-  const failures = wranglerStructureFailures(config, activeWranglerConfigPath);
+  const failures = [
+    ...wranglerStructureFailures(config, activeWranglerConfigPath),
+    ...wranglerEnvironmentFailures(config)
+  ];
   if (failures.length > 0) {
     throw new Error(
       `Active Wrangler configuration is unsafe:\n${failures.map((failure) => `- ${failure}`).join("\n")}`
     );
   }
+  return config;
 }
 
 export function ensureQueues() {

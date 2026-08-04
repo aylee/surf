@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { enqueueAndWaitForRemoteIngest } from "../lib/remote-ingest.mjs";
-import { SURF_WORKER_VERSION_HEADER } from "../lib/worker-version.mjs";
+import {
+  CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
+  SURF_EXPECTED_WORKER_VERSION_HEADER,
+  SURF_WORKER_VERSION_HEADER
+} from "../lib/worker-version.mjs";
 
 const baseUrl = "https://surf.example";
 const requestedAt = "2026-08-03T01:00:00.000Z";
 const ingestId = "ingest-test-id";
 const spot = { id: "test-break", timezone: "America/Los_Angeles" };
 const workerVersion = "9fdf8329-662b-4665-bc74-9b153dc3fc40";
+const workerName = "surf";
 const staleWorkerVersion = "ea3a7a1e-3c43-4aca-9517-dbe1ff562746";
 
 function versionedJson(value, init = {}) {
@@ -189,9 +194,13 @@ test("version-pinned remote ingest proves the exact Worker before and after its 
   const requests = [];
   const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
-    requests.push({ path: url.pathname, headers: new Headers(init.headers) });
+    requests.push({
+      path: `${url.pathname}${url.search}`,
+      method: init.method ?? "GET",
+      headers: new Headers(init.headers)
+    });
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
-    if (url.pathname === "/api/ingest/once") {
+    if (url.pathname === "/api/ingest/deploy") {
       postCount += 1;
       return versionedJson(
         { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt, region: "norcal" },
@@ -207,6 +216,7 @@ test("version-pinned remote ingest proves the exact Worker before and after its 
     token: "secret-token",
     fetcher,
     expectedVersionId: workerVersion,
+    expectedWorkerName: workerName,
     pollIntervalMs: 5,
     timeoutMs: 20
   });
@@ -214,12 +224,82 @@ test("version-pinned remote ingest proves the exact Worker before and after its 
   assert.equal(postCount, 1);
   assert.equal(result.workerVersion, workerVersion);
   assert.equal(result.forecastReadModels, 2);
+  assert.deepEqual(
+    requests.map(({ path, method }) => ({ path, method })),
+    [
+      { path: "/api/spots", method: "GET" },
+      { path: "/api/ingest/deploy", method: "POST" },
+      { path: "/api/forecast/test-break?interval=3h", method: "GET" },
+      { path: "/api/forecast/test-break?interval=1h", method: "GET" }
+    ]
+  );
   for (const request of requests) {
     assert.equal(
-      request.headers.get("Cloudflare-Workers-Version-Key"),
-      workerVersion,
-      `${request.path} must stay on the proven rollout affinity`
+      request.headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+      `${workerName}="${workerVersion}"`,
+      `${request.path} must use the exact Worker-version override`
     );
+    assert.equal(
+      request.headers.get(SURF_EXPECTED_WORKER_VERSION_HEADER),
+      request.method === "POST" ? workerVersion : null,
+      `${request.path} must apply the version precondition only at the mutation boundary`
+    );
+  }
+});
+
+test("a predecessor without the deploy route cannot enqueue on override fallback", async () => {
+  let deployPosts = 0;
+  let legacyQueueSends = 0;
+  let forecastRequests = 0;
+  const fetcher = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+    if (url.pathname === "/api/ingest/deploy") {
+      deployPosts += 1;
+      return new Response("not found", { status: 404 });
+    }
+    if (url.pathname === "/api/ingest/once") {
+      legacyQueueSends += 1;
+      return new Response("unexpected legacy mutation", { status: 202 });
+    }
+    if (url.pathname === `/api/forecast/${spot.id}`) forecastRequests += 1;
+    return new Response("not found", { status: 404 });
+  };
+
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      fetcher,
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName
+    }),
+    /remote ingest enqueue failed: 404/
+  );
+  assert.equal(deployPosts, 1);
+  assert.equal(legacyQueueSends, 0);
+  assert.equal(forecastRequests, 0);
+});
+
+test("version-pinned remote ingest requires the Worker name and version as a fail-closed pair", async () => {
+  for (const versionOptions of [
+    { expectedVersionId: workerVersion },
+    { expectedWorkerName: workerName }
+  ]) {
+    let requests = 0;
+    await assert.rejects(
+      enqueueAndWaitForRemoteIngest({
+        baseUrl,
+        token: "secret-token",
+        ...versionOptions,
+        fetcher: async () => {
+          requests += 1;
+          return new Response("unexpected request");
+        }
+      }),
+      /Worker version ID and Worker name must be provided together/
+    );
+    assert.equal(requests, 0);
   }
 });
 
@@ -239,7 +319,8 @@ test("version mismatch on the read-only preflight prevents enqueue", async () =>
       baseUrl,
       token: "secret-token",
       fetcher,
-      expectedVersionId: workerVersion
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName
     }),
     /served by Worker version stale-worker-version/
   );
@@ -384,7 +465,7 @@ test("a stalled accepted-response body is bounded after exactly one POST", async
   const fetcher = (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return Promise.resolve(versionedJson({ spots: [spot] }));
-    if (url.pathname === "/api/ingest/once") {
+    if (url.pathname === "/api/ingest/deploy") {
       postCount += 1;
       postSignal = init.signal;
       return Promise.resolve(
@@ -404,6 +485,7 @@ test("a stalled accepted-response body is bounded after exactly one POST", async
       token: "secret-token",
       fetcher,
       expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
       requestTimeoutMs: 5
     }),
     (error) => error?.name === "TimeoutError"
@@ -540,13 +622,13 @@ test("persistent forecast transport failure reaches the global deadline after on
   assert.equal(postCount, 1);
 });
 
-test("an accepted response from the wrong Worker rejects without forecast polling", async () => {
+test("an accepted deploy response from the wrong Worker rejects without forecast polling", async () => {
   let postCount = 0;
   let forecastCount = 0;
   const fetcher = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
-    if (url.pathname === "/api/ingest/once") {
+    if (url.pathname === "/api/ingest/deploy") {
       postCount += 1;
       return Response.json(
         { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt },
@@ -565,7 +647,8 @@ test("an accepted response from the wrong Worker rejects without forecast pollin
       baseUrl,
       token: "secret-token",
       fetcher,
-      expectedVersionId: workerVersion
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName
     }),
     /remote ingest enqueue failed: 202/
   );
@@ -579,7 +662,7 @@ test("wrong-version ready forecasts never satisfy publication", async () => {
   const fetcher = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
-    if (url.pathname === "/api/ingest/once") {
+    if (url.pathname === "/api/ingest/deploy") {
       postCount += 1;
       return versionedJson(
         { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt },
@@ -602,6 +685,7 @@ test("wrong-version ready forecasts never satisfy publication", async () => {
       token: "secret-token",
       fetcher,
       expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
       now: () => clock,
       sleep: async (delayMs) => {
         clock += delayMs;

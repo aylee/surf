@@ -84,14 +84,17 @@ async function getJson(
   label,
   fetcher,
   expectedVersionId,
+  expectedWorkerName,
   requestTimeoutMs
 ) {
   return requestWithTimeout(
     fetcher,
     `${baseUrl}${path}`,
     {
-      headers: workerVersionRequestHeaders(expectedVersionId, {
-        Accept: "application/json"
+      headers: workerVersionRequestHeaders({
+        expectedVersionId,
+        expectedWorkerName,
+        headers: { Accept: "application/json" }
       })
     },
     requestTimeoutMs,
@@ -130,6 +133,7 @@ async function getForecastReadModel(
   requireForecastData,
   fetcher,
   expectedVersionId,
+  expectedWorkerName,
   requestTimeoutMs
 ) {
   const path = `/api/forecast/${encodeURIComponent(spot.id)}?interval=${interval}`;
@@ -137,8 +141,10 @@ async function getForecastReadModel(
     fetcher,
     `${baseUrl}${path}`,
     {
-      headers: workerVersionRequestHeaders(expectedVersionId, {
-        Accept: "application/json"
+      headers: workerVersionRequestHeaders({
+        expectedVersionId,
+        expectedWorkerName,
+        headers: { Accept: "application/json" }
       })
     },
     requestTimeoutMs,
@@ -199,6 +205,7 @@ export async function smokeForecastInstance(
     label,
     requireForecastData = true,
     expectedVersionId,
+    expectedWorkerName,
     fetcher = globalThis.fetch,
     now = Date.now,
     requestTimeoutMs = SMOKE_REQUEST_TIMEOUT_MS,
@@ -221,6 +228,7 @@ export async function smokeForecastInstance(
     label,
     fetcher,
     expectedVersionId,
+    expectedWorkerName,
     nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs)
   );
   const spotsResponse = await getJson(
@@ -229,6 +237,7 @@ export async function smokeForecastInstance(
     label,
     fetcher,
     expectedVersionId,
+    expectedWorkerName,
     nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs)
   );
   const health = healthResponse.payload;
@@ -264,6 +273,7 @@ export async function smokeForecastInstance(
         requireForecastData,
         fetcher,
         expectedVersionId,
+        expectedWorkerName,
         nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs)
       )
     );
