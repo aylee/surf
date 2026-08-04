@@ -481,8 +481,9 @@ describe("ForecastBriefAgent in workerd", () => {
         where local_date = ${bundle.input.localDate}
       `;
 
-      // Even after the cooldown, the exact failed input stays suppressed.
-      await expect(instance.signal(bundle)).resolves.toMatchObject({ status: "terminal" });
+      // The later same-material observation advanced the durable high-water,
+      // so this exact older failed input remains suppressed as superseded.
+      await expect(instance.signal(bundle)).resolves.toMatchObject({ status: "superseded" });
       expect(queued).toHaveLength(1);
 
       Object.defineProperty(instance, "generateDraft", {

@@ -1343,3 +1343,17 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
   before ready/merge/deploy. Act — checkpoint manifest/plan, commit/push without
   `.playwright-mcp`, obtain GitHub Verify, request `!pnpm verify` + local ingest/smoke and
   OI-4, then ready/merge/deploy and wait for the next actual :17 before T-B.1.
+
+### 2026-08-04 — Draft PR #23 first GitHub Verify corrective
+
+- **Evidence:** run `30894701075` passed isolated migrations/seed, checks, scripts 182/182,
+  web unit 263 (+1 skipped), the new real-D1 publication test, and every new Agent race test.
+  Workerd ended 17/18 because an older terminal-recovery test expected `terminal` after a
+  newer same-material input had already advanced durable high-water.
+- **Verdict/fix:** actual `superseded` is correct: older G0 must lose authority before
+  terminal cooldown logic once G1 is the latest observed generation. Change only that
+  assertion/comment; queue count and later G1 recovery/publish assertions remain. Independent
+  review is DRY; focused Agent unit 5/5, type/config, and diff checks pass.
+- **Gate:** PR #23 remains draft. Push the test-only correction and require second GitHub
+  Verify green. OI-4 and operator-shell `pnpm verify` + local ingest/smoke still gate ready
+  status; no deploy or Phase B work is authorized yet.

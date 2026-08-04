@@ -115,6 +115,15 @@ honestly still open: this execution environment rejects Unix-socket/listener cre
 local dev/e2e), while an escalation retry is unavailable under the current Codex execution
 limit. The branch therefore remains pre-ready until GitHub Verify and the operator-shell local
 gate supply that missing evidence. OI-4 also remains open, so no deploy or PR-B work may begin.
+Draft PR #23 now carries commit `d411245` and the full incident/review/recovery contract.
+Its first GitHub Verify run (`30894701075`) completed fresh D1, repo checks, scripts, and all
+263 web unit tests, then ran the previously blocked workerd suite: the new real-D1 and race
+regressions passed, as did 17/18 total Worker tests. One pre-existing terminal-recovery
+assertion expected `terminal` when replaying generation A after newer same-material B had
+advanced the new high-water; the runtime correctly returned `superseded`. This is an isolated
+stale expectation, not a code regression. The assertion/comment is corrected on the branch,
+focused unit/type checks are green, and an independent control-flow review is DRY. The
+corrective is ready to commit/push for a second Verify run. The PR remains draft.
 The owner's 2026-08-03 browser-quality amendment (OD-9) raises PR-B/C's UI bar: preserve
 v2's visual identity but remove duplicate decision content, keep the freshness signal visible
 on mobile, put forecast data in the first viewport, and prove every changed page in the code
@@ -843,3 +852,17 @@ state, publish only as incomplete to obtain GitHub evidence, request the exact o
 and OI-4 actions, and move to ready/merge/deploy only after both gates are real. Then wait for
 the next actual :17, close OI-6 from Logfire evidence, prove 12-ready ops + dual-origin smoke
 and browser health, and only then begin PR-B.
+
+_2026-08-04_ — **Draft PR #23 first GitHub gate failed on one stale high-water assertion;
+runtime behavior and the corrective are independently DRY.** Commit `d411245` was pushed and
+opened as an intentionally incomplete draft because OI-4 and the operator-shell local gate
+remain open. Verify run `30894701075` passed fresh isolated migrations/seed, portability and
+all package checks, 182 scripts, 263 web unit (+1 skipped), and 17 of 18 workerd tests. The new
+real-D1 publish/supersede test and every direct/coalesced Agent race regression passed. The sole
+failure replayed old bundle G0 after newer same-material G1 had already advanced durable
+high-water, but retained the pre-high-water expectation `terminal`; actual
+`superseded` is the required monotonic outcome. A one-line expectation/comment correction
+preserves the queue-length assertion and the later proof that equal-high-water G1 recovers and
+publishes after cooldown. Independent control-flow review is DRY; focused Agent unit 5/5,
+type/config check, and diff check pass. No runtime code or production state changed. Push the
+test-only corrective and require a wholly green second Verify before reconsidering readiness.
