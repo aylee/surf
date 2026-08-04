@@ -19,12 +19,16 @@ import {
   getMaterializedForecastFactBundle,
   getMaterializedForecastJson
 } from "./forecast-read-model";
+import { getForecastReadiness } from "./forecast-readiness";
 import {
   ingestRequiresRetry,
   runNorcalIngest,
   type ForecastMaterializationQueueMessage
 } from "./ingest";
-import { processIngestQueueMessage } from "./ingest/queue";
+import {
+  processIngestQueueMessage,
+  type ForecastBriefSignalContext
+} from "./ingest/queue";
 import { localDateForTime } from "./time";
 
 export type Env = Omit<
@@ -100,6 +104,28 @@ app.get("/api/spots", (c) =>
   })
 );
 
+app.get("/api/forecast-readiness", async (c) => {
+  try {
+    return c.json(await getForecastReadiness(c.env.DB, c.env.SURF_REGION));
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        message: "forecast readiness lookup failed",
+        ...briefAssemblyDiagnostic(error)
+      })
+    );
+    return c.json(
+      {
+        error: "forecast_readiness_unavailable",
+        message: "Forecast readiness is temporarily unavailable.",
+        retryable: true
+      },
+      503,
+      { "Retry-After": "5" }
+    );
+  }
+});
+
 function forecastBriefEnabled(env: Env): boolean {
   return (
     env.FORECAST_BRIEF_ENABLED?.trim().toLowerCase() === "true" &&
@@ -119,7 +145,8 @@ function briefAssemblyDiagnostic(error: unknown): { errorName: string; errorMess
 async function signalForecastBriefAgent(
   env: Env,
   spotId: ForecastMaterializationQueueMessage["spotId"],
-  generatedAt = new Date()
+  generatedAt = new Date(),
+  context?: ForecastBriefSignalContext
 ): Promise<void> {
   const namespace = env.FORECAST_BRIEF_AGENT;
   if (!namespace || !forecastBriefEnabled(env)) return;
@@ -133,11 +160,21 @@ async function signalForecastBriefAgent(
     }
     await namespace.getByName(spot.id).signal(bundle);
   } catch (error) {
+    const { errorName, errorMessage } = briefAssemblyDiagnostic(error);
+    const fallbackGeneratedAt = Number.isNaN(generatedAt.getTime())
+      ? undefined
+      : generatedAt.toISOString();
     console.error(
       JSON.stringify({
-        message: "forecast brief agent signaling failed",
+        event: "forecast_brief_signal_failed",
+        message: "forecast brief signaling failed after materialization publication",
+        phase: "brief_signal",
+        ...(context ? { ingestId: context.ingestId } : {}),
         spotId,
-        error: error instanceof Error ? error.message : String(error)
+        generatedAt: context?.generatedAt ?? fallbackGeneratedAt,
+        ...(context ? { materializedAt: context.materializedAt } : {}),
+        errorName,
+        error: errorMessage
       })
     );
   }

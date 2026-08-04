@@ -1,0 +1,2 @@
+export const SCHEDULED_INGEST_MINUTE = 17;
+export const SCHEDULED_INGEST_CRON = `${SCHEDULED_INGEST_MINUTE} * * * *`;

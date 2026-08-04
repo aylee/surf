@@ -324,11 +324,55 @@ describe("forecast materialization queue orchestration", () => {
       expect.anything(),
       "2026-08-03T01:00:00.000Z"
     );
-    expect(info).toHaveBeenCalledWith(expect.stringContaining("superseded source generation"));
+    expect(info.mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual({
+      event: "forecast_materialization_superseded",
+      message: "forecast materialization skipped superseded source generation",
+      ingestId: "ingest-123",
+      spotId: NORCAL_SPOTS[0]!.id,
+      generatedAt: "2026-08-03T01:00:00.000Z",
+      sourceCompletedAt: "2026-08-03T01:20:00.000Z"
+    });
     info.mockRestore();
   });
 
+  it("records a lineage-check failure before the queue retries it", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const materializeSpot = vi.fn();
+    const signalBrief = vi.fn();
+    const deps: IngestQueueDependencies = {
+      runIngest: vi.fn() as unknown as IngestQueueDependencies["runIngest"],
+      materializeSpot: materializeSpot as unknown as IngestQueueDependencies["materializeSpot"],
+      sourceGenerationIsCurrent: vi.fn(async () => {
+        throw new Error("D1 lineage query timed out");
+      })
+    };
+    const message = buildForecastMaterializationMessages(summary())[0]!;
+
+    await expect(
+      processIngestQueueMessage(testEnv(), message, signalBrief, deps)
+    ).rejects.toThrow("D1 lineage query timed out");
+
+    expect(materializeSpot).not.toHaveBeenCalled();
+    expect(signalBrief).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(error.mock.calls[0]![0]))).toEqual({
+      event: "forecast_materialization_failed",
+      message: "forecast materialization lineage check failed",
+      phase: "lineage_check",
+      ingestId: message.ingestId,
+      spotId: message.spotId,
+      generatedAt: message.generatedAt,
+      errorName: "Error",
+      error: "D1 lineage query timed out"
+    });
+    info.mockRestore();
+    error.mockRestore();
+  });
+
   it("keeps a failed spot job isolated from brief signaling and eligible for retry", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const signalBrief = vi.fn();
     const materializeSpot = vi.fn(async () => ({
       rowsWritten: 0,
@@ -352,9 +396,117 @@ describe("forecast materialization queue orchestration", () => {
     ).rejects.toThrow("D1 temporarily unavailable");
     expect(materializeSpot).toHaveBeenCalledOnce();
     expect(signalBrief).not.toHaveBeenCalled();
+    expect(info.mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual(
+      expect.objectContaining({
+        event: "forecast_materialization_started",
+        ingestId: "ingest-123",
+        spotId: NORCAL_SPOTS[0]!.id,
+        generatedAt: "2026-08-03T01:02:03.456Z"
+      })
+    );
+    expect(error).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(error.mock.calls[0]![0]))).toEqual({
+      event: "forecast_materialization_failed",
+      message: "forecast materialization rejected before publication",
+      phase: "materialize",
+      ingestId: "ingest-123",
+      spotId: NORCAL_SPOTS[0]!.id,
+      generatedAt: "2026-08-03T01:02:03.456Z",
+      materializedAt: expect.any(String),
+      rowsWritten: 0,
+      forecastRowsWritten: 0,
+      factBundleRowsWritten: 0,
+      failureCount: 1,
+      failures: ["D1 temporarily unavailable"],
+      omittedFailureCount: 0,
+      errorName: "Error",
+      error: `forecast materialization failed for ${NORCAL_SPOTS[0]!.id}: D1 temporarily unavailable`
+    });
+    info.mockRestore();
+    error.mockRestore();
+  });
+
+  it("bounds materialization failure samples and reports omissions", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const failures = ["x".repeat(700), "second", "third", "fourth", "fifth"];
+    const materializeSpot = vi.fn(async () => ({
+      rowsWritten: 0,
+      forecastRowsWritten: 0,
+      factBundleRowsWritten: 0,
+      errors: failures
+    }));
+    const deps: IngestQueueDependencies = {
+      runIngest: vi.fn() as unknown as IngestQueueDependencies["runIngest"],
+      materializeSpot: materializeSpot as IngestQueueDependencies["materializeSpot"],
+      sourceGenerationIsCurrent: vi.fn(async () => true)
+    };
+
+    await expect(
+      processIngestQueueMessage(
+        testEnv(),
+        buildForecastMaterializationMessages(summary())[0],
+        vi.fn(),
+        deps
+      )
+    ).rejects.toThrow("forecast materialization failed");
+
+    const evidence = JSON.parse(String(error.mock.calls[0]![0])) as {
+      failureCount: number;
+      failures: string[];
+      omittedFailureCount: number;
+      error: string;
+    };
+    expect(evidence.failureCount).toBe(5);
+    expect(evidence.failures).toEqual(["x".repeat(500), "second", "third"]);
+    expect(evidence.omittedFailureCount).toBe(2);
+    expect(evidence.error).toContain("2 additional failures omitted");
+    expect(evidence.error).not.toContain("fourth");
+    info.mockRestore();
+    error.mockRestore();
+  });
+
+  it("records a thrown materialization failure before the queue retries it", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const signalBrief = vi.fn();
+    const materializeSpot = vi.fn(async () => {
+      throw new Error("D1 read timed out");
+    });
+    const deps: IngestQueueDependencies = {
+      runIngest: vi.fn() as unknown as IngestQueueDependencies["runIngest"],
+      materializeSpot: materializeSpot as IngestQueueDependencies["materializeSpot"],
+      sourceGenerationIsCurrent: vi.fn(async () => true)
+    };
+
+    await expect(
+      processIngestQueueMessage(
+        testEnv(),
+        buildForecastMaterializationMessages(summary())[0],
+        signalBrief,
+        deps
+      )
+    ).rejects.toThrow("D1 read timed out");
+
+    expect(error).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(error.mock.calls[0]![0]))).toEqual({
+      event: "forecast_materialization_failed",
+      message: "forecast materialization threw before publication",
+      phase: "materialize",
+      ingestId: "ingest-123",
+      spotId: NORCAL_SPOTS[0]!.id,
+      generatedAt: "2026-08-03T01:02:03.456Z",
+      materializedAt: expect.any(String),
+      errorName: "Error",
+      error: "D1 read timed out"
+    });
+    expect(signalBrief).not.toHaveBeenCalled();
+    info.mockRestore();
+    error.mockRestore();
   });
 
   it("signals only the published spot and treats history errors as non-gating", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const signalBrief = vi.fn(async () => undefined);
     const materializeSpot = vi.fn(async () => ({
@@ -386,9 +538,36 @@ describe("forecast materialization queue orchestration", () => {
     expect(signalBrief).toHaveBeenCalledWith(
       expect.anything(),
       message.spotId,
-      new Date(message.generatedAt)
+      new Date(message.generatedAt),
+      {
+        ingestId: message.ingestId,
+        generatedAt: message.generatedAt,
+        materializedAt: expect.any(String)
+      }
     );
+    expect(info.mock.calls.map(([entry]) => JSON.parse(String(entry)))).toEqual([
+      {
+        event: "forecast_materialization_started",
+        message: "forecast materialization started",
+        ingestId: message.ingestId,
+        spotId: message.spotId,
+        generatedAt: message.generatedAt,
+        sourceCompletedAt: message.sourceCompletedAt
+      },
+      {
+        event: "forecast_materialization_published",
+        message: "forecast materialization published",
+        ingestId: message.ingestId,
+        spotId: message.spotId,
+        generatedAt: message.generatedAt,
+        materializedAt: expect.any(String),
+        rowsWritten: 7,
+        forecastRowsWritten: 2,
+        factBundleRowsWritten: 5
+      }
+    ]);
     expect(warning).toHaveBeenCalledWith(expect.stringContaining("history capture"));
+    info.mockRestore();
     warning.mockRestore();
   });
 

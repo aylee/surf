@@ -1142,4 +1142,86 @@ describe("worker api", () => {
     expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("ingest queue message failed"));
     errorLog.mockRestore();
   });
+
+  it("acks a published materialization when the production brief signal fails", async () => {
+    const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { db } = dbMock({ forecastAssemblyRows: true });
+    const generatedAt = "2026-07-08T15:00:00.000Z";
+    const forecast = buildFixtureForecast("obsf-north", new Date(generatedAt));
+    const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-07-08" });
+    const signal = vi.fn(async () => {
+      throw new Error("brief agent unavailable");
+    });
+    const getByName = vi.fn(() => ({ signal }));
+    const ack = vi.fn();
+    const retry = vi.fn();
+    const agentEnv: Env = {
+      ...env(withMaterializedRows(db, [], [bundle])),
+      FORECAST_BRIEF_ENABLED: "true",
+      GEMINI_API_KEY: "test-key-never-sent",
+      FORECAST_BRIEF_AGENT: {
+        getByName
+      } as unknown as NonNullable<Env["FORECAST_BRIEF_AGENT"]>
+    };
+
+    try {
+      await worker.queue(
+        {
+          queue: "surf-ingest",
+          messages: [
+            {
+              id: "materialize-obsf-north",
+              timestamp: new Date("2026-07-08T15:05:00.000Z"),
+              attempts: 1,
+              body: {
+                job: "forecast-materialization",
+                ingestId: "ingest-test-id",
+                spotId: "obsf-north",
+                requestedAt: generatedAt,
+                region: "norcal",
+                generatedAt,
+                sourceCompletedAt: "2026-07-08T15:05:00.000Z",
+                captureHistory: false
+              },
+              ack,
+              retry
+            }
+          ]
+        } as unknown as MessageBatch,
+        agentEnv
+      );
+
+      expect(getByName).toHaveBeenCalledWith("obsf-north");
+      expect(signal).toHaveBeenCalledOnce();
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(infoLog.mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual(
+        expect.objectContaining({
+          event: "forecast_materialization_published",
+          ingestId: "ingest-test-id",
+          spotId: "obsf-north",
+          generatedAt
+        })
+      );
+      expect(errorLog).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+        event: "forecast_brief_signal_failed",
+        message: "forecast brief signaling failed after materialization publication",
+        phase: "brief_signal",
+        ingestId: "ingest-test-id",
+        spotId: "obsf-north",
+        generatedAt,
+        materializedAt: expect.any(String),
+        errorName: "Error",
+        error: "brief agent unavailable"
+      });
+      expect(errorLog).not.toHaveBeenCalledWith(
+        expect.stringContaining("ingest queue message failed")
+      );
+    } finally {
+      infoLog.mockRestore();
+      errorLog.mockRestore();
+    }
+  });
 });

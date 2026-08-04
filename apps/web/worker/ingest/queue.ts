@@ -8,10 +8,17 @@ import {
   type IngestSummary
 } from "./types";
 
+export type ForecastBriefSignalContext = {
+  ingestId: string;
+  generatedAt: string;
+  materializedAt: string;
+};
+
 export type ForecastBriefSignal = (
   env: Env,
   spotId: ForecastMaterializationQueueMessage["spotId"],
-  generatedAt: Date
+  generatedAt: Date,
+  context: ForecastBriefSignalContext
 ) => Promise<void>;
 
 export type IngestQueueDependencies = {
@@ -25,6 +32,9 @@ const defaultDependencies: IngestQueueDependencies = {
   materializeSpot: materializeForecastReadModelForSpot,
   sourceGenerationIsCurrent
 };
+
+const FAILURE_EVIDENCE_LIMIT = 3;
+const FAILURE_EVIDENCE_MAX_CHARS = 500;
 
 export async function sourceGenerationIsCurrent(
   db: D1Database,
@@ -61,6 +71,32 @@ export function buildForecastMaterializationMessages(
   }));
 }
 
+function queueErrorEvidence(error: unknown): { errorName: string; error: string } {
+  if (error instanceof Error) {
+    return {
+      errorName: error.name,
+      error: error.message.slice(0, 1000)
+    };
+  }
+  return {
+    errorName: typeof error,
+    error: String(error).slice(0, 1000)
+  };
+}
+
+function boundedFailureEvidence(failures: string[]): {
+  failures: string[];
+  omittedFailureCount: number;
+} {
+  const samples = failures
+    .slice(0, FAILURE_EVIDENCE_LIMIT)
+    .map((failure) => failure.slice(0, FAILURE_EVIDENCE_MAX_CHARS));
+  return {
+    failures: samples,
+    omittedFailureCount: Math.max(0, failures.length - samples.length)
+  };
+}
+
 export async function processIngestQueueMessage(
   env: Env,
   rawBody: unknown,
@@ -69,9 +105,37 @@ export async function processIngestQueueMessage(
 ): Promise<void> {
   const body = normalizeIngestMessage(rawBody, env.SURF_REGION);
   if (body.job === "forecast-materialization") {
-    if (!(await dependencies.sourceGenerationIsCurrent(env.DB, body.generatedAt))) {
+    console.info(
+      JSON.stringify({
+        event: "forecast_materialization_started",
+        message: "forecast materialization started",
+        ingestId: body.ingestId,
+        spotId: body.spotId,
+        generatedAt: body.generatedAt,
+        sourceCompletedAt: body.sourceCompletedAt
+      })
+    );
+    let sourceIsCurrent: boolean;
+    try {
+      sourceIsCurrent = await dependencies.sourceGenerationIsCurrent(env.DB, body.generatedAt);
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: "forecast_materialization_failed",
+          message: "forecast materialization lineage check failed",
+          phase: "lineage_check",
+          ingestId: body.ingestId,
+          spotId: body.spotId,
+          generatedAt: body.generatedAt,
+          ...queueErrorEvidence(error)
+        })
+      );
+      throw error;
+    }
+    if (!sourceIsCurrent) {
       console.info(
         JSON.stringify({
+          event: "forecast_materialization_superseded",
           message: "forecast materialization skipped superseded source generation",
           ingestId: body.ingestId,
           spotId: body.spotId,
@@ -81,25 +145,87 @@ export async function processIngestQueueMessage(
       );
       return;
     }
-    const result = await dependencies.materializeSpot(
-      env,
-      body.spotId,
-      new Date(body.generatedAt),
-      {
-        materializedAt: new Date().toISOString(),
-        captureHistory: body.captureHistory,
-        ingestId: body.ingestId
-      }
-    );
+    const materializedAt = new Date().toISOString();
+    let result: Awaited<ReturnType<typeof materializeForecastReadModelForSpot>>;
+    try {
+      result = await dependencies.materializeSpot(
+        env,
+        body.spotId,
+        new Date(body.generatedAt),
+        {
+          materializedAt,
+          captureHistory: body.captureHistory,
+          ingestId: body.ingestId
+        }
+      );
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          event: "forecast_materialization_failed",
+          message: "forecast materialization threw before publication",
+          phase: "materialize",
+          ingestId: body.ingestId,
+          spotId: body.spotId,
+          generatedAt: body.generatedAt,
+          materializedAt,
+          ...queueErrorEvidence(error)
+        })
+      );
+      throw error;
+    }
     if (
       result.errors.length > 0 ||
       result.forecastRowsWritten !== 2 ||
       result.factBundleRowsWritten === 0
     ) {
-      throw new Error(
-        `forecast materialization failed for ${body.spotId}: ${result.errors.join("; ") || "incomplete publication"}`
+      const failureEvidence = boundedFailureEvidence(result.errors);
+      const failureSummary = [
+        ...failureEvidence.failures,
+        ...(failureEvidence.omittedFailureCount > 0
+          ? [`${failureEvidence.omittedFailureCount} additional failures omitted`]
+          : [])
+      ].join("; ");
+      const error = new Error(
+        `forecast materialization failed for ${body.spotId}: ${failureSummary || "incomplete publication"}`
       );
+      console.error(
+        JSON.stringify({
+          event: "forecast_materialization_failed",
+          message: "forecast materialization rejected before publication",
+          phase: "materialize",
+          ingestId: body.ingestId,
+          spotId: body.spotId,
+          generatedAt: body.generatedAt,
+          materializedAt,
+          rowsWritten: result.rowsWritten,
+          forecastRowsWritten: result.forecastRowsWritten,
+          factBundleRowsWritten: result.factBundleRowsWritten,
+          ...(result.snapshotRowsWritten === undefined
+            ? {}
+            : { snapshotRowsWritten: result.snapshotRowsWritten }),
+          failureCount: result.errors.length,
+          ...failureEvidence,
+          ...queueErrorEvidence(error)
+        })
+      );
+      throw error;
     }
+    console.info(
+      JSON.stringify({
+        event: "forecast_materialization_published",
+        message: "forecast materialization published",
+        ingestId: body.ingestId,
+        spotId: body.spotId,
+        generatedAt: body.generatedAt,
+        materializedAt,
+        rowsWritten: result.rowsWritten,
+        forecastRowsWritten: result.forecastRowsWritten,
+        factBundleRowsWritten: result.factBundleRowsWritten,
+        ...(result.snapshotRowsWritten === undefined
+          ? {}
+          : { snapshotRowsWritten: result.snapshotRowsWritten })
+      })
+    );
     if ((result.historyErrors?.length ?? 0) > 0) {
       console.warn(
         JSON.stringify({
@@ -109,7 +235,11 @@ export async function processIngestQueueMessage(
         })
       );
     }
-    await signalBrief(env, body.spotId, new Date(body.generatedAt));
+    await signalBrief(env, body.spotId, new Date(body.generatedAt), {
+      ingestId: body.ingestId,
+      generatedAt: body.generatedAt,
+      materializedAt
+    });
     return;
   }
 

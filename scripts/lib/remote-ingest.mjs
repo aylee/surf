@@ -5,12 +5,16 @@ import {
   SURF_EXPECTED_WORKER_VERSION_HEADER,
   workerVersionRequestHeaders
 } from "./worker-version.mjs";
+import { SCHEDULED_INGEST_MINUTE } from "./ingest-schedule.mjs";
 
 export const REMOTE_INGEST_POLL_INTERVAL_MS = 5_000;
 export const REMOTE_INGEST_TIMEOUT_MS = 10 * 60_000;
 export const REMOTE_INGEST_REQUEST_TIMEOUT_MS = 30_000;
 export const REMOTE_INGEST_HANDOFF_TIMEOUT_MS = 60_000;
 
+const HOUR_MS = 60 * 60_000;
+const SCHEDULED_INGEST_SETTLE_MS = 10 * 60_000;
+const SCHEDULED_INGEST_SAFETY_MS = 60_000;
 const FORECAST_INTERVALS = ["3h", "1h"];
 const REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS = 3;
 const REMOTE_INGEST_HANDOFF_MAX_SESSIONS = 60;
@@ -21,6 +25,108 @@ const CLOUDFLARE_WORKERS_VERSION_KEY_HEADER =
   "Cloudflare-Workers-Version-Key";
 const CLOUDFLARE_1102_TYPE =
   "https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1102/";
+const FORECAST_GENERATION_PATTERN =
+  /^sha256:[a-f0-9]{64}(?::ingest:([A-Za-z0-9][A-Za-z0-9._-]{0,127}))?$/;
+
+function cronSafeDeployDeferralMs(nowMs, verificationTimeoutMs, handoffTimeoutMs) {
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("remote ingest cron-safety clock must be finite");
+  }
+  const protectedWindowMs =
+    verificationTimeoutMs + handoffTimeoutMs + SCHEDULED_INGEST_SAFETY_MS;
+  const safeWindowMs = HOUR_MS - SCHEDULED_INGEST_SETTLE_MS;
+  if (!(protectedWindowMs > 0) || protectedWindowMs >= safeWindowMs) {
+    throw new Error(
+      `remote ingest verification window must be shorter than ${safeWindowMs}ms after including handoff and safety budgets`
+    );
+  }
+
+  const hourStartMs = Math.floor(nowMs / HOUR_MS) * HOUR_MS;
+  const cronThisHourMs = hourStartMs + SCHEDULED_INGEST_MINUTE * 60_000;
+  const previousCronMs = nowMs < cronThisHourMs
+    ? cronThisHourMs - HOUR_MS
+    : cronThisHourMs;
+  const nextCronMs = previousCronMs + HOUR_MS;
+  const previousSettleBoundaryMs = previousCronMs + SCHEDULED_INGEST_SETTLE_MS;
+
+  if (nowMs < previousSettleBoundaryMs) {
+    return previousSettleBoundaryMs - nowMs;
+  }
+  if (nowMs + protectedWindowMs >= nextCronMs) {
+    return nextCronMs + SCHEDULED_INGEST_SETTLE_MS - nowMs;
+  }
+  return 0;
+}
+
+async function waitForCronSafeDeployWindow(options) {
+  const {
+    now,
+    sleep,
+    logger,
+    verificationTimeoutMs,
+    handoffTimeoutMs
+  } = options;
+  const observedAtMs = now();
+  const delayMs = cronSafeDeployDeferralMs(
+    observedAtMs,
+    verificationTimeoutMs,
+    handoffTimeoutMs
+  );
+  if (delayMs === 0) return observedAtMs;
+  if (!(delayMs > 0) || delayMs >= HOUR_MS) {
+    throw new Error("remote ingest cron-safety deferral exceeded its hourly bound");
+  }
+  const resumeAtMs = observedAtMs + delayMs;
+  logger.info?.(
+    JSON.stringify({
+      event: "remote_ingest_cron_deferral",
+      observedAt: new Date(observedAtMs).toISOString(),
+      resumeAt: new Date(resumeAtMs).toISOString(),
+      delayMs,
+      scheduledIngestMinute: SCHEDULED_INGEST_MINUTE,
+      settleMs: SCHEDULED_INGEST_SETTLE_MS,
+      verificationTimeoutMs,
+      handoffTimeoutMs
+    })
+  );
+  await sleep(delayMs);
+  const resumedAtMs = now();
+  if (!Number.isFinite(resumedAtMs) || resumedAtMs < resumeAtMs) {
+    throw new Error(
+      "remote ingest cron-safety wait ended before the required settle boundary; mutation did not begin"
+    );
+  }
+  if (
+    cronSafeDeployDeferralMs(
+      resumedAtMs,
+      verificationTimeoutMs,
+      handoffTimeoutMs
+    ) !== 0
+  ) {
+    throw new Error(
+      "remote ingest cron-safety wait did not reach a safe verification window; mutation did not begin"
+    );
+  }
+  return resumedAtMs;
+}
+
+function assertCronSafeAuthenticatedMutationWindow(now, verificationTimeoutMs) {
+  const observedAtMs = now();
+  if (!Number.isFinite(observedAtMs)) {
+    throw new Error(
+      "remote ingest cron-safety clock became invalid before authenticated PATCH; mutation did not begin"
+    );
+  }
+  const delayMs = cronSafeDeployDeferralMs(
+    observedAtMs,
+    verificationTimeoutMs,
+    0
+  );
+  if (delayMs === 0) return;
+  throw new Error(
+    `remote ingest cron-safety window closed before authenticated PATCH at ${new Date(observedAtMs).toISOString()}; required deferral=${delayMs}ms; mutation did not begin`
+  );
+}
 
 function validTimestamp(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
@@ -111,14 +217,12 @@ function isExactLegacyPatchlessRejection(response, legacyPatchlessVersionId) {
   );
 }
 
-function isTypedPendingForecast(value, spotId, interval) {
+function isTypedPendingForecastReadiness(value) {
   return Boolean(
-    value &&
-      typeof value === "object" &&
-      value.error === "forecast_temporarily_unavailable" &&
-      value.retryable === true &&
-      value.spotId === spotId &&
-      value.interval === interval
+    exactObjectKeys(value, ["error", "message", "retryable"]) &&
+      value.error === "forecast_readiness_unavailable" &&
+      value.message === "Forecast readiness is temporarily unavailable." &&
+      value.retryable === true
   );
 }
 
@@ -693,10 +797,152 @@ async function configuredSpotIdsForHandoff({
   }
 }
 
-async function inspectForecastReadModel(
+function canonicalTimestampMs(value) {
+  if (typeof value !== "string") return Number.NaN;
+  const timestampMs = Date.parse(value);
+  return Number.isFinite(timestampMs) && new Date(timestampMs).toISOString() === value
+    ? timestampMs
+    : Number.NaN;
+}
+
+function invalidForecastReadinessPayload(reason) {
+  throw new Error(
+    `/api/forecast-readiness returned an invalid successful payload: ${reason}`
+  );
+}
+
+function classifyForecastReadinessSnapshot(
+  payload,
+  targets,
+  expectedIngestId,
+  requestedAtMs,
+  minimumGeneratedAtMs
+) {
+  if (!exactObjectKeys(payload, ["forecastReadModels"])) {
+    invalidForecastReadinessPayload("expected only forecastReadModels");
+  }
+  if (!Array.isArray(payload.forecastReadModels)) {
+    invalidForecastReadinessPayload("forecastReadModels must be an array");
+  }
+
+  const expectedTargets = new Map(
+    targets.map((target) => [`${target.spotId}:${target.interval}`, target])
+  );
+  const observedTargets = new Map();
+  for (const row of payload.forecastReadModels) {
+    if (
+      !exactObjectKeys(row, [
+        "spotId",
+        "interval",
+        "generationId",
+        "ingestId",
+        "generatedAt",
+        "materializedAt"
+      ])
+    ) {
+      invalidForecastReadinessPayload("each row must contain only the readiness metadata fields");
+    }
+    if (
+      typeof row.spotId !== "string" ||
+      !FORECAST_INTERVALS.includes(row.interval)
+    ) {
+      invalidForecastReadinessPayload("row target identity is invalid");
+    }
+    const key = `${row.spotId}:${row.interval}`;
+    if (!expectedTargets.has(key)) {
+      invalidForecastReadinessPayload(`unexpected target ${key}`);
+    }
+    if (observedTargets.has(key)) {
+      invalidForecastReadinessPayload(`duplicate target ${key}`);
+    }
+
+    if (row.generationId === null) {
+      if (
+        row.ingestId !== null ||
+        row.generatedAt !== null ||
+        row.materializedAt !== null
+      ) {
+        invalidForecastReadinessPayload(`missing target ${key} has partial metadata`);
+      }
+      observedTargets.set(key, {
+        ...expectedTargets.get(key),
+        ingestId: null,
+        generatedAt: null,
+        generatedAtMs: Number.NaN,
+        materializedAt: null
+      });
+      continue;
+    }
+
+    if (typeof row.generationId !== "string") {
+      invalidForecastReadinessPayload(`target ${key} generationId is invalid`);
+    }
+    const generationMatch = FORECAST_GENERATION_PATTERN.exec(row.generationId);
+    const generationIngestId = generationMatch?.[1] ?? null;
+    if (!generationMatch || row.ingestId !== generationIngestId) {
+      invalidForecastReadinessPayload(`target ${key} generation identity is inconsistent`);
+    }
+    const generatedAtMs = canonicalTimestampMs(row.generatedAt);
+    const materializedAtMs = canonicalTimestampMs(row.materializedAt);
+    if (
+      !Number.isFinite(generatedAtMs) ||
+      !Number.isFinite(materializedAtMs) ||
+      materializedAtMs < generatedAtMs
+    ) {
+      invalidForecastReadinessPayload(`target ${key} timestamps are invalid`);
+    }
+
+    observedTargets.set(key, {
+      ...expectedTargets.get(key),
+      ingestId: generationIngestId,
+      generatedAt: row.generatedAt,
+      generatedAtMs,
+      materializedAtMs,
+      materializedAt: row.materializedAt
+    });
+  }
+
+  if (observedTargets.size !== expectedTargets.size) {
+    const missing = [...expectedTargets.keys()].filter(
+      (key) => !observedTargets.has(key)
+    );
+    invalidForecastReadinessPayload(`missing targets: ${missing.join(", ")}`);
+  }
+
+  const superseded = [...observedTargets.values()].find(
+    (target) =>
+      target.ingestId &&
+      target.ingestId !== expectedIngestId &&
+      target.generatedAtMs > minimumGeneratedAtMs
+  );
+  if (superseded) {
+    return {
+      status: "superseded",
+      spotId: superseded.spotId,
+      interval: superseded.interval,
+      ingestId: superseded.ingestId,
+      generatedAt: superseded.generatedAt,
+      materializedAt: superseded.materializedAt
+    };
+  }
+
+  const pending = [...observedTargets.values()].filter(
+    (target) =>
+      target.ingestId !== expectedIngestId ||
+      target.generatedAtMs < minimumGeneratedAtMs ||
+      target.materializedAtMs < requestedAtMs
+  );
+  if (pending.length > 0) return { status: "pending", pending };
+  const latestMaterializedAt = [...observedTargets.values()]
+    .map((target) => target.materializedAt)
+    .filter(Boolean)
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0] ?? null;
+  return { status: "ready", materializedAt: latestMaterializedAt };
+}
+
+async function inspectForecastReadinessSnapshot(
   baseUrl,
-  spotId,
-  interval,
+  targets,
   expectedIngestId,
   requestedAtMs,
   minimumGeneratedAtMs,
@@ -705,7 +951,7 @@ async function inspectForecastReadModel(
   expectedWorkerName,
   requestTimeoutMs
 ) {
-  const path = `/api/forecast/${encodeURIComponent(spotId)}?interval=${interval}`;
+  const path = "/api/forecast-readiness";
   try {
     return await requestWithTimeout(
       fetcher,
@@ -716,7 +962,8 @@ async function inspectForecastReadModel(
           expectedWorkerName,
           override: false,
           headers: { Accept: "application/json" }
-        })
+        }),
+        cache: "no-store"
       },
       requestTimeoutMs,
       async (response) => {
@@ -725,47 +972,39 @@ async function inspectForecastReadModel(
           responseWorkerVersion(response) !== expectedVersionId
         ) {
           await cancelBody(response);
-          return { spotId, interval, status: "pending", materializedAt: null };
+          return { status: "pending", pending: targets };
         }
 
         if (response.status === 503) {
           const payload = await jsonOrNull(response);
           if (
-            isTypedPendingForecast(payload, spotId, interval) ||
+            (isJsonContentType(response.headers.get("Content-Type")) &&
+              isTypedPendingForecastReadiness(payload)) ||
             isCloudflare1102Problem(payload)
           ) {
-            return { spotId, interval, status: "pending", materializedAt: null };
+            return { status: "pending", pending: targets };
           }
-          throw new Error(`${path} returned an invalid retryable-unavailable response`);
+          throw new Error(`${path} returned an invalid 503 response`);
         }
         if (!response.ok) {
           throw new Error(`${path} failed: ${response.status} ${await response.text()}`);
         }
-
-        const materializedAt = response.headers.get("X-Surf-Forecast-Materialized-At");
-        const generatedAt = response.headers.get("X-Surf-Forecast-Generated-At");
-        const responseIngestId = response.headers.get("X-Surf-Ingest-Id");
-        await cancelBody(response);
-        const materializedAtMs = materializedAt ? Date.parse(materializedAt) : Number.NaN;
-        const generatedAtMs = generatedAt ? Date.parse(generatedAt) : Number.NaN;
-        return {
-          spotId,
-          interval,
-          status:
-            Number.isFinite(materializedAtMs) &&
-            materializedAtMs >= requestedAtMs &&
-            Number.isFinite(generatedAtMs) &&
-            generatedAtMs >= minimumGeneratedAtMs &&
-            responseIngestId === expectedIngestId
-              ? "ready"
-              : "pending",
-          materializedAt: Number.isFinite(materializedAtMs) ? materializedAt : null
-        };
+        if (!isJsonContentType(response.headers.get("Content-Type"))) {
+          cancelBodyWithoutWaiting(response);
+          invalidForecastReadinessPayload("content type must be application/json");
+        }
+        return classifyForecastReadinessSnapshot(
+          await jsonOrNull(response),
+          targets,
+          expectedIngestId,
+          requestedAtMs,
+          minimumGeneratedAtMs
+        );
       }
     );
   } catch (error) {
     if (error?.name === "TimeoutError" || error?.name === "TransportError") {
-      return { spotId, interval, status: "pending", materializedAt: null };
+      return { status: "pending", pending: targets };
     }
     throw error;
   }
@@ -812,20 +1051,15 @@ export async function waitForRemoteForecastReadModels(options) {
   );
   const deadlineMs = now() + timeoutMs;
   let attempts = 0;
-  const pending = new Map(
-    targets.map((target) => [`${target.spotId}:${target.interval}`, target])
-  );
-  let latestMaterializedAt = null;
+  let pending = targets;
 
   while (true) {
     attempts += 1;
-    for (const { spotId, interval } of [...pending.values()]) {
-      const remainingBeforeRequestMs = deadlineMs - now();
-      if (remainingBeforeRequestMs <= 0) break;
-      const state = await inspectForecastReadModel(
+    const remainingBeforeRequestMs = deadlineMs - now();
+    if (remainingBeforeRequestMs > 0) {
+      const state = await inspectForecastReadinessSnapshot(
         baseUrl,
-        spotId,
-        interval,
+        targets,
         ingestId,
         requestedAtMs,
         minimumGeneratedAtMs,
@@ -834,30 +1068,27 @@ export async function waitForRemoteForecastReadModels(options) {
         expectedWorkerName,
         Math.min(requestTimeoutMs, remainingBeforeRequestMs)
       );
-      if (state.status !== "ready") continue;
-      pending.delete(`${state.spotId}:${state.interval}`);
-      if (
-        state.materializedAt &&
-        (!latestMaterializedAt ||
-          Date.parse(state.materializedAt) > Date.parse(latestMaterializedAt))
-      ) {
-        latestMaterializedAt = state.materializedAt;
+      if (state.status === "superseded") {
+        throw new Error(
+          `queued ingest ${ingestId} was superseded before complete publication; target=${state.spotId}:${state.interval} expectedGeneratedAt=${forecastGeneratedAt} observedIngestId=${state.ingestId} observedGeneratedAt=${state.generatedAt} observedMaterializedAt=${state.materializedAt}; exact-lineage verification cannot converge and the ingest must not be accepted as mixed-lineage success`
+        );
       }
-    }
-    if (pending.size === 0) {
-      return {
-        status: "published",
-        requestedAt,
-        attempts,
-        spots: spotIds.length,
-        forecastReadModels: targets.length,
-        materializedAt: latestMaterializedAt
-      };
+      if (state.status === "ready") {
+        return {
+          status: "published",
+          requestedAt,
+          attempts,
+          spots: spotIds.length,
+          forecastReadModels: targets.length,
+          materializedAt: state.materializedAt
+        };
+      }
+      pending = state.pending;
     }
 
     const remainingMs = deadlineMs - now();
     if (remainingMs <= 0) {
-      const pendingLabels = [...pending.values()]
+      const pendingLabels = pending
         .map((state) => `${state.spotId}:${state.interval}`)
         .join(", ");
       throw new Error(
@@ -881,6 +1112,7 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     logger = console,
     requestTimeoutMs = REMOTE_INGEST_REQUEST_TIMEOUT_MS,
     handoffTimeoutMs = REMOTE_INGEST_HANDOFF_TIMEOUT_MS,
+    timeoutMs = REMOTE_INGEST_TIMEOUT_MS,
     versionAffinityKeyFactory = randomUUID
   } = options;
 
@@ -910,6 +1142,37 @@ export async function enqueueAndWaitForRemoteIngest(options) {
   if (expectedVersionId && typeof versionAffinityKeyFactory !== "function") {
     throw new Error("version affinity key factory must be a function");
   }
+  if (!(timeoutMs > 0)) {
+    throw new Error(
+      "remote ingest publication timeout must be positive; mutation did not begin"
+    );
+  }
+  if (expectedVersionId !== undefined || expectedWorkerName !== undefined) {
+    // Validate the fail-closed name/version pair before a cron hold can make a
+    // malformed deploy invocation wait needlessly.
+    workerVersionRequestHeaders({
+      expectedVersionId,
+      expectedWorkerName,
+      override: false
+    });
+  }
+
+  // The Queue is intentionally unordered. A newer :17 source generation can
+  // therefore overtake one of this deploy's per-spot children, after which the
+  // immutable exact-lineage gate can never converge. Hold before even the
+  // first read-only affinity session so the wait cannot age a winning key or
+  // consume the shared 60-second handoff clock. No network request, token, or
+  // mutation crosses this boundary until the conservative settle time.
+  let cronSafeHandoffStartedAtMs;
+  if (expectedVersionId) {
+    cronSafeHandoffStartedAtMs = await waitForCronSafeDeployWindow({
+      now,
+      sleep,
+      logger,
+      verificationTimeoutMs: timeoutMs,
+      handoffTimeoutMs
+    });
+  }
 
   let versionAffinityKey;
   let handoffStartedAtMs;
@@ -917,7 +1180,7 @@ export async function enqueueAndWaitForRemoteIngest(options) {
   let spotIds;
   const affinitySessions = { count: 0, usedKeys: new Set() };
   if (expectedVersionId) {
-    handoffStartedAtMs = now();
+    handoffStartedAtMs = cronSafeHandoffStartedAtMs;
     handoffDeadlineMs = handoffStartedAtMs + handoffTimeoutMs;
   } else {
     spotIds = await configuredSpotIds(
@@ -1149,6 +1412,11 @@ export async function enqueueAndWaitForRemoteIngest(options) {
         requestTimeoutMs,
         handoff.remainingMs
       );
+      // Do not sleep while holding a proven affinity session. A clock jump or
+      // process suspension after the initial guard must fail before the one
+      // authenticated Queue mutation, leaving a fresh deploy attempt to wait
+      // outside the cron window from the beginning.
+      assertCronSafeAuthenticatedMutationWindow(now, timeoutMs);
       authenticatedAttempts += 1;
       try {
         enqueue = await requestWithTimeout(
@@ -1266,7 +1534,8 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     forecastGeneratedAt: payload.forecastGeneratedAt,
     ingestId: payload.ingestId,
     fetcher,
-    spotIds
+    spotIds,
+    timeoutMs
   });
   return {
     ...result,
