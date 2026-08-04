@@ -34,12 +34,14 @@ export type Env = Omit<
   | "SURF_USER_AGENT"
   | "FORECAST_BRIEF_AGENT"
   | "FORECAST_BRIEF_ENABLED"
+  | "CF_VERSION_METADATA"
   | "GEMINI_API_KEY"
 > & {
   ENVIRONMENT: string;
   SURF_REGION: "norcal";
   SURF_USER_AGENT: string;
   INGEST_TOKEN?: string;
+  CF_VERSION_METADATA?: WorkerVersionMetadata;
   FORECAST_BRIEF_AGENT?: DurableObjectNamespace<ForecastBriefAgent>;
   FORECAST_BRIEF_ENABLED?: string;
   GEMINI_API_KEY?: string;
@@ -60,6 +62,11 @@ const spotsResponse = SpotsResponseSchema.parse({
     "NorCal spot registry with verified NWS MTR coastal-wave grids and transparent cold-start breaking-height scales."
 });
 
+app.use("/api/*", async (c, next) => {
+  await next();
+  const versionId = c.env.CF_VERSION_METADATA?.id;
+  if (versionId) c.res.headers.set("X-Surf-Worker-Version", versionId);
+});
 app.use("/api/*", cors());
 app.use("/api/*", async (c, next) => {
   await next();

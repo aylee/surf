@@ -85,6 +85,21 @@ test("instance validation preserves version-scoped Worker response caching", () 
   ]);
 });
 
+test("instance validation requires the exact Worker version metadata binding", () => {
+  const missing = structuredClone(canonical);
+  delete missing.version_metadata;
+  const renamed = structuredClone(canonical);
+  renamed.version_metadata.binding = "WORKER_VERSION";
+  const extended = structuredClone(canonical);
+  extended.version_metadata.extra = true;
+
+  for (const config of [missing, renamed, extended]) {
+    assert.deepEqual(wranglerStructureFailures(config, configPath), [
+      "Worker version metadata must bind exactly as CF_VERSION_METADATA."
+    ]);
+  }
+});
+
 test("an ignored instance config may enable the brief after the lifecycle deploy", () => {
   const config = structuredClone(canonical);
   config.vars.FORECAST_BRIEF_ENABLED = "true";
