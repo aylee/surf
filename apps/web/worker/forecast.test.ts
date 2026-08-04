@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ForecastResponseSchema } from "@surf/contracts";
 import { estimateBreakingWaveHeight } from "@surf/forecast-core";
 import { buildForecastResponse, buildSynchronizedForecastResponses } from "./forecast";
@@ -229,6 +229,66 @@ describe("forecast assembly", () => {
     expect(batched.individualAllCalls()).toBe(0);
     expect(synchronized.threeHour).toEqual(expectedThreeHour);
     expect(synchronized.hourly).toEqual(expectedHourly);
+  });
+
+  it("emits one bounded nonterminal diagnostic when standalone assembly falls back", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const db = {
+      prepare() {
+        throw new Error("D1 read exposed token=should-not-appear");
+      }
+    } as unknown as D1Database;
+
+    const response = await buildForecastResponse(
+      env(db),
+      "bolinas",
+      new Date("2026-07-10T02:53:07.000Z"),
+      "3h"
+    );
+
+    expect(response.windows.every(({ ratingStatus }) => ratingStatus === "unknown")).toBe(true);
+    expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "forecast_assembly_failed",
+      message: "forecast assembly failed",
+      spotId: "bolinas",
+      interval: "3h",
+      reasonCode: "forecast_assembly_failed",
+      errorName: "Error"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain("should-not-appear");
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).not.toHaveProperty("outcome");
+    errorLog.mockRestore();
+  });
+
+  it("emits only the synchronized diagnostic before a fail-fast caller owns terminal logging", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const db = {
+      prepare() {
+        throw new Error("synchronized D1 token=should-not-appear");
+      }
+    } as unknown as D1Database;
+
+    await expect(
+      buildSynchronizedForecastResponses(
+        env(db),
+        "bolinas",
+        new Date("2026-07-10T02:53:07.000Z"),
+        { failOnReadError: true }
+      )
+    ).rejects.toThrow("synchronized D1 token=should-not-appear");
+
+    expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "synchronized_forecast_assembly_failed",
+      message: "synchronized forecast assembly failed",
+      spotId: "bolinas",
+      reasonCode: "synchronized_forecast_assembly_failed",
+      errorName: "Error"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain("should-not-appear");
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).not.toHaveProperty("outcome");
+    errorLog.mockRestore();
   });
 
   it("returns sourced, scaled NWS waves on stable local-clock slots with provenance", async () => {

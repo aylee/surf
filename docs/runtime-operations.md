@@ -56,6 +56,85 @@ Health, errors, ingest responses, and other API responses are explicitly
 uncacheable. Treat the cache as request-load protection, not as the source of
 truth; D1 read models remain the durable last-good generation.
 
+## Post-merge routine
+
+Use the supported path in this order after a merge. Set `SURF_BASE_URL` to the
+bare HTTPS origin being checked; `SURF_WRANGLER_CONFIG` may select the ignored
+instance overlay. `ops:status` is strictly read-only and honors that same
+overlay.
+
+```bash
+pnpm verify
+pnpm deploy
+pnpm ops:status
+pnpm smoke:cloudflare
+```
+
+Expected results:
+
+- `pnpm verify` completes the fresh-D1, test, build, and secretless bundle
+  gates before production changes.
+- `pnpm deploy` activates one version, publishes one complete generation, and
+  finishes its strict smoke. After Worker activation, recover a failed
+  readiness/publication check by fixing forward; rollback still requires
+  explicit Queue-quiescence and payload-compatibility proof.
+- `pnpm ops:status` prints four compact `PASS` rows: HTTPS health and the exact
+  serving Worker version; one active deployment at 100%; one ingest consumer
+  with batch/concurrency `1/1` and the configured DLQ; and `12/12` ready
+  read-model rows as six synchronized 1h/3h spot pairs. Any missing proof exits
+  nonzero. It performs one health GET
+  plus exactly three read-only Wrangler operations and never triggers ingest,
+  prints forecast JSON, or changes D1/Queue state.
+- `pnpm smoke:cloudflare` reports six spots, 12 ready read models, zero pending,
+  and scored forecasts. Run it once with the custom hostname and once with the
+  emitted `workers.dev` origin when both are part of the deployment.
+- At the next actual `:17` cycle, inspect Logfire for the cron, source job, six
+  serialized spot jobs, and 12 publication outcomes, with the same structured
+  `ingestId`/spot/generation evidence and no `exceededCpu`/1102 outcome.
+
+For the authoritative answer to “what is live,” use:
+
+```bash
+pnpm wrangler -- deployments status --json
+```
+
+The active deployment must contain exactly one version at 100%. `pnpm wrangler
+-- versions list` is supporting upload history only; it does not identify the
+version receiving production traffic.
+
+### Logfire OTLP destinations
+
+In the Cloudflare account dashboard, open **Workers Observability**, choose
+**Add destination**, and create these two destinations:
+
+| Destination | Type | OTLP endpoint |
+|---|---|---|
+| `surf-logfire-traces` | Traces | `https://logfire-us.pydantic.dev/v1/traces` |
+| `surf-logfire-logs` | Logs | `https://logfire-us.pydantic.dev/v1/logs` |
+
+Give each destination a custom `Authorization` header whose value is the
+Logfire project write token. Enter that token only in the Cloudflare
+destination; never put it in this repository, the ignored instance config, a
+command line, or captured shell output. For a Logfire EU project, substitute
+the matching `logfire-eu.pydantic.dev` endpoints.
+
+The tracked `wrangler.jsonc` remains destination-neutral. After the operator
+creates both account-level destinations, add only their names to the matching
+logs/traces `destinations` arrays in the ignored `wrangler.instance.jsonc`, run
+the normal config/verify gates, and deploy through the supported path. See the
+[Cloudflare Workers OTLP export documentation](https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/)
+and [Logfire OTLP documentation](https://logfire.pydantic.dev/docs/how-to-guides/alternative-clients/).
+
+Automatic Cron-to-Queue trace continuity is not a documented guarantee. Verify
+the one-correlated-trace criterion on a real `:17` production cycle. If
+Cloudflare emits separate traces, `ingestId` is the explicit cross-trace
+correlation fallback and evidence for the limitation—not permission to rewrite
+the one-trace acceptance criterion silently.
+
+Rollback is configuration-only and does not mutate forecast data: disable or
+delete the two Cloudflare destinations and remove their names from the ignored
+instance overlay.
+
 ## Manual ingest
 
 Production manual ingest requires the Worker `INGEST_TOKEN` secret and a

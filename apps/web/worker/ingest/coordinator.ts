@@ -318,8 +318,20 @@ export async function runNorcalIngest(
   // healthy forecasts. Each spot materialization independently refuses an
   // unscored generation and preserves its prior row.
   const readModelPersistence = options.deferForecastMaterialization
-    ? { rowsWritten: 0, forecastRowsWritten: 0, factBundleRowsWritten: 0, errors: [] }
-    : await materializeForecastReadModels(env, now, sourceIssueFingerprint, completedAt);
+    ? {
+        rowsWritten: 0,
+        forecastRowsWritten: 0,
+        factBundleRowsWritten: 0,
+        errors: [],
+        forecastOutcomes: []
+      }
+    : await materializeForecastReadModels(
+        env,
+        now,
+        sourceIssueFingerprint,
+        completedAt,
+        ingestId
+      );
   const persistenceErrors = [
     ...sourceRunRecordErrors,
     ...preMaterializationErrors,
@@ -385,7 +397,8 @@ export async function runNorcalIngest(
       sourcePersistenceReady: sourcePersistenceErrors.length === 0,
       sourcePersistenceErrors,
       deferred: options.deferForecastMaterialization === true,
-      captureHistory
+      captureHistory,
+      forecastOutcomes: readModelPersistence.forecastOutcomes
     }
   };
 }

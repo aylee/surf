@@ -2,14 +2,14 @@
 status: active
 type: implementation-plan
 created: 2026-08-03
-verified_at: HEAD 87f45dc
+verified_at: HEAD 334c907 + PR-A branch diff
 ---
 
 # Implementation Plan: Surf Ops, Freshness & Tabs
 
 **Owner:** Alex Lee
 **Status:** `APPROVED — executing one-shot (ledger OI-1 resolved 2026-08-03)`
-**Last Updated:** 2026-08-03
+**Last Updated:** 2026-08-04
 **Source Spec:** approved runtime plan `~/.claude/plans/goal-i-want-to-graceful-cocoa.md`
 (spec of record; its RCA evidence and locked decisions are reproduced here — this plan is
 self-contained and executable without it)
@@ -190,10 +190,10 @@ Documented RCA from the planning session — do not re-litigate; do close OI-2:
 |-------|------|-------------|------|--------|--------------|
 | 0 | T-0.1: Production state snapshot | Deploy timeline, 12-row read-model state, DLQ depth (evidence in Log) | S | done | OI-1 approval |
 | 0 | T-0.2: Pin the 23:23Z flapping cause | OI-2 verdict + chosen smallest corrective for PR-A | S | done | T-0.1 |
-| A | T-A.1: Structured pipeline logging | Silent 503 logged; one line per publish/skip/supersede/failure; corrective folded in | M | — | T-0.2 |
-| A | T-A.2: Tracing beta + OTLP → Logfire | wrangler config + operator-assisted destination/token; correlated traces visible | M | — | T-0.2 |
-| A | T-A.3: `pnpm ops:status` + post-merge runbook | Read-only status script + tests + `docs/runtime-operations.md` routine | M | — | — (parallel-safe with T-A.1/A.2) |
-| A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | — | T-A.1–A.3 |
+| A | T-A.1: Structured pipeline logging | Silent 503 logged; one line per publish/skip/supersede/failure; corrective folded in | M | done — final review DRY | T-0.2 |
+| A | T-A.2: Tracing beta + OTLP → Logfire | wrangler config + operator-assisted destination/token; correlated traces visible | M | in progress — repo half done; OI-4 operator action pending | T-0.2 |
+| A | T-A.3: `pnpm ops:status` + post-merge runbook | Read-only status script + tests + `docs/runtime-operations.md` routine | M | done — final review DRY | — (parallel-safe with T-A.1/A.2) |
+| A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | in progress — review DRY; local listener/canonical gate missing | T-A.1–A.3 |
 | A | T-A.5: Ship + live-verify PR-A | Deployed; one full hourly cycle as one Logfire trace; `ops:status` all-ready | S | — | T-A.4 |
 | B | T-B.1: Contracts cadence + verdict | `expectedCadenceMinutes`/grace fields + pure verdict fn + matrix tests | M | — | T-A.5 |
 | B | T-B.2: Adapters declare cadence | Documented cadence flows into payload source entries at materialization | M | — | T-B.1 |
@@ -1239,3 +1239,107 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
   optional AI non-gating, and preserve strict no-replay/fix-forward rules. Act — ready PR →
   GitHub Verify → merge → exactly one supported deploy; close OI-5 only on dual-origin target
   identity, one lineage/12 rows, Queue 1/1, strict smoke, and production code-browser proof.
+
+### 2026-08-04 — PR #22 live recovery checkpoint; OI-5 resolved
+
+- **Ship evidence:** PR #22 passed its two independent DRY passes, canonical/local ladder, and
+  GitHub Verify, then merged as `334c9071dfa3c8607383410dd1a1c623b2066d37` at `07:17:31Z`.
+  Exactly one supported deploy activated Worker `04e3ace7-78b2-4f03-b722-44cc7cd0c126` in
+  deployment `e3ab7a95-3a2a-4839-9910-15cc2cbd15de`; authenticated status had that sole version
+  at 100% before enqueue and after smoke. Pre-deploy/seed/post-proof D1 recovery bookmarks were
+  `00000347-000000d8-000050bd-c8eefe6a78750cc70af40919b6564957`,
+  `00000347-000000dc-000050bd-7822198dfc0b4c58f36ecf5143f49065`, and
+  `00000348-000000fc-000050bd-e9575969459305a3ef9ef348f15658c6` respectively.
+- **Real cron-collision proof:** predecessor cron `7d430198…` completed 12/12 before upload.
+  The new deploy then emitted `remote_ingest_cron_deferral` with resume `07:27:00Z`, performing
+  no handoff mutation during the collision window. At `07:27:00.914Z`, one affinity session and
+  one authenticated PATCH were accepted. Five source rows completed by `07:27:22.746Z` (four
+  success; NDBC partial with known optional caveats, no recorded error). Six serialized Queue
+  children published all rows by `07:27:29.599Z`.
+- **Independent atomic/data-plane proof:** a primary-served, zero-write D1 query grouped the
+  current table into one exact ingest suffix, one generation time, 12 models, six spots, and two
+  intervals. The twelve keyed rows are schema 1, nonempty, and span materialization
+  `07:27:23.402Z`–`07:27:29.599Z`. Custom and workers.dev aggregate responses were byte-identical,
+  200/JSON/no-store/cache-bypass, exact Worker, exact 6×{3h,1h} keys, canonical chronology, and
+  no duplicate/missing/extra target. Strict smoke on both hostnames returned six spots, 12 ready,
+  zero pending, scored forecasts. Queue inspection independently showed one producer/one
+  consumer, batch/concurrency 1, retries 3, and expected DLQ.
+- **Browser/product proof:** daily report and Bolinas reloaded after target publication with no
+  alert, console warning/error, or desktop overflow. An independent 390×844 pass had no mobile
+  overflow and exposed deterministic workbench data. The source-age chip disappearing on phone
+  and AI Daily Outlook consuming the first spot viewport are accepted baseline evidence for
+  OD-9/PR-B/C, not PR #22 regressions.
+- **Tradeoffs:** the cron settle adds up to ten minutes to a ship-time ingest and the public
+  aggregate adds one small indexed metadata SELECT per poll. Those costs buy a coherent proof
+  and eliminate mixed-lineage false positives. It still does not claim Queue quiescence, so
+  terminal supersession and fix-forward after any accepted 202 remain mandatory. No replay,
+  migration, queue-drain controller, or payload behavior was added.
+- **Boundary OODA:** Observe — control-plane activation and data publication are distinct; the
+  guard preserved that distinction and every independent surface converged on one target cycle.
+  Orient — a friends-and-family surf planner needs quiet, causal trust more than elaborate ops;
+  deterministic forecasts remain authoritative and optional AI remains non-gating. Decide —
+  close OI-5, preserve atomic/serialized/fix-forward constraints, and carry the concrete mobile
+  freshness + AI-first noise into the already-planned UI legs. Act — update the singular ledger
+  and both logs, remove the temporary reconstruction after checkpointing, then branch PR-A from
+  `334c907`; do not open PR-B until PR-A has its real :17 trace and 12-ready ops proof.
+
+### 2026-08-04 — PR-A stabilized pre-ready checkpoint
+
+- **Task reconciliation:** T-A.1 and T-A.3 are repo-complete and ended with a parallel DRY
+  review. T-A.2's repo/config/runbook half is complete; its account-side OI-4 destination/token
+  remains operator-owned. T-A.4 is still in progress because review is dry but the canonical
+  listener/local e2e evidence is missing. T-A.5 and every B/C task remain untouched.
+- **Pipeline authority:** orchestration emits one source terminal plus one terminal per
+  spot/interval. D1 `meta.changes` decides publish vs supersede. Nonretryable
+  skip/supersede ACK; retryable failure rejects. Mixed publish/supersede is logged literally
+  and ACKed, with no history or Agent signal; a later complete generation repairs the pair.
+  Source-stage success reasons now say `inline_source_persistence_completed[_with_caveats]`
+  so they cannot contradict interval publication facts.
+- **Privacy + optional Agent:** every touched console boundary uses fixed events/reason codes
+  and a total, single-read allowlisted error-name bucket. Exact published lineage is compared
+  with the active D1 fact bundle before RPC. The Agent separately persists a per-date
+  generated-time high-water, bootstrapped through integrity-checked legacy state and advanced
+  on every enabled equal/newer signal even when material coalesces. Older callbacks cannot
+  rotate job tokens or queue work; high-water survives queue-submission cleanup. Equal-time
+  material corrections remain intentionally eligible.
+- **Ops/config:** tracked Wrangler config persists 100% invocation logs and automatic traces
+  but stays destination-neutral. The ignored overlay contains only the two destination names.
+  `ops:status` performs one bounded health GET plus exactly deployment, Queue-consumer, and
+  metadata-only D1 probes; it proves serving-version identity, Queue 1/1 + DLQ, and six
+  canonical synchronized 1h/3h pairs without requiring every spot to share one generation.
+  Generic Cloudflare children are finite; exact operator-held `tail` is the sole unbounded
+  exception. The runbook records Logfire US/EU endpoints, token placement, :17 proof, and
+  configuration-only rollback.
+- **Adversarial rounds:** Round 1 confirmed raw-error leakage, deterministic retry after
+  terminal skip/supersede, unbounded subprocesses, missing top observability enablement, and
+  noncanonical timestamps; a refuter caught the initial `tail` regression. Round 2 confirmed
+  split-pair ops false positives, arbitrary/hostile error-name escape, and invalid inline
+  signaling; refuters proved the missing generation fence. Round 3 confirmed read→RPC
+  regression, same-material high-water loss, and false forecast-publication source reasons.
+  Each majority-confirmed finding was corrected; majority-refuted candidates died. The final
+  independent runtime and ops/security passes are DRY.
+- **Testing notes:** fresh serial results are scripts 182/182; web unit 263 passed +1 skipped;
+  focused Agent/order + inline Queue + Worker 57/57; web type/config check; TypeScript;
+  production Vite build; secretless ignored-overlay Wrangler dry-run; diff check clean. One
+  App timer miss under a reviewer's deliberately parallel run passed isolated and in the serial
+  suite, refuting product failure. New workerd tests cover real D1 write authority, direct and
+  coalesced B→A races, queue-failure high-water survival, and corrupt bootstrap, but local
+  listener creation is denied with `EPERM`. Root `pnpm check` independently fails at
+  `tsx` seed-check IPC for the same environment reason. No canonical `pnpm verify`, local
+  public-feed ingest/smoke, or production mutation is claimed.
+- **Tradeoffs:** four compact probes and 100% telemetry are proportionate at six hourly spot
+  jobs; no broad admin API, replay controller, migration, raw payload logging, or global
+  freshness heuristic was added. A tiny durable high-water row costs storage but prevents
+  stale optional analysis from reasserting authority. Preserving equal-time corrections and
+  independent complete spot generations avoids inventing an ordering rule the deterministic
+  source does not own. Failed newer Agent submission still fences older work, while exact/newer
+  retries remain possible.
+- **OODA:** Observe — repo tests/config/log semantics and two final reviewers agree, while
+  listener-backed local evidence and OI-4 do not exist. Orient — operational detail earns its
+  place only when it improves trust for Alex and friends; deterministic forecast facts lead,
+  optional AI stays non-gating, and B/C cannot start on an unproved predecessor. Decide — keep
+  the diff frozen, record the environmental red gate honestly, and publish only as incomplete
+  to obtain GitHub evidence; require operator-shell local proof and destination provisioning
+  before ready/merge/deploy. Act — checkpoint manifest/plan, commit/push without
+  `.playwright-mcp`, obtain GitHub Verify, request `!pnpm verify` + local ingest/smoke and
+  OI-4, then ready/merge/deploy and wait for the next actual :17 before T-B.1.

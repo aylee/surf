@@ -1,5 +1,6 @@
 import type { SpotId } from "@surf/contracts";
 import type { AdapterStatus, SourceCaveat } from "../adapters/types";
+import type { ForecastMaterializationOutcome } from "../forecast-read-model";
 
 export type IngestKind = "manual-ingest" | "scheduled-ingest" | "queued-ingest";
 
@@ -97,6 +98,7 @@ export type IngestSummary = {
     sourcePersistenceErrors: string[];
     deferred: boolean;
     captureHistory: boolean;
+    forecastOutcomes: ForecastMaterializationOutcome[];
   };
 };
 

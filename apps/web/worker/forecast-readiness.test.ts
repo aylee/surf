@@ -278,14 +278,22 @@ describe("forecast readiness", () => {
     );
 
     await expectReadinessUnavailable(response);
-    expect(errorLog).toHaveBeenCalledWith(
-      expect.stringContaining("forecast readiness lookup failed")
+    expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "forecast_readiness_lookup_failed",
+      message: "forecast readiness lookup failed",
+      reasonCode: "readiness_lookup_failed",
+      errorName: "Error"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain(
+      "Stored forecast readiness metadata is invalid"
     );
+    errorLog.mockRestore();
   });
 
   it("returns the same bounded-pending response when the D1 SELECT fails", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const database = readinessDatabase([], new Error("simulated D1 read failure"));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const database = readinessDatabase([], new Error("simulated D1 read failure secret"));
 
     const response = await worker.fetch(
       new Request("https://surf.test/api/forecast-readiness") as unknown as Parameters<
@@ -297,5 +305,14 @@ describe("forecast readiness", () => {
 
     await expectReadinessUnavailable(response);
     expect(database.executionCount()).toBe(1);
+    expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "forecast_readiness_lookup_failed",
+      message: "forecast readiness lookup failed",
+      reasonCode: "readiness_lookup_failed",
+      errorName: "Error"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain("simulated D1 read failure secret");
+    errorLog.mockRestore();
   });
 });

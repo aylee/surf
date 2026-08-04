@@ -48,6 +48,11 @@ export type MaterializedForecastJson = {
   forecastJson: string;
 };
 
+export type ActiveMaterializedForecastFactBundle = {
+  generationId: string;
+  bundle: ForecastFactBundle;
+};
+
 export type ForecastSpotMaterializationOptions = {
   materializedAt?: string;
   captureHistory?: boolean;
@@ -59,8 +64,40 @@ export type ForecastReadModelPersistenceResult = {
   forecastRowsWritten: number;
   factBundleRowsWritten: number;
   errors: string[];
+  forecastOutcomes: ForecastMaterializationOutcome[];
   snapshotRowsWritten?: number;
   historyErrors?: string[];
+};
+
+// Repository helpers return terminal facts but never log them. Queue and
+// inline orchestration own the single canonical log line for each interval.
+export type ForecastMaterializationReasonCode =
+  | "forecast_generation_published"
+  | "newer_generation_active"
+  | "unsynchronized_inputs"
+  | "no_scored_windows"
+  | "synchronized_generation_rejected"
+  | "invalid_materialization_metadata"
+  | "forecast_payload_too_large"
+  | "fact_bundle_payload_too_large"
+  | "forecast_persistence_failed"
+  | "forecast_assembly_failed"
+  | "lineage_check_failed"
+  | "newer_source_generation_active"
+  | "materialization_threw"
+  | "invalid_forecast_outcome_contract"
+  | "incomplete_publication";
+
+export type ForecastMaterializationOutcome = {
+  ingestId: string | null;
+  spotId: SpotId;
+  interval: ForecastInterval;
+  generationId: string | null;
+  generatedAt: string;
+  materializedAt: string | null;
+  outcome: "publish" | "skip" | "supersede" | "failure";
+  reasonCode: ForecastMaterializationReasonCode;
+  retryable: boolean;
 };
 
 function validIso(value: string): boolean {
@@ -139,11 +176,11 @@ export async function getMaterializedForecastJson(
   };
 }
 
-export async function getMaterializedForecastFactBundle(
+export async function getActiveMaterializedForecastFactBundle(
   db: D1Database,
   spotId: SpotId,
   localDate: string
-): Promise<ForecastFactBundle | null> {
+): Promise<ActiveMaterializedForecastFactBundle | null> {
   const row = await db
     .prepare(
       `select bundle.generation_id, bundle.schema_version, bundle.fact_bundle_json
@@ -165,18 +202,57 @@ export async function getMaterializedForecastFactBundle(
   if (bundle.input.spotId !== spotId || bundle.input.localDate !== localDate) {
     throw new Error("Stored forecast fact bundle identity does not match its row");
   }
-  return bundle;
+  return { generationId: row.generation_id, bundle };
+}
+
+export async function getMaterializedForecastFactBundle(
+  db: D1Database,
+  spotId: SpotId,
+  localDate: string
+): Promise<ForecastFactBundle | null> {
+  return (await getActiveMaterializedForecastFactBundle(db, spotId, localDate))?.bundle ?? null;
 }
 
 async function executeMaterialization(
   db: D1Database,
   statements: D1PreparedStatement[]
-): Promise<void> {
+): Promise<D1Result<unknown>[]> {
   if (typeof db.batch === "function") {
-    await db.batch(statements);
-    return;
+    return db.batch(statements);
   }
-  for (const statement of statements) await statement.run();
+  const results: D1Result<unknown>[] = [];
+  for (const statement of statements) results.push(await statement.run());
+  return results;
+}
+
+const FORECAST_INTERVALS = ["3h", "1h"] as const satisfies readonly ForecastInterval[];
+
+function forecastOutcomes(options: {
+  spotId: SpotId;
+  ingestId?: string;
+  generatedAt: string;
+  materializedAt: string | null;
+  generationId?: string;
+  outcome: ForecastMaterializationOutcome["outcome"];
+  retryable: boolean;
+  reasonCode:
+    | ForecastMaterializationReasonCode
+    | Partial<Record<ForecastInterval, ForecastMaterializationReasonCode>>;
+}): ForecastMaterializationOutcome[] {
+  return FORECAST_INTERVALS.map((interval) => ({
+    ingestId: options.ingestId ?? null,
+    spotId: options.spotId,
+    interval,
+    generationId: options.generationId ?? null,
+    generatedAt: options.generatedAt,
+    materializedAt: options.materializedAt,
+    outcome: options.outcome,
+    retryable: options.retryable,
+    reasonCode:
+      typeof options.reasonCode === "string"
+        ? options.reasonCode
+        : options.reasonCode[interval] ?? "synchronized_generation_rejected"
+  }));
 }
 
 export async function persistForecastMaterialization(options: {
@@ -199,7 +275,16 @@ export async function persistForecastMaterialization(options: {
       rowsWritten: 0,
       forecastRowsWritten: 0,
       factBundleRowsWritten: 0,
-      errors: ["Forecast read model inputs do not describe one synchronized spot generation."]
+      errors: ["Forecast read model inputs do not describe one synchronized spot generation."],
+      forecastOutcomes: forecastOutcomes({
+        spotId: threeHour.spot.id,
+        ingestId: options.ingestId,
+        generatedAt: threeHour.generatedAt,
+        materializedAt: options.materializedAt,
+        outcome: "failure",
+        retryable: true,
+        reasonCode: "unsynchronized_inputs"
+      })
     };
   }
   const missingScoredIntervals = [threeHour, hourly]
@@ -214,7 +299,18 @@ export async function persistForecastMaterialization(options: {
         `Forecast read model publication rejected because ${missingScoredIntervals.join(
           ", "
         )} contained no scored windows; the previous materialization remains active.`
-      ]
+      ],
+      forecastOutcomes: forecastOutcomes({
+        spotId: threeHour.spot.id,
+        ingestId: options.ingestId,
+        generatedAt: threeHour.generatedAt,
+        materializedAt: options.materializedAt,
+        outcome: "skip",
+        retryable: false,
+        reasonCode: Object.fromEntries(
+          missingScoredIntervals.map((interval) => [interval, "no_scored_windows"])
+        ) as Partial<Record<ForecastInterval, ForecastMaterializationReasonCode>>
+      })
     };
   }
   if (
@@ -226,7 +322,16 @@ export async function persistForecastMaterialization(options: {
       rowsWritten: 0,
       forecastRowsWritten: 0,
       factBundleRowsWritten: 0,
-      errors: ["Forecast read model materialization metadata is invalid."]
+      errors: ["Forecast read model materialization metadata is invalid."],
+      forecastOutcomes: forecastOutcomes({
+        spotId: threeHour.spot.id,
+        ingestId: options.ingestId,
+        generatedAt: threeHour.generatedAt,
+        materializedAt: options.materializedAt,
+        outcome: "failure",
+        retryable: true,
+        reasonCode: "invalid_materialization_metadata"
+      })
     };
   }
 
@@ -250,19 +355,22 @@ export async function persistForecastMaterialization(options: {
     const json = stableJson(bundle);
     return { bundle, json, bytes: serializedBytes(json) };
   });
+  const oversizedForecastIntervals = new Set<ForecastInterval>();
   const payloadErrors = [
-    ...serializedForecasts.flatMap(({ forecast, bytes }) =>
-      bytes > MAX_FORECAST_READ_MODEL_BYTES
-        ? [
-            oversizedPayloadError({
-              spotId: threeHour.spot.id,
-              payload: `${forecast.interval ?? "unknown"} forecast`,
-              bytes,
-              limit: MAX_FORECAST_READ_MODEL_BYTES
-            })
-          ]
-        : []
-    ),
+    ...serializedForecasts.flatMap(({ forecast, bytes }) => {
+      if (bytes <= MAX_FORECAST_READ_MODEL_BYTES) return [];
+      if (forecast.interval === "1h" || forecast.interval === "3h") {
+        oversizedForecastIntervals.add(forecast.interval);
+      }
+      return [
+        oversizedPayloadError({
+          spotId: threeHour.spot.id,
+          payload: `${forecast.interval ?? "unknown"} forecast`,
+          bytes,
+          limit: MAX_FORECAST_READ_MODEL_BYTES
+        })
+      ];
+    }),
     ...serializedFactBundles.flatMap(({ bundle, bytes }) =>
       bytes > MAX_FORECAST_FACT_BUNDLE_BYTES
         ? [
@@ -281,7 +389,24 @@ export async function persistForecastMaterialization(options: {
       rowsWritten: 0,
       forecastRowsWritten: 0,
       factBundleRowsWritten: 0,
-      errors: payloadErrors
+      errors: payloadErrors,
+      forecastOutcomes: forecastOutcomes({
+        spotId: threeHour.spot.id,
+        ingestId: options.ingestId,
+        generatedAt: threeHour.generatedAt,
+        materializedAt: options.materializedAt,
+        outcome: "skip",
+        retryable: false,
+        reasonCode:
+          oversizedForecastIntervals.size > 0
+            ? Object.fromEntries(
+                [...oversizedForecastIntervals].map((interval) => [
+                  interval,
+                  "forecast_payload_too_large"
+                ])
+              ) as Partial<Record<ForecastInterval, ForecastMaterializationReasonCode>>
+            : "fact_bundle_payload_too_large"
+      })
     };
   }
 
@@ -346,19 +471,65 @@ export async function persistForecastMaterialization(options: {
   });
 
   try {
-    await executeMaterialization(options.db, [...forecastStatements, ...factStatements]);
+    const results = await executeMaterialization(options.db, [
+      ...forecastStatements,
+      ...factStatements
+    ]);
+    if (
+      results.length !== forecastStatements.length + factStatements.length ||
+      results.some(
+        (result) =>
+          !Number.isInteger(result.meta.changes) ||
+          result.meta.changes < 0
+      )
+    ) {
+      throw new Error("D1 materialization result metadata is invalid");
+    }
+    const changes = results.map((result) => result.meta.changes);
+    const forecastChanges = changes.slice(0, forecastStatements.length);
+    const factBundleChanges = changes.slice(forecastStatements.length);
+    // Conditional upserts can be real no-ops when a newer generation wins
+    // after the lineage precheck. D1 changes, not prepared-statement count,
+    // are the publication authority for each interval's terminal outcome.
+    const outcomes = FORECAST_INTERVALS.map(
+      (interval, index): ForecastMaterializationOutcome => {
+        const published = (forecastChanges[index] ?? 0) > 0;
+        return {
+          ingestId: options.ingestId ?? null,
+          spotId: threeHour.spot.id,
+          interval,
+          generationId,
+          generatedAt: threeHour.generatedAt,
+          materializedAt: options.materializedAt,
+          outcome: published ? "publish" : "supersede",
+          retryable: false,
+          reasonCode: published ? "forecast_generation_published" : "newer_generation_active"
+        };
+      }
+    );
     return {
-      rowsWritten: forecastStatements.length + factStatements.length,
-      forecastRowsWritten: forecastStatements.length,
-      factBundleRowsWritten: factStatements.length,
-      errors: []
+      rowsWritten: changes.reduce((total, count) => total + count, 0),
+      forecastRowsWritten: forecastChanges.filter((count) => count > 0).length,
+      factBundleRowsWritten: factBundleChanges.filter((count) => count > 0).length,
+      errors: [],
+      forecastOutcomes: outcomes
     };
   } catch (error) {
     return {
       rowsWritten: 0,
       forecastRowsWritten: 0,
       factBundleRowsWritten: 0,
-      errors: [`${threeHour.spot.id}: forecast read model persistence failed: ${errorMessage(error)}`]
+      errors: [`${threeHour.spot.id}: forecast read model persistence failed: ${errorMessage(error)}`],
+      forecastOutcomes: forecastOutcomes({
+        spotId: threeHour.spot.id,
+        ingestId: options.ingestId,
+        generatedAt: threeHour.generatedAt,
+        materializedAt: options.materializedAt,
+        generationId,
+        outcome: "failure",
+        retryable: true,
+        reasonCode: "forecast_persistence_failed"
+      })
     };
   }
 }
@@ -367,12 +538,14 @@ export async function materializeForecastReadModels(
   env: Env,
   now: Date,
   _sourceIssueFingerprint: string,
-  materializedAt = new Date().toISOString()
+  materializedAt = new Date().toISOString(),
+  ingestId?: string
 ): Promise<ForecastReadModelPersistenceResult> {
   let rowsWritten = 0;
   let forecastRowsWritten = 0;
   let factBundleRowsWritten = 0;
   const errors: string[] = [];
+  const outcomes: ForecastMaterializationOutcome[] = [];
 
   for (const spot of NORCAL_SPOTS) {
     const result = await materializeForecastReadModelForSpot(
@@ -380,16 +553,24 @@ export async function materializeForecastReadModels(
       spot.id,
       now,
       {
-        materializedAt
+        materializedAt,
+        ingestId
       }
     );
     rowsWritten += result.rowsWritten;
     forecastRowsWritten += result.forecastRowsWritten;
     factBundleRowsWritten += result.factBundleRowsWritten;
     errors.push(...result.errors);
+    outcomes.push(...result.forecastOutcomes);
   }
 
-  return { rowsWritten, forecastRowsWritten, factBundleRowsWritten, errors };
+  return {
+    rowsWritten,
+    forecastRowsWritten,
+    factBundleRowsWritten,
+    errors,
+    forecastOutcomes: outcomes
+  };
 }
 
 export async function materializeForecastReadModelForSpot(
@@ -423,7 +604,12 @@ export async function materializeForecastReadModelForSpot(
       materializedAt,
       ingestId: options.ingestId
     });
-    if (!options.captureHistory || materialization.errors.length > 0) return materialization;
+    const publicationComplete =
+      materialization.errors.length === 0 &&
+      materialization.forecastRowsWritten === FORECAST_INTERVALS.length &&
+      materialization.factBundleRowsWritten > 0 &&
+      materialization.forecastOutcomes.every(({ outcome }) => outcome === "publish");
+    if (!options.captureHistory || !publicationComplete) return materialization;
     const history = await persistForecastSnapshots(env.DB, threeHour, {
       capturedAt: materializedAt,
       issuedAt: now.toISOString(),
@@ -439,7 +625,16 @@ export async function materializeForecastReadModelForSpot(
       rowsWritten: 0,
       forecastRowsWritten: 0,
       factBundleRowsWritten: 0,
-      errors: [`${spotId}: forecast read model assembly failed: ${errorMessage(error)}`]
+      errors: [`${spotId}: forecast read model assembly failed: ${errorMessage(error)}`],
+      forecastOutcomes: forecastOutcomes({
+        spotId,
+        ingestId: options.ingestId,
+        generatedAt: Number.isNaN(now.getTime()) ? "invalid" : now.toISOString(),
+        materializedAt: options.materializedAt ?? null,
+        outcome: "failure",
+        retryable: true,
+        reasonCode: "forecast_assembly_failed"
+      })
     };
   }
 }

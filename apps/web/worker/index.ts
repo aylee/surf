@@ -16,17 +16,21 @@ import {
   buildUnavailableForecastBriefResponse
 } from "./brief";
 import {
+  getActiveMaterializedForecastFactBundle,
   getMaterializedForecastFactBundle,
   getMaterializedForecastJson
 } from "./forecast-read-model";
 import { getForecastReadiness } from "./forecast-readiness";
 import {
-  ingestRequiresRetry,
   runNorcalIngest,
   type ForecastMaterializationQueueMessage
 } from "./ingest";
 import {
+  boundedPipelineErrorName,
+  logInlineIngestTerminalOutcomes,
+  logSourceIngestTerminalOutcome,
   processIngestQueueMessage,
+  signalInlineForecastBriefs,
   type ForecastBriefSignalContext
 } from "./ingest/queue";
 import { localDateForTime } from "./time";
@@ -110,8 +114,10 @@ app.get("/api/forecast-readiness", async (c) => {
   } catch (error) {
     console.error(
       JSON.stringify({
+        event: "forecast_readiness_lookup_failed",
         message: "forecast readiness lookup failed",
-        ...briefAssemblyDiagnostic(error)
+        reasonCode: "readiness_lookup_failed",
+        errorName: boundedPipelineErrorName(error)
       })
     );
     return c.json(
@@ -133,57 +139,57 @@ function forecastBriefEnabled(env: Env): boolean {
   );
 }
 
-function briefAssemblyDiagnostic(error: unknown): { errorName: string; errorMessage: string } {
-  const errorName = error instanceof Error && error.name ? error.name : "UnknownError";
-  const rawMessage = error instanceof Error ? error.message : String(error);
-  return {
-    errorName,
-    errorMessage: rawMessage.replace(/\s+/g, " ").slice(0, 240)
-  };
-}
-
 async function signalForecastBriefAgent(
   env: Env,
   spotId: ForecastMaterializationQueueMessage["spotId"],
-  generatedAt = new Date(),
-  context?: ForecastBriefSignalContext
+  _generatedAt: Date,
+  context: ForecastBriefSignalContext
 ): Promise<void> {
   const namespace = env.FORECAST_BRIEF_AGENT;
   if (!namespace || !forecastBriefEnabled(env)) return;
   const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
   if (!spot) return;
   try {
-    const localDate = localDateForTime(generatedAt.toISOString(), spot.timezone);
-    const bundle = await getMaterializedForecastFactBundle(env.DB, spot.id, localDate);
-    if (!bundle) {
+    const localDate = localDateForTime(context.generatedAt, spot.timezone);
+    const active = await getActiveMaterializedForecastFactBundle(env.DB, spot.id, localDate);
+    if (!active) {
       throw new Error(`Materialized forecast facts are unavailable for ${spot.id} on ${localDate}`);
     }
-    await namespace.getByName(spot.id).signal(bundle);
+    if (active.generationId !== context.generationId) {
+      console.info(
+        JSON.stringify({
+          event: "forecast_brief_signal_superseded",
+          message: "forecast brief signal superseded before Agent RPC",
+          phase: "brief_signal",
+          ingestId: context.ingestId,
+          spotId,
+          generationId: context.generationId,
+          generatedAt: context.generatedAt,
+          materializedAt: context.materializedAt,
+          outcome: "supersede",
+          reasonCode: "forecast_generation_no_longer_active",
+          retryable: false
+        })
+      );
+      return;
+    }
+    await namespace.getByName(spot.id).signal(active.bundle);
   } catch (error) {
-    const { errorName, errorMessage } = briefAssemblyDiagnostic(error);
-    const fallbackGeneratedAt = Number.isNaN(generatedAt.getTime())
-      ? undefined
-      : generatedAt.toISOString();
     console.error(
       JSON.stringify({
         event: "forecast_brief_signal_failed",
         message: "forecast brief signaling failed after materialization publication",
         phase: "brief_signal",
-        ...(context ? { ingestId: context.ingestId } : {}),
+        ingestId: context.ingestId,
         spotId,
-        generatedAt: context?.generatedAt ?? fallbackGeneratedAt,
-        ...(context ? { materializedAt: context.materializedAt } : {}),
-        errorName,
-        error: errorMessage
+        generationId: context.generationId,
+        generatedAt: context.generatedAt,
+        materializedAt: context.materializedAt,
+        reasonCode: "brief_signal_failed",
+        errorName: boundedPipelineErrorName(error)
       })
     );
   }
-}
-
-async function signalForecastBriefAgents(env: Env, generatedAt = new Date()): Promise<void> {
-  await Promise.all(
-    NORCAL_SPOTS.map((spot) => signalForecastBriefAgent(env, spot.id, generatedAt))
-  );
 }
 
 app.get(
@@ -218,10 +224,11 @@ app.get(
       if (!bundle) {
         console.warn(
           JSON.stringify({
+            event: "forecast_brief_fallback_used",
             message: "forecast brief response used the safe summary",
             spotId,
             localDate,
-            reason: "requested_date_unavailable"
+            reasonCode: "requested_date_unavailable"
           })
         );
         return c.json(
@@ -244,11 +251,14 @@ app.get(
           : "brief_assembly_failed";
       console.warn(
         JSON.stringify({
+          event: "forecast_brief_fallback_used",
           message: "forecast brief response used the safe summary",
           spotId,
           localDate,
-          reason,
-          ...(reason === "brief_assembly_failed" ? briefAssemblyDiagnostic(error) : {})
+          reasonCode: reason,
+          ...(reason === "brief_assembly_failed"
+            ? { errorName: boundedPipelineErrorName(error) }
+            : {})
         })
       );
       return c.json(
@@ -283,6 +293,13 @@ app.get(
     try {
       const materialized = await getMaterializedForecastJson(c.env.DB, spotId, interval);
       if (!materialized) {
+        console.error(
+          JSON.stringify({
+            message: "forecast read model missing",
+            spotId,
+            interval
+          })
+        );
         return c.json(
           {
             error: "forecast_temporarily_unavailable",
@@ -315,10 +332,12 @@ app.get(
     } catch (error) {
       console.error(
         JSON.stringify({
+          event: "forecast_read_model_lookup_failed",
           message: "forecast read model lookup failed",
           spotId,
           interval,
-          ...briefAssemblyDiagnostic(error)
+          reasonCode: "read_model_lookup_failed",
+          errorName: boundedPipelineErrorName(error)
         })
       );
       return c.json(
@@ -430,17 +449,27 @@ app.post("/api/ingest/once", async (c) => {
   const requestedAt = new Date().toISOString();
   const ingestId = crypto.randomUUID();
 
-  const summary = await runNorcalIngest(c.env, {
-    kind: "manual-ingest",
-    ingestId,
-    idSuffix: ingestId,
-    requestedAt,
-    region: c.env.SURF_REGION
-  });
-
-  if (!ingestRequiresRetry(summary)) {
-    await signalForecastBriefAgents(c.env, new Date(summary.publication.generatedAt));
+  let summary: Awaited<ReturnType<typeof runNorcalIngest>>;
+  try {
+    summary = await runNorcalIngest(c.env, {
+      kind: "manual-ingest",
+      ingestId,
+      idSuffix: ingestId,
+      requestedAt,
+      region: c.env.SURF_REGION
+    });
+  } catch (error) {
+    logSourceIngestTerminalOutcome({
+      ingestId,
+      generatedAt: requestedAt,
+      outcome: "failure",
+      reasonCode: "source_ingest_threw",
+      errorName: boundedPipelineErrorName(error)
+    });
+    throw error;
   }
+  const briefSignals = logInlineIngestTerminalOutcomes(summary);
+  await signalInlineForecastBriefs(c.env, briefSignals, signalForecastBriefAgent);
 
   return c.json(summary);
 });
@@ -468,9 +497,12 @@ export default {
       } catch (error) {
         console.error(
           JSON.stringify({
+            event: "ingest_queue_retry_scheduled",
             message: "ingest queue message failed",
             messageId: message.id,
-            error: error instanceof Error ? error.message : String(error)
+            attempts: message.attempts,
+            reasonCode: "queue_message_processing_failed",
+            errorName: boundedPipelineErrorName(error)
           })
         );
         message.retry({

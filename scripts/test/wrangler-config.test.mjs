@@ -116,6 +116,47 @@ test("instance validation protects the Agent lifecycle and secret boundary", () 
   ]);
 });
 
+test("observability validation requires persisted full-sample logs and automatic traces", () => {
+  const config = structuredClone(canonical);
+  config.observability.logs.head_sampling_rate = 0.5;
+  config.observability.logs.invocation_logs = false;
+  config.observability.logs.persist = false;
+  config.observability.traces.enabled = false;
+  config.observability.traces.head_sampling_rate = 0.25;
+  config.observability.traces.persist = false;
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "Worker observability logs must be enabled, persisted, invocation-complete, and sampled at 100%.",
+    "Worker automatic traces must be enabled, persisted, and sampled at 100%."
+  ]);
+});
+
+test("observability validation requires the top-level enablement switch", () => {
+  for (const enabled of [false, undefined]) {
+    const config = structuredClone(canonical);
+    if (enabled === undefined) delete config.observability.enabled;
+    else config.observability.enabled = enabled;
+
+    assert.deepEqual(wranglerStructureFailures(config, configPath), [
+      "Worker observability must be enabled at the top level."
+    ]);
+  }
+});
+
+test("tracked config stays destination-neutral while ignored overlays may name destinations", () => {
+  const config = structuredClone(canonical);
+  config.observability.logs.destinations = ["surf-logfire-logs"];
+  config.observability.traces.destinations = ["surf-logfire-traces"];
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "The tracked Wrangler config must remain destination-neutral; account-scoped telemetry destination names belong only in the ignored instance overlay."
+  ]);
+  assert.deepEqual(
+    wranglerStructureFailures(config, resolve(root, "apps/web/wrangler.instance.jsonc")),
+    []
+  );
+});
+
 test("instance validation preserves serialized ingest generations", () => {
   const config = structuredClone(canonical);
   config.queues.consumers[0].max_batch_size = 10;
