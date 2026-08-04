@@ -13,10 +13,15 @@ const VERSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
 
-function assertVersionId(value) {
-  if (typeof value !== "string" || !VERSION_ID_PATTERN.test(value)) {
-    throw new Error("expected Worker version ID must be a UUID");
-  }
+export function isWorkerVersionId(value) {
+  return typeof value === "string" && VERSION_ID_PATTERN.test(value);
+}
+
+export function assertWorkerVersionId(
+  value,
+  label = "expected Worker version ID"
+) {
+  if (!isWorkerVersionId(value)) throw new Error(`${label} must be a UUID`);
 }
 
 function assertWorkerName(value) {
@@ -62,7 +67,7 @@ export function workerVersionRequestHeaders(
     );
   }
   if (!hasVersion) return headers;
-  assertVersionId(expectedVersionId);
+  assertWorkerVersionId(expectedVersionId);
   assertWorkerName(expectedWorkerName);
   if (override) {
     headers.set(
@@ -147,7 +152,7 @@ export async function waitForWorkerVersion(options) {
     requestTimeoutMs = WORKER_VERSION_REQUEST_TIMEOUT_MS
   } = options;
 
-  assertVersionId(expectedVersionId);
+  assertWorkerVersionId(expectedVersionId);
   assertWorkerName(expectedWorkerName);
   if (typeof fetcher !== "function" || typeof now !== "function" || typeof sleep !== "function") {
     throw new Error("Worker readiness requires fetch, clock, and sleep functions");

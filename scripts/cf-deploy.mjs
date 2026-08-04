@@ -12,13 +12,28 @@ import {
   resolveDeployedUrl,
   resolveDeployedVersionId
 } from "./lib/deploy-url.mjs";
-import { waitForWorkerVersion } from "./lib/worker-version.mjs";
+import {
+  assertWorkerVersionId,
+  waitForWorkerVersion
+} from "./lib/worker-version.mjs";
 
 const mode = process.argv[2];
 const dryRun = process.argv.includes("--dry-run");
 
 if (mode !== "setup" && mode !== "deploy") {
   throw new Error("Usage: node scripts/cf-deploy.mjs <setup|deploy> [--dry-run]");
+}
+
+const legacyPatchlessVersionId =
+  process.env.SURF_LEGACY_PATCHLESS_WORKER_VERSION?.trim();
+if (legacyPatchlessVersionId) {
+  // Validate the bootstrap-only input before build, Queue inspection, D1
+  // migration/seed, or Worker activation. The target version is not known
+  // until upload, so inequality is rechecked by the ingest client.
+  assertWorkerVersionId(
+    legacyPatchlessVersionId,
+    "legacy patchless Worker version ID"
+  );
 }
 
 function buildAndValidate() {

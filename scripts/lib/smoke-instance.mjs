@@ -5,6 +5,19 @@ import {
 
 export const SMOKE_REQUEST_TIMEOUT_MS = 15_000;
 export const SMOKE_TIMEOUT_MS = 2 * 60_000;
+export const SMOKE_ROUND_RETRY_INTERVAL_MS = 1_000;
+
+class WorkerVersionSkewError extends Error {
+  constructor(path, actualVersionId, expectedVersionId) {
+    super(
+      `${path} was served by Worker version ${actualVersionId ?? "unknown"}; expected ${expectedVersionId}.`
+    );
+    this.name = "WorkerVersionSkewError";
+    this.path = path;
+    this.actualVersionId = actualVersionId;
+    this.expectedVersionId = expectedVersionId;
+  }
+}
 
 function timeoutError(message) {
   const error = new Error(message);
@@ -51,6 +64,19 @@ function nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs) {
   return Math.min(requestTimeoutMs, remainingMs);
 }
 
+function versionSkewTimeoutError(
+  expectedVersionId,
+  timeoutMs,
+  rounds,
+  latestSkew
+) {
+  const error = timeoutError(
+    `cloud smoke did not complete one exact Worker ${expectedVersionId} round within ${timeoutMs}ms after ${rounds} round(s); latest version skew: path=${latestSkew.path} actualWorkerVersion=${latestSkew.actualVersionId ?? "missing"}`
+  );
+  error.cause = latestSkew;
+  return error;
+}
+
 function localDateKey(value, timeZone) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
@@ -67,12 +93,21 @@ function localDateKey(value, timeZone) {
   return year && month && day ? `${year}-${month}-${day}` : null;
 }
 
-async function requireWorkerVersion(response, path, expectedVersionId) {
+function requireWorkerVersion(response, path, expectedVersionId) {
   const actualVersionId = responseWorkerVersion(response);
   if (expectedVersionId && actualVersionId !== expectedVersionId) {
-    await response.body?.cancel();
-    throw new Error(
-      `${path} was served by Worker version ${actualVersionId ?? "unknown"}; expected ${expectedVersionId}.`
+    try {
+      const cancellation = response.body?.cancel();
+      if (cancellation && typeof cancellation.catch === "function") {
+        void cancellation.catch(() => {});
+      }
+    } catch {
+      // Version identity alone controls whether the complete round can continue.
+    }
+    throw new WorkerVersionSkewError(
+      path,
+      actualVersionId,
+      expectedVersionId
     );
   }
   return actualVersionId;
@@ -201,29 +236,20 @@ function validateForecast(spot, interval, forecast, requireForecastData) {
   }
 }
 
-export async function smokeForecastInstance(
-  configuredUrl,
+async function smokeForecastRound(
+  baseUrl,
   {
     label,
-    requireForecastData = true,
+    requireForecastData,
     expectedVersionId,
     expectedWorkerName,
-    fetcher = globalThis.fetch,
-    now = Date.now,
-    requestTimeoutMs = SMOKE_REQUEST_TIMEOUT_MS,
-    timeoutMs = SMOKE_TIMEOUT_MS
+    fetcher,
+    now,
+    requestTimeoutMs,
+    timeoutMs,
+    deadlineMs
   }
 ) {
-  if (
-    typeof fetcher !== "function" ||
-    typeof now !== "function" ||
-    !(requestTimeoutMs > 0) ||
-    !(timeoutMs > 0)
-  ) {
-    throw new Error("cloud smoke requires fetch, clock, and positive request/overall timeouts");
-  }
-  const baseUrl = configuredUrl.replace(/\/$/, "");
-  const deadlineMs = now() + timeoutMs;
   const healthResponse = await getJson(
     baseUrl,
     "/api/health",
@@ -233,6 +259,11 @@ export async function smokeForecastInstance(
     expectedWorkerName,
     nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs)
   );
+  const health = healthResponse.payload;
+  if (health.status !== "ok") {
+    throw new Error(`Unexpected health status: ${JSON.stringify(health)}`);
+  }
+
   const spotsResponse = await getJson(
     baseUrl,
     "/api/spots",
@@ -242,12 +273,8 @@ export async function smokeForecastInstance(
     expectedWorkerName,
     nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs)
   );
-  const health = healthResponse.payload;
   const spots = spotsResponse.payload;
 
-  if (health.status !== "ok") {
-    throw new Error(`Unexpected health status: ${JSON.stringify(health)}`);
-  }
   if (!Array.isArray(spots.spots) || spots.spots.length === 0) {
     throw new Error(`Expected at least one configured spot, got: ${JSON.stringify(spots)}`);
   }
@@ -266,25 +293,22 @@ export async function smokeForecastInstance(
   );
   const results = [];
   for (const { spot, interval } of requests) {
-    results.push(
-      await getForecastReadModel(
-        baseUrl,
-        spot,
-        interval,
-        label,
-        requireForecastData,
-        fetcher,
-        expectedVersionId,
-        expectedWorkerName,
-        nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs)
-      )
+    const result = await getForecastReadModel(
+      baseUrl,
+      spot,
+      interval,
+      label,
+      requireForecastData,
+      fetcher,
+      expectedVersionId,
+      expectedWorkerName,
+      nextRequestTimeout(deadlineMs, now, requestTimeoutMs, timeoutMs)
     );
+    if (result.status === "ready") {
+      validateForecast(spot, interval, result.forecast, requireForecastData);
+    }
+    results.push(result);
   }
-  results.forEach((result, index) => {
-    if (result.status === "pending") return;
-    const request = requests[index];
-    validateForecast(request.spot, request.interval, result.forecast, requireForecastData);
-  });
   const readyForecasts = results.filter((result) => result.status === "ready").length;
   const pendingForecasts = results.length - readyForecasts;
 
@@ -300,4 +324,84 @@ export async function smokeForecastInstance(
       : {}),
     generatedAt: new Date().toISOString()
   };
+}
+
+export async function smokeForecastInstance(
+  configuredUrl,
+  {
+    label,
+    requireForecastData = true,
+    expectedVersionId,
+    expectedWorkerName,
+    fetcher = globalThis.fetch,
+    now = Date.now,
+    sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+    requestTimeoutMs = SMOKE_REQUEST_TIMEOUT_MS,
+    timeoutMs = SMOKE_TIMEOUT_MS,
+    roundRetryIntervalMs = SMOKE_ROUND_RETRY_INTERVAL_MS
+  }
+) {
+  if (
+    typeof fetcher !== "function" ||
+    typeof now !== "function" ||
+    typeof sleep !== "function" ||
+    !(requestTimeoutMs > 0) ||
+    !(timeoutMs > 0) ||
+    !(roundRetryIntervalMs > 0)
+  ) {
+    throw new Error(
+      "cloud smoke requires fetch, clock, sleep, and positive request/overall/retry timeouts"
+    );
+  }
+
+  const baseUrl = configuredUrl.replace(/\/$/, "");
+  const deadlineMs = now() + timeoutMs;
+  const maximumRounds = Math.max(
+    1,
+    Math.ceil(timeoutMs / roundRetryIntervalMs) + 1
+  );
+  let rounds = 0;
+
+  while (true) {
+    rounds += 1;
+    try {
+      const result = await smokeForecastRound(baseUrl, {
+        label,
+        requireForecastData,
+        expectedVersionId,
+        expectedWorkerName,
+        fetcher,
+        now,
+        requestTimeoutMs,
+        timeoutMs,
+        deadlineMs
+      });
+      return rounds > 1
+        ? { ...result, versionConvergenceRounds: rounds }
+        : result;
+    } catch (error) {
+      if (!(error instanceof WorkerVersionSkewError) || !expectedVersionId) {
+        throw error;
+      }
+
+      const remainingMs = deadlineMs - now();
+      if (remainingMs <= 0 || rounds >= maximumRounds) {
+        throw versionSkewTimeoutError(
+          expectedVersionId,
+          timeoutMs,
+          rounds,
+          error
+        );
+      }
+      await sleep(Math.min(roundRetryIntervalMs, remainingMs));
+      if (deadlineMs - now() <= 0) {
+        throw versionSkewTimeoutError(
+          expectedVersionId,
+          timeoutMs,
+          rounds,
+          error
+        );
+      }
+    }
+  }
 }
