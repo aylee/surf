@@ -74,19 +74,24 @@ command polls every configured spot's 1-hour and 3-hour read models until they
 were materialized at or after the Worker-issued request timestamp. It does not
 hold the HTTP request open for ingest. The polling deadline is bounded and a
 timeout reports the exact spot/interval pairs that did not publish. During a
-deployment, the command sends Cloudflare's exact version override, addressed
-with the active config's Worker name, and requires `X-Surf-Worker-Version` to
-match the exact version emitted by Wrangler on every request. The authenticated
-POST also sends `X-Surf-Expected-Worker-Version`; the Worker compares it with
-its own `CF_VERSION_METADATA.id` before `INGEST_QUEUE.send`, so a silently
-ignored override cannot enqueue on the wrong version. Deploys use the protected
-`/api/ingest/deploy` route, which is intentionally absent from predecessors;
-fallback during the first rollout therefore returns 404 before Queue mutation.
-The legacy `/api/ingest/once` route remains the manual/local operator path.
-Forecast polling is sequential so the verification client cannot recreate a
-burst of expensive requests. Exact override reachability and unpinned production
-convergence are separate deploy gates because Cloudflare may ignore an
-unavailable override.
+deployment, the command requires `X-Surf-Worker-Version` to match the exact
+version emitted by Wrangler while exercising ordinary production routing.
+Before authenticating, it sends one unpinned `PATCH /api/ingest/once` route
+probe that must return `401`, `WWW-Authenticate: Bearer`, and that exact Worker
+version. It then sends exactly one authenticated PATCH with
+`X-Surf-Expected-Worker-Version`; the Worker compares it with immutable
+`CF_VERSION_METADATA.id` before `INGEST_QUEUE.send`. The PATCH method is
+intentionally absent from every predecessor before this invariant, so fallback
+during the first rollout returns 404 before Queue mutation. Keep deploy PATCH
+permanently version-preconditioned and never retry or fall back to POST. Its
+logical ingest identity derives from immutable version metadata, while its
+generation timestamp is captured at the authenticated Worker request; an
+accidental replay therefore stays on one stable lineage without inheriting an
+older upload timestamp. The legacy POST on the same
+path remains the manual/local operator route. Forecast polling is sequential so
+the verification client cannot recreate a burst of expensive requests. Exact
+override reachability is a separate read-only gate; mutation, lineage polling,
+and smoke stay unpinned because Cloudflare may ignore an unavailable override.
 
 ## Provider failure
 
@@ -244,13 +249,25 @@ For additive changes, back up D1 and export the required
 applies migrations, deploys the Worker, parses Wrangler's exact version ID,
 proves that version is reachable with an exact override, and then requires
 three consecutive cache-busted, unpinned version-matched health responses
-before it queues one authenticated ingest. It then waits for every read model
-from that ingest lineage to publish and runs a version-pinned strict cloud
-smoke. A callable 0%-traffic version therefore cannot cross the mutation gate.
+before requiring the active deployment JSON to contain exactly that one version
+at 100%. It probes the unpinned PATCH route without credentials, queues exactly
+one authenticated ingest, waits for every unpinned read model from that lineage
+to publish, and runs an unpinned, exact-version strict cloud smoke. It then
+rechecks the one-version/100% control-plane state. A callable 0%-traffic version
+therefore cannot cross the initial gate. These control-plane reads are strong
+before/after checkpoints, not an atomic deployment lock: a concurrent split can
+begin between them. The Worker UUID precondition is the mutation-safety
+boundary—it guarantees the PATCH can enqueue only on the expected version—and
+the final checkpoint detects a split that remains after smoke.
 
 Worker activation is the rollback safety boundary, not the deploy command's
 own ingest handoff. Cron, authenticated traffic, or an existing backlog can
 produce or consume Queue messages as soon as Wrangler activates the version.
+The HTTP version precondition proves the producer invocation; Cloudflare does
+not pin the later Queue consumer to that same version. A payload-incompatible
+consumer change therefore must preserve predecessor handling or add an explicit
+message-level consumer-version fence before shipping; the deploy harness alone
+is not that fence.
 Consequently, any readiness, publication, or smoke failure leaves the new
 Worker active and must be treated as an urgent fix-forward. Only roll back
 after independently proving the Queue is quiescent, no consumer is in flight,

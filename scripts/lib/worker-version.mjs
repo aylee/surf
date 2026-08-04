@@ -46,7 +46,12 @@ function normalizedBaseUrl(value) {
 }
 
 export function workerVersionRequestHeaders(
-  { expectedVersionId, expectedWorkerName, headers: baseHeaders } = {}
+  {
+    expectedVersionId,
+    expectedWorkerName,
+    headers: baseHeaders,
+    override = true
+  } = {}
 ) {
   const headers = new Headers(baseHeaders);
   const hasVersion = expectedVersionId !== undefined && expectedVersionId !== null;
@@ -59,10 +64,12 @@ export function workerVersionRequestHeaders(
   if (!hasVersion) return headers;
   assertVersionId(expectedVersionId);
   assertWorkerName(expectedWorkerName);
-  headers.set(
-    CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
-    `${expectedWorkerName}="${expectedVersionId}"`
-  );
+  if (override) {
+    headers.set(
+      CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
+      `${expectedWorkerName}="${expectedVersionId}"`
+    );
+  }
   return headers;
 }
 

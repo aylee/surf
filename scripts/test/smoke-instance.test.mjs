@@ -155,7 +155,7 @@ function versionedFixture({ versionForPath = () => expectedVersionId } = {}) {
   };
 }
 
-test("version-pinned smoke checks health, spots, and every forecast on one Worker version", async () => {
+test("version-checked smoke exercises ordinary routing for health, spots, and every forecast", async () => {
   const fixture = versionedFixture();
   const result = await smokeForecastInstance("https://surf.example", {
     label: "version smoke",
@@ -179,7 +179,7 @@ test("version-pinned smoke checks health, spots, and every forecast on one Worke
   for (const request of fixture.requests) {
     assert.equal(
       request.headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
-      `${expectedWorkerName}="${expectedVersionId}"`
+      null
     );
   }
 });

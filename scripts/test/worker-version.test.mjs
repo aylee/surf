@@ -67,6 +67,17 @@ test("version request headers preserve caller headers and select the exact Worke
   );
 });
 
+test("version request headers can validate identity without overriding ordinary routing", () => {
+  const headers = workerVersionRequestHeaders({
+    expectedVersionId,
+    expectedWorkerName,
+    override: false,
+    headers: { Accept: "application/json" }
+  });
+  assert.equal(headers.get("Accept"), "application/json");
+  assert.equal(headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER), null);
+});
+
 test("exact override preserves an active instance Worker name", () => {
   const headers = workerVersionRequestHeaders({
     expectedVersionId,

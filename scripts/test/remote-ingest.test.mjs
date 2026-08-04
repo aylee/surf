@@ -21,13 +21,20 @@ function versionedJson(value, init = {}) {
   return Response.json(value, { ...init, headers });
 }
 
-function versionedForecast() {
+function versionedUnauthorized() {
+  return versionedJson(
+    { error: "Unauthorized" },
+    { status: 401, headers: { "WWW-Authenticate": "Bearer" } }
+  );
+}
+
+function versionedForecast(expectedIngestId = ingestId) {
   return new Response("{}", {
     headers: {
       [SURF_WORKER_VERSION_HEADER]: workerVersion,
       "X-Surf-Forecast-Generated-At": requestedAt,
       "X-Surf-Forecast-Materialized-At": "2026-08-03T01:00:30.000Z",
-      "X-Surf-Ingest-Id": ingestId
+      "X-Surf-Ingest-Id": expectedIngestId
     }
   });
 }
@@ -189,25 +196,36 @@ test("remote ingest ignores fresh read models from a different ingest", async ()
   assert.equal(forecastRequests, 4);
 });
 
-test("version-pinned remote ingest proves the exact Worker before and after its single enqueue", async () => {
-  let postCount = 0;
+test("version-checked remote ingest proves the ordinary route before and after its single enqueue", async () => {
+  let patchCount = 0;
   const requests = [];
   const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     requests.push({
       path: `${url.pathname}${url.search}`,
       method: init.method ?? "GET",
-      headers: new Headers(init.headers)
+      headers: new Headers(init.headers),
+      cache: init.cache,
+      redirect: init.redirect
     });
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
-    if (url.pathname === "/api/ingest/deploy") {
-      postCount += 1;
+    if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+      patchCount += 1;
+      if (!new Headers(init.headers).has("Authorization")) {
+        return versionedUnauthorized();
+      }
       return versionedJson(
-        { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt, region: "norcal" },
+        {
+          status: "accepted",
+          ingestId: workerVersion,
+          requestedAt,
+          forecastGeneratedAt: requestedAt,
+          region: "norcal"
+        },
         { status: 202 }
       );
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) return versionedForecast();
+    if (url.pathname === `/api/forecast/${spot.id}`) return versionedForecast(workerVersion);
     return new Response("not found", { status: 404 });
   };
 
@@ -221,14 +239,16 @@ test("version-pinned remote ingest proves the exact Worker before and after its 
     timeoutMs: 20
   });
 
-  assert.equal(postCount, 1);
+  assert.equal(patchCount, 2);
   assert.equal(result.workerVersion, workerVersion);
+  assert.equal(result.ingestId, workerVersion);
   assert.equal(result.forecastReadModels, 2);
   assert.deepEqual(
     requests.map(({ path, method }) => ({ path, method })),
     [
       { path: "/api/spots", method: "GET" },
-      { path: "/api/ingest/deploy", method: "POST" },
+      { path: "/api/ingest/once", method: "PATCH" },
+      { path: "/api/ingest/once", method: "PATCH" },
       { path: "/api/forecast/test-break?interval=3h", method: "GET" },
       { path: "/api/forecast/test-break?interval=1h", method: "GET" }
     ]
@@ -236,29 +256,219 @@ test("version-pinned remote ingest proves the exact Worker before and after its 
   for (const request of requests) {
     assert.equal(
       request.headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
-      `${workerName}="${workerVersion}"`,
-      `${request.path} must use the exact Worker-version override`
+      null,
+      `${request.path} must exercise ordinary production routing`
     );
     assert.equal(
       request.headers.get(SURF_EXPECTED_WORKER_VERSION_HEADER),
-      request.method === "POST" ? workerVersion : null,
+      request.method === "PATCH" ? workerVersion : null,
       `${request.path} must apply the version precondition only at the mutation boundary`
     );
   }
+  const patchRequests = requests.filter(({ method }) => method === "PATCH");
+  assert.deepEqual(
+    patchRequests.map(({ headers }) => headers.get("Authorization")),
+    [null, "Bearer secret-token"],
+    "the route probe must be unauthenticated and exactly one PATCH may carry credentials"
+  );
+  assert.deepEqual(
+    patchRequests.map(({ cache, redirect }) => ({ cache, redirect })),
+    [
+      { cache: "no-store", redirect: "error" },
+      { cache: "no-store", redirect: "error" }
+    ]
+  );
 });
 
-test("a predecessor without the deploy route cannot enqueue on override fallback", async () => {
-  let deployPosts = 0;
-  let legacyQueueSends = 0;
-  let forecastRequests = 0;
-  const fetcher = async (input) => {
+test("deploy route probe requires exact unauthorized method-path identity before enqueue", async () => {
+  for (const probeResponse of [
+    versionedJson({ error: "Unauthorized" }, { status: 404 }),
+    versionedJson({ error: "Unauthorized" }, { status: 401 }),
+    Response.json(
+      { error: "Unauthorized" },
+      {
+        status: 401,
+        headers: {
+          "WWW-Authenticate": "Bearer",
+          [SURF_WORKER_VERSION_HEADER]: staleWorkerVersion,
+          "CF-Ray": "stale-ray"
+        }
+      }
+    )
+  ]) {
+    let authenticatedPatches = 0;
+    const fetcher = async (input, init = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+      if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+        if (new Headers(init.headers).has("Authorization")) authenticatedPatches += 1;
+        return probeResponse.clone();
+      }
+      return new Response("unexpected request", { status: 500 });
+    };
+
+    await assert.rejects(
+      enqueueAndWaitForRemoteIngest({
+        baseUrl,
+        token: "secret-token",
+        fetcher,
+        expectedVersionId: workerVersion,
+        expectedWorkerName: workerName
+      }),
+      /remote ingest route probe failed: PATCH \/api\/ingest\/once/
+    );
+    assert.equal(authenticatedPatches, 0);
+  }
+});
+
+test("deploy request failures distinguish pre-mutation from ambiguous enqueue transport", async () => {
+  let probePatchRequests = 0;
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+        if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+          probePatchRequests += 1;
+          throw new TypeError("redirect rejected");
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    (error) => {
+      assert.equal(error.name, "TransportError");
+      assert.match(
+        error.message,
+        /remote ingest route probe request failed: PATCH \/api\/ingest\/once; mutation did not begin/
+      );
+      assert.equal(error.cause?.name, "TransportError");
+      return true;
+    }
+  );
+  assert.equal(probePatchRequests, 1);
+
+  let authenticatedPatchRequests = 0;
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+        if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+          if (!new Headers(init.headers).has("Authorization")) {
+            return versionedUnauthorized();
+          }
+          authenticatedPatchRequests += 1;
+          throw new TypeError("connection reset after send");
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    (error) => {
+      assert.equal(error.name, "TransportError");
+      assert.match(
+        error.message,
+        /remote ingest enqueue request failed: PATCH \/api\/ingest\/once; mutation may have occurred; do not retry/
+      );
+      assert.equal(error.cause?.name, "TransportError");
+      return true;
+    }
+  );
+  assert.equal(authenticatedPatchRequests, 1);
+});
+
+test("deploy enqueue diagnostics preserve bounded text evidence without leaking the token", async () => {
+  const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
-    if (url.pathname === "/api/ingest/deploy") {
-      deployPosts += 1;
-      return new Response("not found", { status: 404 });
+    if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+      if (!new Headers(init.headers).has("Authorization")) return versionedUnauthorized();
+      return new Response("upstream reflected secret-token\nwith control\u0000bytes", {
+        status: 502,
+        headers: {
+          [SURF_WORKER_VERSION_HEADER]: workerVersion,
+          "CF-Ray": "diagnostic-ray"
+        }
+      });
     }
-    if (url.pathname === "/api/ingest/once") {
+    return new Response("unexpected request", { status: 500 });
+  };
+
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      fetcher,
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName
+    }),
+    (error) => {
+      assert.match(
+        error.message,
+        /status=502 workerVersion=9fdf8329-662b-4665-bc74-9b153dc3fc40 cfRay=diagnostic-ray body=upstream reflected \[REDACTED\] with control bytes/
+      );
+      assert.doesNotMatch(error.message, /secret-token/);
+      return true;
+    }
+  );
+});
+
+test("deploy diagnostics redact a token before the evidence boundary is truncated", async () => {
+  const reflected = `${"x".repeat(495)}secret-token trailing`;
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+    if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+      if (!new Headers(init.headers).has("Authorization")) return versionedUnauthorized();
+      return new Response(reflected, {
+        status: 502,
+        headers: { [SURF_WORKER_VERSION_HEADER]: workerVersion }
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  };
+
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      fetcher,
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName
+    }),
+    (error) => {
+      assert.doesNotMatch(error.message, /secret|secret-token/);
+      assert.match(error.message, /body=x{495}\[REDA/);
+      return true;
+    }
+  );
+});
+
+test("a predecessor without the deploy PATCH cannot enqueue on override fallback", async () => {
+  let deployPatches = 0;
+  let legacyQueueSends = 0;
+  let forecastRequests = 0;
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+    if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+      deployPatches += 1;
+      return new Response("not found", {
+        status: 404,
+        headers: {
+          [SURF_WORKER_VERSION_HEADER]: staleWorkerVersion,
+          "CF-Ray": "predecessor-ray"
+        }
+      });
+    }
+    if (url.pathname === "/api/ingest/once" && init.method === "POST") {
       legacyQueueSends += 1;
       return new Response("unexpected legacy mutation", { status: 202 });
     }
@@ -274,9 +484,9 @@ test("a predecessor without the deploy route cannot enqueue on override fallback
       expectedVersionId: workerVersion,
       expectedWorkerName: workerName
     }),
-    /remote ingest enqueue failed: 404/
+    /remote ingest route probe failed: PATCH \/api\/ingest\/once status=404 workerVersion=ea3a7a1e-3c43-4aca-9517-dbe1ff562746 cfRay=predecessor-ray body=not found/
   );
-  assert.equal(deployPosts, 1);
+  assert.equal(deployPatches, 1);
   assert.equal(legacyQueueSends, 0);
   assert.equal(forecastRequests, 0);
 });
@@ -458,16 +668,19 @@ test("a stalled catalog body times out before enqueue and aborts its request", a
   assert.equal(postCount, 0);
 });
 
-test("a stalled accepted-response body is bounded after exactly one POST", async () => {
-  let postCount = 0;
+test("a stalled accepted-response body is bounded after exactly one authenticated PATCH", async () => {
+  let authenticatedPatchCount = 0;
   let forecastCount = 0;
-  let postSignal;
+  let patchSignal;
   const fetcher = (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return Promise.resolve(versionedJson({ spots: [spot] }));
-    if (url.pathname === "/api/ingest/deploy") {
-      postCount += 1;
-      postSignal = init.signal;
+    if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+      if (!new Headers(init.headers).has("Authorization")) {
+        return Promise.resolve(versionedUnauthorized());
+      }
+      authenticatedPatchCount += 1;
+      patchSignal = init.signal;
       return Promise.resolve(
         hangingBodyResponse({
           status: 202,
@@ -488,10 +701,18 @@ test("a stalled accepted-response body is bounded after exactly one POST", async
       expectedWorkerName: workerName,
       requestTimeoutMs: 5
     }),
-    (error) => error?.name === "TimeoutError"
+    (error) => {
+      assert.equal(error?.name, "TimeoutError");
+      assert.match(
+        error.message,
+        /remote ingest enqueue request failed: PATCH \/api\/ingest\/once; mutation may have occurred; do not retry/
+      );
+      assert.equal(error.cause?.name, "TimeoutError");
+      return true;
+    }
   );
-  assert.equal(postSignal.aborted, true);
-  assert.equal(postCount, 1);
+  assert.equal(patchSignal.aborted, true);
+  assert.equal(authenticatedPatchCount, 1);
   assert.equal(forecastCount, 0);
 });
 
@@ -623,13 +844,16 @@ test("persistent forecast transport failure reaches the global deadline after on
 });
 
 test("an accepted deploy response from the wrong Worker rejects without forecast polling", async () => {
-  let postCount = 0;
+  let authenticatedPatchCount = 0;
   let forecastCount = 0;
-  const fetcher = async (input) => {
+  const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
-    if (url.pathname === "/api/ingest/deploy") {
-      postCount += 1;
+    if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+      if (!new Headers(init.headers).has("Authorization")) {
+        return versionedUnauthorized();
+      }
+      authenticatedPatchCount += 1;
       return Response.json(
         { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt },
         {
@@ -650,22 +874,30 @@ test("an accepted deploy response from the wrong Worker rejects without forecast
       expectedVersionId: workerVersion,
       expectedWorkerName: workerName
     }),
-    /remote ingest enqueue failed: 202/
+    /remote ingest enqueue failed: PATCH \/api\/ingest\/once status=202 workerVersion=ea3a7a1e-3c43-4aca-9517-dbe1ff562746/
   );
-  assert.equal(postCount, 1);
+  assert.equal(authenticatedPatchCount, 1);
   assert.equal(forecastCount, 0);
 });
 
 test("wrong-version ready forecasts never satisfy publication", async () => {
   let clock = Date.parse(requestedAt);
-  let postCount = 0;
-  const fetcher = async (input) => {
+  let authenticatedPatchCount = 0;
+  const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
-    if (url.pathname === "/api/ingest/deploy") {
-      postCount += 1;
+    if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+      if (!new Headers(init.headers).has("Authorization")) {
+        return versionedUnauthorized();
+      }
+      authenticatedPatchCount += 1;
       return versionedJson(
-        { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt },
+        {
+          status: "accepted",
+          ingestId: workerVersion,
+          requestedAt,
+          forecastGeneratedAt: requestedAt
+        },
         { status: 202 }
       );
     }
@@ -674,7 +906,7 @@ test("wrong-version ready forecasts never satisfy publication", async () => {
         [SURF_WORKER_VERSION_HEADER]: staleWorkerVersion,
         "X-Surf-Forecast-Generated-At": requestedAt,
         "X-Surf-Forecast-Materialized-At": "2026-08-03T01:00:30.000Z",
-        "X-Surf-Ingest-Id": ingestId
+        "X-Surf-Ingest-Id": workerVersion
       }
     });
   };
@@ -695,7 +927,7 @@ test("wrong-version ready forecasts never satisfy publication", async () => {
     }),
     /pending: test-break:3h, test-break:1h/
   );
-  assert.equal(postCount, 1);
+  assert.equal(authenticatedPatchCount, 1);
 });
 
 test("persistent exact Cloudflare 1102 reaches the global deadline without reenqueuing", async () => {

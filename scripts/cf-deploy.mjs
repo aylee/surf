@@ -8,6 +8,7 @@ import {
 } from "./lib/cloudflare-commands.mjs";
 import { bootstrapDeployedWorker } from "./lib/deploy-bootstrap.mjs";
 import {
+  resolveActiveDeploymentId,
   resolveDeployedUrl,
   resolveDeployedVersionId
 } from "./lib/deploy-url.mjs";
@@ -103,6 +104,27 @@ function refreshForecastReadModels(
   });
 }
 
+function assertDeploymentActive(expectedVersionId, checkpoint) {
+  const deploymentStatusOutput = runWrangler(
+    ["deployments", "status", "--json"],
+    { capture: true, echo: false }
+  );
+  const deploymentId = resolveActiveDeploymentId(
+    deploymentStatusOutput,
+    expectedVersionId
+  );
+  console.log(
+    JSON.stringify({
+      status: "deployment-active",
+      checkpoint,
+      deploymentId,
+      workerVersion: expectedVersionId,
+      percentage: 100
+    })
+  );
+  return deploymentId;
+}
+
 async function waitUntilServing(output, expectedWorkerName) {
   const url = deployedUrl(output);
   if (!url) {
@@ -117,7 +139,8 @@ async function waitUntilServing(output, expectedWorkerName) {
     expectedWorkerName
   });
   console.log(JSON.stringify(result));
-  return { expectedVersionId, expectedWorkerName };
+  const deploymentId = assertDeploymentActive(expectedVersionId, "pre-enqueue");
+  return { deploymentId, expectedVersionId, expectedWorkerName };
 }
 
 const activeWranglerConfig = assertActiveWranglerConfig();
@@ -156,6 +179,7 @@ if (mode === "setup") {
     rollout.expectedVersionId,
     rollout.expectedWorkerName
   );
+  assertDeploymentActive(rollout.expectedVersionId, "post-smoke");
 } else {
   try {
     migrateAndSeed();
@@ -180,12 +204,14 @@ if (mode === "setup") {
         rollout.expectedVersionId,
         rollout.expectedWorkerName
       ),
-    smoke: () =>
+    smoke: () => {
       smoke(
         output,
         true,
         rollout.expectedVersionId,
         rollout.expectedWorkerName
-      )
+      );
+      assertDeploymentActive(rollout.expectedVersionId, "post-smoke");
+    }
   });
 }

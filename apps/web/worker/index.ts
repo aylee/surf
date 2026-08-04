@@ -51,6 +51,8 @@ const app = new Hono<{ Bindings: Env }>();
 type AppContext = Context<{ Bindings: Env }>;
 const INGEST_RETRY_DELAYS_SECONDS = [15, 30, 60, 300] as const;
 const EXPECTED_WORKER_VERSION_HEADER = "X-Surf-Expected-Worker-Version";
+const WORKER_VERSION_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const spotsResponse = SpotsResponseSchema.parse({
   spots: NORCAL_SPOTS.map((spot) => ({
@@ -297,9 +299,12 @@ app.get(
   }
 );
 
-async function queueRemoteIngest(c: AppContext) {
+async function queueRemoteIngest(
+  c: AppContext,
+  identity: { ingestId: string } | null = null
+) {
   const requestedAt = new Date().toISOString();
-  const ingestId = crypto.randomUUID();
+  const ingestId = identity?.ingestId ?? crypto.randomUUID();
   await c.env.INGEST_QUEUE.send({
     job: "source-ingest",
     kind: "manual-ingest",
@@ -329,7 +334,12 @@ async function requireIngestAuthorization(c: AppContext) {
   });
 }
 
-app.post("/api/ingest/deploy", async (c) => {
+// Supported deployments deliberately use a predecessor-absent method on the
+// established ingest path. Keep this PATCH preconditioned forever: older
+// Workers know only POST and therefore fail closed before Queue.send, while
+// every Worker from this version onward rejects a stale expected UUID before
+// mutation. Do not alias or fall back to POST from the deploy client.
+app.patch("/api/ingest/once", async (c) => {
   const authorizationFailure = await requireIngestAuthorization(c);
   if (authorizationFailure) return authorizationFailure;
 
@@ -338,6 +348,9 @@ app.post("/api/ingest/deploy", async (c) => {
     ?.trim();
   if (!expectedWorkerVersion) {
     return c.json({ error: "worker_version_precondition_required" }, 428);
+  }
+  if (!WORKER_VERSION_ID_PATTERN.test(expectedWorkerVersion)) {
+    return c.json({ error: "worker_version_precondition_invalid" }, 400);
   }
   const actualWorkerVersion = c.env.CF_VERSION_METADATA?.id?.trim();
   if (!actualWorkerVersion) {
@@ -359,7 +372,13 @@ app.post("/api/ingest/deploy", async (c) => {
       409
     );
   }
-  return queueRemoteIngest(c);
+  // A replay of the same deployment PATCH carries one logical lineage even if
+  // a noncompliant intermediary duplicates the unsafe request after an
+  // ambiguous connection failure. Serialized Queue work and persistence
+  // converge on the same ingestId/run_key rather than publishing two lineages.
+  return queueRemoteIngest(c, {
+    ingestId: actualWorkerVersion
+  });
 });
 
 app.post("/api/ingest/once", async (c) => {

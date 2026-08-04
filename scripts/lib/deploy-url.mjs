@@ -25,6 +25,55 @@ export function resolveDeployedVersionId(output) {
   return match[1];
 }
 
+export function resolveActiveDeploymentId(output, expectedVersionId) {
+  if (!VERSION_ID_PATTERN.test(expectedVersionId)) {
+    throw new Error("Expected Worker version must be a UUID.");
+  }
+
+  let status;
+  try {
+    status = JSON.parse(stripAnsi(output).trim());
+  } catch {
+    throw new Error("Wrangler deployment status must be exactly one JSON object.");
+  }
+  if (!status || typeof status !== "object" || Array.isArray(status)) {
+    throw new Error("Wrangler deployment status must be a JSON object.");
+  }
+  if (!VERSION_ID_PATTERN.test(status.id ?? "")) {
+    throw new Error("Wrangler deployment status contained an invalid deployment ID UUID.");
+  }
+  if (status.strategy !== "percentage") {
+    throw new Error(
+      `Wrangler deployment status used an unsupported strategy: ${String(status.strategy)}.`
+    );
+  }
+  if (!Array.isArray(status.versions) || status.versions.length !== 1) {
+    throw new Error(
+      `Active deployment must contain exactly one version; found ${Array.isArray(status.versions) ? status.versions.length : "invalid"}.`
+    );
+  }
+
+  const [activeVersion] = status.versions;
+  if (!activeVersion || typeof activeVersion !== "object" || Array.isArray(activeVersion)) {
+    throw new Error("Active deployment version must be a JSON object.");
+  }
+  if (activeVersion.version_id !== expectedVersionId) {
+    throw new Error(
+      `Active deployment version does not match the uploaded Worker version; expected ${expectedVersionId}, received ${activeVersion.version_id ?? "missing"}.`
+    );
+  }
+  if (
+    typeof activeVersion.percentage !== "number" ||
+    !Number.isFinite(activeVersion.percentage) ||
+    activeVersion.percentage !== 100
+  ) {
+    throw new Error(
+      `Uploaded Worker version must receive exactly 100% of deployment traffic; received ${String(activeVersion.percentage)}.`
+    );
+  }
+  return status.id;
+}
+
 export function resolveDeployedUrl(output, configuredUrl) {
   const plainOutput = stripAnsi(output);
   const candidates = plainOutput.match(/https:\/\/[^\s]+/g) ?? [];

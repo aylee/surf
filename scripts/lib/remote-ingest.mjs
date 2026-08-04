@@ -24,6 +24,29 @@ async function jsonOrNull(response) {
   }
 }
 
+async function responseEvidence(response, sensitiveValues = []) {
+  const rawBody = await response.text();
+  let payload = null;
+  try {
+    payload = rawBody ? JSON.parse(rawBody) : null;
+  } catch {
+    // Preserve non-JSON Cloudflare/proxy failures in the bounded diagnostic.
+  }
+  let safeBody = rawBody;
+  for (const sensitiveValue of sensitiveValues) {
+    if (sensitiveValue) {
+      safeBody = safeBody.split(sensitiveValue).join("[REDACTED]");
+    }
+  }
+  const body = safeBody
+    .slice(0, 2_000)
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+  return { payload, body: body || "<empty>" };
+}
+
 function isTypedPendingForecast(value, spotId, interval) {
   return Boolean(
     value &&
@@ -64,6 +87,19 @@ function transportError(cause) {
 
 function isFetchTransportFailure(error) {
   return error instanceof TypeError || error?.name === "AbortError";
+}
+
+function annotatedRequestFailure(error, { phase, method, path, mutationPossible }) {
+  const cause = error instanceof Error ? error : new Error(String(error));
+  const ambiguity = mutationPossible
+    ? "mutation may have occurred; do not retry"
+    : "mutation did not begin";
+  const annotated = new Error(
+    `remote ingest ${phase} request failed: ${method} ${path}; ${ambiguity}; ${cause.name}: ${cause.message}`,
+    { cause }
+  );
+  annotated.name = cause.name;
+  return annotated;
 }
 
 async function requestWithTimeout(fetcher, input, init, timeoutMs, consume) {
@@ -126,6 +162,7 @@ async function configuredSpotIds(
       headers: workerVersionRequestHeaders({
         expectedVersionId,
         expectedWorkerName,
+        override: false,
         headers: { Accept: "application/json" }
       })
     },
@@ -178,6 +215,7 @@ async function inspectForecastReadModel(
         headers: workerVersionRequestHeaders({
           expectedVersionId,
           expectedWorkerName,
+          override: false,
           headers: { Accept: "application/json" }
         })
       },
@@ -347,31 +385,98 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     expectedWorkerName,
     requestTimeoutMs
   );
-  const enqueueHeaders = workerVersionRequestHeaders({
-    expectedVersionId,
-    expectedWorkerName,
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${token}`
-    }
+  const enqueueHeaders = new Headers({
+    Accept: "application/json",
+    Authorization: `Bearer ${token}`
   });
   if (expectedVersionId) {
     enqueueHeaders.set(SURF_EXPECTED_WORKER_VERSION_HEADER, expectedVersionId);
   }
-  const enqueue = await requestWithTimeout(
-    fetcher,
-    `${baseUrl}${expectedVersionId ? "/api/ingest/deploy" : "/api/ingest/once"}`,
-    {
-      method: "POST",
-      headers: enqueueHeaders
-    },
-    requestTimeoutMs,
-    async (response) => ({
-      status: response.status,
-      workerVersion: responseWorkerVersion(response),
-      payload: await jsonOrNull(response)
-    })
-  );
+  const enqueuePath = "/api/ingest/once";
+  const enqueueMethod = expectedVersionId ? "PATCH" : "POST";
+
+  if (expectedVersionId) {
+    const routeProbeHeaders = new Headers({
+      Accept: "application/json",
+      [SURF_EXPECTED_WORKER_VERSION_HEADER]: expectedVersionId
+    });
+    let routeProbe;
+    try {
+      routeProbe = await requestWithTimeout(
+        fetcher,
+        `${baseUrl}${enqueuePath}`,
+        {
+          method: enqueueMethod,
+          headers: routeProbeHeaders,
+          cache: "no-store",
+          redirect: "error"
+        },
+        requestTimeoutMs,
+        async (response) => {
+          const evidence = await responseEvidence(response);
+          return {
+            status: response.status,
+            workerVersion: responseWorkerVersion(response),
+            authenticate: response.headers.get("WWW-Authenticate"),
+            cfRay: response.headers.get("CF-Ray"),
+            ...evidence
+          };
+        }
+      );
+    } catch (error) {
+      throw annotatedRequestFailure(error, {
+        phase: "route probe",
+        method: enqueueMethod,
+        path: enqueuePath,
+        mutationPossible: false
+      });
+    }
+    if (
+      routeProbe.status !== 401 ||
+      routeProbe.workerVersion !== expectedVersionId ||
+      routeProbe.authenticate !== "Bearer"
+    ) {
+      throw new Error(
+        remoteIngestDiagnostic({
+          phase: "route probe",
+          method: enqueueMethod,
+          path: enqueuePath,
+          ...routeProbe
+        })
+      );
+    }
+  }
+
+  let enqueue;
+  try {
+    enqueue = await requestWithTimeout(
+      fetcher,
+      `${baseUrl}${enqueuePath}`,
+      {
+        method: enqueueMethod,
+        headers: enqueueHeaders,
+        cache: "no-store",
+        redirect: "error"
+      },
+      requestTimeoutMs,
+      async (response) => {
+        const evidence = await responseEvidence(response, [token]);
+        return {
+          status: response.status,
+          workerVersion: responseWorkerVersion(response),
+          cfRay: response.headers.get("CF-Ray"),
+          ...evidence
+        };
+      }
+    );
+  } catch (error) {
+    throw annotatedRequestFailure(error, {
+      phase: "enqueue",
+      method: enqueueMethod,
+      path: enqueuePath,
+      mutationPossible: true
+    });
+  }
   const { payload } = enqueue;
   if (
     enqueue.status !== 202 ||
@@ -379,11 +484,18 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     payload?.status !== "accepted" ||
     typeof payload?.ingestId !== "string" ||
     !payload.ingestId ||
+    (expectedVersionId && payload.ingestId !== expectedVersionId) ||
     !validTimestamp(payload?.requestedAt) ||
-    !validTimestamp(payload?.forecastGeneratedAt)
+    !validTimestamp(payload?.forecastGeneratedAt) ||
+    payload.forecastGeneratedAt !== payload.requestedAt
   ) {
     throw new Error(
-      `remote ingest enqueue failed: ${enqueue.status} ${JSON.stringify(payload)}`
+      remoteIngestDiagnostic({
+        phase: "enqueue",
+        method: enqueueMethod,
+        path: enqueuePath,
+        ...enqueue
+      })
     );
   }
   const result = await waitForRemoteForecastReadModels({
@@ -399,4 +511,23 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     ingestId: payload.ingestId,
     ...(expectedVersionId ? { workerVersion: expectedVersionId } : {})
   };
+}
+
+function remoteIngestDiagnostic({
+  phase,
+  method,
+  path,
+  status,
+  workerVersion,
+  cfRay,
+  body
+}) {
+  return [
+    `remote ingest ${phase} failed:`,
+    `${method} ${path}`,
+    `status=${status}`,
+    `workerVersion=${workerVersion ?? "missing"}`,
+    `cfRay=${cfRay ?? "missing"}`,
+    `body=${body ?? "<unavailable>"}`
+  ].join(" ");
 }
