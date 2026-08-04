@@ -41,8 +41,8 @@ current brief** (one pointer line, below).
 Plan approved for execution 2026-08-03 via the owner's one-shot kickoff (OD-8; OI-1 resolved;
 runtime plan captured at `~/.claude/plans/goal-i-want-to-graceful-cocoa.md`;
 its RCA evidence and locked decisions are folded into this workstream and the implementation
-plan). Execution began at `87f45dc`; recovery PRs #17–#19 are merged and `main` is now
-`fd70a23`.
+plan). Execution began at `87f45dc`; recovery PRs #17–#20 are merged and `main` is now
+`7d7b042`.
 **Phase 0 is complete and corrected the planning record:** PR #16 merged but was never
 deployed, so the 23:23Z incident was old request-time assembly exhausting CPU (OI-2), not D1
 flapping. The second supported recovery activated version `04915a00…` at 100%, corrected the
@@ -63,15 +63,20 @@ deploy activated `ce93cdde…` at exactly 100%. The unpinned unauthenticated PAT
 `ce93cdde…` and returned its expected 401, but the immediately following authenticated PATCH
 was independently routed to predecessor `c0075263…`, which returned 404 before Queue access.
 Read-only D1 proof shows zero source runs since the attempt and Queue remains 1/1, so write
-safety held; request-level routing liveness did not. The fourth recovery is now implemented
-and locally green on `aylee/surf-proven-noop-handoff`: one stable version-affinity key is a
-liveness aid only; catalog and no-auth PATCH identity are polled inside one 60-second handoff
-window; an authenticated PATCH repeats at most three times and only after the exact typed
-pre-Queue 409 contract or the one runtime-allowlisted c007 Hono 404 fingerprint. Every 202 and
-every ambiguous response is terminal. Strict smoke now requires one fully exact-version round
-instead of accepting mixed rollout responses. Three independent final reviews are DRY;
-canonical verify and local queue-to-browser e2e are green. The narrow ready PR is the next
-mutation boundary.
+safety held; request-level routing liveness did not. PR #20 shipped the bounded proven-no-op
+handoff after three independent final DRY reviews and green local/GitHub gates. Supported
+deploy activated `ce82bb5d…` at exactly 100% and passed exact plus ordinary readiness. Its one
+stable version-affinity key then deterministically pinned all 57 read-only catalog requests to
+predecessor `ce93cdde…` for 60 seconds; no PATCH of any kind occurred. `ce82bb5d…` remains the
+sole active version for queue-safe fix-forward. Read-only sampling after the failure used 12
+fresh keys × two adjacent requests × two origins and returned 48/48 `ce82bb5d…` with zero split
+pairs. A fifth narrow recovery is ready for review on `aylee/surf-affinity-session-rotation`:
+stale/missing identity and transport/body misses before exact-target identity discard the
+entire read-only catalog/probe session; exact-target defects are terminal. One winning key is
+frozen only across exact-target catalog → exact 401/Bearer probe → one authenticated PATCH. The
+60-second deadline, global 60-session cap, three-auth cap, exact safe-rejection classifiers,
+and terminal ambiguity boundary remain unchanged. Two frozen-snapshot reviewers are DRY;
+canonical verify and the local queue/read-model/browser ladder are green.
 PR-A remains blocked on OI-5 live 12/12. OI-4 destination
 provisioning is still operator-side/open.
 The owner's 2026-08-03 browser-quality amendment (OD-9) raises PR-B/C's UI bar: preserve
@@ -90,7 +95,7 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | ID | Item | Owner | Status | Resolves in |
 |---|---|---|---|---|
 | OI-4 | Logfire OTLP destination + token provisioning (Cloudflare dashboard/API side; operator-assisted; secrets never in repo) | alex + agent | OPEN | PR-A, stop-and-ask step with named rollback |
-| OI-5 | Live-verify merged PR #16 before PR-A starts; PR #19 activated `ce93cdde…` at 100%, then proved Cloudflare can route an adjacent probe to the new Worker and the authenticated PATCH to stale `c0075263…`. Stale 404 occurred before Queue access; post-attempt D1 has zero source runs. The bounded proven-no-op handoff and clean-round smoke corrective are implemented, independently DRY, and locally green | agent | FIX FORWARD — READY PR | Ready PR → GitHub Verify → merge → one supported deploy with shell-only c007 bootstrap UUID → dual-origin exact/default version + one lineage + 12/12 + queue 1/1 live proof |
+| OI-5 | Live-verify merged PR #16 before PR-A starts; PR #20 activated `ce82bb5d…` at 100% but one stable affinity key pinned 57/57 read-only catalogs to `ce93cdde…` until the shared deadline. No PATCH occurred. Fresh-key diagnostics were 48/48 target with zero adjacent splits; the reviewed corrective is whole-session rotation before authentication | agent | FIX FORWARD — READY PR | Publish the dry/green narrow PR, merge only after GitHub Verify, run one supported deploy without the retired c007 bootstrap value, then exact dual-origin identity + one lineage + 12/12 + queue 1/1 + browser live proof |
 | OI-6 | Native automatic trace continuity across durable Queue producer→consumer boundaries is undocumented; verify the locked one-trace criterion on the PR-A :17 cycle | agent | OPEN | PR-A live gate; `ingestId` remains the cross-trace fallback, not a silent acceptance rewrite |
 
 ### Resolved (this workstream)
@@ -177,13 +182,13 @@ remained green.
 
 ## Next Action
 
-**Publish `aylee/surf-proven-noop-handoff` as a ready recovery PR, require GitHub Verify, merge,
-and run exactly one supported `pnpm deploy` with
-`SURF_LEGACY_PATCHLESS_WORKER_VERSION=c0075263-2f92-47ae-bbcc-d3a12a9fbbe7` scoped to that
-command only. Prove dual-origin exact/default identity, one accepted lineage, 12/12 strict
-smoke, deployment at exactly 100%, and queue 1/1. Any post-activation failure remains a
-queue-safe fix-forward unless quiescence and payload compatibility make rollback provable.
-Then close OI-5, checkpoint the full recovery OODA loop, and only then branch PR-A.**
+**Publish the dry/green `aylee/surf-affinity-session-rotation` as a ready PR, require GitHub
+Verify, merge, then run one supported `pnpm deploy` without the retired c007 bootstrap value.
+Prove exact/default identity on both origins, one accepted lineage, 12/12 strict smoke,
+deployment at exactly 100%, queue 1/1, and the production page in the code browser. Any
+post-activation failure remains queue-safe fix-forward unless quiescence and payload
+compatibility make rollback provable. Then close OI-5, checkpoint the full recovery OODA loop,
+and only then branch PR-A.**
 
 ## Closeout Path
 
@@ -490,3 +495,63 @@ manual replay, status-as-lock, or rollback without Queue quiescence. **Act:** pu
 recovery PR, require GitHub Verify, merge, take a fresh D1 bookmark, and run one supported deploy
 with the c007 UUID scoped to that command. Close OI-5 only after one lineage, 12/12, exact
 dual-origin identity, 100% deployment, queue 1/1, and browser proof are all live-green.
+
+_2026-08-03_ — **PR #20 live gate failed closed; affinity-session OODA corrective began.**
+Ready PR #20 at `c0c3539` passed GitHub Verify in 1m12s and merged as
+`7d7b04209f36895d2ac641e6ef16c13b5918c58f` at `2026-08-04T05:34:36Z`. The local OAuth
+token could execute D1 migration/seed but not the read-only Time Travel info endpoint, so the
+named recovery anchor remained the 04:52 bookmark plus D1 point-in-time recovery; this patch
+had no schema/seed delta. Seed completed at bookmark
+`00000340-00000004-000050bd-e3bd374fc658291057f24d5f5b97b9a7`. Supported deploy activated
+Worker `ce82bb5d-b9ba-46db-8621-c68fcb8ffbac` in deployment
+`e4c83439-2632-48c7-a50e-112ab1085e6b` at exactly 100%; exact override and three ordinary
+readiness checks passed. The handoff then made 57 keyed `GET /api/spots` requests, all served
+by `ce93cdde…`, and reached its 60-second deadline before any route probe or authenticated
+PATCH. The command explicitly reported “mutation did not begin”; ce82 remains active.
+
+**OODA — Observe:** Cloudflare affinity did exactly what its contract promises: one key maps
+deterministically to one version for a deployment and does not select the target. Fifty-seven
+same-key reads were one frozen sample, not 57 convergence opportunities. After the deadline,
+12 fresh keys × two adjacent requests on each origin produced 48/48 ce82 responses and zero
+split pairs, proving key rotation is the missing liveness mechanism. Preflight and post-failure
+control plane still show one target version at 100% and Queue 1 producer/1 consumer. **Orient:**
+the safety boundary remains correct—no surf generation was duplicated or falsely attributed—
+but OI-5 still blocks the quieter freshness and educational UI work. A personal planning tool
+can tolerate one delayed refresh; it cannot tolerate a deploy path that permanently mistakes a
+deterministic stale affinity assignment for convergence. **Decide:** reject longer same-key
+polling, removal of affinity, override-pinned mutation, manual replay, and rollback. Rotate the
+whole read-only candidate session: one fresh key, one exact-target valid catalog, one exact
+401/Bearer probe, then at most one authenticated PATCH on that same key. Any read-only miss
+discards the key; only the existing exact pre-Queue 409/allowlisted legacy 404 may discard a key
+after authentication. Keep one 60-second deadline, one 60-session cap, three auth attempts, and
+terminal semantics for every 202/ambiguity. The c007 shell exception was consumed by PR #20 and
+will not be carried into the next deploy. **Act:** three independent design reviews converged on
+this state machine. Implement it with deterministic key-factory, uniqueness, cap/deadline,
+full-session restart, keyless convergence evidence, ambiguity, and no-leak tests; correct the
+runbook; then repeat the full local/adversarial/GitHub/live ladder before touching PR-A.
+
+_2026-08-03_ — **Fifth recovery reached the ready-PR checkpoint.** Two independent
+frozen-snapshot reviews are DRY after successive finder/refuter rounds closed the stable-key
+liveness trap, unread unauthenticated-2xx ambiguity, exact-target fail-fast boundary, token/key
+cause leakage, lost prior evidence, misleading prospective auth counts, catch-path session
+continuity, and the deadline-crossing-before-send counter edge. Focused remote-ingest tests are
+77/77; all script tests are 131/131. Fresh canonical `pnpm verify` is green: 131 Node, 21 core,
+10 DB, 226 web unit (+1 skipped), 14 Worker, 45 Python, fresh migration/seed, production build,
+and secretless Wrangler dry-run. Local public-feed ingest published 12/12 read models with the
+known non-fatal NDBC partial caveat; strict smoke returned 6 spots/12 ready/0 pending. The code
+browser rendered the complete 1280px report with zero alerts, zero console warnings/errors, and
+no horizontal overflow. Optional Gemini brief work hit quota/schema and prior-local-date
+failures independently; deterministic forecast publication stayed green, so that signal remains
+a PR-C Analysis-path test note rather than a recovery blocker.
+
+**Checkpoint OODA — Observe:** every adversarial and real local path now preserves the exact
+line between safe read-only session rotation and potentially mutating terminal outcomes; the
+artifact, runbook, and diagnostics agree. **Orient:** this recovery carries no user-facing
+forecast change, but it is the trust substrate for the quiet freshness and educational tabs
+Alex and friends will use to decide when and where to surf. **Decide:** accept a bounded chance
+that 60 fresh Cloudflare assignments still miss the target, because fail-closed fix-forward is
+safer than weakening mutation identity; retain one extra catalog read per candidate for a
+coherent evidence chain. Do not carry the consumed c007 exception into deployment. **Act:**
+publish the ready PR, require GitHub Verify, merge, and execute exactly one supported deploy.
+OI-5 stays open—and PR-A stays untouched—until one target lineage, 12/12, exact dual-origin
+identity, deployment 100%, Queue 1/1, and production-browser proof are all simultaneously green.

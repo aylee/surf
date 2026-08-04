@@ -13,6 +13,7 @@ export const REMOTE_INGEST_HANDOFF_TIMEOUT_MS = 60_000;
 
 const FORECAST_INTERVALS = ["3h", "1h"];
 const REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS = 3;
+const REMOTE_INGEST_HANDOFF_MAX_SESSIONS = 60;
 const REMOTE_INGEST_HANDOFF_MAX_PROBES = 60;
 const REMOTE_INGEST_HANDOFF_BACKOFF_MS = [1_000, 2_000];
 const REMOTE_INGEST_PROBE_BACKOFF_MS = 1_000;
@@ -33,6 +34,16 @@ async function jsonOrNull(response) {
   }
 }
 
+function redactSensitiveValues(value, sensitiveValues = []) {
+  let safeValue = String(value);
+  for (const sensitiveValue of sensitiveValues) {
+    if (sensitiveValue) {
+      safeValue = safeValue.split(sensitiveValue).join("[REDACTED]");
+    }
+  }
+  return safeValue;
+}
+
 async function responseEvidence(response, sensitiveValues = []) {
   const rawBody = await response.text();
   let payload = null;
@@ -41,12 +52,7 @@ async function responseEvidence(response, sensitiveValues = []) {
   } catch {
     // Preserve non-JSON Cloudflare/proxy failures in the bounded diagnostic.
   }
-  let safeBody = rawBody;
-  for (const sensitiveValue of sensitiveValues) {
-    if (sensitiveValue) {
-      safeBody = safeBody.split(sensitiveValue).join("[REDACTED]");
-    }
-  }
+  const safeBody = redactSensitiveValues(rawBody, sensitiveValues);
   const body = safeBody
     .slice(0, 2_000)
     .replace(/[\u0000-\u001f\u007f]+/g, " ")
@@ -149,9 +155,21 @@ function isFetchTransportFailure(error) {
 
 function annotatedRequestFailure(
   error,
-  { phase, method, path, mutationPossible, handoff, safeRejections = [] }
+  {
+    phase,
+    method,
+    path,
+    mutationPossible,
+    handoff,
+    safeRejections = [],
+    sensitiveValues = []
+  }
 ) {
-  const cause = error instanceof Error ? error : new Error(String(error));
+  const rawCause = error instanceof Error ? error : new Error(String(error));
+  const cause = new Error(
+    redactSensitiveValues(rawCause.message, sensitiveValues)
+  );
+  cause.name = rawCause.name;
   const ambiguity = mutationPossible
     ? "mutation may have occurred; do not retry"
     : "mutation did not begin";
@@ -167,11 +185,11 @@ function annotatedRequestFailure(
   return annotated;
 }
 
-function handoffState(startedAtMs, deadlineMs, now, attempt) {
+function handoffState(startedAtMs, deadlineMs, now, authenticatedAttempts) {
   const currentMs = now();
   return {
-    attempt,
-    maxAttempts: REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS,
+    authenticatedAttempts,
+    maxAuthenticatedAttempts: REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS,
     elapsedMs: Math.max(0, currentMs - startedAtMs),
     remainingMs: Math.max(0, deadlineMs - currentMs),
     timeoutMs: deadlineMs - startedAtMs
@@ -179,8 +197,9 @@ function handoffState(startedAtMs, deadlineMs, now, attempt) {
 }
 
 function handoffDiagnosticContext({
-  attempt,
-  maxAttempts,
+  authenticatedAttempts,
+  maxAuthenticatedAttempts,
+  sessionCount,
   catalogCount,
   probeCount,
   elapsedMs,
@@ -188,7 +207,8 @@ function handoffDiagnosticContext({
   timeoutMs
 }) {
   return [
-    `attempt=${attempt}/${maxAttempts}`,
+    `authenticatedAttempts=${authenticatedAttempts}/${maxAuthenticatedAttempts}`,
+    ...(Number.isInteger(sessionCount) ? [`sessionCount=${sessionCount}`] : []),
     ...(Number.isInteger(catalogCount) ? [`catalogCount=${catalogCount}`] : []),
     ...(Number.isInteger(probeCount) ? [`probeCount=${probeCount}`] : []),
     `handoffElapsedMs=${elapsedMs}`,
@@ -197,12 +217,21 @@ function handoffDiagnosticContext({
   ].join(" ");
 }
 
+function handoffSessionBudgetError(handoff, safeRejections = []) {
+  const evidence = safeRejections.length > 0
+    ? safeRejectionDiagnostics(safeRejections)
+    : "none";
+  return new Error(
+    `remote ingest affinity session budget exhausted: ${handoffDiagnosticContext(handoff)} latestCatalog=${handoff.latestCatalogEvidence ?? "none"} latestProbe=${handoff.latestProbeEvidence ?? "none"} safeRejections=${evidence}; no request-attributable Queue mutation was accepted`
+  );
+}
+
 function handoffDeadlineError(handoff, safeRejections) {
   const evidence = safeRejections.length > 0
     ? safeRejectionDiagnostics(safeRejections)
     : "none";
   return new Error(
-    `remote ingest handoff deadline reached: ${handoffDiagnosticContext(handoff)} latestProbe=${handoff.latestProbeEvidence ?? "none"} safeRejections=${evidence}; no request-attributable Queue mutation was accepted`
+    `remote ingest handoff deadline reached: ${handoffDiagnosticContext(handoff)} latestCatalog=${handoff.latestCatalogEvidence ?? "none"} latestProbe=${handoff.latestProbeEvidence ?? "none"} safeRejections=${evidence}; no request-attributable Queue mutation was accepted`
   );
 }
 
@@ -211,19 +240,19 @@ function handoffProbeBudgetError(handoff, safeRejections) {
     ? safeRejectionDiagnostics(safeRejections)
     : "none";
   return new Error(
-    `remote ingest handoff probe budget exhausted: ${handoffDiagnosticContext(handoff)} latestProbe=${handoff.latestProbeEvidence ?? "none"} safeRejections=${evidence}; no request-attributable Queue mutation was accepted`
+    `remote ingest handoff probe budget exhausted: ${handoffDiagnosticContext(handoff)} latestCatalog=${handoff.latestCatalogEvidence ?? "none"} latestProbe=${handoff.latestProbeEvidence ?? "none"} safeRejections=${evidence}; no request-attributable Queue mutation was accepted`
   );
 }
 
 function handoffExhaustedError(handoff, safeRejections) {
   return new Error(
-    `remote ingest handoff exhausted: ${handoffDiagnosticContext(handoff)} latestProbe=${handoff.latestProbeEvidence ?? "none"} safeRejections=${safeRejectionDiagnostics(safeRejections)}; no request-attributable Queue mutation was accepted`
+    `remote ingest handoff exhausted: ${handoffDiagnosticContext(handoff)} latestCatalog=${handoff.latestCatalogEvidence ?? "none"} latestProbe=${handoff.latestProbeEvidence ?? "none"} safeRejections=${safeRejectionDiagnostics(safeRejections)}; no request-attributable Queue mutation was accepted`
   );
 }
 
-function safeRejectionEvidence(attempt, response, kind) {
+function safeRejectionEvidence(authenticatedAttempt, response, kind) {
   return {
-    attempt,
+    authenticatedAttempt,
     kind,
     status: response.status,
     workerVersion: response.workerVersion,
@@ -235,7 +264,7 @@ function safeRejectionEvidence(attempt, response, kind) {
 
 function safeRejectionDiagnostic(evidence) {
   return [
-    `attempt=${evidence.attempt}`,
+    `authenticatedAttempt=${evidence.authenticatedAttempt}`,
     `kind=${evidence.kind}`,
     `status=${evidence.status}`,
     `workerVersion=${evidence.workerVersion}`,
@@ -261,8 +290,11 @@ function probeResponseEvidence(probeCount, response) {
   ].join(" ");
 }
 
-function boundedErrorEvidence(error) {
-  return `${error?.name ?? "Error"}: ${error?.message ?? String(error)}`
+function boundedErrorEvidence(error, sensitiveValues = []) {
+  return redactSensitiveValues(
+    `${error?.name ?? "Error"}: ${error?.message ?? String(error)}`,
+    sensitiveValues
+  )
     .slice(0, 2_000)
     .replace(/[\u0000-\u001f\u007f]+/g, " ")
     .replace(/\s+/g, " ")
@@ -270,16 +302,57 @@ function boundedErrorEvidence(error) {
     .slice(0, 500);
 }
 
-function probeRequestEvidence(probeCount, error) {
-  return `probe=${probeCount} requestError=${boundedErrorEvidence(error)}`;
+function probeRequestEvidence(probeCount, error, sensitiveValues = []) {
+  return `probe=${probeCount} requestError=${boundedErrorEvidence(error, sensitiveValues)}`;
 }
 
-function withProbeState(handoff, probeCount, latestProbeEvidence) {
-  return { ...handoff, probeCount, latestProbeEvidence };
+function withProbeState(
+  handoff,
+  probeCount,
+  latestProbeEvidence,
+  sessionCount,
+  catalogCount,
+  latestCatalogEvidence
+) {
+  return {
+    ...handoff,
+    probeCount,
+    latestProbeEvidence,
+    sessionCount,
+    catalogCount,
+    latestCatalogEvidence
+  };
 }
 
-function withCatalogState(handoff, catalogCount, latestCatalogEvidence) {
-  return { ...handoff, catalogCount, latestCatalogEvidence };
+function withCatalogState(
+  handoff,
+  catalogCount,
+  latestCatalogEvidence,
+  sessionCount,
+  probeCount,
+  latestProbeEvidence
+) {
+  return {
+    ...handoff,
+    catalogCount,
+    latestCatalogEvidence,
+    sessionCount,
+    probeCount,
+    latestProbeEvidence
+  };
+}
+
+function nextVersionAffinityKey(factory, sessions) {
+  const key = factory();
+  if (!isWorkerVersionId(key)) {
+    throw new Error("version affinity key factory must return a UUID");
+  }
+  if (sessions.usedKeys.has(key)) {
+    throw new Error("version affinity key factory reused a discarded session key");
+  }
+  sessions.usedKeys.add(key);
+  sessions.count += 1;
+  return key;
 }
 
 function configuredSpotIdsFromPayload(payload, { strict = false } = {}) {
@@ -315,19 +388,20 @@ function catalogResponseEvidence(catalogCount, response) {
   ].join(" ");
 }
 
-function catalogRequestEvidence(catalogCount, error) {
-  return `catalog=${catalogCount} requestError=${boundedErrorEvidence(error)}`;
+function catalogRequestEvidence(
+  catalogCount,
+  error,
+  sensitiveValues = []
+) {
+  return `catalog=${catalogCount} requestError=${boundedErrorEvidence(error, sensitiveValues)}`;
 }
 
-function catalogDeadlineError(handoff) {
+function catalogDeadlineError(handoff, safeRejections = []) {
+  const safeRejectionContext = safeRejections.length > 0
+    ? ` safeRejections=${safeRejectionDiagnostics(safeRejections)}`
+    : "";
   return new Error(
-    `remote ingest catalog handoff deadline reached: ${handoffDiagnosticContext(handoff)} latestCatalog=${handoff.latestCatalogEvidence ?? "none"}; mutation did not begin`
-  );
-}
-
-function catalogBudgetError(handoff) {
-  return new Error(
-    `remote ingest catalog probe budget exhausted: ${handoffDiagnosticContext(handoff)} latestCatalog=${handoff.latestCatalogEvidence ?? "none"}; mutation did not begin`
+    `remote ingest catalog handoff deadline reached: ${handoffDiagnosticContext(handoff)} latestCatalog=${handoff.latestCatalogEvidence ?? "none"} latestProbe=${handoff.latestProbeEvidence ?? "none"}${safeRejectionContext}; no request-attributable Queue mutation was accepted`
   );
 }
 
@@ -377,6 +451,12 @@ async function cancelBody(response) {
   }
 }
 
+function cancelBodyWithoutWaiting(response) {
+  void response.body?.cancel().catch(() => {
+    // Header-only classifications must never wait on an untrusted body stream.
+  });
+}
+
 async function configuredSpotIds(
   baseUrl,
   fetcher,
@@ -424,39 +504,61 @@ async function configuredSpotIdsForHandoff({
   fetcher,
   expectedVersionId,
   expectedWorkerName,
-  versionAffinityKey,
+  versionAffinityKeyFactory,
+  affinitySessions,
   requestTimeoutMs,
   handoffStartedAtMs,
   handoffDeadlineMs,
+  authenticatedAttempts,
+  initialCatalogCount = 0,
+  initialLatestCatalogEvidence = "none",
+  initialProbeCount = 0,
+  initialLatestProbeEvidence = "none",
+  safeRejections = [],
   now,
   sleep
 }) {
   const catalogPath = "/api/spots";
-  const catalogHeaders = workerVersionRequestHeaders({
-    expectedVersionId,
-    expectedWorkerName,
-    override: false,
-    headers: {
-      Accept: "application/json",
-      [CLOUDFLARE_WORKERS_VERSION_KEY_HEADER]: versionAffinityKey
-    }
-  });
-  let catalogCount = 0;
-  let latestCatalogEvidence = "none";
+  let catalogCount = initialCatalogCount;
+  let latestCatalogEvidence = initialLatestCatalogEvidence;
 
   while (true) {
     let handoff = withCatalogState(
-      handoffState(handoffStartedAtMs, handoffDeadlineMs, now, 0),
+      handoffState(
+        handoffStartedAtMs,
+        handoffDeadlineMs,
+        now,
+        authenticatedAttempts
+      ),
       catalogCount,
-      latestCatalogEvidence
+      latestCatalogEvidence,
+      affinitySessions.count,
+      initialProbeCount,
+      initialLatestProbeEvidence
     );
-    if (handoff.remainingMs <= 0) throw catalogDeadlineError(handoff);
-    if (catalogCount >= REMOTE_INGEST_HANDOFF_MAX_PROBES) {
-      throw catalogBudgetError(handoff);
+    if (handoff.remainingMs <= 0) {
+      throw catalogDeadlineError(handoff, safeRejections);
+    }
+    if (affinitySessions.count >= REMOTE_INGEST_HANDOFF_MAX_SESSIONS) {
+      throw handoffSessionBudgetError(handoff, safeRejections);
     }
 
+    const versionAffinityKey = nextVersionAffinityKey(
+      versionAffinityKeyFactory,
+      affinitySessions
+    );
+    const catalogHeaders = workerVersionRequestHeaders({
+      expectedVersionId,
+      expectedWorkerName,
+      override: false,
+      headers: {
+        Accept: "application/json",
+        [CLOUDFLARE_WORKERS_VERSION_KEY_HEADER]: versionAffinityKey
+      }
+    });
     catalogCount += 1;
     let catalog;
+    let exactTargetCatalogHeaders;
     try {
       catalog = await requestWithTimeout(
         fetcher,
@@ -468,34 +570,97 @@ async function configuredSpotIdsForHandoff({
         },
         Math.min(requestTimeoutMs, handoff.remainingMs),
         async (response) => {
-          const evidence = await responseEvidence(response);
-          return {
+          const headers = {
             status: response.status,
             workerVersion: responseWorkerVersion(response),
             cfRay: response.headers.get("CF-Ray"),
-            ...evidence
+            contentType: response.headers.get("Content-Type")
           };
+          if (headers.workerVersion === expectedVersionId) {
+            exactTargetCatalogHeaders = headers;
+            if (!(response.status >= 200 && response.status < 300)) {
+              cancelBodyWithoutWaiting(response);
+              return {
+                ...headers,
+                payload: null,
+                exactHonoNotFound: false,
+                body: "<unread target catalog HTTP defect>"
+              };
+            }
+          }
+          const evidence = await responseEvidence(response, [
+            versionAffinityKey
+          ]);
+          return { ...headers, ...evidence };
         }
       );
       latestCatalogEvidence = catalogResponseEvidence(catalogCount, catalog);
     } catch (error) {
-      latestCatalogEvidence = catalogRequestEvidence(catalogCount, error);
+      if (exactTargetCatalogHeaders) {
+        catalog = {
+          ...exactTargetCatalogHeaders,
+          body: `<unread target catalog body: ${boundedErrorEvidence(error, [versionAffinityKey])}>`
+        };
+        latestCatalogEvidence = catalogResponseEvidence(catalogCount, catalog);
+        handoff = withCatalogState(
+          handoffState(
+            handoffStartedAtMs,
+            handoffDeadlineMs,
+            now,
+            authenticatedAttempts
+          ),
+          catalogCount,
+          latestCatalogEvidence,
+          affinitySessions.count,
+          initialProbeCount,
+          initialLatestProbeEvidence
+        );
+        throw new Error(
+          `${remoteIngestDiagnostic({
+            phase: "catalog",
+            method: "GET",
+            path: catalogPath,
+            handoff,
+            safeRejections,
+            ...catalog
+          })}; expected Worker returned an unreadable spot catalog; mutation did not begin`
+        );
+      }
+      latestCatalogEvidence = catalogRequestEvidence(catalogCount, error, [
+        versionAffinityKey
+      ]);
       handoff = withCatalogState(
-        handoffState(handoffStartedAtMs, handoffDeadlineMs, now, 0),
+        handoffState(
+          handoffStartedAtMs,
+          handoffDeadlineMs,
+          now,
+          authenticatedAttempts
+        ),
         catalogCount,
-        latestCatalogEvidence
+        latestCatalogEvidence,
+        affinitySessions.count,
+        initialProbeCount,
+        initialLatestProbeEvidence
       );
       if (handoff.remainingMs <= REMOTE_INGEST_PROBE_BACKOFF_MS) {
-        throw catalogDeadlineError(handoff);
+        throw catalogDeadlineError(handoff, safeRejections);
       }
       await sleep(REMOTE_INGEST_PROBE_BACKOFF_MS);
       continue;
     }
 
     handoff = withCatalogState(
-      handoffState(handoffStartedAtMs, handoffDeadlineMs, now, 0),
+      handoffState(
+        handoffStartedAtMs,
+        handoffDeadlineMs,
+        now,
+        authenticatedAttempts
+      ),
       catalogCount,
-      latestCatalogEvidence
+      latestCatalogEvidence,
+      affinitySessions.count,
+      initialProbeCount,
+      initialLatestProbeEvidence
     );
     if (catalog.workerVersion === expectedVersionId) {
       const spotIds = configuredSpotIdsFromPayload(catalog.payload, {
@@ -508,15 +673,21 @@ async function configuredSpotIdsForHandoff({
             method: "GET",
             path: catalogPath,
             handoff,
+            safeRejections,
             ...catalog
           })}; expected Worker returned an invalid spot catalog; mutation did not begin`
         );
       }
-      return { spotIds, catalogCount, latestCatalogEvidence };
+      return {
+        spotIds,
+        versionAffinityKey,
+        catalogCount,
+        latestCatalogEvidence
+      };
     }
 
     if (handoff.remainingMs <= REMOTE_INGEST_PROBE_BACKOFF_MS) {
-      throw catalogDeadlineError(handoff);
+      throw catalogDeadlineError(handoff, safeRejections);
     }
     await sleep(REMOTE_INGEST_PROBE_BACKOFF_MS);
   }
@@ -709,7 +880,8 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
     logger = console,
     requestTimeoutMs = REMOTE_INGEST_REQUEST_TIMEOUT_MS,
-    handoffTimeoutMs = REMOTE_INGEST_HANDOFF_TIMEOUT_MS
+    handoffTimeoutMs = REMOTE_INGEST_HANDOFF_TIMEOUT_MS,
+    versionAffinityKeyFactory = randomUUID
   } = options;
 
   if (legacyPatchlessVersionId !== undefined) {
@@ -735,27 +907,18 @@ export async function enqueueAndWaitForRemoteIngest(options) {
       `remote ingest handoff timeout must be positive and no greater than ${REMOTE_INGEST_HANDOFF_TIMEOUT_MS}ms`
     );
   }
+  if (expectedVersionId && typeof versionAffinityKeyFactory !== "function") {
+    throw new Error("version affinity key factory must be a function");
+  }
 
   let versionAffinityKey;
   let handoffStartedAtMs;
   let handoffDeadlineMs;
   let spotIds;
+  const affinitySessions = { count: 0, usedKeys: new Set() };
   if (expectedVersionId) {
-    versionAffinityKey = randomUUID();
     handoffStartedAtMs = now();
     handoffDeadlineMs = handoffStartedAtMs + handoffTimeoutMs;
-    ({ spotIds } = await configuredSpotIdsForHandoff({
-      baseUrl,
-      fetcher,
-      expectedVersionId,
-      expectedWorkerName,
-      versionAffinityKey,
-      requestTimeoutMs,
-      handoffStartedAtMs,
-      handoffDeadlineMs,
-      now,
-      sleep
-    }));
   } else {
     spotIds = await configuredSpotIds(
       baseUrl,
@@ -777,6 +940,7 @@ export async function enqueueAndWaitForRemoteIngest(options) {
 
   let enqueue;
   let enqueueHandoff;
+  let authenticatedAttempts = 0;
   const safeRejections = [];
   if (!expectedVersionId) {
     try {
@@ -805,39 +969,62 @@ export async function enqueueAndWaitForRemoteIngest(options) {
         phase: "enqueue",
         method: enqueueMethod,
         path: enqueuePath,
-        mutationPossible: true
+        mutationPossible: true,
+        sensitiveValues: [token]
       });
     }
   } else {
-    enqueueHeaders.set(
-      CLOUDFLARE_WORKERS_VERSION_KEY_HEADER,
-      versionAffinityKey
-    );
-    const routeProbeHeaders = new Headers({
-      Accept: "application/json",
-      [SURF_EXPECTED_WORKER_VERSION_HEADER]: expectedVersionId,
-      [CLOUDFLARE_WORKERS_VERSION_KEY_HEADER]: versionAffinityKey
-    });
+    let catalogCount = 0;
+    let latestCatalogEvidence = "none";
     let probeCount = 0;
     let latestProbeEvidence = "none";
+    const currentHandoff = () =>
+      withProbeState(
+        handoffState(
+          handoffStartedAtMs,
+          handoffDeadlineMs,
+          now,
+          authenticatedAttempts
+        ),
+        probeCount,
+        latestProbeEvidence,
+        affinitySessions.count,
+        catalogCount,
+        latestCatalogEvidence
+      );
 
-    for (
-      let attempt = 1;
-      attempt <= REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS;
-      attempt += 1
-    ) {
+    while (authenticatedAttempts < REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS) {
       let handoff;
       while (true) {
-        handoff = withProbeState(
-          handoffState(
-            handoffStartedAtMs,
-            handoffDeadlineMs,
-            now,
-            attempt
-          ),
-          probeCount,
-          latestProbeEvidence
-        );
+        handoff = currentHandoff();
+        if (affinitySessions.count >= REMOTE_INGEST_HANDOFF_MAX_SESSIONS) {
+          throw handoffSessionBudgetError(handoff, safeRejections);
+        }
+        const catalog = await configuredSpotIdsForHandoff({
+          baseUrl,
+          fetcher,
+          expectedVersionId,
+          expectedWorkerName,
+          versionAffinityKeyFactory,
+          affinitySessions,
+          requestTimeoutMs,
+          handoffStartedAtMs,
+          handoffDeadlineMs,
+          authenticatedAttempts,
+          initialCatalogCount: catalogCount,
+          initialLatestCatalogEvidence: latestCatalogEvidence,
+          initialProbeCount: probeCount,
+          initialLatestProbeEvidence: latestProbeEvidence,
+          safeRejections,
+          now,
+          sleep
+        });
+        spotIds = catalog.spotIds;
+        versionAffinityKey = catalog.versionAffinityKey;
+        catalogCount = catalog.catalogCount;
+        latestCatalogEvidence = catalog.latestCatalogEvidence;
+
+        handoff = currentHandoff();
         if (handoff.remainingMs <= 0) {
           throw handoffDeadlineError(handoff, safeRejections);
         }
@@ -845,6 +1032,11 @@ export async function enqueueAndWaitForRemoteIngest(options) {
           throw handoffProbeBudgetError(handoff, safeRejections);
         }
 
+        const routeProbeHeaders = new Headers({
+          Accept: "application/json",
+          [SURF_EXPECTED_WORKER_VERSION_HEADER]: expectedVersionId,
+          [CLOUDFLARE_WORKERS_VERSION_KEY_HEADER]: versionAffinityKey
+        });
         probeCount += 1;
         let routeProbe;
         try {
@@ -859,29 +1051,43 @@ export async function enqueueAndWaitForRemoteIngest(options) {
             },
             Math.min(requestTimeoutMs, handoff.remainingMs),
             async (response) => {
-              const evidence = await responseEvidence(response);
-              return {
+              const headers = {
                 status: response.status,
                 workerVersion: responseWorkerVersion(response),
                 authenticate: response.headers.get("WWW-Authenticate"),
                 cfRay: response.headers.get("CF-Ray"),
-                ...evidence
+                contentType: response.headers.get("Content-Type")
+              };
+              if (
+                (response.status >= 200 && response.status < 300) ||
+                headers.workerVersion === expectedVersionId
+              ) {
+                cancelBodyWithoutWaiting(response);
+                return {
+                  ...headers,
+                  payload: null,
+                  exactHonoNotFound: false,
+                  body:
+                    response.status >= 200 && response.status < 300
+                      ? "<unread unauthenticated 2xx>"
+                      : response.status === 401 &&
+                          headers.authenticate === "Bearer"
+                        ? "<unread exact auth challenge>"
+                        : "<unread target auth-contract defect>"
+                };
+              }
+              return {
+                ...headers,
+                ...(await responseEvidence(response, [versionAffinityKey]))
               };
             }
           );
           latestProbeEvidence = probeResponseEvidence(probeCount, routeProbe);
         } catch (error) {
-          latestProbeEvidence = probeRequestEvidence(probeCount, error);
-          handoff = withProbeState(
-            handoffState(
-              handoffStartedAtMs,
-              handoffDeadlineMs,
-              now,
-              attempt
-            ),
-            probeCount,
-            latestProbeEvidence
-          );
+          latestProbeEvidence = probeRequestEvidence(probeCount, error, [
+            versionAffinityKey
+          ]);
+          handoff = currentHandoff();
           if (handoff.remainingMs <= REMOTE_INGEST_PROBE_BACKOFF_MS) {
             throw handoffDeadlineError(handoff, safeRejections);
           }
@@ -889,16 +1095,7 @@ export async function enqueueAndWaitForRemoteIngest(options) {
           continue;
         }
 
-        handoff = withProbeState(
-          handoffState(
-            handoffStartedAtMs,
-            handoffDeadlineMs,
-            now,
-            attempt
-          ),
-          probeCount,
-          latestProbeEvidence
-        );
+        handoff = currentHandoff();
         const exactTargetProbe =
           routeProbe.status === 401 &&
           routeProbe.workerVersion === expectedVersionId &&
@@ -935,20 +1132,24 @@ export async function enqueueAndWaitForRemoteIngest(options) {
         await sleep(REMOTE_INGEST_PROBE_BACKOFF_MS);
       }
 
-      handoff = withProbeState(
-        handoffState(
-          handoffStartedAtMs,
-          handoffDeadlineMs,
-          now,
-          attempt
-        ),
-        probeCount,
-        latestProbeEvidence
-      );
+      handoff = currentHandoff();
       if (handoff.remainingMs <= 0) {
         throw handoffDeadlineError(handoff, safeRejections);
       }
 
+      enqueueHeaders.set(
+        CLOUDFLARE_WORKERS_VERSION_KEY_HEADER,
+        versionAffinityKey
+      );
+      handoff = currentHandoff();
+      if (handoff.remainingMs <= 0) {
+        throw handoffDeadlineError(handoff, safeRejections);
+      }
+      const authenticatedRequestTimeoutMs = Math.min(
+        requestTimeoutMs,
+        handoff.remainingMs
+      );
+      authenticatedAttempts += 1;
       try {
         enqueue = await requestWithTimeout(
           fetcher,
@@ -959,9 +1160,12 @@ export async function enqueueAndWaitForRemoteIngest(options) {
             cache: "no-store",
             redirect: "error"
           },
-          Math.min(requestTimeoutMs, handoff.remainingMs),
+          authenticatedRequestTimeoutMs,
           async (response) => {
-            const evidence = await responseEvidence(response, [token]);
+            const evidence = await responseEvidence(response, [
+              token,
+              versionAffinityKey
+            ]);
             return {
               status: response.status,
               workerVersion: responseWorkerVersion(response),
@@ -971,36 +1175,19 @@ export async function enqueueAndWaitForRemoteIngest(options) {
           }
         );
       } catch (error) {
-        handoff = withProbeState(
-          handoffState(
-            handoffStartedAtMs,
-            handoffDeadlineMs,
-            now,
-            attempt
-          ),
-          probeCount,
-          latestProbeEvidence
-        );
+        handoff = currentHandoff();
         throw annotatedRequestFailure(error, {
           phase: "enqueue",
           method: enqueueMethod,
           path: enqueuePath,
           mutationPossible: true,
           handoff,
-          safeRejections
+          safeRejections,
+          sensitiveValues: [token, versionAffinityKey]
         });
       }
 
-      enqueueHandoff = withProbeState(
-        handoffState(
-          handoffStartedAtMs,
-          handoffDeadlineMs,
-          now,
-          attempt
-        ),
-        probeCount,
-        latestProbeEvidence
-      );
+      enqueueHandoff = currentHandoff();
       if (enqueue.status === 202) break;
 
       const typedStale = isTypedStaleVersionRejection(
@@ -1025,7 +1212,7 @@ export async function enqueueAndWaitForRemoteIngest(options) {
       }
 
       const safeRejection = safeRejectionEvidence(
-        attempt,
+        authenticatedAttempts,
         enqueue,
         typedStale ? "typed-stale-409" : "exact-legacy-404"
       );
@@ -1036,11 +1223,13 @@ export async function enqueueAndWaitForRemoteIngest(options) {
           ...safeRejection
         })
       );
-      if (attempt === REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS) {
+      if (authenticatedAttempts === REMOTE_INGEST_HANDOFF_MAX_ATTEMPTS) {
         throw handoffExhaustedError(enqueueHandoff, safeRejections);
       }
 
-      const backoffMs = REMOTE_INGEST_HANDOFF_BACKOFF_MS[attempt - 1];
+      versionAffinityKey = undefined;
+      const backoffMs =
+        REMOTE_INGEST_HANDOFF_BACKOFF_MS[authenticatedAttempts - 1];
       if (enqueueHandoff.remainingMs <= backoffMs) {
         throw handoffDeadlineError(enqueueHandoff, safeRejections);
       }
@@ -1082,7 +1271,15 @@ export async function enqueueAndWaitForRemoteIngest(options) {
   return {
     ...result,
     ingestId: payload.ingestId,
-    ...(expectedVersionId ? { workerVersion: expectedVersionId } : {})
+    ...(expectedVersionId
+      ? {
+          workerVersion: expectedVersionId,
+          versionAffinitySessions:
+            enqueueHandoff?.sessionCount ?? affinitySessions.count,
+          authenticatedAttempts:
+            enqueueHandoff?.authenticatedAttempts ?? authenticatedAttempts
+        }
+      : {})
   };
 }
 
