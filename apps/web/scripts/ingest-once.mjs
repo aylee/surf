@@ -9,7 +9,11 @@ if (mode === "--remote") loadRootEnv();
 const { baseUrl, token } = resolveIngestTarget(mode, process.env);
 
 if (mode === "--remote") {
-  const result = await enqueueAndWaitForRemoteIngest({ baseUrl, token });
+  const result = await enqueueAndWaitForRemoteIngest({
+    baseUrl,
+    token,
+    expectedVersionId: process.env.SURF_EXPECTED_WORKER_VERSION?.trim() || undefined
+  });
   console.log(JSON.stringify(result, null, 2));
   process.exit(0);
 }

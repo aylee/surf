@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { smokeForecastInstance } from "../lib/smoke-instance.mjs";
+import {
+  CLOUDFLARE_WORKERS_VERSION_KEY_HEADER,
+  SURF_WORKER_VERSION_HEADER
+} from "../lib/worker-version.mjs";
 
 const spot = { id: "test-break", timezone: "America/Los_Angeles" };
+const expectedVersionId = "11111111-2222-4333-8444-555555555555";
+const otherVersionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const windows = Array.from({ length: 5 }, (_, day) => ({
   forecastAt: new Date(Date.UTC(2026, 6, 10 + day, 16)).toISOString(),
   ratingStatus: "scored",
@@ -115,4 +121,175 @@ test("strict smoke rejects synthesized unknown windows", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+function versionedFixture({ versionForPath = () => expectedVersionId } = {}) {
+  const requests = [];
+  return {
+    requests,
+    fetcher: async (input, init = {}) => {
+      const url = new URL(String(input));
+      requests.push({ url, headers: new Headers(init.headers) });
+      const headers = {
+        [SURF_WORKER_VERSION_HEADER]: versionForPath(url)
+      };
+      if (url.pathname === "/api/health") {
+        return Response.json({ status: "ok" }, { headers });
+      }
+      if (url.pathname === "/api/spots") {
+        return Response.json({ spots: [spot] }, { headers });
+      }
+      if (url.pathname === "/api/forecast/test-break") {
+        return Response.json(
+          {
+            spot,
+            interval: url.searchParams.get("interval") ?? "3h",
+            windows
+          },
+          { headers }
+        );
+      }
+      return new Response("not found", { status: 404, headers });
+    }
+  };
+}
+
+test("version-pinned smoke checks health, spots, and every forecast on one Worker version", async () => {
+  const fixture = versionedFixture();
+  const result = await smokeForecastInstance("https://surf.example", {
+    label: "version smoke",
+    requireForecastData: true,
+    expectedVersionId,
+    fetcher: fixture.fetcher
+  });
+
+  assert.equal(result.workerVersion, expectedVersionId);
+  assert.equal(fixture.requests.length, 4);
+  assert.deepEqual(
+    fixture.requests.map(({ url }) => `${url.pathname}${url.search}`),
+    [
+      "/api/health",
+      "/api/spots",
+      "/api/forecast/test-break?interval=3h",
+      "/api/forecast/test-break?interval=1h"
+    ]
+  );
+  for (const request of fixture.requests) {
+    assert.equal(
+      request.headers.get(CLOUDFLARE_WORKERS_VERSION_KEY_HEADER),
+      expectedVersionId
+    );
+  }
+});
+
+test("version-pinned smoke rejects a mismatched catalog response", async () => {
+  const fixture = versionedFixture({
+    versionForPath: (url) =>
+      url.pathname === "/api/spots" ? otherVersionId : expectedVersionId
+  });
+  await assert.rejects(
+    smokeForecastInstance("https://surf.example", {
+      label: "version smoke",
+      expectedVersionId,
+      fetcher: fixture.fetcher
+    }),
+    new RegExp(`/api/spots was served by Worker version ${otherVersionId}`)
+  );
+});
+
+test("version-pinned smoke rejects any mismatched forecast response", async () => {
+  const fixture = versionedFixture({
+    versionForPath: (url) =>
+      url.pathname === "/api/forecast/test-break" &&
+      url.searchParams.get("interval") === "1h"
+        ? otherVersionId
+        : expectedVersionId
+  });
+  await assert.rejects(
+    smokeForecastInstance("https://surf.example", {
+      label: "version smoke",
+      expectedVersionId,
+      fetcher: fixture.fetcher
+    }),
+    new RegExp(`interval=1h was served by Worker version ${otherVersionId}`)
+  );
+});
+
+test("smoke bounds a stalled fetch and aborts the request", async () => {
+  let signal;
+  await assert.rejects(
+    smokeForecastInstance("https://surf.example", {
+      label: "bounded smoke",
+      fetcher: async (_input, init) => {
+        signal = init.signal;
+        return new Promise(() => {});
+      },
+      requestTimeoutMs: 5,
+      timeoutMs: 20
+    }),
+    (error) => error?.name === "TimeoutError"
+  );
+  assert.equal(signal.aborted, true);
+});
+
+test("smoke bounds stalled response-body consumption", async () => {
+  let signal;
+  await assert.rejects(
+    smokeForecastInstance("https://surf.example", {
+      label: "bounded smoke",
+      fetcher: async (_input, init) => {
+        signal = init.signal;
+        return new Response(
+          new ReadableStream({
+            start() {
+              // Intentionally never emit or close.
+            }
+          })
+        );
+      },
+      requestTimeoutMs: 5,
+      timeoutMs: 20
+    }),
+    (error) => error?.name === "TimeoutError"
+  );
+  assert.equal(signal.aborted, true);
+});
+
+test("smoke inspects forecast read models sequentially", async () => {
+  const spots = Array.from({ length: 6 }, (_, index) => ({
+    id: `test-break-${index + 1}`,
+    timezone: "America/Los_Angeles"
+  }));
+  let activeForecasts = 0;
+  let maximumActiveForecasts = 0;
+  let forecastRequests = 0;
+  const fetcher = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/health") return Response.json({ status: "ok" });
+    if (url.pathname === "/api/spots") return Response.json({ spots });
+    const matchedSpot = spots.find(
+      (candidate) => url.pathname === `/api/forecast/${candidate.id}`
+    );
+    if (!matchedSpot) return new Response("not found", { status: 404 });
+    forecastRequests += 1;
+    activeForecasts += 1;
+    maximumActiveForecasts = Math.max(maximumActiveForecasts, activeForecasts);
+    await new Promise((resolve) => setImmediate(resolve));
+    activeForecasts -= 1;
+    return Response.json({
+      spot: matchedSpot,
+      interval: url.searchParams.get("interval") ?? "3h",
+      windows
+    });
+  };
+
+  const result = await smokeForecastInstance("https://surf.example", {
+    label: "sequential smoke",
+    fetcher,
+    requestTimeoutMs: 100,
+    timeoutMs: 2_000
+  });
+  assert.equal(result.forecastReadModels, 12);
+  assert.equal(forecastRequests, 12);
+  assert.equal(maximumActiveForecasts, 1);
 });

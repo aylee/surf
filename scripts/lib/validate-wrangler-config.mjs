@@ -62,6 +62,13 @@ export function wranglerStructureFailures(config, configPath) {
   }
 
   if (config?.assets?.binding !== "ASSETS") failures.push("Static assets binding must be ASSETS.");
+  const versionMetadata = config?.version_metadata;
+  if (
+    versionMetadata?.binding !== "CF_VERSION_METADATA" ||
+    Object.keys(versionMetadata ?? {}).length !== 1
+  ) {
+    failures.push("Worker version metadata must bind exactly as CF_VERSION_METADATA.");
+  }
   const briefBindings = config?.durable_objects?.bindings ?? [];
   const briefBinding = briefBindings.filter(
     (entry) => entry.name === "FORECAST_BRIEF_AGENT"

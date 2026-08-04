@@ -1,7 +1,15 @@
+import {
+  responseWorkerVersion,
+  workerVersionRequestHeaders
+} from "./worker-version.mjs";
+
 export const REMOTE_INGEST_POLL_INTERVAL_MS = 5_000;
 export const REMOTE_INGEST_TIMEOUT_MS = 10 * 60_000;
+export const REMOTE_INGEST_REQUEST_TIMEOUT_MS = 30_000;
 
 const FORECAST_INTERVALS = ["3h", "1h"];
+const CLOUDFLARE_1102_TYPE =
+  "https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1102/";
 
 function validTimestamp(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
@@ -26,21 +34,118 @@ function isTypedPendingForecast(value, spotId, interval) {
   );
 }
 
-async function configuredSpotIds(baseUrl, fetcher) {
-  const response = await fetcher(`${baseUrl}/api/spots`, {
-    headers: { Accept: "application/json" }
+function isCloudflare1102Problem(value) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      value.type === CLOUDFLARE_1102_TYPE &&
+      value.status === 503 &&
+      value.error_code === 1102 &&
+      value.error_name === "worker_exceeded_resources" &&
+      value.error_category === "worker" &&
+      value.cloudflare_error === true
+  );
+}
+
+function requestTimeoutError(timeoutMs) {
+  const error = new Error(`request timed out after ${timeoutMs}ms`);
+  error.name = "TimeoutError";
+  return error;
+}
+
+function transportError(cause) {
+  const error = new Error(`forecast transport failed: ${cause?.message ?? String(cause)}`, {
+    cause
   });
-  if (!response.ok) {
-    throw new Error(`spot catalog request failed: ${response.status} ${await response.text()}`);
+  error.name = "TransportError";
+  return error;
+}
+
+function isFetchTransportFailure(error) {
+  return error instanceof TypeError || error?.name === "AbortError";
+}
+
+async function requestWithTimeout(fetcher, input, init, timeoutMs, consume) {
+  if (!(timeoutMs > 0)) throw new Error("remote ingest request timeout must be positive");
+  const controller = new AbortController();
+  const timeoutFailure = requestTimeoutError(timeoutMs);
+  let timedOut = false;
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      reject(timeoutFailure);
+      controller.abort(timeoutFailure);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      (async () => {
+        let response;
+        try {
+          response = await fetcher(input, {
+            ...init,
+            signal: controller.signal
+          });
+        } catch (error) {
+          if (isFetchTransportFailure(error)) throw transportError(error);
+          throw error;
+        }
+        return consume(response);
+      })(),
+      timeout
+    ]);
+  } catch (error) {
+    if (timedOut) throw timeoutFailure;
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  const payload = await response.json();
-  const spotIds = Array.isArray(payload?.spots)
-    ? payload.spots.flatMap((spot) => typeof spot?.id === "string" && spot.id ? [spot.id] : [])
-    : [];
-  if (spotIds.length === 0 || new Set(spotIds).size !== spotIds.length) {
-    throw new Error("spot catalog did not contain a non-empty set of unique spot IDs");
+}
+
+async function cancelBody(response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The caller already captured the response headers that decide readiness.
   }
-  return spotIds;
+}
+
+async function configuredSpotIds(baseUrl, fetcher, expectedVersionId, requestTimeoutMs) {
+  return requestWithTimeout(
+    fetcher,
+    `${baseUrl}/api/spots`,
+    {
+      headers: workerVersionRequestHeaders(expectedVersionId, {
+        Accept: "application/json"
+      })
+    },
+    requestTimeoutMs,
+    async (response) => {
+      if (!response.ok) {
+        throw new Error(
+          `spot catalog request failed: ${response.status} ${await response.text()}`
+        );
+      }
+      const actualVersionId = responseWorkerVersion(response);
+      if (expectedVersionId && actualVersionId !== expectedVersionId) {
+        await cancelBody(response);
+        throw new Error(
+          `spot catalog was served by Worker version ${actualVersionId ?? "unknown"}; expected ${expectedVersionId}`
+        );
+      }
+      const payload = await response.json();
+      const spotIds = Array.isArray(payload?.spots)
+        ? payload.spots.flatMap((spot) =>
+            typeof spot?.id === "string" && spot.id ? [spot.id] : []
+          )
+        : [];
+      if (spotIds.length === 0 || new Set(spotIds).size !== spotIds.length) {
+        throw new Error("spot catalog did not contain a non-empty set of unique spot IDs");
+      }
+      return spotIds;
+    }
+  );
 }
 
 async function inspectForecastReadModel(
@@ -50,42 +155,71 @@ async function inspectForecastReadModel(
   expectedIngestId,
   requestedAtMs,
   minimumGeneratedAtMs,
-  fetcher
+  fetcher,
+  expectedVersionId,
+  requestTimeoutMs
 ) {
   const path = `/api/forecast/${encodeURIComponent(spotId)}?interval=${interval}`;
-  const response = await fetcher(`${baseUrl}${path}`, {
-    headers: { Accept: "application/json" }
-  });
-  if (response.status === 503) {
-    const payload = await jsonOrNull(response);
-    if (isTypedPendingForecast(payload, spotId, interval)) {
+  try {
+    return await requestWithTimeout(
+      fetcher,
+      `${baseUrl}${path}`,
+      {
+        headers: workerVersionRequestHeaders(expectedVersionId, {
+          Accept: "application/json"
+        })
+      },
+      requestTimeoutMs,
+      async (response) => {
+        if (response.status === 503) {
+          const payload = await jsonOrNull(response);
+          if (
+            isTypedPendingForecast(payload, spotId, interval) ||
+            isCloudflare1102Problem(payload)
+          ) {
+            return { spotId, interval, status: "pending", materializedAt: null };
+          }
+          throw new Error(`${path} returned an invalid retryable-unavailable response`);
+        }
+        if (!response.ok) {
+          throw new Error(`${path} failed: ${response.status} ${await response.text()}`);
+        }
+
+        if (
+          expectedVersionId &&
+          responseWorkerVersion(response) !== expectedVersionId
+        ) {
+          await cancelBody(response);
+          return { spotId, interval, status: "pending", materializedAt: null };
+        }
+
+        const materializedAt = response.headers.get("X-Surf-Forecast-Materialized-At");
+        const generatedAt = response.headers.get("X-Surf-Forecast-Generated-At");
+        const responseIngestId = response.headers.get("X-Surf-Ingest-Id");
+        await cancelBody(response);
+        const materializedAtMs = materializedAt ? Date.parse(materializedAt) : Number.NaN;
+        const generatedAtMs = generatedAt ? Date.parse(generatedAt) : Number.NaN;
+        return {
+          spotId,
+          interval,
+          status:
+            Number.isFinite(materializedAtMs) &&
+            materializedAtMs >= requestedAtMs &&
+            Number.isFinite(generatedAtMs) &&
+            generatedAtMs >= minimumGeneratedAtMs &&
+            responseIngestId === expectedIngestId
+              ? "ready"
+              : "pending",
+          materializedAt: Number.isFinite(materializedAtMs) ? materializedAt : null
+        };
+      }
+    );
+  } catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "TransportError") {
       return { spotId, interval, status: "pending", materializedAt: null };
     }
-    throw new Error(`${path} returned an invalid retryable-unavailable response`);
+    throw error;
   }
-  if (!response.ok) {
-    throw new Error(`${path} failed: ${response.status} ${await response.text()}`);
-  }
-
-  const materializedAt = response.headers.get("X-Surf-Forecast-Materialized-At");
-  const generatedAt = response.headers.get("X-Surf-Forecast-Generated-At");
-  const ingestId = response.headers.get("X-Surf-Ingest-Id");
-  await response.body?.cancel();
-  const materializedAtMs = materializedAt ? Date.parse(materializedAt) : Number.NaN;
-  const generatedAtMs = generatedAt ? Date.parse(generatedAt) : Number.NaN;
-  return {
-    spotId,
-    interval,
-    status:
-      Number.isFinite(materializedAtMs) &&
-      materializedAtMs >= requestedAtMs &&
-      Number.isFinite(generatedAtMs) &&
-      generatedAtMs >= minimumGeneratedAtMs &&
-      ingestId === expectedIngestId
-        ? "ready"
-        : "pending",
-    materializedAt: Number.isFinite(materializedAtMs) ? materializedAt : null
-  };
 }
 
 export async function waitForRemoteForecastReadModels(options) {
@@ -98,7 +232,10 @@ export async function waitForRemoteForecastReadModels(options) {
     now = Date.now,
     sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
     pollIntervalMs = REMOTE_INGEST_POLL_INTERVAL_MS,
-    timeoutMs = REMOTE_INGEST_TIMEOUT_MS
+    timeoutMs = REMOTE_INGEST_TIMEOUT_MS,
+    requestTimeoutMs = REMOTE_INGEST_REQUEST_TIMEOUT_MS,
+    expectedVersionId,
+    spotIds: configuredSpotIdsOption
   } = options;
   const requestedAtMs = Date.parse(requestedAt);
   if (typeof ingestId !== "string" || !ingestId) {
@@ -109,11 +246,16 @@ export async function waitForRemoteForecastReadModels(options) {
   if (!Number.isFinite(minimumGeneratedAtMs)) {
     throw new Error("queued ingest returned an invalid forecastGeneratedAt");
   }
-  if (!(pollIntervalMs > 0) || !(timeoutMs > 0)) {
-    throw new Error("remote ingest polling interval and timeout must be positive");
+  if (!(pollIntervalMs > 0) || !(timeoutMs > 0) || !(requestTimeoutMs > 0)) {
+    throw new Error("remote ingest polling interval and timeouts must be positive");
   }
 
-  const spotIds = await configuredSpotIds(baseUrl, fetcher);
+  const spotIds = configuredSpotIdsOption ?? await configuredSpotIds(
+    baseUrl,
+    fetcher,
+    expectedVersionId,
+    requestTimeoutMs
+  );
   const targets = spotIds.flatMap((spotId) =>
     FORECAST_INTERVALS.map((interval) => ({ spotId, interval }))
   );
@@ -126,20 +268,20 @@ export async function waitForRemoteForecastReadModels(options) {
 
   while (true) {
     attempts += 1;
-    const states = await Promise.all(
-      [...pending.values()].map(({ spotId, interval }) =>
-        inspectForecastReadModel(
-          baseUrl,
-          spotId,
-          interval,
-          ingestId,
-          requestedAtMs,
-          minimumGeneratedAtMs,
-          fetcher
-        )
-      )
-    );
-    for (const state of states) {
+    for (const { spotId, interval } of [...pending.values()]) {
+      const remainingBeforeRequestMs = deadlineMs - now();
+      if (remainingBeforeRequestMs <= 0) break;
+      const state = await inspectForecastReadModel(
+        baseUrl,
+        spotId,
+        interval,
+        ingestId,
+        requestedAtMs,
+        minimumGeneratedAtMs,
+        fetcher,
+        expectedVersionId,
+        Math.min(requestTimeoutMs, remainingBeforeRequestMs)
+      );
       if (state.status !== "ready") continue;
       pending.delete(`${state.spotId}:${state.interval}`);
       if (
@@ -175,17 +317,40 @@ export async function waitForRemoteForecastReadModels(options) {
 }
 
 export async function enqueueAndWaitForRemoteIngest(options) {
-  const { baseUrl, token, fetcher = globalThis.fetch } = options;
-  const response = await fetcher(`${baseUrl}/api/ingest/once`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${token}`
-    }
-  });
-  const payload = await jsonOrNull(response);
+  const {
+    baseUrl,
+    token,
+    fetcher = globalThis.fetch,
+    expectedVersionId,
+    requestTimeoutMs = REMOTE_INGEST_REQUEST_TIMEOUT_MS
+  } = options;
+  const spotIds = await configuredSpotIds(
+    baseUrl,
+    fetcher,
+    expectedVersionId,
+    requestTimeoutMs
+  );
+  const enqueue = await requestWithTimeout(
+    fetcher,
+    `${baseUrl}/api/ingest/once`,
+    {
+      method: "POST",
+      headers: workerVersionRequestHeaders(expectedVersionId, {
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`
+      })
+    },
+    requestTimeoutMs,
+    async (response) => ({
+      status: response.status,
+      workerVersion: responseWorkerVersion(response),
+      payload: await jsonOrNull(response)
+    })
+  );
+  const { payload } = enqueue;
   if (
-    response.status !== 202 ||
+    enqueue.status !== 202 ||
+    (expectedVersionId && enqueue.workerVersion !== expectedVersionId) ||
     payload?.status !== "accepted" ||
     typeof payload?.ingestId !== "string" ||
     !payload.ingestId ||
@@ -193,7 +358,7 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     !validTimestamp(payload?.forecastGeneratedAt)
   ) {
     throw new Error(
-      `remote ingest enqueue failed: ${response.status} ${JSON.stringify(payload)}`
+      `remote ingest enqueue failed: ${enqueue.status} ${JSON.stringify(payload)}`
     );
   }
   const result = await waitForRemoteForecastReadModels({
@@ -201,7 +366,12 @@ export async function enqueueAndWaitForRemoteIngest(options) {
     requestedAt: payload.requestedAt,
     forecastGeneratedAt: payload.forecastGeneratedAt,
     ingestId: payload.ingestId,
-    fetcher
+    fetcher,
+    spotIds
   });
-  return { ...result, ingestId: payload.ingestId };
+  return {
+    ...result,
+    ingestId: payload.ingestId,
+    ...(expectedVersionId ? { workerVersion: expectedVersionId } : {})
+  };
 }

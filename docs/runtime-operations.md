@@ -73,7 +73,13 @@ In production the endpoint acknowledges the request with `202`, then the
 command polls every configured spot's 1-hour and 3-hour read models until they
 were materialized at or after the Worker-issued request timestamp. It does not
 hold the HTTP request open for ingest. The polling deadline is bounded and a
-timeout reports the exact spot/interval pairs that did not publish.
+timeout reports the exact spot/interval pairs that did not publish. During a
+deployment, the command also sends Cloudflare version affinity and requires
+`X-Surf-Worker-Version` to match the exact version emitted by Wrangler before
+and after the one-and-only-one enqueue. Forecast polling is sequential so the
+verification client cannot recreate a burst of expensive requests. Affinity
+stabilizes routing; it does not select a version, so the response-owned version
+header is the proof and a mismatch never counts as ready.
 
 ## Provider failure
 
@@ -228,10 +234,20 @@ untouched.
 
 For additive changes, back up D1 and export the required
 `SURF_INGEST_TOKEN`, then use the supported `pnpm deploy` path. Deployment
-applies migrations, deploys the Worker, queues one authenticated ingest, waits
-for every compatible read-model generation to publish, and finally runs the
-strict cloud smoke. A read-model bootstrap or strict-smoke failure triggers an
-automatic rollback of the Worker version; additive D1 tables remain in place.
+applies migrations, deploys the Worker, parses Wrangler's exact version ID,
+and requires three consecutive version-matched health responses before it
+queues one authenticated ingest. It then waits for every read model from that
+ingest lineage to publish and runs a version-pinned strict cloud smoke.
+
+Worker activation is the rollback safety boundary, not the deploy command's
+own ingest handoff. Cron, authenticated traffic, or an existing backlog can
+produce or consume Queue messages as soon as Wrangler activates the version.
+Consequently, any readiness, publication, or smoke failure leaves the new
+Worker active and must be treated as an urgent fix-forward. Only roll back
+after independently proving the Queue is quiescent, no consumer is in flight,
+and every queued payload is compatible with the predecessor. Additive D1
+tables remain in place.
+
 If a later problem is found while the schema remains backward compatible, use
 Wrangler's version rollback:
 

@@ -276,9 +276,21 @@ describe("worker api", () => {
 
   it("returns health", async () => {
     const request = new Request("http://surf.test/api/health") as unknown as Parameters<typeof worker.fetch>[0];
-    const response = await worker.fetch(request, env(), {} as ExecutionContext);
+    const response = await worker.fetch(
+      request,
+      {
+        ...env(),
+        CF_VERSION_METADATA: {
+          id: "worker-version-test-id",
+          tag: "",
+          timestamp: "2026-08-04T00:00:00.000Z"
+        }
+      },
+      {} as ExecutionContext
+    );
     expect(response.status).toBe(200);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("X-Surf-Worker-Version")).toBe("worker-version-test-id");
     expect(await response.json()).toMatchObject({ status: "ok", service: "surf" });
   });
 

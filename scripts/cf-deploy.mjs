@@ -6,7 +6,12 @@ import {
   runPnpm,
   runWrangler
 } from "./lib/cloudflare-commands.mjs";
-import { resolveDeployedUrl } from "./lib/deploy-url.mjs";
+import { bootstrapDeployedWorker } from "./lib/deploy-bootstrap.mjs";
+import {
+  resolveDeployedUrl,
+  resolveDeployedVersionId
+} from "./lib/deploy-url.mjs";
+import { waitForWorkerVersion } from "./lib/worker-version.mjs";
 
 const mode = process.argv[2];
 const dryRun = process.argv.includes("--dry-run");
@@ -51,7 +56,7 @@ function deployedUrl(output) {
   return resolveDeployedUrl(output, process.env.SURF_BASE_URL);
 }
 
-function smoke(output, requireForecastData) {
+function smoke(output, requireForecastData, expectedVersionId) {
   const url = deployedUrl(output);
   if (!url) {
     throw new Error(
@@ -62,12 +67,15 @@ function smoke(output, requireForecastData) {
   runPnpm(["--filter", "@surf/web", "smoke:cloudflare"], {
     env: {
       SURF_BASE_URL: url,
-      SURF_REQUIRE_FORECAST_DATA: requireForecastData ? "true" : "false"
+      SURF_REQUIRE_FORECAST_DATA: requireForecastData ? "true" : "false",
+      ...(expectedVersionId
+        ? { SURF_EXPECTED_WORKER_VERSION: expectedVersionId }
+        : {})
     }
   });
 }
 
-function refreshForecastReadModels(output) {
+function refreshForecastReadModels(output, expectedVersionId) {
   const url = deployedUrl(output);
   if (!url) {
     throw new Error(
@@ -75,30 +83,27 @@ function refreshForecastReadModels(output) {
     );
   }
   runPnpm(["ingest:remote"], {
-    env: { SURF_BASE_URL: url }
+    env: {
+      SURF_BASE_URL: url,
+      SURF_EXPECTED_WORKER_VERSION: expectedVersionId
+    }
   });
 }
 
-function rollbackFailedDeployment(cause) {
-  try {
-    runWrangler([
-      "rollback",
-      "--message",
-      "Automatic rollback: forecast read-model bootstrap failed",
-      "--yes"
-    ], {
-      env: { CI: "true" }
-    });
-  } catch (rollbackError) {
-    throw new AggregateError(
-      [cause, rollbackError],
-      "Forecast read-model bootstrap failed after deployment, and the automatic Worker rollback also failed."
+async function waitUntilServing(output) {
+  const url = deployedUrl(output);
+  if (!url) {
+    throw new Error(
+      "Deployment completed, but its URL could not be inferred. Set SURF_BASE_URL so exact-version readiness can run."
     );
   }
-  throw new Error(
-    "Forecast read-model bootstrap or strict smoke failed after deployment; the Worker was automatically rolled back.",
-    { cause }
-  );
+  const expectedVersionId = resolveDeployedVersionId(output);
+  const result = await waitForWorkerVersion({
+    baseUrl: url,
+    expectedVersionId
+  });
+  console.log(JSON.stringify(result));
+  return expectedVersionId;
 }
 
 assertActiveWranglerConfig();
@@ -129,7 +134,8 @@ if (mode === "setup") {
       { cause: error }
     );
   }
-  smoke(output, false);
+  const expectedVersionId = await waitUntilServing(output);
+  smoke(output, false, expectedVersionId);
 } else {
   try {
     migrateAndSeed();
@@ -140,12 +146,15 @@ if (mode === "setup") {
     );
   }
   output = deployWorker();
-  try {
+  let expectedVersionId;
+  await bootstrapDeployedWorker({
+    waitUntilServing: async () => {
+      expectedVersionId = await waitUntilServing(output);
+    },
     // Forecast GETs intentionally serve precomputed D1 read models. Queue the
-    // first generation and wait for publication before strict post-deploy smoke.
-    refreshForecastReadModels(output);
-    smoke(output, true);
-  } catch (error) {
-    rollbackFailedDeployment(error);
-  }
+    // first generation only after the exact rollout version is stable, then
+    // wait for publication before strict post-deploy smoke.
+    enqueueAndWait: () => refreshForecastReadModels(output, expectedVersionId),
+    smoke: () => smoke(output, true, expectedVersionId)
+  });
 }

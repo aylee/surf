@@ -175,8 +175,9 @@ your shell, provide the same value through the ignored environment variable
 `SURF_INGEST_TOKEN`; never paste it into a script or GitHub issue.
 
 Keep that variable available for later `pnpm deploy` runs. An update deploy
-performs one authenticated ingest after the new Worker is active so any newly
-migrated forecast read-model tables are populated before strict smoke testing.
+first proves the exact Wrangler-emitted Worker version is serving consistently,
+then performs one authenticated ingest so any newly migrated forecast
+read-model tables are populated before version-pinned strict smoke testing.
 
 ### 5. Optional Gemini production rollout
 
@@ -267,15 +268,41 @@ low-confidence mapping is more honest.
 ```bash
 git pull --ff-only
 pnpm install --frozen-lockfile
+```
+
+If this instance uses ignored `apps/web/wrangler.instance.jsonc`, manually
+merge newly tracked structural keys and bindings from `apps/web/wrangler.jsonc`
+into it before verification, while preserving the instance name, resource IDs,
+operator contact, routes, secrets boundary, and intentional feature flags. Do
+not overwrite the overlay with a fresh copy. For this upgrade the overlay must
+include:
+
+```jsonc
+"version_metadata": {
+  "binding": "CF_VERSION_METADATA"
+}
+```
+
+Select the reconciled overlay again in every fresh shell, then verify and
+deploy:
+
+```bash
+export SURF_WRANGLER_CONFIG=wrangler.instance.jsonc
 pnpm verify
 export SURF_INGEST_TOKEN=<matching-secret-in-your-shell>
 pnpm deploy
 ```
 
+Instances that use the tracked canonical configuration can omit the export.
+
 The deploy command applies migrations, deploys, refreshes the materialized
-forecast generation, and then runs the strict remote smoke. If bootstrap or
-smoke fails, it automatically rolls the Worker version back while leaving the
-additive D1 schema intact. It fails if any configured spot lacks a five-day
+forecast generation, and then runs the strict remote smoke. Once Wrangler
+activates the version, any readiness, publication, or smoke failure
+deliberately leaves it active for a Queue-safe fix-forward: cron, manual
+traffic, or backlog processing may already have crossed the Queue schema
+boundary. Rolling back requires first proving the Queue quiescent, no consumer
+in flight, and every payload predecessor-compatible. Additive D1 schema changes
+remain intact. The command fails if any configured spot lacks a five-day
 horizon with sourced, scored wave data.
 
 Back up D1 before a migration that changes or removes data. See
