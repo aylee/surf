@@ -123,7 +123,10 @@ assertion expected `terminal` when replaying generation A after newer same-mater
 advanced the new high-water; the runtime correctly returned `superseded`. This is an isolated
 stale expectation, not a code regression. The assertion/comment is corrected on the branch,
 focused unit/type checks are green, and an independent control-flow review is DRY. The
-corrective is ready to commit/push for a second Verify run. The PR remains draft.
+corrective landed as `5787482`; second Verify run `30895038090` passed in 1m16s at that
+exact head, including fresh D1, all package/workerd/Python tests, build, and secretless bundle.
+The GitHub half of T-A.4 is green. The PR remains draft because the operator-shell
+`pnpm verify` + local ingest/smoke evidence and OI-4 still do not exist.
 The owner's 2026-08-03 browser-quality amendment (OD-9) raises PR-B/C's UI bar: preserve
 v2's visual identity but remove duplicate decision content, keep the freshness signal visible
 on mobile, put forecast data in the first viewport, and prove every changed page in the code
@@ -866,3 +869,11 @@ preserves the queue-length assertion and the later proof that equal-high-water G
 publishes after cooldown. Independent control-flow review is DRY; focused Agent unit 5/5,
 type/config check, and diff check pass. No runtime code or production state changed. Push the
 test-only corrective and require a wholly green second Verify before reconsidering readiness.
+
+_2026-08-04_ — **PR #23 GitHub Verify is green at the corrected head.** Commit `5787482`
+passed run `30895038090` in 1m16s: fresh isolated D1, repo/package checks, scripts, web unit,
+all 18 workerd tests, Python, production build, and secretless Wrangler bundle. This closes the
+CI execution gap for the new listener-backed regressions but does not rewrite the local gate:
+Alex still needs to run `!pnpm verify`, `!pnpm dev`, and
+`!pnpm ingest:local && pnpm smoke:local` in his ordinary shell. OI-4 destination/token
+provisioning also remains open. Keep PR #23 draft, make no deployment, and do not start PR-B.

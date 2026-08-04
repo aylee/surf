@@ -1357,3 +1357,13 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
 - **Gate:** PR #23 remains draft. Push the test-only correction and require second GitHub
   Verify green. OI-4 and operator-shell `pnpm verify` + local ingest/smoke still gate ready
   status; no deploy or Phase B work is authorized yet.
+
+### 2026-08-04 — PR #23 second GitHub Verify green
+
+- **Evidence:** commit `5787482` passed run `30895038090` in 1m16s. The canonical
+  `pnpm verify` job completed fresh isolated D1 migration/seed, repository and package
+  checks, scripts, web unit, all 18 workerd tests (including new real-D1 and Agent ordering
+  regressions), Python, production build, and the secretless Wrangler bundle.
+- **Gate state:** GitHub Verify is closed green. T-A.4 remains in progress, and PR #23 remains
+  draft, because the required operator-shell `pnpm verify` plus local public-feed
+  ingest/smoke and OI-4 provisioning are still absent. No merge, deploy, or Phase B work.
