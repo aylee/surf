@@ -295,9 +295,11 @@ app.get(
       if (!materialized) {
         console.error(
           JSON.stringify({
+            event: "forecast_read_model_missing",
             message: "forecast read model missing",
             spotId,
-            interval
+            interval,
+            reasonCode: "read_model_missing"
           })
         );
         return c.json(

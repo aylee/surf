@@ -56,6 +56,55 @@ Health, errors, ingest responses, and other API responses are explicitly
 uncacheable. Treat the cache as request-load protection, not as the source of
 truth; D1 read models remain the durable last-good generation.
 
+### Local missing-read-model proof
+
+Run this local-only degraded-path check before readying an observability change.
+It removes one regenerable row from the local D1 database; it never targets a
+remote binding. The recovery path is a normal local ingest.
+
+1. Start `pnpm dev` and retain its output, then in a second terminal run
+   `pnpm ingest:local` followed by `pnpm smoke:local` to establish a healthy
+   baseline. In the dev output, take the `ingestId` from the one
+   `source_ingest_published` terminal object. Require exactly 12
+   `forecast_materialization_published` terminal objects with that same
+   `ingestId`: one for every configured spot × `1h|3h`, each with a nonempty
+   `generationId`, `outcome: "publish"`, and a stable `reasonCode`. Started
+   events and optional-brief diagnostics are not terminal objects; do not count
+   them. Any missing or duplicate spot/interval terminal fails this proof.
+2. Stop the dev process so the local D1 file has no listener holding it, then
+   delete exactly the `obsf-central` 3-hour row:
+
+   ```bash
+   pnpm --filter @surf/web exec wrangler d1 execute DB --local --yes --command \
+     "delete from forecast_read_models where spot_id = 'obsf-central' and interval = '3h'"
+   ```
+
+3. Restart `pnpm dev` and request the missing interval:
+
+   ```bash
+   curl -i "http://127.0.0.1:8787/api/forecast/obsf-central?interval=3h"
+   ```
+
+   Require HTTP `503`, `Retry-After: 300`, and this bounded JSON log in the dev
+   terminal (field order is not significant):
+
+   ```json
+   {"event":"forecast_read_model_missing","message":"forecast read model missing","spotId":"obsf-central","interval":"3h","reasonCode":"read_model_missing"}
+   ```
+
+4. Recover the row and prove the full healthy state again:
+
+   ```bash
+   pnpm ingest:local
+   pnpm smoke:local
+   ```
+
+   Apply the same one-source/12-interval terminal-set assertion to this recovery
+   ingest, using its new `ingestId`.
+
+If the check is interrupted after deletion, step 4 is the rollback. Do not
+substitute a remote D1 command for this procedure.
+
 ## Post-merge routine
 
 Use the supported path in this order after a merge. Set `SURF_BASE_URL` to the

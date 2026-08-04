@@ -357,9 +357,11 @@ describe("worker api", () => {
     });
     expect(error).toHaveBeenCalledOnce();
     expect(JSON.parse(String(error.mock.calls[0]![0]))).toEqual({
+      event: "forecast_read_model_missing",
       message: "forecast read model missing",
       spotId: "obsf-central",
-      interval: "3h"
+      interval: "3h",
+      reasonCode: "read_model_missing"
     });
     error.mockRestore();
   });

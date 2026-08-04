@@ -190,7 +190,7 @@ Documented RCA from the planning session — do not re-litigate; do close OI-2:
 |-------|------|-------------|------|--------|--------------|
 | 0 | T-0.1: Production state snapshot | Deploy timeline, 12-row read-model state, DLQ depth (evidence in Log) | S | done | OI-1 approval |
 | 0 | T-0.2: Pin the 23:23Z flapping cause | OI-2 verdict + chosen smallest corrective for PR-A | S | done | T-0.1 |
-| A | T-A.1: Structured pipeline logging | Silent 503 logged; one line per publish/skip/supersede/failure; corrective folded in | M | done — final review DRY | T-0.2 |
+| A | T-A.1: Structured pipeline logging | Silent 503 logged; one line per publish/skip/supersede/failure; corrective folded in | M | in progress — corrective review DRY; local degraded-path proof pending | T-0.2 |
 | A | T-A.2: Tracing beta + OTLP → Logfire | wrangler config + operator-assisted destination/token; correlated traces visible | M | in progress — repo half done; OI-4 operator action pending | T-0.2 |
 | A | T-A.3: `pnpm ops:status` + post-merge runbook | Read-only status script + tests + `docs/runtime-operations.md` routine | M | done — final review DRY | — (parallel-safe with T-A.1/A.2) |
 | A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | in progress — review DRY; local listener/canonical gate missing | T-A.1–A.3 |
@@ -1367,3 +1367,33 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
 - **Gate state:** GitHub Verify is closed green. T-A.4 remains in progress, and PR #23 remains
   draft, because the required operator-shell `pnpm verify` plus local public-feed
   ingest/smoke and OI-4 provisioning are still absent. No merge, deploy, or Phase B work.
+
+### 2026-08-04 — PR-A boundary refuter reopened local acceptance
+
+- **Finding:** the operator handoff named only the healthy local ingest/smoke sequence even
+  though T-A.1/T-A.4 also require an artificially missing read-model row. Separately, the
+  signature 503 log had the promised message/spot/interval but lacked the stable `event` and
+  `reasonCode` used by the rest of the production observability vocabulary.
+- **Correction:** T-A.1 returns to in-progress until the operator performs the explicit
+  local-only `obsf-central`/`3h` delete → 503/log assertion → ingest/smoke recovery procedure
+  now recorded in `docs/runtime-operations.md`. Healthy and recovery ingests must each prove
+  one source terminal plus exactly six spots × two interval terminals under one `ingestId`.
+  The missing-row log is normalized to
+  `forecast_read_model_missing` / `read_model_missing`, with its unit contract updated.
+- **Current-head gate:** the last green GitHub run proves `5787482`, not docs head `3a73ac2`
+  or this corrective. Require a new green run at the eventual pushed head; no current-head CI
+  claim, ready transition, merge, deploy, or Phase B work is permitted yet.
+- **OODA:** Observe — independent refutation overturned a too-narrow healthy-path handoff and
+  an overbroad log-coverage claim. Orient — a quiet surf-planning UI is trustworthy only if
+  its rare unavailable state is diagnosable without payload leakage, and strict PR ordering
+  matters more than preserving a “done” label. Decide — reopen T-A.1, add the smallest stable
+  fields and a reversible local procedure, and keep the draft frozen at the safety boundary.
+  Act — run focused unit/docs checks and a fresh independent refuter; until both are complete,
+  do not call the corrective review dry. Then checkpoint/push and require exact-head GitHub
+  plus operator-local/OI-4 evidence.
+- **Corrective gate evidence:** the first refutation required explicit terminal cardinality,
+  so baseline and recovery now each require one source terminal + 12 unique published
+  spot/interval terminals under one `ingestId`. The second refutation is DRY. Focused Worker
+  API tests pass 24/24; serial web unit is 263 passed +1 skipped; scripts are 182/182; web
+  type/config check and `git diff --check` pass. An isolated-temp-D1 CLI rehearsal still hit
+  this sandbox's known listener `EPERM`; neither the degraded path nor local e2e is claimed.

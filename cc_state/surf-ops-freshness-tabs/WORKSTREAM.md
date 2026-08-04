@@ -115,7 +115,7 @@ honestly still open: this execution environment rejects Unix-socket/listener cre
 local dev/e2e), while an escalation retry is unavailable under the current Codex execution
 limit. The branch therefore remains pre-ready until GitHub Verify and the operator-shell local
 gate supply that missing evidence. OI-4 also remains open, so no deploy or PR-B work may begin.
-Draft PR #23 now carries commit `d411245` and the full incident/review/recovery contract.
+Draft PR #23 carries pushed docs head `3a73ac2` and the full incident/review/recovery contract.
 Its first GitHub Verify run (`30894701075`) completed fresh D1, repo checks, scripts, and all
 263 web unit tests, then ran the previously blocked workerd suite: the new real-D1 and race
 regressions passed, as did 17/18 total Worker tests. One pre-existing terminal-recovery
@@ -125,8 +125,10 @@ stale expectation, not a code regression. The assertion/comment is corrected on 
 focused unit/type checks are green, and an independent control-flow review is DRY. The
 corrective landed as `5787482`; second Verify run `30895038090` passed in 1m16s at that
 exact head, including fresh D1, all package/workerd/Python tests, build, and secretless bundle.
-The GitHub half of T-A.4 is green. The PR remains draft because the operator-shell
-`pnpm verify` + local ingest/smoke evidence and OI-4 still do not exist.
+That is green evidence for `5787482`, not the later docs head or the boundary-refuter
+corrective now in the local worktree. T-A.1 is reopened until its explicit missing-row local
+proof passes. The PR remains draft because exact-head GitHub evidence, the operator-shell
+canonical + healthy/degraded local e2e, and OI-4 still do not exist.
 The owner's 2026-08-03 browser-quality amendment (OD-9) raises PR-B/C's UI bar: preserve
 v2's visual identity but remove duplicate decision content, keep the freshness signal visible
 on mobile, put forecast data in the first viewport, and prove every changed page in the code
@@ -241,11 +243,13 @@ and no production mutation have been performed for PR-A.
 
 ## Next Action
 
-**Freeze the DRY PR-A diff and publish it only as incomplete while the local canonical/e2e gate
-is unavailable; use GitHub Verify to execute the listener/workerd portion without claiming it
-replaces the required operator-shell local proof. Alex's exact operator commands are
-`!pnpm verify`, then `!pnpm dev` in one terminal and `!pnpm ingest:local && pnpm smoke:local`
-in another. Separately complete OI-4 by creating the two named Logfire destinations/tokens in
+**Keep PR-A incomplete while the local canonical/e2e gate is unavailable; use GitHub Verify
+to execute the listener/workerd portion without claiming it replaces the required
+operator-shell local proof. Alex's exact healthy-path commands are `!pnpm verify`, then
+`!pnpm dev` in one terminal and `!pnpm ingest:local && pnpm smoke:local` in another. He must
+also execute `docs/runtime-operations.md` §Local missing-read-model proof: local-only exact-row
+delete → asserted 503 + bounded log → normal ingest/smoke recovery. Separately complete OI-4
+by creating the two named Logfire destinations/tokens in
 Cloudflare (instructions are in `docs/runtime-operations.md`; never paste the token into chat or
 the repo). Only after review stays DRY, both canonical/local gates are green, and OI-4 exists:
 ready PR → GitHub Verify → merge → one supported `pnpm deploy` → wait for the next actual `:17`
@@ -877,3 +881,17 @@ CI execution gap for the new listener-backed regressions but does not rewrite th
 Alex still needs to run `!pnpm verify`, `!pnpm dev`, and
 `!pnpm ingest:local && pnpm smoke:local` in his ordinary shell. OI-4 destination/token
 provisioning also remains open. Keep PR #23 draft, make no deployment, and do not start PR-B.
+
+_2026-08-04_ — **PR-A boundary OODA/refuter reopened T-A.1.** Independent manifest-to-code
+reconciliation found that the operator commands covered only healthy ingest/smoke, not the
+locked missing-read-model acceptance, and that the signature 503 line lacked the stable
+event/reason vocabulary claimed for production logs. The smallest corrective adds
+`forecast_read_model_missing` / `read_model_missing`, pins the exact JSON contract, and records
+a reversible local-only `obsf-central`/`3h` delete → 503/log → ingest/smoke recovery procedure.
+Each healthy/recovery ingest must also prove one source terminal plus exactly 12 unique
+spot/interval terminals under its `ingestId`; smoke alone is insufficient.
+The corrective's second independent refutation is DRY; focused Worker 24/24, serial web unit
+263 +1 skipped, scripts 182/182, web check, and diff check are green. T-A.1 is still in
+progress until that procedure runs in Alex's ordinary shell. The last green CI is
+evidence for `5787482`, not the later docs/corrective head; require exact-head Verify. OI-4
+remains open, production is unchanged, and PR-B/C remain untouched.
