@@ -126,6 +126,18 @@ test("instance validation preserves serialized ingest generations", () => {
   ]);
 });
 
+test("instance validation locks the cron schedule used by deploy safety", () => {
+  for (const crons of [undefined, [], ["18 * * * *"], ["17 * * * *", "47 * * * *"]]) {
+    const config = structuredClone(canonical);
+    if (crons === undefined) delete config.triggers;
+    else config.triggers.crons = crons;
+
+    assert.deepEqual(wranglerStructureFailures(config, configPath), [
+      "Scheduled ingest must use exactly 17 * * * * so deploy cron-safety remains valid."
+    ]);
+  }
+});
+
 test("instance validation preserves version-scoped Worker response caching", () => {
   const config = structuredClone(canonical);
   config.cache.cross_version_cache = true;

@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
+import { SCHEDULED_INGEST_CRON } from "./ingest-schedule.mjs";
 
 const OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
 
@@ -67,6 +68,15 @@ export function wranglerStructureFailures(config, configPath) {
   }
   if (consumers[0]?.max_batch_size !== 1 || consumers[0]?.max_concurrency !== 1) {
     failures.push("Ingest queue consumption must be serialized one message at a time.");
+  }
+  if (
+    !Array.isArray(config?.triggers?.crons) ||
+    config.triggers.crons.length !== 1 ||
+    config.triggers.crons[0] !== SCHEDULED_INGEST_CRON
+  ) {
+    failures.push(
+      `Scheduled ingest must use exactly ${SCHEDULED_INGEST_CRON} so deploy cron-safety remains valid.`
+    );
   }
 
   if (config?.assets?.binding !== "ASSETS") failures.push("Static assets binding must be ASSETS.");

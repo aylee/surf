@@ -1152,3 +1152,90 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
   blind or ambiguous replay. Act — ready PR → GitHub Verify → merge → exactly one supported
   deploy; close OI-5 only on target-only dual-origin identity, one lineage, 12/12, deployment
   100%, Queue 1/1, and production code-browser proof. PR-A remains blocked until then.
+
+### 2026-08-03 — PR #21 live failure; cron-safe Queue-tail fix-forward
+
+- **Merge/control plane:** PR #21 (`ec0e222`) passed GitHub Verify in 1m29s and merged as
+  `51849a8dcdcd994ec2420edddd1ce7e42c8d41df` at `06:11:53Z`. Pre-deploy state was
+  `ce82bb5d…` at 100%, Queue 1 producer/1 consumer, DLQ present, D1 recovery bookmark
+  `00000343-00000000-000050bd-83c68ca69e04f678e438127ce7b612af`, and legacy override unset.
+  Seed advanced to `00000343-00000004-000050bd-8b408874d63624808bbf8bce5e29f2c1`.
+  Supported deploy activated `8ce5bdf1-9b9b-4496-ab3b-08089f09a1a8` in
+  `04dbca1e-9e55-41dc-bcf4-9fe3124965ab` at exactly 100% after exact + three ordinary probes.
+- **Accepted lineage/failure:** one exact target handoff began at `06:13:19.808Z`; five source
+  runs completed by `06:13:43.490Z` (CO-OPS/NWS point/NWS wave/CDIP success; NDBC partial only
+  for optional missing/stale observations). Five spots published by `06:13:48.853Z`; the command
+  reached its ten-minute bound with only Bolinas 1h/3h pending and explicitly left the activated
+  Worker in fix-forward. No replay or rollback occurred.
+- **Supersession evidence:** cron lineage `541dcaff…` began at `06:17:27.614Z`, published four
+  spots by `06:17:57.258Z`, and made any older queued child unable to overwrite those rows under
+  the monotonic generated-at fence. Current rows are mixed: OB×3/Linda on cron, Stinson on deploy,
+  Bolinas on 05:17 lineage `3eae0acd…`. Exact production headers agree with D1 on Worker 8ce.
+- **Negative/equivalence proof:** read-only exact-code reconstruction from production rows at
+  06:13 produced 121/121 scored 1h windows, 41/41 scored 3h windows, 402,585/147,208-byte
+  forecast payloads, and six fact bundles ≤24,312 bytes. All five source rows were persistence
+  ready. Therefore auth/routing, sources, deterministic assembly, schema, and payload limits are
+  refuted; the residual is Queue child execution/persistence-tail, whose exact exception was not
+  durably recorded and could not be recovered by a post-fact live tail.
+- **Code-shaped corrective:** before starting the 60-second affinity handoff, defer when the
+  ten-minute exact-lineage verification horizon would cross the hourly :17 trigger, and resume
+  only after a conservative post-cron settle window. During polling, a valid different ingest
+  with strictly newer generated-at is terminal supersession, never indefinite pending or mixed
+  success. Add structured child start, publish, materialization failure, superseded, and
+  post-publish brief-signal failure evidence; keep Queue batch/concurrency 1.
+- **OODA/tradeoff:** Observe — handoff safety/liveness passed; downstream exact-lineage liveness
+  collided with an unordered Queue and scheduled supersession. Orient — one old spot hidden by
+  eleven recent rows is precisely the trust failure freshness UI must expose, not normalize.
+  Decide — accept up to a conservative pre-handoff wait and immediate explicit failure on newer
+  lineage; reject longer blind polling, mixed-lineage success, manual replay, or rollback after
+  acknowledged mutation. Act — narrow recovery PR, finder/refuter dry gate, canonical/local,
+  GitHub Verify, merge, and one supported deploy. PR-A remains blocked until full live proof.
+
+### 2026-08-03 — Sixth recovery ready-PR checkpoint
+
+- **Confirmed/refuted findings:** the first full-round HTTP poller closed cumulative readiness
+  but not within-round TOCTOU; a refuter reproduced false success after an earlier target was
+  overwritten. A second refuter reproduced an unsafe clock jump between the initial cron guard
+  and handoff. A logging refuter proved the queue-level brief-failure event was synthetic because
+  the real optional brief helper catches and resolves. All three findings were accepted and
+  corrected; final aggregate client/config review plus endpoint compatibility review are DRY.
+- **Atomic readiness corrective:** public no-store `GET /api/forecast-readiness` executes one
+  prepared/bound metadata-only D1 statement across active regional spots × 3h/1h. Its response
+  includes exact target/generation/ingest/generated/materialized metadata and never
+  `forecast_json`. The deploy client strictly validates schema, target keyset, content type,
+  generation/timestamp consistency, and target Worker identity. Only one all-exact statement
+  snapshot succeeds; old/equal rows remain pending; any valid strictly newer foreign lineage
+  terminates. Full forecast GETs remain strict-smoke consumers, not publication authority.
+- **Mutation-time corrective:** the initial cron guard returns its validated timestamp and
+  anchors the existing 60-second handoff deadline before affinity-key generation or networking.
+  A suspension beyond the deadline creates zero keys/requests. A final synchronous check before
+  each authenticated PATCH catches jumps during read-only handoff and fails without sleeping on
+  an aging key. The schedule literal is shared with config validation, which requires exactly
+  `17 * * * *`; the Queue remains batch/concurrency 1.
+- **Real observability corrective:** child start/publish/supersede/lineage/materialization
+  failure paths emit bounded structured evidence. Optional brief failure ownership remains in
+  the production helper; it now records one `forecast_brief_signal_failed` event with lineage,
+  then resolves so the deterministic publication is ACKed and never retried. This explicitly
+  refutes brief signaling as the cause of Bolinas missing publication because publish logging
+  precedes brief work.
+- **Verification:** focused remote-ingest 99/99; focused Worker 49/49; full `pnpm verify` green:
+  scripts 154/154, core 21/21, DB 10/10, web unit 240 (+1 skipped), workerd/D1 15/15, Python
+  45/45, isolated migration/seed, production build, secretless Wrangler bundle; diff check clean.
+  Fresh local public-feed ingest wrote 12/12 read models (known non-fatal NDBC partial, zero
+  errors); strict smoke returned 6 spots/12 ready/0 pending. `/api/forecast-readiness` returned
+  one no-store 2,774-byte/12-row snapshot with the exact local Worker version. Code-browser
+  daily-report + Bolinas checks at 1280×720 found zero alerts, console warnings/errors, or
+  horizontal overflow. The unchanged AI-first spot baseline remains deliberately noisy and is
+  evidence for, not scope expansion into, PR-C's Forecast-default tab.
+- **Tradeoffs:** one aggregate metadata query every poll is cheaper and stronger than twelve
+  forecast GETs. Public exposure is limited to metadata already carried in public response
+  headers. The ten-minute settle window mitigates but cannot prove Queue emptiness, so newer
+  lineage remains terminal and any post-202 failure remains queue-safe fix-forward. JS/TS
+  generation regexes are duplicated but currently identical; sharing a fixture is non-blocking.
+- **OODA:** Observe — sequential reads, reset clocks, and synthetic tests each created plausible
+  but false evidence. Orient — this app should stay quiet and trustworthy for friends planning
+  surf, so the smallest useful operations surface is one indexed snapshot and causal logs, not a
+  schema or replay subsystem. Decide — require atomic evidence, anchor time before handoff, keep
+  optional AI non-gating, and preserve strict no-replay/fix-forward rules. Act — ready PR →
+  GitHub Verify → merge → exactly one supported deploy; close OI-5 only on dual-origin target
+  identity, one lineage/12 rows, Queue 1/1, strict smoke, and production code-browser proof.

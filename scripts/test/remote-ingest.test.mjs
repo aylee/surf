@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { enqueueAndWaitForRemoteIngest } from "../lib/remote-ingest.mjs";
+import {
+  enqueueAndWaitForRemoteIngest as enqueueAndWaitForRemoteIngestImplementation
+} from "../lib/remote-ingest.mjs";
 import {
   CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
   SURF_EXPECTED_WORKER_VERSION_HEADER,
@@ -17,6 +19,15 @@ const staleWorkerVersion = "ea3a7a1e-3c43-4aca-9517-dbe1ff562746";
 const legacyWorkerVersion = "69ae1d6c-4f4a-4e24-9167-2ee2a17244a8";
 const workerVersionKeyHeader = "Cloudflare-Workers-Version-Key";
 const silentLogger = { warn() {} };
+
+function enqueueAndWaitForRemoteIngest(options) {
+  return enqueueAndWaitForRemoteIngestImplementation({
+    // Keep every pre-existing deploy-handoff test deterministic and outside
+    // the hourly cron exclusion window. Individual cron tests override this.
+    now: () => Date.parse(requestedAt),
+    ...options
+  });
+}
 
 function affinityKey(index) {
   return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
@@ -90,14 +101,59 @@ function acceptedDeployResponse(overrides = {}, responseVersion = workerVersion)
   );
 }
 
-function versionedForecast(expectedIngestId = ingestId) {
-  return new Response("{}", {
-    headers: {
-      [SURF_WORKER_VERSION_HEADER]: workerVersion,
-      "X-Surf-Forecast-Generated-At": requestedAt,
-      "X-Surf-Forecast-Materialized-At": "2026-08-03T01:00:30.000Z",
-      "X-Surf-Ingest-Id": expectedIngestId
-    }
+const readinessDigest = "a".repeat(64);
+
+function readinessRow({
+  spotId = spot.id,
+  interval,
+  rowIngestId = ingestId,
+  generatedAt = requestedAt,
+  materializedAt = "2026-08-03T01:00:30.000Z",
+  generationId = rowIngestId === null
+    ? `sha256:${readinessDigest}`
+    : `sha256:${readinessDigest}:ingest:${rowIngestId}`
+}) {
+  return {
+    spotId,
+    interval,
+    generationId,
+    ingestId: rowIngestId,
+    generatedAt,
+    materializedAt
+  };
+}
+
+function missingReadinessRow(spotId, interval) {
+  return {
+    spotId,
+    interval,
+    generationId: null,
+    ingestId: null,
+    generatedAt: null,
+    materializedAt: null
+  };
+}
+
+function readinessRows(spots = [spot], options = {}) {
+  return spots.flatMap(({ id: spotId }) =>
+    ["3h", "1h"].map((interval) =>
+      readinessRow({ spotId, interval, ...options })
+    )
+  );
+}
+
+function readinessResponse(
+  forecastReadModels = readinessRows(),
+  { responseVersion, status = 200, headers: initialHeaders } = {}
+) {
+  const headers = new Headers(initialHeaders);
+  if (responseVersion) headers.set(SURF_WORKER_VERSION_HEADER, responseVersion);
+  return Response.json({ forecastReadModels }, { status, headers });
+}
+
+function versionedReadinessResponse(spots = [spot], rowIngestId = workerVersion) {
+  return readinessResponse(readinessRows(spots, { rowIngestId }), {
+    responseVersion: workerVersion
   });
 }
 
@@ -113,22 +169,276 @@ function hangingBodyResponse(init = {}) {
   );
 }
 
-function pendingResponse(interval) {
-  return Response.json(
-    {
-      error: "forecast_temporarily_unavailable",
-      message: "Forecast data is being refreshed. Please retry shortly.",
-      retryable: true,
-      spotId: spot.id,
-      interval
+async function successfulVersionedDeployAt(startedAt) {
+  let clock = Date.parse(startedAt);
+  const delays = [];
+  const requests = [];
+  const infoEvents = [];
+  const result = await enqueueAndWaitForRemoteIngest({
+    baseUrl,
+    token: "secret-token",
+    expectedVersionId: workerVersion,
+    expectedWorkerName: workerName,
+    now: () => clock,
+    sleep: async (delayMs) => {
+      assert.equal(requests.length, 0, "cron deferral must precede every network request");
+      delays.push(delayMs);
+      clock += delayMs;
     },
-    { status: 503 }
-  );
+    logger: {
+      warn() {},
+      info(message) {
+        infoEvents.push(JSON.parse(message));
+      }
+    },
+    fetcher: async (input, init = {}) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init.headers);
+      requests.push({
+        path: `${url.pathname}${url.search}`,
+        method: init.method ?? "GET",
+        at: clock,
+        authorization: headers.get("Authorization")
+      });
+      if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+      if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+        return headers.has("Authorization")
+          ? acceptedDeployResponse()
+          : versionedUnauthorized();
+      }
+      if (url.pathname === "/api/forecast-readiness") {
+        return readinessResponse(
+          readinessRows([spot], { rowIngestId: workerVersion }),
+          { responseVersion: workerVersion }
+        );
+      }
+      return new Response("unexpected request", { status: 500 });
+    }
+  });
+  return { result, clock, delays, requests, infoEvents };
 }
 
-test("remote ingest enqueues work and waits for every interval to publish a fresh read model", async () => {
+test("versioned deploys defer before handoff when exact verification would overlap :17", async (t) => {
+  const cases = [
+    ["one millisecond before the protected window", "2026-08-04T06:04:59.999Z", 0],
+    ["protected-window boundary", "2026-08-04T06:05:00.000Z", 22 * 60_000],
+    ["observed failed-deploy time", "2026-08-04T06:13:19.808Z", 820_192],
+    ["cron instant", "2026-08-04T06:17:00.000Z", 10 * 60_000],
+    ["one millisecond before settle", "2026-08-04T06:26:59.999Z", 1],
+    ["settle boundary", "2026-08-04T06:27:00.000Z", 0]
+  ];
+
+  for (const [name, startedAt, expectedDelayMs] of cases) {
+    await t.test(name, async () => {
+      const startedAtMs = Date.parse(startedAt);
+      const { result, delays, requests, infoEvents } =
+        await successfulVersionedDeployAt(startedAt);
+      assert.equal(result.status, "published");
+      assert.deepEqual(delays, expectedDelayMs === 0 ? [] : [expectedDelayMs]);
+      assert.ok(requests.length > 0);
+      assert.equal(requests[0].path, "/api/spots");
+      assert.equal(requests[0].authorization, null);
+      assert.equal(requests[0].at, startedAtMs + expectedDelayMs);
+      assert.equal(
+        requests.find((request) => request.authorization !== null)?.method,
+        "PATCH"
+      );
+      assert.equal(infoEvents.length, expectedDelayMs === 0 ? 0 : 1);
+      if (expectedDelayMs > 0) {
+        assert.deepEqual(infoEvents[0], {
+          event: "remote_ingest_cron_deferral",
+          observedAt: new Date(startedAtMs).toISOString(),
+          resumeAt: "2026-08-04T06:27:00.000Z",
+          delayMs: expectedDelayMs,
+          scheduledIngestMinute: 17,
+          settleMs: 10 * 60_000,
+          verificationTimeoutMs: 10 * 60_000,
+          handoffTimeoutMs: 60_000
+        });
+      }
+    });
+  }
+});
+
+test("cron safety fails closed before networking when the wait ends early", async () => {
+  let clock = Date.parse("2026-08-04T06:13:19.808Z");
+  let networkRequests = 0;
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      now: () => clock,
+      sleep: async (delayMs) => {
+        clock += delayMs - 1;
+      },
+      logger: silentLogger,
+      fetcher: async () => {
+        networkRequests += 1;
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    /cron-safety wait ended before the required settle boundary; mutation did not begin/
+  );
+  assert.equal(networkRequests, 0);
+});
+
+test("cron safety fails closed before networking when the wait overshoots into the next protected window", async () => {
+  let clock = Date.parse("2026-08-04T06:13:19.808Z");
+  let networkRequests = 0;
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      now: () => clock,
+      sleep: async (delayMs) => {
+        clock += delayMs + 40 * 60_000;
+      },
+      logger: silentLogger,
+      fetcher: async () => {
+        networkRequests += 1;
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    /cron-safety wait did not reach a safe verification window; mutation did not begin/
+  );
+  assert.equal(networkRequests, 0);
+});
+
+test("cron safety rejects an unbounded verification window before networking", async () => {
+  let networkRequests = 0;
+  let sleeps = 0;
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      timeoutMs: 48 * 60_000,
+      now: () => Date.parse("2026-08-04T06:27:00.000Z"),
+      sleep: async () => {
+        sleeps += 1;
+      },
+      fetcher: async () => {
+        networkRequests += 1;
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    /verification window must be shorter than 3000000ms/
+  );
+  assert.equal(sleeps, 0);
+  assert.equal(networkRequests, 0);
+});
+
+test("a clock jump after the initial guard expires before affinity or networking", async () => {
+  const initialClock = Date.parse("2026-08-04T06:04:59.999Z");
+  const jumpedClock = Date.parse("2026-08-04T06:16:30.000Z");
+  let clockReads = 0;
+  let catalogRequests = 0;
+  let probePatches = 0;
+  let authenticatedPatches = 0;
+  let sleeps = 0;
+  let affinityKeys = 0;
+
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      versionAffinityKeyFactory: () => {
+        affinityKeys += 1;
+        return affinityKey(affinityKeys);
+      },
+      now: () => (clockReads++ === 0 ? initialClock : jumpedClock),
+      sleep: async () => {
+        sleeps += 1;
+      },
+      logger: silentLogger,
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/spots") {
+          catalogRequests += 1;
+          return versionedJson({ spots: [spot] });
+        }
+        if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+          if (new Headers(init.headers).has("Authorization")) {
+            authenticatedPatches += 1;
+            return acceptedDeployResponse();
+          }
+          probePatches += 1;
+          return versionedUnauthorized();
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    /remote ingest catalog handoff deadline reached.*no request-attributable Queue mutation was accepted/
+  );
+
+  assert.equal(catalogRequests, 0);
+  assert.equal(probePatches, 0);
+  assert.equal(authenticatedPatches, 0);
+  assert.equal(sleeps, 0);
+  assert.equal(affinityKeys, 0);
+});
+
+test("a final clock jump after the last handoff check fails before authenticated PATCH", async () => {
+  const safeClock = Date.parse("2026-08-04T06:27:00.000Z");
+  const jumpedClock = Date.parse("2026-08-04T07:16:30.000Z");
+  let probeReturned = false;
+  let postProbeClockReads = 0;
+  let catalogRequests = 0;
+  let probePatches = 0;
+  let authenticatedPatches = 0;
+
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      now: () => {
+        if (!probeReturned) return safeClock;
+        postProbeClockReads += 1;
+        return postProbeClockReads >= 4 ? jumpedClock : safeClock;
+      },
+      sleep: async () => {
+        assert.fail("the client must not wait while holding an affinity session");
+      },
+      logger: silentLogger,
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/spots") {
+          catalogRequests += 1;
+          return versionedJson({ spots: [spot] });
+        }
+        if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+          if (new Headers(init.headers).has("Authorization")) {
+            authenticatedPatches += 1;
+            return acceptedDeployResponse();
+          }
+          probePatches += 1;
+          probeReturned = true;
+          return versionedUnauthorized();
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    /cron-safety window closed before authenticated PATCH.*mutation did not begin/
+  );
+
+  assert.equal(catalogRequests, 1);
+  assert.equal(probePatches, 1);
+  assert.equal(authenticatedPatches, 0);
+  assert.equal(postProbeClockReads, 4);
+});
+
+test("remote ingest succeeds only after one aggregate snapshot exposes the exact lineage", async () => {
   let clock = Date.parse(requestedAt);
-  const forecastRequests = new Map();
+  let readinessRequests = 0;
   const authorizationHeaders = [];
   const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
@@ -140,21 +450,20 @@ test("remote ingest enqueues work and waits for every interval to publish a fres
       );
     }
     if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      const interval = url.searchParams.get("interval");
-      const requests = (forecastRequests.get(interval) ?? 0) + 1;
-      forecastRequests.set(interval, requests);
-      if (interval === "3h" && requests === 1) return pendingResponse(interval);
-      const materializedAt = interval === "1h"
-        ? "2026-08-03T01:00:30.000Z"
-        : "2026-08-03T01:01:00.000Z";
-      return new Response("{}", {
-        headers: {
-          "X-Surf-Forecast-Generated-At": requestedAt,
-          "X-Surf-Forecast-Materialized-At": materializedAt,
-          "X-Surf-Ingest-Id": ingestId
-        }
-      });
+    if (url.pathname === "/api/forecast-readiness") {
+      readinessRequests += 1;
+      const rows = [
+        readinessRequests === 1
+          ? missingReadinessRow(spot.id, "3h")
+          : readinessRow({
+              interval: "3h",
+              materializedAt: "2026-08-03T01:01:00.000Z"
+            }),
+        readinessRequests === 2
+          ? missingReadinessRow(spot.id, "1h")
+          : readinessRow({ interval: "1h" })
+      ];
+      return readinessResponse(rows);
     }
     return new Response("not found", { status: 404 });
   };
@@ -174,11 +483,11 @@ test("remote ingest enqueues work and waits for every interval to publish a fres
   assert.deepEqual(authorizationHeaders, ["Bearer secret-token"]);
   assert.equal(result.status, "published");
   assert.equal(result.ingestId, ingestId);
-  assert.equal(result.attempts, 2);
+  assert.equal(result.attempts, 3);
   assert.equal(result.spots, 1);
   assert.equal(result.forecastReadModels, 2);
   assert.equal(result.materializedAt, "2026-08-03T01:01:00.000Z");
-  assert.deepEqual(Object.fromEntries(forecastRequests), { "3h": 2, "1h": 1 });
+  assert.equal(readinessRequests, 3);
 });
 
 test("remote ingest polling is bounded and names unpublished read models", async () => {
@@ -192,8 +501,11 @@ test("remote ingest polling is bounded and names unpublished read models", async
       );
     }
     if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      return pendingResponse(url.searchParams.get("interval"));
+    if (url.pathname === "/api/forecast-readiness") {
+      return readinessResponse([
+        missingReadinessRow(spot.id, "3h"),
+        missingReadinessRow(spot.id, "1h")
+      ]);
     }
     return new Response("not found", { status: 404 });
   };
@@ -214,9 +526,9 @@ test("remote ingest polling is bounded and names unpublished read models", async
   );
 });
 
-test("remote ingest ignores fresh read models from a different ingest", async () => {
+test("remote ingest keeps polling a different lineage at the same generation time", async () => {
   let clock = Date.parse(requestedAt);
-  let forecastRequests = 0;
+  let readinessRequests = 0;
   const fetcher = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/ingest/once") {
@@ -226,16 +538,14 @@ test("remote ingest ignores fresh read models from a different ingest", async ()
       );
     }
     if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      forecastRequests += 1;
-      const wrongIngest = forecastRequests <= 2;
-      return new Response("{}", {
-        headers: {
-          "X-Surf-Forecast-Generated-At": "2026-08-03T01:05:00.000Z",
-          "X-Surf-Forecast-Materialized-At": "2026-08-03T01:05:30.000Z",
-          "X-Surf-Ingest-Id": wrongIngest ? "different-ingest" : ingestId
-        }
-      });
+    if (url.pathname === "/api/forecast-readiness") {
+      readinessRequests += 1;
+      return readinessResponse(
+        readinessRows([spot], {
+          rowIngestId: readinessRequests === 1 ? "different-ingest" : ingestId,
+          materializedAt: "2026-08-03T01:05:30.000Z"
+        })
+      );
     }
     return new Response("not found", { status: 404 });
   };
@@ -255,7 +565,203 @@ test("remote ingest ignores fresh read models from a different ingest", async ()
   assert.equal(result.status, "published");
   assert.equal(result.ingestId, ingestId);
   assert.equal(result.attempts, 2);
-  assert.equal(forecastRequests, 4);
+  assert.equal(readinessRequests, 2);
+});
+
+test("malformed successful readiness payloads fail closed", async (t) => {
+  const cases = [
+    [
+      "generation identity",
+      () => {
+        const rows = readinessRows();
+        rows[0].generationId = `sha256:${readinessDigest}:ingest:invalid lineage with spaces`;
+        rows[0].ingestId = "invalid lineage with spaces";
+        return readinessResponse(rows);
+      },
+      /generation identity is inconsistent/
+    ],
+    [
+      "noncanonical timestamp",
+      () => {
+        const rows = readinessRows();
+        rows[0].generatedAt = "2026-08-03T01:00:00Z";
+        return readinessResponse(rows);
+      },
+      /timestamps are invalid/
+    ],
+    [
+      "duplicate target",
+      () => {
+        const rows = readinessRows();
+        return readinessResponse([rows[0], rows[0], rows[1]]);
+      },
+      /duplicate target test-break:3h/
+    ],
+    [
+      "missing target",
+      () => readinessResponse([readinessRows()[0]]),
+      /missing targets: test-break:1h/
+    ],
+    [
+      "extra target",
+      () => readinessResponse([
+        ...readinessRows(),
+        readinessRow({ spotId: "unexpected-break", interval: "3h" })
+      ]),
+      /unexpected target unexpected-break:3h/
+    ],
+    [
+      "partial missing metadata",
+      () => {
+        const rows = readinessRows();
+        rows[0].generationId = null;
+        return readinessResponse(rows);
+      },
+      /missing target test-break:3h has partial metadata/
+    ],
+    [
+      "extra top-level field",
+      () => Response.json({ forecastReadModels: readinessRows(), extra: true }),
+      /expected only forecastReadModels/
+    ],
+    [
+      "wrong content type",
+      () => new Response(JSON.stringify({ forecastReadModels: readinessRows() }), {
+        headers: { "Content-Type": "text/plain" }
+      }),
+      /content type must be application\/json/
+    ]
+  ];
+
+  for (const [name, readinessResponseFactory, expectedError] of cases) {
+    await t.test(name, async () => {
+      let clock = Date.parse(requestedAt);
+      let readinessRequests = 0;
+      let sleeps = 0;
+      const fetcher = async (input) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/ingest/once") {
+          return Response.json(
+            { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt },
+            { status: 202 }
+          );
+        }
+        if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
+        if (url.pathname === "/api/forecast-readiness") {
+          readinessRequests += 1;
+          return readinessResponseFactory();
+        }
+        return new Response("not found", { status: 404 });
+      };
+
+      await assert.rejects(
+        enqueueAndWaitForRemoteIngest({
+          baseUrl,
+          token: "secret-token",
+          fetcher,
+          now: () => clock,
+          sleep: async (delayMs) => {
+            sleeps += 1;
+            clock += delayMs;
+          },
+          pollIntervalMs: 1,
+          timeoutMs: 5
+        }),
+        expectedError
+      );
+      assert.equal(readinessRequests, 1);
+      assert.equal(sleeps, 0);
+    });
+  }
+});
+
+test("five ready spots then a superseding cron lineage fail instead of mixing rounds", async () => {
+  const spots = [
+    "obsf-north",
+    "obsf-central",
+    "obsf-south",
+    "linda-mar",
+    "stinson",
+    "bolinas"
+  ].map((id) => ({ id, timezone: "America/Los_Angeles" }));
+  const newerIngestId = "scheduled-ingest-after-deploy";
+  const newerGeneratedAt = "2026-08-03T01:17:00.000Z";
+  const olderGeneratedAt = "2026-08-03T00:17:00.000Z";
+  let readinessRequests = 0;
+  let individualForecastRequests = 0;
+  let authenticatedPatches = 0;
+  let sleeps = 0;
+
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      logger: silentLogger,
+      sleep: async () => {
+        sleeps += 1;
+      },
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        const headers = new Headers(init.headers);
+        if (url.pathname === "/api/spots") return versionedJson({ spots });
+        if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+          if (!headers.has("Authorization")) return versionedUnauthorized();
+          authenticatedPatches += 1;
+          return acceptedDeployResponse();
+        }
+        if (url.pathname === "/api/forecast-readiness") {
+          readinessRequests += 1;
+          const rows = readinessRows(spots, { rowIngestId: workerVersion });
+          for (const row of rows) {
+            if (row.spotId === "bolinas") {
+              Object.assign(
+                row,
+                readinessRow({
+                  spotId: row.spotId,
+                  interval: row.interval,
+                  rowIngestId: "scheduled-ingest-before-deploy",
+                  generatedAt: olderGeneratedAt,
+                  materializedAt: "2026-08-03T00:17:30.000Z"
+                })
+              );
+            }
+          }
+          if (readinessRequests === 2) {
+            rows[0] = readinessRow({
+              spotId: "obsf-north",
+              interval: "3h",
+              rowIngestId: newerIngestId,
+              generatedAt: newerGeneratedAt,
+              materializedAt: "2026-08-03T01:17:30.000Z"
+            });
+          }
+          return readinessResponse(rows, { responseVersion: workerVersion });
+        }
+        if (url.pathname.startsWith("/api/forecast/")) {
+          individualForecastRequests += 1;
+          return new Response("unexpected individual forecast request", { status: 500 });
+        }
+        return new Response("unexpected request", { status: 500 });
+      }
+    }),
+    (error) => {
+      assert.match(error.message, /was superseded before complete publication/);
+      assert.match(error.message, /target=obsf-north:3h/);
+      assert.match(error.message, new RegExp(`queued ingest ${workerVersion}`));
+      assert.match(error.message, /expectedGeneratedAt=2026-08-03T01:00:00.000Z/);
+      assert.match(error.message, /observedIngestId=scheduled-ingest-after-deploy/);
+      assert.match(error.message, /observedGeneratedAt=2026-08-03T01:17:00.000Z/);
+      assert.match(error.message, /must not be accepted as mixed-lineage success/);
+      return true;
+    }
+  );
+
+  assert.equal(authenticatedPatches, 1);
+  assert.equal(sleeps, 1);
+  assert.equal(readinessRequests, 2);
+  assert.equal(individualForecastRequests, 0);
 });
 
 test("version-checked remote ingest proves the ordinary route before and after its single enqueue", async () => {
@@ -287,7 +793,12 @@ test("version-checked remote ingest proves the ordinary route before and after i
         { status: 202 }
       );
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) return versionedForecast(workerVersion);
+    if (url.pathname === "/api/forecast-readiness") {
+      return readinessResponse(
+        readinessRows([spot], { rowIngestId: workerVersion }),
+        { responseVersion: workerVersion }
+      );
+    }
     return new Response("not found", { status: 404 });
   };
 
@@ -313,8 +824,7 @@ test("version-checked remote ingest proves the ordinary route before and after i
       { path: "/api/spots", method: "GET" },
       { path: "/api/ingest/once", method: "PATCH" },
       { path: "/api/ingest/once", method: "PATCH" },
-      { path: "/api/forecast/test-break?interval=3h", method: "GET" },
-      { path: "/api/forecast/test-break?interval=1h", method: "GET" }
+      { path: "/api/forecast-readiness", method: "GET" }
     ]
   );
   for (const request of requests) {
@@ -388,8 +898,8 @@ test("versioned catalog rotates stale and failed affinity sessions before freezi
       authenticatedPatches += 1;
       return acceptedDeployResponse();
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      return versionedForecast(workerVersion);
+    if (url.pathname === "/api/forecast-readiness") {
+      return versionedReadinessResponse();
     }
     return new Response("unexpected request", { status: 500 });
   };
@@ -465,8 +975,8 @@ test("a stalled stale-version catalog body rotates within the shared handoff clo
         clockAtAuthenticatedPatch = clock;
         return acceptedDeployResponse();
       }
-      if (url.pathname === `/api/forecast/${spot.id}`) {
-        return versionedForecast(workerVersion);
+      if (url.pathname === "/api/forecast-readiness") {
+        return versionedReadinessResponse();
       }
       return new Response("unexpected request", { status: 500 });
     }
@@ -527,8 +1037,8 @@ test("a stale route probe discards its target-catalog session before authenticat
         handoff.push(["auth", key]);
         return acceptedDeployResponse();
       }
-      if (url.pathname === `/api/forecast/${spot.id}`) {
-        return versionedForecast(workerVersion);
+      if (url.pathname === "/api/forecast-readiness") {
+        return versionedReadinessResponse();
       }
       return new Response("unexpected request", { status: 500 });
     }
@@ -676,8 +1186,8 @@ test("typed stale-version rejection retries one fresh probe/auth pair with fixed
         ? typedStaleVersionResponse()
         : acceptedDeployResponse();
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      return versionedForecast(workerVersion);
+    if (url.pathname === "/api/forecast-readiness") {
+      return versionedReadinessResponse();
     }
     return new Response("unexpected request", { status: 500 });
   };
@@ -753,8 +1263,8 @@ test("an explicitly named legacy PATCH-less version retries only its exact Hono 
         ? legacyPatchlessResponse()
         : acceptedDeployResponse();
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      return versionedForecast(workerVersion);
+    if (url.pathname === "/api/forecast-readiness") {
+      return versionedReadinessResponse();
     }
     return new Response("unexpected request", { status: 500 });
   };
@@ -1535,8 +2045,8 @@ test("the exact 401 Bearer probe advances from headers without awaiting its body
         authenticatedRequests += 1;
         return acceptedDeployResponse();
       }
-      if (url.pathname === `/api/forecast/${spot.id}`) {
-        return versionedForecast(workerVersion);
+      if (url.pathname === "/api/forecast-readiness") {
+        return versionedReadinessResponse();
       }
       return new Response("unexpected request", { status: 500 });
     }
@@ -1685,8 +2195,8 @@ test("probe transport failures poll safely while authenticated transport remains
         recoveredHandoff.push(["auth", key]);
         return acceptedDeployResponse();
       }
-      if (url.pathname === `/api/forecast/${spot.id}`) {
-        return versionedForecast(workerVersion);
+      if (url.pathname === "/api/forecast-readiness") {
+        return versionedReadinessResponse();
       }
       return new Response("unexpected request", { status: 500 });
     }
@@ -1802,8 +2312,8 @@ test("a stalled probe body is aborted and polled without consuming an authentica
         authenticatedPatches += 1;
         return acceptedDeployResponse();
       }
-      if (url.pathname === `/api/forecast/${spot.id}`) {
-        return versionedForecast(workerVersion);
+      if (url.pathname === "/api/forecast-readiness") {
+        return versionedReadinessResponse();
       }
       return new Response("unexpected request", { status: 500 });
     }
@@ -2063,7 +2573,7 @@ test("catalog transport diagnostics redact every discarded affinity key", async 
 
 test("exact Cloudflare 1102 responses are bounded pending while near-misses fail closed", async () => {
   let clock = Date.parse(requestedAt);
-  let forecastRequests = 0;
+  let readinessRequests = 0;
   const cloudflare1102 = {
     type: "https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1102/",
     status: 503,
@@ -2081,16 +2591,22 @@ test("exact Cloudflare 1102 responses are bounded pending while near-misses fail
         { status: 202 }
       );
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      forecastRequests += 1;
-      if (forecastRequests <= 2) return Response.json(cloudflare1102, { status: 503 });
-      return new Response("{}", {
-        headers: {
-          "X-Surf-Forecast-Generated-At": requestedAt,
-          "X-Surf-Forecast-Materialized-At": "2026-08-03T01:00:30.000Z",
-          "X-Surf-Ingest-Id": ingestId
-        }
-      });
+    if (url.pathname === "/api/forecast-readiness") {
+      readinessRequests += 1;
+      if (readinessRequests === 1) {
+        return Response.json(
+          {
+            error: "forecast_readiness_unavailable",
+            message: "Forecast readiness is temporarily unavailable.",
+            retryable: true
+          },
+          { status: 503 }
+        );
+      }
+      if (readinessRequests === 2) {
+        return Response.json(cloudflare1102, { status: 503 });
+      }
+      return readinessResponse();
     }
     return new Response("not found", { status: 404 });
   };
@@ -2106,7 +2622,7 @@ test("exact Cloudflare 1102 responses are bounded pending while near-misses fail
     pollIntervalMs: 5,
     timeoutMs: 20
   });
-  assert.equal(result.attempts, 2);
+  assert.equal(result.attempts, 3);
 
   const nearMissFetcher = async (input) => {
     const url = new URL(String(input));
@@ -2127,13 +2643,42 @@ test("exact Cloudflare 1102 responses are bounded pending while near-misses fail
       pollIntervalMs: 5,
       timeoutMs: 20
     }),
-    /invalid retryable-unavailable response/
+    /invalid 503 response/
+  );
+
+  const typedWrongContentTypeFetcher = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
+    if (url.pathname === "/api/ingest/once") {
+      return Response.json(
+        { status: "accepted", ingestId, requestedAt, forecastGeneratedAt: requestedAt },
+        { status: 202 }
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        error: "forecast_readiness_unavailable",
+        message: "Forecast readiness is temporarily unavailable.",
+        retryable: true
+      }),
+      { status: 503, headers: { "Content-Type": "text/plain" } }
+    );
+  };
+  await assert.rejects(
+    enqueueAndWaitForRemoteIngest({
+      baseUrl,
+      token: "secret-token",
+      fetcher: typedWrongContentTypeFetcher,
+      pollIntervalMs: 5,
+      timeoutMs: 20
+    }),
+    /invalid 503 response/
   );
 });
 
-test("forecast polling is sequential to avoid recreating the Worker CPU burst", async () => {
-  let inFlightForecasts = 0;
-  let maximumInFlightForecasts = 0;
+test("publication polling uses one aggregate snapshot request per attempt", async () => {
+  let readinessRequests = 0;
+  let individualForecastRequests = 0;
   const fetcher = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
@@ -2143,18 +2688,12 @@ test("forecast polling is sequential to avoid recreating the Worker CPU burst", 
         { status: 202 }
       );
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      inFlightForecasts += 1;
-      maximumInFlightForecasts = Math.max(maximumInFlightForecasts, inFlightForecasts);
-      await new Promise((resolve) => setImmediate(resolve));
-      inFlightForecasts -= 1;
-      return new Response("{}", {
-        headers: {
-          "X-Surf-Forecast-Generated-At": requestedAt,
-          "X-Surf-Forecast-Materialized-At": "2026-08-03T01:00:30.000Z",
-          "X-Surf-Ingest-Id": ingestId
-        }
-      });
+    if (url.pathname === "/api/forecast-readiness") {
+      readinessRequests += 1;
+      return readinessResponse();
+    }
+    if (url.pathname.startsWith("/api/forecast/")) {
+      individualForecastRequests += 1;
     }
     return new Response("not found", { status: 404 });
   };
@@ -2166,7 +2705,8 @@ test("forecast polling is sequential to avoid recreating the Worker CPU burst", 
     pollIntervalMs: 5,
     timeoutMs: 20
   });
-  assert.equal(maximumInFlightForecasts, 1);
+  assert.equal(readinessRequests, 1);
+  assert.equal(individualForecastRequests, 0);
 });
 
 test("a stalled catalog body times out before enqueue and aborts its request", async () => {
@@ -2284,13 +2824,13 @@ test("signal-aware AbortError races normalize to bounded pending forecast state"
     /pending: test-break:3h, test-break:1h/
   );
   assert.equal(postCount, 1);
-  assert.equal(abortedForecasts, 2);
+  assert.equal(abortedForecasts, 1);
 });
 
 test("transient forecast transport failures stay bounded and recover without reenqueuing", async () => {
   let clock = Date.parse(requestedAt);
   let postCount = 0;
-  const forecastAttempts = new Map();
+  let readinessAttempts = 0;
   const fetcher = async (input) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return Response.json({ spots: [spot] });
@@ -2301,20 +2841,12 @@ test("transient forecast transport failures stay bounded and recover without ree
         { status: 202 }
       );
     }
-    const interval = url.searchParams.get("interval");
-    const attempts = (forecastAttempts.get(interval) ?? 0) + 1;
-    forecastAttempts.set(interval, attempts);
-    if (attempts === 1) {
-      if (interval === "3h") throw new TypeError("fetch failed");
-      throw new DOMException("independent abort", "AbortError");
+    if (url.pathname === "/api/forecast-readiness") {
+      readinessAttempts += 1;
+      if (readinessAttempts === 1) throw new TypeError("fetch failed");
+      return readinessResponse();
     }
-    return new Response("{}", {
-      headers: {
-        "X-Surf-Forecast-Generated-At": requestedAt,
-        "X-Surf-Forecast-Materialized-At": "2026-08-03T01:00:30.000Z",
-        "X-Surf-Ingest-Id": ingestId
-      }
-    });
+    return new Response("not found", { status: 404 });
   };
 
   const result = await enqueueAndWaitForRemoteIngest({
@@ -2331,7 +2863,7 @@ test("transient forecast transport failures stay bounded and recover without ree
 
   assert.equal(result.attempts, 2);
   assert.equal(postCount, 1);
-  assert.deepEqual(Object.fromEntries(forecastAttempts), { "3h": 2, "1h": 2 });
+  assert.equal(readinessAttempts, 2);
 });
 
 test("persistent forecast transport failure reaches the global deadline after one POST", async () => {
@@ -2404,7 +2936,7 @@ test("an accepted deploy response from the wrong Worker rejects without forecast
   assert.equal(forecastCount, 0);
 });
 
-test("wrong-version ready forecasts never satisfy publication", async () => {
+test("wrong-version readiness snapshots never satisfy publication", async () => {
   let clock = Date.parse(requestedAt);
   let authenticatedPatchCount = 0;
   const fetcher = async (input, init = {}) => {
@@ -2454,10 +2986,10 @@ test("wrong-version ready forecasts never satisfy publication", async () => {
   assert.equal(authenticatedPatchCount, 1);
 });
 
-test("wrong-version forecast errors stay pending until the target Worker publishes", async () => {
+test("wrong-version readiness errors stay pending until the target Worker publishes", async () => {
   let clock = Date.parse(requestedAt);
   let authenticatedPatchCount = 0;
-  const forecastAttempts = new Map();
+  let readinessAttempts = 0;
   const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
@@ -2468,17 +3000,15 @@ test("wrong-version forecast errors stay pending until the target Worker publish
       authenticatedPatchCount += 1;
       return acceptedDeployResponse();
     }
-    if (url.pathname === `/api/forecast/${spot.id}`) {
-      const interval = url.searchParams.get("interval");
-      const attempt = (forecastAttempts.get(interval) ?? 0) + 1;
-      forecastAttempts.set(interval, attempt);
-      if (attempt === 1) {
+    if (url.pathname === "/api/forecast-readiness") {
+      readinessAttempts += 1;
+      if (readinessAttempts === 1) {
         return new Response("stale route", {
-          status: interval === "3h" ? 404 : 500,
+          status: 404,
           headers: { [SURF_WORKER_VERSION_HEADER]: staleWorkerVersion }
         });
       }
-      if (attempt === 2) {
+      if (readinessAttempts === 2) {
         return Response.json(
           { error: "not_the_target_contract" },
           {
@@ -2487,7 +3017,7 @@ test("wrong-version forecast errors stay pending until the target Worker publish
           }
         );
       }
-      return versionedForecast(workerVersion);
+      return versionedReadinessResponse();
     }
     return new Response("unexpected request", { status: 500 });
   };
@@ -2509,7 +3039,7 @@ test("wrong-version forecast errors stay pending until the target Worker publish
   assert.equal(result.status, "published");
   assert.equal(result.attempts, 3);
   assert.equal(authenticatedPatchCount, 1);
-  assert.deepEqual(Object.fromEntries(forecastAttempts), { "3h": 3, "1h": 3 });
+  assert.equal(readinessAttempts, 3);
 });
 
 test("persistent exact Cloudflare 1102 reaches the global deadline without reenqueuing", async () => {

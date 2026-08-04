@@ -70,13 +70,29 @@ stable version-affinity key then deterministically pinned all 57 read-only catal
 predecessor `ce93cdde…` for 60 seconds; no PATCH of any kind occurred. `ce82bb5d…` remains the
 sole active version for queue-safe fix-forward. Read-only sampling after the failure used 12
 fresh keys × two adjacent requests × two origins and returned 48/48 `ce82bb5d…` with zero split
-pairs. A fifth narrow recovery is ready for review on `aylee/surf-affinity-session-rotation`:
+pairs. PR #21 shipped the fifth narrow recovery from `aylee/surf-affinity-session-rotation`:
 stale/missing identity and transport/body misses before exact-target identity discard the
 entire read-only catalog/probe session; exact-target defects are terminal. One winning key is
 frozen only across exact-target catalog → exact 401/Bearer probe → one authenticated PATCH. The
 60-second deadline, global 60-session cap, three-auth cap, exact safe-rejection classifiers,
 and terminal ambiguity boundary remain unchanged. Two frozen-snapshot reviewers are DRY;
 canonical verify and the local queue/read-model/browser ladder are green.
+PR #21 then passed GitHub Verify, merged, and proved that handoff liveness correction in
+production: supported deploy activated `8ce5bdf1…` at exactly 100% and acknowledged one exact
+target lineage. Five spots published it, but sixth/last child Bolinas did not before the
+ten-minute wait crossed the :17 cron; the newer scheduled generation made the older child
+permanently unable to satisfy exact-lineage polling. The command failed closed with only
+`bolinas:1h|3h` pending and left `8ce5bdf1…` active. Read-only reconstruction against the
+production rows yields fully scored Bolinas forecasts below every payload cap, isolating a
+Queue child execution/persistence-tail failure rather than routing, source, or deterministic
+forecast data. The sixth recovery on `aylee/surf-cron-safe-deploy-lineage` is now dry and
+canonically green. It anchors the handoff clock before any affinity key/network access, defers
+outside the cron collision window, rechecks immediately before authenticated PATCH, and locks
+Wrangler to the matching `17 * * * *` schedule. A public metadata-only
+`GET /api/forecast-readiness` reads all 12 targets in one D1 statement; only one atomic exact
+snapshot can authorize deploy success, while a valid newer lineage terminates immediately.
+Structured child start/publish/supersede/failure events now preserve bounded causal evidence,
+including real non-gating brief failures with lineage context.
 PR-A remains blocked on OI-5 live 12/12. OI-4 destination
 provisioning is still operator-side/open.
 The owner's 2026-08-03 browser-quality amendment (OD-9) raises PR-B/C's UI bar: preserve
@@ -95,7 +111,7 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | ID | Item | Owner | Status | Resolves in |
 |---|---|---|---|---|
 | OI-4 | Logfire OTLP destination + token provisioning (Cloudflare dashboard/API side; operator-assisted; secrets never in repo) | alex + agent | OPEN | PR-A, stop-and-ask step with named rollback |
-| OI-5 | Live-verify merged PR #16 before PR-A starts; PR #20 activated `ce82bb5d…` at 100% but one stable affinity key pinned 57/57 read-only catalogs to `ce93cdde…` until the shared deadline. No PATCH occurred. Fresh-key diagnostics were 48/48 target with zero adjacent splits; the reviewed corrective is whole-session rotation before authentication | agent | FIX FORWARD — READY PR | Publish the dry/green narrow PR, merge only after GitHub Verify, run one supported deploy without the retired c007 bootstrap value, then exact dual-origin identity + one lineage + 12/12 + queue 1/1 + browser live proof |
+| OI-5 | Live-verify merged PR #16 before PR-A starts; PR #21 proved whole-session handoff and acknowledged exact Worker `8ce5bdf1…`, but only 5/6 spots published before the ten-minute poll crossed :17. Bolinas remained old; the newer cron lineage made the expected child non-convergent. Exact-code reconstruction from production rows is fully scored/below caps, so the remaining fault is Queue child execution/persistence-tail plus deploy/cron collision | agent | FIX FORWARD — READY PR | Atomic one-statement readiness, cron-safe handoff/pre-PATCH guards, locked schedule, and real child evidence are DRY + `pnpm verify` green; publish ready PR, require GitHub Verify, merge/deploy once, then exact dual-origin identity + one lineage + 12/12 + queue 1/1 + browser live proof |
 | OI-6 | Native automatic trace continuity across durable Queue producer→consumer boundaries is undocumented; verify the locked one-trace criterion on the PR-A :17 cycle | agent | OPEN | PR-A live gate; `ingestId` remains the cross-trace fallback, not a silent acceptance rewrite |
 
 ### Resolved (this workstream)
@@ -182,13 +198,15 @@ remained green.
 
 ## Next Action
 
-**Publish the dry/green `aylee/surf-affinity-session-rotation` as a ready PR, require GitHub
-Verify, merge, then run one supported `pnpm deploy` without the retired c007 bootstrap value.
-Prove exact/default identity on both origins, one accepted lineage, 12/12 strict smoke,
-deployment at exactly 100%, queue 1/1, and the production page in the code browser. Any
-post-activation failure remains queue-safe fix-forward unless quiescence and payload
-compatibility make rollback provable. Then close OI-5, checkpoint the full recovery OODA loop,
-and only then branch PR-A.**
+**Publish `aylee/surf-cron-safe-deploy-lineage` as a ready PR, require GitHub Verify, merge,
+and run exactly one supported deploy. The reviewed/green branch now uses a cron-safe handoff,
+one atomic D1 readiness snapshot, terminal newer-lineage detection, and real structured child
+evidence. Prove
+exact/default identity on both origins, one accepted lineage, 12/12 strict smoke, deployment at
+exactly 100%, queue 1/1, and the production page in the code browser. Any post-activation
+failure remains queue-safe fix-forward unless quiescence and payload compatibility make
+rollback provable. Then close OI-5, checkpoint the full recovery OODA loop, and only then
+branch PR-A.**
 
 ## Closeout Path
 
@@ -555,3 +573,99 @@ coherent evidence chain. Do not carry the consumed c007 exception into deploymen
 publish the ready PR, require GitHub Verify, merge, and execute exactly one supported deploy.
 OI-5 stays open—and PR-A stays untouched—until one target lineage, 12/12, exact dual-origin
 identity, deployment 100%, Queue 1/1, and production-browser proof are all simultaneously green.
+
+_2026-08-03_ — **PR #21 merged; live gate isolated the cron/Queue-tail predecessor.** Ready
+PR #21 at `ec0e222` passed GitHub Verify in 1m29s and merged as
+`51849a8dcdcd994ec2420edddd1ce7e42c8d41df` at `2026-08-04T06:11:53Z`. Pre-deploy control
+plane was exactly `ce82bb5d…` at 100%, Queue 1 producer/1 consumer, DLQ present, and D1 bookmark
+`00000343-00000000-000050bd-83c68ca69e04f678e438127ce7b612af`; the historical legacy
+override was explicitly unset. Supported deploy seeded to bookmark
+`00000343-00000004-000050bd-8b408874d63624808bbf8bce5e29f2c1`, activated Worker
+`8ce5bdf1-9b9b-4496-ab3b-08089f09a1a8` in deployment
+`04dbca1e-9e55-41dc-bcf4-9fe3124965ab`, and passed exact + three ordinary readiness and 100%
+deployment proof. The corrected affinity protocol acknowledged that exact Worker and began one
+lineage at `06:13:19.808Z`; all five source runs completed by `06:13:43.490Z` (four success,
+NDBC partial only for optional stale/missing metrics). Five spots published between 06:13:44Z
+and 06:13:48.853Z. Bolinas did not, so the ten-minute verifier failed closed with exactly
+`bolinas:1h|3h` pending; no replay or rollback followed.
+
+The independent `:17` cron lineage `541dcaff…` started at `06:17:27.614Z`, completed at
+`06:17:51.013Z`, and superseded four published rows by 06:17:57.258Z while Stinson retained the
+deploy lineage and Bolinas retained `3eae0acd…` from 05:17Z. Read-only production-row
+reconstruction at the deploy timestamp produced 121/121 scored hourly windows, 41/41 scored
+three-hour windows, forecast payloads 402,585/147,208 bytes, and six fact bundles no larger
+than 24,312 bytes. This rules out auth/routing, source ingest/persistence, schema, payload cap,
+and deterministic Bolinas assembly. The exact child exception is absent from D1 and historical
+tail was not available, leaving Queue child execution/persistence-tail as the bounded fault.
+
+**Checkpoint OODA — Observe:** the new handoff worked and mutation identity held; the failure
+moved downstream to sixth-child publication, then a newer scheduled source generation made the
+older exact-lineage condition impossible. **Orient:** accepting mixed recent rows would hide a
+real publication gap and teach the UI the wrong freshness semantics; blindly replaying could
+duplicate work while the Queue state is unknown. `8ce5bdf1…` serves 12 usable rows and is safer
+to fix forward than roll back after acknowledged Queue mutation. **Decide:** keep exact-lineage
+success strict, but make non-convergence explicit and prevent the known schedule collision:
+wait before any handoff request until the :17 cycle settles, terminate on positively newer
+lineage, and log every child boundary durably. Retain batch/concurrency 1 and reject manual
+replay, mixed-lineage success, longer blind polling, or rollback. **Act:** implement/review/test
+the sixth narrow recovery, keep a read-only tail armed, ship through the full PR ladder, then
+run one supported deploy and close OI-5 only on the original complete live proof.
+
+_2026-08-03_ — **Sixth recovery reached the ready-PR checkpoint after two confirmed review
+findings.** The first implementation reset readiness each polling round, but an independent
+refuter proved that twelve sequential HTTP reads still have a within-round TOCTOU: an early
+target can be overwritten while later targets are read, producing false mixed-lineage success.
+The corrective is a public, no-store, metadata-only `/api/forecast-readiness` endpoint backed
+by exactly one prepared D1 statement over active regional spots × 3h/1h. The client rejects
+duplicate/missing/extra targets, non-canonical generation/timestamp metadata, wrong content
+types, and malformed typed failures; one all-exact statement snapshot alone authorizes success.
+A five-spots-exact/Bolinas-old snapshot remains pending, and any valid strictly newer foreign
+lineage is immediately terminal. Individual forecast GETs no longer authorize publication;
+strict smoke still validates their full payloads after the atomic gate.
+
+The second refuter proved a clock-suspension race between the first safe-window read and the
+authenticated PATCH. The guard now returns the exact validated timestamp and anchors the
+existing 60-second handoff deadline there, before affinity-key creation or any network access;
+a suspension beyond it creates zero keys and zero requests. A final synchronous pre-PATCH
+check catches a jump during catalog/probe without sleeping on an aging affinity session. The
+schedule literal is shared with Wrangler validation, which rejects anything except exactly
+`17 * * * *`. The ten-minute post-cron settle is deliberately conservative but does not claim
+Queue quiescence; atomic supersession remains fail-closed, and every accepted 202 remains
+fix-forward unless quiescence and predecessor compatibility are independently proved.
+
+The logging review also killed a synthetic signal: the Queue-level brief-failure catch could
+never run because the production brief helper intentionally swallows optional Agent failures.
+Ownership now stays in that helper, which emits one bounded
+`forecast_brief_signal_failed` event with `ingestId`, `spotId`, generated/materialized times,
+then resolves so the published deterministic forecast is ACKed and never retried. Queue child
+start, supersede, lineage-check failure, materialization throw/rejection, and publish paths have
+bounded structured evidence. Batch size/concurrency remain 1; no schema, auth, source, scoring,
+or forecast payload behavior changed.
+
+**Review/test evidence:** finder/refuter rounds confirmed and corrected the atomicity,
+clock-anchor, and dead-observability findings; the final independent client/config review and
+endpoint compatibility pass are DRY. Fresh `pnpm verify` passed 154/154 script tests, 21/21
+forecast-core, 10/10 DB, 240 web unit (+1 skipped), 15/15 workerd/D1, 45/45 Python, isolated
+migration/seed, production build, and secretless Wrangler dry-run. Focused remote-ingest is
+99/99; focused Worker paths are 49/49; `git diff --check` is clean. Fresh local public-feed
+ingest published 12/12 rows (known non-fatal NDBC partial, zero errors), strict smoke returned
+6 spots/12 ready/0 pending, and the new endpoint returned one no-store 2,774-byte snapshot with
+12 complete rows and the exact local Worker version. Code-browser checks at 1280×720 covered
+the daily report and Bolinas spot page: zero alerts, console warnings/errors, or horizontal
+overflow. The unchanged spot baseline still visibly leads with the large Daily Outlook before
+forecast data, reinforcing rather than weakening the locked PR-C low-noise/tab direction.
+
+**Checkpoint OODA — Observe:** the failed deploy exposed both a real sixth-child gap and the
+inability of sequential client reads to prove a coherent database state; adversarial review
+then found the same kind of false evidence in brief logging and clock anchoring. **Orient:**
+Surf is a small friends-and-family planning tool, so operational complexity must earn its keep:
+one cheap indexed metadata query and a few bounded log lines materially improve truth, while a
+new schema, replay controller, or broad ops API would add noise. The deterministic forecast is
+the product authority; AI brief work stays optional. **Decide:** pay one conservative pre-deploy
+wait and one atomic metadata read per poll, expose only metadata already present in public
+headers, and reject mixed/malformed evidence. Accept that a settle timer cannot prove Queue
+emptiness, retain terminal supersession/fix-forward semantics, and record the duplicated JS/TS
+generation regex as a non-blocking future drift risk. **Act:** publish the ready PR, require
+GitHub Verify, merge, deploy exactly once, and close OI-5 only on simultaneous target identity,
+one lineage/12 rows, Queue 1/1, strict smoke, and production code-browser proof. PR-A remains
+untouched until that live checkpoint is green.
