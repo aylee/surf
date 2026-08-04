@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assertWorkerVersionId,
   CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
+  isWorkerVersionId,
   SURF_WORKER_VERSION_HEADER,
   responseWorkerVersion,
   waitForWorkerVersion,
@@ -11,6 +13,22 @@ import {
 const expectedVersionId = "11111111-2222-4333-8444-555555555555";
 const otherVersionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const expectedWorkerName = "surf";
+
+test("Worker version validation is reusable before deployment mutation", () => {
+  assert.equal(isWorkerVersionId(expectedVersionId), true);
+  assert.equal(isWorkerVersionId("not-a-version-id"), false);
+  assert.doesNotThrow(() =>
+    assertWorkerVersionId(expectedVersionId, "legacy patchless Worker version ID")
+  );
+  assert.throws(
+    () =>
+      assertWorkerVersionId(
+        "not-a-version-id",
+        "legacy patchless Worker version ID"
+      ),
+    /legacy patchless Worker version ID must be a UUID/
+  );
+});
 
 function versionResponse(versionId = expectedVersionId, status = 200) {
   return new Response(status === 200 ? '{"status":"ok"}' : "unavailable", {

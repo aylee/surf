@@ -10,6 +10,7 @@ const spot = { id: "test-break", timezone: "America/Los_Angeles" };
 const expectedVersionId = "11111111-2222-4333-8444-555555555555";
 const expectedWorkerName = "surf";
 const otherVersionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const workerVersionKeyHeader = "Cloudflare-Workers-Version-Key";
 const windows = Array.from({ length: 5 }, (_, day) => ({
   forecastAt: new Date(Date.UTC(2026, 6, 10 + day, 16)).toISOString(),
   ratingStatus: "scored",
@@ -181,6 +182,7 @@ test("version-checked smoke exercises ordinary routing for health, spots, and ev
       request.headers.get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
       null
     );
+    assert.equal(request.headers.get(workerVersionKeyHeader), null);
   }
 });
 
@@ -205,65 +207,272 @@ test("version-pinned smoke requires the Worker name and version as a fail-closed
   }
 });
 
-test("version-pinned smoke rejects a mismatched health response", async () => {
+test("smoke validates its injected sleep and retry interval before requesting", async () => {
+  for (const invalidOptions of [
+    { sleep: null },
+    { roundRetryIntervalMs: 0 }
+  ]) {
+    let requests = 0;
+    await assert.rejects(
+      smokeForecastInstance("https://surf.example", {
+        label: "version smoke",
+        ...invalidOptions,
+        fetcher: async () => {
+          requests += 1;
+          return new Response("unexpected request");
+        }
+      }),
+      /requires fetch, clock, sleep, and positive request\/overall\/retry timeouts/
+    );
+    assert.equal(requests, 0);
+  }
+});
+
+test("version-pinned smoke restarts the full round after stale health", async () => {
+  let clock = 0;
+  let healthResponses = 0;
+  const delays = [];
   const fixture = versionedFixture({
-    versionForPath: (url) =>
-      url.pathname === "/api/health" ? otherVersionId : expectedVersionId
+    versionForPath: (url) => {
+      if (url.pathname !== "/api/health") return expectedVersionId;
+      healthResponses += 1;
+      return healthResponses === 1 ? otherVersionId : expectedVersionId;
+    }
   });
+  const result = await smokeForecastInstance("https://surf.example", {
+    label: "version smoke",
+    expectedVersionId,
+    expectedWorkerName,
+    fetcher: fixture.fetcher,
+    now: () => clock,
+    sleep: async (delayMs) => {
+      delays.push(delayMs);
+      clock += delayMs;
+    }
+  });
+
+  assert.equal(result.workerVersion, expectedVersionId);
+  assert.equal(result.versionConvergenceRounds, 2);
+  assert.deepEqual(delays, [1_000]);
+  assert.deepEqual(
+    fixture.requests.map(({ url }) => `${url.pathname}${url.search}`),
+    [
+      "/api/health",
+      "/api/health",
+      "/api/spots",
+      "/api/forecast/test-break?interval=3h",
+      "/api/forecast/test-break?interval=1h"
+    ]
+  );
+});
+
+test("known version skew does not await a stalled response-body cancellation", async () => {
+  let clock = 0;
+  let healthRequests = 0;
+  const delays = [];
+  const fetcher = async (input) => {
+    const url = new URL(String(input));
+    const headers = { [SURF_WORKER_VERSION_HEADER]: expectedVersionId };
+    if (url.pathname === "/api/health") {
+      healthRequests += 1;
+      if (healthRequests === 1) {
+        return new Response(
+          new ReadableStream({
+            start() {},
+            cancel() {
+              return new Promise(() => {});
+            }
+          }),
+          { headers: { [SURF_WORKER_VERSION_HEADER]: otherVersionId } }
+        );
+      }
+      return Response.json({ status: "ok" }, { headers });
+    }
+    if (url.pathname === "/api/spots") {
+      return Response.json({ spots: [spot] }, { headers });
+    }
+    return Response.json(
+      {
+        spot,
+        interval: url.searchParams.get("interval") ?? "3h",
+        windows
+      },
+      { headers }
+    );
+  };
+
+  const result = await smokeForecastInstance("https://surf.example", {
+    label: "version smoke",
+    expectedVersionId,
+    expectedWorkerName,
+    fetcher,
+    now: () => clock,
+    sleep: async (delayMs) => {
+      delays.push(delayMs);
+      clock += delayMs;
+    },
+    requestTimeoutMs: 10,
+    timeoutMs: 5_000
+  });
+  assert.equal(result.versionConvergenceRounds, 2);
+  assert.equal(healthRequests, 2);
+  assert.deepEqual(delays, [1_000]);
+});
+
+test("an exact-target HTTP defect fails fast without restarting", async () => {
+  const requests = [];
+  const delays = [];
   await assert.rejects(
     smokeForecastInstance("https://surf.example", {
       label: "version smoke",
       expectedVersionId,
       expectedWorkerName,
-      fetcher: fixture.fetcher
+      sleep: async (delayMs) => delays.push(delayMs),
+      fetcher: async (input) => {
+        const url = new URL(String(input));
+        requests.push(url.pathname);
+        const headers = { [SURF_WORKER_VERSION_HEADER]: expectedVersionId };
+        if (url.pathname === "/api/health") {
+          return Response.json({ status: "ok" }, { headers });
+        }
+        return Response.json({ error: "broken catalog" }, { status: 500, headers });
+      }
     }),
-    new RegExp(`/api/health was served by Worker version ${otherVersionId}`)
+    /version smoke \/api\/spots failed: 500/
   );
+  assert.deepEqual(requests, ["/api/health", "/api/spots"]);
+  assert.deepEqual(delays, []);
 });
 
-test("version-pinned smoke rejects a mismatched catalog response", async () => {
-  const fixture = versionedFixture({
-    versionForPath: (url) =>
-      url.pathname === "/api/spots" ? otherVersionId : expectedVersionId
-  });
-  await assert.rejects(
-    smokeForecastInstance("https://surf.example", {
-      label: "version smoke",
-      expectedVersionId,
-      expectedWorkerName,
-      fetcher: fixture.fetcher
-    }),
-    new RegExp(`/api/spots was served by Worker version ${otherVersionId}`)
-  );
-});
-
-test("version-pinned smoke rejects any mismatched forecast response", async () => {
-  const fixture = versionedFixture({
-    versionForPath: (url) =>
-      url.pathname === "/api/forecast/test-break" &&
-      url.searchParams.get("interval") === "1h"
+test("mid-forecast version skew restarts health, catalog, and every forecast", async () => {
+  const spots = Array.from({ length: 6 }, (_, index) => ({
+    id: `round-break-${index + 1}`,
+    timezone: "America/Los_Angeles"
+  }));
+  let clock = 0;
+  let round = 0;
+  const requestCounts = new Map();
+  const delays = [];
+  const fetcher = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const key = `${url.pathname}${url.search}`;
+    requestCounts.set(key, (requestCounts.get(key) ?? 0) + 1);
+    if (url.pathname === "/api/health") round += 1;
+    const staleMidRound =
+      round === 1 &&
+      url.pathname === "/api/forecast/round-break-4" &&
+      url.searchParams.get("interval") === "1h";
+    const headers = {
+      [SURF_WORKER_VERSION_HEADER]: staleMidRound
         ? otherVersionId
         : expectedVersionId
+    };
+    assert.equal(
+      new Headers(init.headers).get(CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER),
+      null
+    );
+    assert.equal(new Headers(init.headers).get(workerVersionKeyHeader), null);
+    if (url.pathname === "/api/health") {
+      return Response.json({ status: "ok" }, { headers });
+    }
+    if (url.pathname === "/api/spots") {
+      return Response.json({ spots }, { headers });
+    }
+    const matchedSpot = spots.find(
+      (candidate) => url.pathname === `/api/forecast/${candidate.id}`
+    );
+    if (!matchedSpot) return new Response("not found", { status: 404, headers });
+    return Response.json({
+      spot: matchedSpot,
+      interval: url.searchParams.get("interval") ?? "3h",
+      windows
+    }, { headers });
+  };
+
+  const result = await smokeForecastInstance("https://surf.example", {
+    label: "version smoke",
+    expectedVersionId,
+    expectedWorkerName,
+    fetcher,
+    now: () => clock,
+    sleep: async (delayMs) => {
+      delays.push(delayMs);
+      clock += delayMs;
+    }
   });
+
+  assert.equal(result.forecastReadModels, 12);
+  assert.equal(result.versionConvergenceRounds, 2);
+  assert.deepEqual(delays, [1_000]);
+  assert.equal(requestCounts.get("/api/health"), 2);
+  assert.equal(requestCounts.get("/api/spots"), 2);
+  assert.equal(
+    requestCounts.get("/api/forecast/round-break-1?interval=3h"),
+    2,
+    "an endpoint before the skew must be repeated in the clean round"
+  );
+  assert.equal(
+    requestCounts.get("/api/forecast/round-break-4?interval=1h"),
+    2
+  );
+  assert.equal(
+    requestCounts.get("/api/forecast/round-break-6?interval=1h"),
+    1,
+    "an endpoint after the skew must run only in the clean round"
+  );
+});
+
+test("persistent missing-version skew reaches the shared deadline with latest evidence", async () => {
+  let clock = 0;
+  let healthRequests = 0;
+  const delays = [];
   await assert.rejects(
     smokeForecastInstance("https://surf.example", {
       label: "version smoke",
       expectedVersionId,
       expectedWorkerName,
-      fetcher: fixture.fetcher
+      timeoutMs: 2_500,
+      roundRetryIntervalMs: 1_000,
+      now: () => clock,
+      sleep: async (delayMs) => {
+        delays.push(delayMs);
+        clock += delayMs;
+      },
+      fetcher: async () => {
+        healthRequests += 1;
+        return Response.json({ status: "ok" });
+      }
     }),
-    new RegExp(`interval=1h was served by Worker version ${otherVersionId}`)
+    (error) => {
+      assert.equal(error.name, "TimeoutError");
+      assert.match(error.message, /within 2500ms after 3 round\(s\)/);
+      assert.match(error.message, /path=\/api\/health/);
+      assert.match(error.message, /actualWorkerVersion=missing/);
+      assert.equal(error.cause?.path, "/api/health");
+      assert.equal(error.cause?.actualVersionId, null);
+      return true;
+    }
   );
+  assert.equal(healthRequests, 3);
+  assert.deepEqual(delays, [1_000, 1_000, 500]);
 });
 
 test("smoke bounds a stalled fetch and aborts the request", async () => {
   let signal;
+  let sleeps = 0;
+  let requests = 0;
   await assert.rejects(
     smokeForecastInstance("https://surf.example", {
       label: "bounded smoke",
+      expectedVersionId,
+      expectedWorkerName,
       fetcher: async (_input, init) => {
+        requests += 1;
         signal = init.signal;
         return new Promise(() => {});
+      },
+      sleep: async () => {
+        sleeps += 1;
       },
       requestTimeoutMs: 5,
       timeoutMs: 20
@@ -271,6 +480,8 @@ test("smoke bounds a stalled fetch and aborts the request", async () => {
     (error) => error?.name === "TimeoutError"
   );
   assert.equal(signal.aborted, true);
+  assert.equal(requests, 1);
+  assert.equal(sleeps, 0);
 });
 
 test("smoke bounds stalled response-body consumption", async () => {

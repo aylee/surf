@@ -76,14 +76,45 @@ hold the HTTP request open for ingest. The polling deadline is bounded and a
 timeout reports the exact spot/interval pairs that did not publish. During a
 deployment, the command requires `X-Surf-Worker-Version` to match the exact
 version emitted by Wrangler while exercising ordinary production routing.
-Before authenticating, it sends one unpinned `PATCH /api/ingest/once` route
-probe that must return `401`, `WWW-Authenticate: Bearer`, and that exact Worker
-version. It then sends exactly one authenticated PATCH with
-`X-Surf-Expected-Worker-Version`; the Worker compares it with immutable
-`CF_VERSION_METADATA.id` before `INGEST_QUEUE.send`. The PATCH method is
-intentionally absent from every predecessor before this invariant, so fallback
-during the first rollout returns 404 before Queue mutation. Keep deploy PATCH
-permanently version-preconditioned and never retry or fall back to POST. Its
+The same bounded handoff first polls `GET /api/spots` with the stable affinity
+key until the exact target Worker returns a valid, unique catalog. Stale or
+missing identity and transport/body failures are safe to retry because the
+catalog is read-only; an invalid catalog from the exact target fails fast.
+No authenticated PATCH occurs before this succeeds.
+
+Before each authenticated attempt, it polls an unpinned
+`PATCH /api/ingest/once` route probe until it returns `401`,
+`WWW-Authenticate: Bearer`, and that exact Worker version. The probe carries no
+credentials or body, so stale non-2xx and transport/body failures can wait
+inside the same bounded handoff without consuming an authenticated attempt.
+Any unauthenticated 2xx is terminal because it violates the auth-first
+invariant; an expected-version response with any contract other than exact 401
+Bearer is also terminal. Worker tests lock auth before Queue access.
+
+One stable `Cloudflare-Workers-Version-Key` covers the complete handoff so
+[Cloudflare version affinity](https://developers.cloudflare.com/workers/versions-and-deployments/gradual-deployments/version-affinity/)
+keeps paired requests together when possible; this is a liveness aid, never the
+mutation-safety proof. The
+authenticated PATCH carries `X-Surf-Expected-Worker-Version`; the Worker
+compares it with immutable `CF_VERSION_METADATA.id` before
+`INGEST_QUEUE.send`. A stale PATCH-capable Worker returns an exact typed 409
+before mutation. Only that fully validated response may trigger another paired
+attempt, with at most three authenticated attempts inside one 60-second handoff
+deadline.
+Any 202, transport/body ambiguity, malformed evidence, or other status is
+terminal, and the client never falls back to POST.
+
+The one production Worker deployed before PATCH existed is a bootstrap-only
+exception. For that recovery run, set its full UUID only in the invoking shell:
+
+```bash
+SURF_LEGACY_PATCHLESS_WORKER_VERSION=<immutable-legacy-version-uuid> pnpm deploy
+```
+
+This permits retry only when that exact UUID returns Hono's exact no-route
+fingerprint (`404`, `text/plain; charset=UTF-8`, `404 Not Found`). Never commit
+the UUID, add it to Wrangler, or retain the variable after the bootstrap. Keep
+deploy PATCH permanently version-preconditioned. Its
 logical ingest identity derives from immutable version metadata, while its
 generation timestamp is captured at the authenticated Worker request; an
 accidental replay therefore stays on one stable lineage without inheriting an
@@ -250,9 +281,19 @@ applies migrations, deploys the Worker, parses Wrangler's exact version ID,
 proves that version is reachable with an exact override, and then requires
 three consecutive cache-busted, unpinned version-matched health responses
 before requiring the active deployment JSON to contain exactly that one version
-at 100%. It probes the unpinned PATCH route without credentials, queues exactly
-one authenticated ingest, waits for every unpinned read model from that lineage
-to publish, and runs an unpinned, exact-version strict cloud smoke. It then
+at 100%. It uses one version-affinity key for a bounded target-version catalog
+poll and an unpinned unauthenticated PATCH probe poll before each authenticated
+attempt. A typed stale-version 409
+proves that invocation did not mutate and may repeat inside the
+three-authenticated-attempt, 60-second bound; any accepted or ambiguous outcome
+cannot repeat. It waits for every
+unpinned read model from the one accepted lineage to publish; any response from
+a non-target or unidentified Worker remains pending before its status/body is
+interpreted. It then runs an
+unpinned, exact-version strict cloud smoke. Transient identity skew restarts
+the entire ordinary-routing smoke within its two-minute bound; only one full
+all-target round passes, and `versionConvergenceRounds` records recovery when
+more than one round was needed. It then
 rechecks the one-version/100% control-plane state. A callable 0%-traffic version
 therefore cannot cross the initial gate. These control-plane reads are strong
 before/after checkpoints, not an atomic deployment lock: a concurrent split can

@@ -1052,11 +1052,18 @@ describe("worker api", () => {
       {} as ExecutionContext
     );
     expect(mismatch.status).toBe(409);
+    expect(mismatch.headers.get("X-Surf-Worker-Version")).toBe(
+      "11111111-2222-4333-8444-555555555555"
+    );
+    expect(mismatch.headers.get("Content-Type")).toMatch(
+      /^application\/json(?:;\s*charset=UTF-8)?$/i
+    );
     expect(await mismatch.json()).toEqual({
       error: "worker_version_mismatch",
       expectedWorkerVersion: "66666666-7777-4888-8999-000000000000",
       actualWorkerVersion: "11111111-2222-4333-8444-555555555555"
     });
+    expect(messages).toEqual([]);
 
     const unavailable = await worker.fetch(
       new Request("https://surf.test/api/ingest/once", {

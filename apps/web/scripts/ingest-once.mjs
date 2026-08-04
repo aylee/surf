@@ -13,7 +13,12 @@ if (mode === "--remote") {
     baseUrl,
     token,
     expectedVersionId: process.env.SURF_EXPECTED_WORKER_VERSION?.trim() || undefined,
-    expectedWorkerName: process.env.SURF_EXPECTED_WORKER_NAME?.trim() || undefined
+    expectedWorkerName: process.env.SURF_EXPECTED_WORKER_NAME?.trim() || undefined,
+    // Bootstrap-only escape hatch for the one immutable production Worker
+    // deployed before PATCH /api/ingest/once existed. Never persist this in
+    // Wrangler or repo config; omit it after that version has aged out.
+    legacyPatchlessVersionId:
+      process.env.SURF_LEGACY_PATCHLESS_WORKER_VERSION?.trim() || undefined
   });
   console.log(JSON.stringify(result, null, 2));
   process.exit(0);
