@@ -932,32 +932,10 @@ async function loadForecastSourceRows(
     ),
     preparedQuery(
       db,
-      // The recent-runs window alone can evict a still-referenced old run:
-      // five runs land per hourly cycle, so 100 rows span ~20 hours, while
-      // the slowest declared late boundary (tide, cadence+grace) is 30 hours.
-      // The union keeps every source's newest completed non-failure run
-      // resolvable — partial runs also write referenced rows, so the
-      // retention predicate must match createSourceRunIndex's usability rule
-      // — letting a single-source outage age to "late" instead of flipping
-      // to "missing".
       `select id, source_id, status, completed_at
        from source_runs
-       where id in (
-         select id from source_runs order by completed_at desc limit 100
-       )
-       or id in (
-         select runs.id
-         from source_runs runs
-         join (
-           select source_id, max(completed_at) as newest_completed_at
-           from source_runs
-           where status != 'failure' and completed_at is not null
-           group by source_id
-         ) newest
-           on newest.source_id = runs.source_id
-          and newest.newest_completed_at = runs.completed_at
-         where runs.status != 'failure'
-       )`
+       order by completed_at desc
+       limit 100`
     ),
     preparedQuery(
       db,
@@ -984,8 +962,39 @@ async function loadForecastSourceRows(
   const waveRows = asRows(results[3] as D1Result<WaveRow>);
   const observationRows = asRows(results[4] as D1Result<ObservationRow>);
   const hazardRows = asRows(results[5] as D1Result<HazardRow>);
-  const sourceRuns = asRows(results[6] as D1Result<SourceRunRow>);
+  const recentSourceRuns = asRows(results[6] as D1Result<SourceRunRow>);
   const forecastIssues = asRows(results[7] as D1Result<ForecastIssueRow>);
+  // Retention is reference-driven, not window-guessed: served rows stay
+  // pinned to the run that wrote them, and during a single-source or
+  // per-station outage that run can outlive the recent-100 window (five runs
+  // land per hour; the slowest declared late boundary — tide, cadence+grace —
+  // is 30 hours). Any referenced run the window missed is fetched exactly, so
+  // freshness ages honestly to "late" instead of flipping to "missing".
+  // Steady state resolves every reference from the window and skips the
+  // follow-up query entirely.
+  const presentRunIds = new Set(recentSourceRuns.map((run) => run.id));
+  const referencedRunIds = [
+    ...new Set(
+      [
+        ...tideRows.map((row) => row.source_run_id),
+        ...tideEventRows.map((row) => row.source_run_id),
+        ...windRows.map((row) => row.source_run_id),
+        ...waveRows.map((row) => row.source_run_id),
+        ...observationRows.map((row) => row.source_run_id),
+        ...hazardRows.map((row) => row.source_run_id)
+      ].filter((id): id is string => typeof id === "string" && id.length > 0 && !presentRunIds.has(id))
+    )
+  ].slice(0, 40);
+  const referencedSourceRuns = referencedRunIds.length > 0
+    ? await queryRows<SourceRunRow>(
+        db,
+        `select id, source_id, status, completed_at
+         from source_runs
+         where id in (${referencedRunIds.map(() => "?").join(", ")})`,
+        ...referencedRunIds
+      )
+    : [];
+  const sourceRuns = [...recentSourceRuns, ...referencedSourceRuns];
   const forecastSnapshotRows = forecastIssues.length >= 2
     ? await queryRows<ForecastSnapshotRow>(
         db,

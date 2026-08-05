@@ -5,12 +5,14 @@ import { describe, expect, it } from "vitest";
 import { buildForecastResponse } from "./forecast";
 import type { Env } from "./index";
 
-// Pins the source_runs retention union against real D1/SQLite: the recent-100
-// window alone evicts a still-referenced run after ~20 hours of five-per-hour
-// run traffic, while the slowest declared late boundary (tide, 1440 + 360) is
-// 30 hours. The union must keep each source's newest completed NON-FAILURE run
-// resolvable — partial runs also write referenced rows — so a single-source
-// outage ages to "late" instead of flipping to "missing".
+// Pins reference-driven source-run retention against real D1/SQLite: the
+// recent-100 window alone evicts a still-referenced run after ~20 hours of
+// five-per-hour run traffic, while the slowest declared late boundary (tide,
+// 1440 + 360) is 30 hours. Served rows stay pinned to the run that wrote
+// them — including OLDER runs of a source that keeps landing newer partial
+// runs during a per-station outage — so the read path must resolve exactly
+// the referenced runs and let freshness age to "late" instead of flipping to
+// "missing".
 describe("forecast source-run retention in workerd D1", () => {
   it("resolves an evicted referenced partial run so tide reaches its declared late verdict", async () => {
     const now = new Date("2026-08-05T12:00:00.000Z");
@@ -65,11 +67,23 @@ describe("forecast source-run retention in workerd D1", () => {
     }
     await env.DB.batch(tideStatements);
 
+    // A NEWER partial run for the same source exists (a per-station outage
+    // keeps producing runs that rewrite only the healthy spots' rows). The
+    // served rows above stay pinned to the older run, which must still
+    // resolve even though it is neither recent nor the source's newest run.
+    const newerPartialAt = new Date(now.getTime() - 30 * 60_000).toISOString();
+    await env.DB.prepare(
+      `insert into source_runs (id, run_key, source_id, run_kind, started_at, completed_at, status)
+       values ('coops-newer-partial', 'coops-newer-partial-key', 'coops:tide-predictions', 'live', ?, ?, 'partial')`
+    )
+      .bind(newerPartialAt, newerPartialAt)
+      .run();
+
     const response = await buildForecastResponse(env as unknown as Env, "bolinas", now);
     const tideEntry = response.windows[0]?.sourceFreshness?.find((entry) => entry.capability === "tide");
 
-    // The union resolves the evicted, referenced, non-failure run: the entry
-    // ages honestly past the 30-hour boundary instead of going missing.
+    // The referenced run resolves exactly: the entry ages honestly past the
+    // 30-hour boundary instead of going missing.
     expect(tideEntry).toMatchObject({
       sourceId: "coops:tide-predictions",
       sourceRunId: "coops-old-partial",
