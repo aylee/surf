@@ -7,6 +7,13 @@ import { PUBLIC_FEED_USER_AGENT } from "./http";
 export const CDIP_MOP_SOURCE_ID = "cdip:mop-forecast";
 export const CDIP_MOP_DOCUMENTATION_URL =
   "https://cdip.ucsd.edu/documents/index/product_docs/mops/mop_intro.html";
+// MOP forecast files are rewritten with each model run, several times daily.
+// Cadence is declared against the source-file update timestamp (HTTP
+// Last-Modified, retained as
+// `http_last_modified_source_update_not_model_cycle`); the physics
+// `model_cycle_at` remains the lead-hour authority and is not re-judged here.
+export const CDIP_MOP_EXPECTED_CADENCE_MINUTES = 360;
+export const CDIP_MOP_GRACE_MINUTES = 180;
 
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const THREE_HOURS_MS = 3 * 60 * 60 * 1000;

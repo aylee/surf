@@ -1,23 +1,11 @@
 import {
   ForecastResponseSchema,
+  sourceFreshnessVerdict,
   type ForecastResponse,
-  type SourceCapability,
   type SourceFreshness
 } from "@surf/contracts";
 
 const MINUTE_MS = 60_000;
-
-// Mirrors the temporal source contracts used when the Worker materializes a
-// forecast. Static and derived capabilities retain their published status.
-const staleAfterMinutes: Partial<Record<SourceCapability, number>> = {
-  forecast_wave_offshore: 12 * 60,
-  forecast_wave_nearshore: 12 * 60,
-  observed_wave: 2 * 60,
-  tide: 12 * 60,
-  wind: 6 * 60,
-  hazard: 6 * 60,
-  comparison_forecast: 12 * 60
-};
 
 function hasScoredWindow(forecast: ForecastResponse): boolean {
   return forecast.windows.some((window) => (
@@ -26,6 +14,10 @@ function hasScoredWindow(forecast: ForecastResponse): boolean {
   ));
 }
 
+// Ages the stored materialization forward with the browser clock. The status
+// re-derivation uses only the entry's own adapter-declared cadence via the
+// shared contracts verdict — this module owns no freshness thresholds.
+// Pre-cadence entries keep the status the Worker shipped.
 function ageSourceFreshness(
   source: SourceFreshness,
   elapsedMinutes: number
@@ -33,15 +25,11 @@ function ageSourceFreshness(
   const freshnessMinutes = source.freshnessMinutes === null
     ? null
     : source.freshnessMinutes + elapsedMinutes;
-  const staleAfter = staleAfterMinutes[source.capability];
-  const status = freshnessMinutes === null
-    ? "missing"
-    : staleAfter === undefined
-      ? source.status
-      : freshnessMinutes <= staleAfter
-        ? "fresh"
-        : "stale";
-  return { ...source, freshnessMinutes, status };
+  const aged = { ...source, freshnessMinutes };
+  if (freshnessMinutes === null) return { ...aged, status: "missing" };
+  const verdict = sourceFreshnessVerdict(aged);
+  if (verdict === null) return aged;
+  return { ...aged, status: verdict === "late" ? "stale" : "fresh" };
 }
 
 export function ageForecastFreshness(

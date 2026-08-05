@@ -165,10 +165,81 @@ export const SourceFreshnessSchema = z.object({
   sourceRunId: z.string().nullable(),
   updatedAt: z.string().nullable(),
   freshnessMinutes: z.number().nonnegative().nullable(),
-  status: z.enum(["fresh", "stale", "missing"])
+  status: z.enum(["fresh", "stale", "missing"]),
+  // Adapter-declared expectations (additive; absent on pre-cadence payloads).
+  // The verdict below is derived exclusively from these shipped values.
+  expectedCadenceMinutes: z.number().positive().nullable().optional(),
+  graceMinutes: z.number().nonnegative().nullable().optional()
 });
 
 export type SourceFreshness = z.infer<typeof SourceFreshnessSchema>;
+
+export const FRESHNESS_VERDICTS = ["fresh", "aging", "late"] as const;
+export const FreshnessVerdictSchema = z.enum(FRESHNESS_VERDICTS);
+export type FreshnessVerdict = z.infer<typeof FreshnessVerdictSchema>;
+
+/**
+ * The single freshness authority. Every surface — worker status, header
+ * chip, banner, workbench — derives fresh | aging | late from this pure
+ * function over the adapter-declared cadence shipped in the payload; no
+ * client may re-judge freshness with thresholds of its own.
+ *
+ * Total by construction: a missing or invalid age or cadence yields "late"
+ * (freshness cannot be proven), never NaN and never a throw. Negative ages
+ * (clock skew) clamp to zero. Boundaries are inclusive: age equal to the
+ * cadence is still fresh; age equal to cadence + grace is still aging.
+ */
+export function freshnessVerdict(input: {
+  ageMinutes: number | null | undefined;
+  expectedCadenceMinutes: number | null | undefined;
+  graceMinutes?: number | null | undefined;
+}): FreshnessVerdict {
+  const cadence =
+    typeof input.expectedCadenceMinutes === "number" &&
+    Number.isFinite(input.expectedCadenceMinutes) &&
+    input.expectedCadenceMinutes > 0
+      ? input.expectedCadenceMinutes
+      : null;
+  const grace =
+    typeof input.graceMinutes === "number" &&
+    Number.isFinite(input.graceMinutes) &&
+    input.graceMinutes >= 0
+      ? input.graceMinutes
+      : 0;
+  const age =
+    typeof input.ageMinutes === "number" && Number.isFinite(input.ageMinutes)
+      ? Math.max(0, input.ageMinutes)
+      : null;
+  if (age === null || cadence === null) return "late";
+  if (age <= cadence) return "fresh";
+  if (age <= cadence + grace) return "aging";
+  return "late";
+}
+
+/**
+ * Verdict for one payload source entry. Entries materialized before cadence
+ * declarations existed return null; callers keep the entry's shipped status
+ * and must not substitute local thresholds.
+ */
+export function sourceFreshnessVerdict(entry: SourceFreshness): FreshnessVerdict | null {
+  if (entry.expectedCadenceMinutes === null || entry.expectedCadenceMinutes === undefined) {
+    return null;
+  }
+  return freshnessVerdict({
+    ageMinutes: entry.freshnessMinutes,
+    expectedCadenceMinutes: entry.expectedCadenceMinutes,
+    graceMinutes: entry.graceMinutes
+  });
+}
+
+/**
+ * Fallback expectations for legacy wave ages that arrive without a per-source
+ * entry (pre-cadence read models and provenance-only history rows). Preserves
+ * the historical 360-minute fresh boundary while keeping the constant here so
+ * no web module owns a freshness threshold.
+ */
+export const LEGACY_WAVE_FALLBACK_CADENCE_MINUTES = 240;
+export const LEGACY_WAVE_FALLBACK_GRACE_MINUTES = 120;
 
 export const TideEventSchema = z.object({
   stationId: z.string(),

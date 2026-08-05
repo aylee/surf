@@ -6,6 +6,11 @@ import { PUBLIC_FEED_USER_AGENT } from "./http";
 import { stableThreeHourForecastTimes } from "../time";
 
 export const NWS_GRID_WAVE_SOURCE_ID = "nws:mtr-grid-wave";
+// The MTR coastal marine grid's `properties.updateTime` advances with office
+// grid refreshes, observed every several hours. This is the fallback wave
+// source, so late is declared only well past a full package cycle.
+export const NWS_GRID_WAVE_EXPECTED_CADENCE_MINUTES = 720;
+export const NWS_GRID_WAVE_GRACE_MINUTES = 240;
 
 type NwsGridValue = {
   validTime?: unknown;

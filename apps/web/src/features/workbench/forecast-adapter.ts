@@ -1,9 +1,15 @@
-import type {
-  ApiSpot,
-  ForecastResponse,
-  ScoredForecastWindow,
-  SwellComponent,
-  WaveObservationSummary
+import {
+  freshnessVerdict,
+  LEGACY_WAVE_FALLBACK_CADENCE_MINUTES,
+  LEGACY_WAVE_FALLBACK_GRACE_MINUTES,
+  sourceFreshnessVerdict,
+  type ApiSpot,
+  type ForecastResponse,
+  type FreshnessVerdict,
+  type ScoredForecastWindow,
+  type SourceFreshness,
+  type SwellComponent,
+  type WaveObservationSummary
 } from "@surf/contracts";
 import { cardinalDirection, confidenceLabel, localDateParts, surfaceCondition, windRelation } from "../../forecast-view";
 
@@ -202,14 +208,29 @@ function dataHealthFor(
   window: ScoredForecastWindow,
   modeledHeightFt: number | null,
   resolutionMethod: WaveResolutionMethod,
-  sourceAge: number | null
+  sourceAge: number | null,
+  waveVerdict: FreshnessVerdict
 ): WorkbenchWindow["dataHealth"] {
   if (window.ratingStatus !== "scored" || modeledHeightFt === null || resolutionMethod === "unavailable") {
     return "limited";
   }
-  if (sourceAge === null || sourceAge > 360 || window.confidence < 50) return "limited";
-  if (sourceAge > 180 || window.confidence < 75 || window.caveats.length > 0) return "watch";
+  if (sourceAge === null || waveVerdict === "late" || window.confidence < 50) return "limited";
+  if (waveVerdict === "aging" || window.confidence < 75 || window.caveats.length > 0) return "watch";
   return "good";
+}
+
+// Verdict for the window's wave age. Cadence-bearing entries judge themselves
+// via the shared contracts function; legacy payloads without an entry use the
+// contracts-owned fallback expectations (the historical 360-minute boundary).
+function waveVerdictFor(waveFreshness: SourceFreshness | undefined, sourceAge: number | null): FreshnessVerdict {
+  if (waveFreshness && waveFreshness.expectedCadenceMinutes !== null && waveFreshness.expectedCadenceMinutes !== undefined) {
+    return sourceFreshnessVerdict(waveFreshness) ?? "late";
+  }
+  return freshnessVerdict({
+    ageMinutes: sourceAge,
+    expectedCadenceMinutes: LEGACY_WAVE_FALLBACK_CADENCE_MINUTES,
+    graceMinutes: LEGACY_WAVE_FALLBACK_GRACE_MINUTES
+  });
 }
 
 function localMinuteOfDay(value: string, timeZone: string): number {
@@ -318,7 +339,13 @@ function adaptWindow(window: ScoredForecastWindow, spot: ApiSpot): WorkbenchWind
     confidence: window.confidence,
     confidenceLabel: confidenceLabel(window.confidence),
     sourceFreshnessMinutes: sourceAge,
-    dataHealth: dataHealthFor(window, modeledHeightFt, waveResolutionMethod, sourceAge),
+    dataHealth: dataHealthFor(
+      window,
+      modeledHeightFt,
+      waveResolutionMethod,
+      sourceAge,
+      waveVerdictFor(waveFreshness, sourceAge)
+    ),
     weatherSummary:
       stringValue(nestedValue(raw, ["weather", "summary"], ["weatherSummary"])) ?? window.weatherSummary ?? null,
     explanation: window.explanation,
@@ -368,15 +395,23 @@ export function sourceHealthForWindow(window: WorkbenchWindow): SourceHealth[] {
       id: `forecast_wave_nearshore:${window.raw.waveProvenance.sourceId}`,
       label: window.raw.waveProvenance.provider,
       ageMinutes: window.sourceFreshnessMinutes,
-      status: window.sourceFreshnessMinutes === null
-        ? "missing"
-        : window.sourceFreshnessMinutes <= 360
-          ? "fresh"
-          : "stale",
+      status: legacyAgeStatus(window.sourceFreshnessMinutes),
       issuedAt: window.raw.waveProvenance.sourceUpdatedAt
     }];
   }
   return [];
+}
+
+// Legacy provenance/untyped rows carry an age but no cadence; the boundary
+// comes from the contracts fallback constants, never a local threshold.
+function legacyAgeStatus(ageMinutes: number | null): SourceHealth["status"] {
+  if (ageMinutes === null) return "missing";
+  const verdict = freshnessVerdict({
+    ageMinutes,
+    expectedCadenceMinutes: LEGACY_WAVE_FALLBACK_CADENCE_MINUTES,
+    graceMinutes: LEGACY_WAVE_FALLBACK_GRACE_MINUTES
+  });
+  return verdict === "late" ? "stale" : "fresh";
 }
 
 function adaptSourceHealth(response: UnknownRecord, windows: WorkbenchWindow[]): SourceHealth[] {
@@ -406,7 +441,7 @@ function adaptSourceHealth(response: UnknownRecord, windows: WorkbenchWindow[]):
         id: stringValue(item.id) ?? `source-${index}`,
         label: stringValue(item.label) ?? stringValue(item.provider) ?? `Source ${index + 1}`,
         ageMinutes,
-        status: ageMinutes === null ? "missing" as const : ageMinutes <= 360 ? "fresh" as const : "stale" as const,
+        status: legacyAgeStatus(ageMinutes),
         issuedAt: stringValue(item.issuedAt) ?? stringValue(item.sourceUpdatedAt)
       }];
     });

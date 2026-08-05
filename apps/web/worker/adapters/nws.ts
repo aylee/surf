@@ -92,6 +92,13 @@ export type NwsMetadata = {
   requestUrls: string[];
 };
 
+export const NWS_POINT_SOURCE_ID = "nws:point-forecast-alerts";
+// NWS point forecasts refresh with each office forecast package — issued at
+// least twice daily and amended between packages, in practice every 2–6
+// hours. `updateTime` on the hourly product is the observed update signal.
+export const NWS_POINT_EXPECTED_CADENCE_MINUTES = 360;
+export const NWS_POINT_GRACE_MINUTES = 180;
+
 const NWS_BASE_URL = "https://api.weather.gov";
 const MPH_TO_KT = 0.868976;
 

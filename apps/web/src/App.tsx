@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type {
-  ApiSpot,
-  ForecastResponse,
-  ScoredForecastWindow,
-  SpotId,
-  SpotsResponse
+import {
+  sourceFreshnessVerdict,
+  type ApiSpot,
+  type ForecastResponse,
+  type ScoredForecastWindow,
+  type SourceCapability,
+  type SourceFreshness,
+  type SpotId,
+  type SpotsResponse
 } from "@surf/contracts";
 import {
   ArrowLeft,
@@ -106,16 +109,18 @@ function formatNumber(value: number | null, suffix: string, digits = 0): string 
 
 function formatSourceAgeRange(values: number[]): string {
   if (values.length === 0) return "Source ages unavailable";
-  const minimum = Math.min(...values);
-  const maximum = Math.max(...values);
   const formatAge = (minutes: number) => {
     if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
     if (minutes < 24 * 60) return `${Math.round(minutes / 60)}h`;
     return `${Math.round(minutes / (24 * 60))}d`;
   };
-  return minimum === maximum
-    ? `Source data ${formatAge(maximum)} old`
-    : `Sources ${formatAge(minimum)}–${formatAge(maximum)} old`;
+  const minimumLabel = formatAge(Math.min(...values));
+  const maximumLabel = formatAge(Math.max(...values));
+  // Compare the formatted labels, not the raw minutes: distinct ages that
+  // round to the same label collapse to one value instead of "3h–3h".
+  return minimumLabel === maximumLabel
+    ? `Source data ${maximumLabel} old`
+    : `Sources ${minimumLabel}–${maximumLabel} old`;
 }
 
 function formatFetchedAt(value: string | null): string {
@@ -126,6 +131,67 @@ function formatFetchedAt(value: string | null): string {
     hour: "numeric",
     minute: "2-digit"
   }).format(new Date(value));
+}
+
+function formatClockTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(value));
+}
+
+function formatBannerAge(minutes: number): string {
+  if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
+  const hours = minutes / 60;
+  return `${hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10}h`;
+}
+
+function formatCadence(expectedCadenceMinutes: number): string {
+  if (expectedCadenceMinutes <= 90) return "hourly";
+  if (expectedCadenceMinutes >= 1440) return "daily";
+  return `every ${Math.round(expectedCadenceMinutes / 60)} hours`;
+}
+
+const lateSourceLabels: Partial<Record<SourceCapability, string>> = {
+  observed_wave: "Buoy observations",
+  wind: "Wind forecast",
+  tide: "Tide predictions",
+  forecast_wave_nearshore: "Wave model data",
+  forecast_wave_offshore: "Wave model data"
+};
+
+// The banner names actionable causes only. A source is actionable when the
+// contracts verdict over its own shipped cadence says "late"; fresh and aging
+// sources stay quiet. Whole-source absence (null age) belongs to per-window
+// caveats and the data-health panel, not the dashboard banner.
+function lateSourceNotice(forecasts: Partial<Record<SpotId, ForecastResult>>): string | null {
+  let worst: { entry: SourceFreshness; ratio: number } | null = null;
+  for (const result of Object.values(forecasts)) {
+    if (result?.status !== "ready") continue;
+    const window = result.data.windows[0];
+    for (const entry of window?.sourceFreshness ?? []) {
+      if (entry.freshnessMinutes === null) continue;
+      if (entry.expectedCadenceMinutes === null || entry.expectedCadenceMinutes === undefined) continue;
+      if (sourceFreshnessVerdict(entry) !== "late") continue;
+      const ratio = entry.freshnessMinutes / (entry.expectedCadenceMinutes + (entry.graceMinutes ?? 0));
+      if (!worst || ratio > worst.ratio) worst = { entry, ratio };
+    }
+  }
+  if (!worst) return null;
+  const label = lateSourceLabels[worst.entry.capability] ?? "Source data";
+  return `${label} ${formatBannerAge(worst.entry.freshnessMinutes ?? 0)} old; expected ${formatCadence(
+    worst.entry.expectedCadenceMinutes ?? 0
+  )}.`;
+}
+
+function delayedSpotsNotice(names: string[], lastGoodAt: string | null): string {
+  const first = names[0] ?? "Some spots";
+  const others = names.length - 1;
+  const subject = others <= 0 ? first : `${first} + ${others} other${others === 1 ? "" : "s"}`;
+  const verb = others <= 0 ? "is" : "are";
+  return lastGoodAt
+    ? `${subject} ${verb} refreshing — showing data from ${formatClockTime(lastGoodAt)}.`
+    : `${subject} ${verb} refreshing.`;
 }
 
 function forecastHref(spotId: SpotId): string {
@@ -492,10 +558,13 @@ export function App() {
         const delayedSpotIds = forecastEntries.flatMap(([spotId, result]) =>
           result.status === "error" ? [spotId] : []
         );
+        const delayedSpotNames = delayedSpotIds.map(
+          (spotId) => spotsPayload.spots.find((spot) => spot.id === spotId)?.name ?? spotId
+        );
         const notice = failedForecastCount === 0
-          ? null
+          ? lateSourceNotice(forecasts)
           : retainedForecastCount > 0
-            ? "Some forecast updates are delayed. Showing the last forecast we loaded."
+            ? delayedSpotsNotice(delayedSpotNames, current.fetchedAt)
             : "Some forecasts are temporarily unavailable. We'll try again automatically.";
         return {
           loading: false,

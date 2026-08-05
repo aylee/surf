@@ -233,7 +233,9 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
-    expect(await screen.findByText("Some forecast updates are delayed. Showing the last forecast we loaded.")).toBeTruthy();
+    expect(
+      await screen.findByText(/Test Break is refreshing — showing data from/)
+    ).toBeTruthy();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
     expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
@@ -259,10 +261,108 @@ describe("App", () => {
     expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
-    expect(await screen.findByText("Some forecast updates are delayed. Showing the last forecast we loaded.")).toBeTruthy();
+    expect(
+      await screen.findByText(/Test Break is refreshing — showing data from/)
+    ).toBeTruthy();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
     expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
+  });
+
+  it("banners a late source by name and cadence, from the payload's own verdict inputs", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    const lateForecast = ForecastResponseSchema.parse({
+      ...forecast,
+      generatedAt: new Date().toISOString(),
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshness: index === 0
+          ? [{
+              capability: "observed_wave",
+              sourceId: "ndbc-46237",
+              sourceRunId: "obs-run",
+              updatedAt: new Date(Date.now() - 186 * 60_000).toISOString(),
+              freshnessMinutes: 186,
+              status: "stale",
+              expectedCadenceMinutes: 60,
+              graceMinutes: 60
+            }]
+          : window.sourceFreshness
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(lateForecast);
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Buoy observations 3.1h old; expected hourly.")).toBeTruthy();
+  });
+
+  it("shows no banner when sources are merely aging within their declared grace", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    const agingForecast = ForecastResponseSchema.parse({
+      ...forecast,
+      generatedAt: new Date().toISOString(),
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshness: index === 0
+          ? [{
+              capability: "observed_wave",
+              sourceId: "ndbc-46237",
+              sourceRunId: "obs-run",
+              updatedAt: new Date(Date.now() - 90 * 60_000).toISOString(),
+              freshnessMinutes: 90,
+              status: "fresh",
+              expectedCadenceMinutes: 60,
+              graceMinutes: 60
+            }]
+          : window.sourceFreshness
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(agingForecast);
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(container.querySelector(".noticeBanner")).toBeNull();
+  });
+
+  it("collapses the header chip range when distinct ages format to the same label", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    const spreadForecast = ForecastResponseSchema.parse({
+      ...forecast,
+      generatedAt: new Date().toISOString(),
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshnessMinutes: index === 0 ? 181 : 200
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(spreadForecast);
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    // 181m and 200m both format to "3h": one collapsed value, never "3h–3h".
+    expect(await screen.findByText("Source data 3h old")).toBeTruthy();
   });
 
   it("keeps the table, graph, interval, and selected timestamp in the URL", async () => {

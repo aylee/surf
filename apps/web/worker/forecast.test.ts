@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ForecastResponseSchema } from "@surf/contracts";
+import { ForecastResponseSchema, sourceFreshnessVerdict } from "@surf/contracts";
 import { estimateBreakingWaveHeight } from "@surf/forecast-core";
 import { buildForecastResponse, buildSynchronizedForecastResponses } from "./forecast";
 import type { Env } from "./index";
@@ -956,6 +956,45 @@ describe("forecast assembly", () => {
       status: "stale"
     });
     expect(response.windows[0]?.sourceFreshnessMinutes).toBe(893);
+  });
+
+  it("ships adapter-declared cadence and grace on every source freshness entry", async () => {
+    const response = await buildForecastResponse(
+      env(queryDb(liveRows())),
+      "bolinas",
+      new Date("2026-07-10T02:53:00.000Z")
+    );
+
+    expect(response.windows.length).toBeGreaterThan(0);
+    for (const window of response.windows) {
+      expect(window.sourceFreshness?.length).toBeGreaterThan(0);
+      for (const entry of window.sourceFreshness ?? []) {
+        expect(entry.expectedCadenceMinutes).toBeGreaterThan(0);
+        expect(entry.graceMinutes).toBeGreaterThanOrEqual(0);
+        // The shipped status must agree with the shared contracts verdict:
+        // late renders as stale; fresh/aging stay quiet-fresh.
+        const verdict = sourceFreshnessVerdict(entry);
+        if (entry.freshnessMinutes === null) {
+          expect(entry.status).toBe("missing");
+        } else {
+          expect(entry.status).toBe(verdict === "late" ? "stale" : "fresh");
+        }
+      }
+    }
+
+    const first = response.windows[0]?.sourceFreshness ?? [];
+    expect(first.find((entry) => entry.capability === "wind")).toMatchObject({
+      expectedCadenceMinutes: 360,
+      graceMinutes: 180
+    });
+    expect(first.find((entry) => entry.capability === "tide")).toMatchObject({
+      expectedCadenceMinutes: 1440,
+      graceMinutes: 360
+    });
+    expect(first.find((entry) => entry.capability === "observed_wave")).toMatchObject({
+      expectedCadenceMinutes: 60,
+      graceMinutes: 60
+    });
   });
 
   it("summarizes changes between the latest two persisted deterministic issues", async () => {
