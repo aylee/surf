@@ -226,3 +226,70 @@ describe("forecast workbench adapter", () => {
     });
   });
 });
+
+describe("cadence-aware data health", () => {
+  function forecastWithWaveEntry(
+    freshnessMinutes: number,
+    cadence?: { expectedCadenceMinutes: number; graceMinutes: number }
+  ): ForecastResponse {
+    const base = fixture();
+    return ForecastResponseSchema.parse({
+      ...base,
+      windows: base.windows.map((window) => ({
+        ...window,
+        confidence: 90,
+        caveats: [],
+        sourceFreshness: [
+          {
+            capability: "forecast_wave_nearshore",
+            sourceId: "cdip:test",
+            sourceRunId: "wave-run",
+            updatedAt: "2026-08-02T11:30:00.000Z",
+            freshnessMinutes,
+            status: "fresh",
+            ...(cadence ?? {})
+          }
+        ]
+      }))
+    });
+  }
+
+  it("maps the shared verdict onto good/watch/limited boundaries", () => {
+    const cadence = { expectedCadenceMinutes: 360, graceMinutes: 180 };
+    const good = adaptForecastResponse(forecastWithWaveEntry(360, cadence), spot, "3h");
+    const watch = adaptForecastResponse(forecastWithWaveEntry(540, cadence), spot, "3h");
+    const limited = adaptForecastResponse(forecastWithWaveEntry(541, cadence), spot, "3h");
+    expect(good.windows[0]?.dataHealth).toBe("good");
+    expect(watch.windows[0]?.dataHealth).toBe("watch");
+    expect(limited.windows[0]?.dataHealth).toBe("limited");
+  });
+
+  it("judges legacy no-entry windows with the contracts fallback boundary", () => {
+    const base = fixture();
+    const legacy = (sourceFreshnessMinutes: number) =>
+      ForecastResponseSchema.parse({
+        ...base,
+        windows: base.windows.map((window) => ({
+          ...window,
+          sourceFreshness: undefined,
+          sourceFreshnessMinutes,
+          waveProvenance: {
+            sourceId: "nws:mtr-grid-wave",
+            provider: "NOAA/NWS MTR",
+            sourceUrl: "https://api.weather.gov/gridpoints/MTR/85,105",
+            sourceUpdatedAt: "2026-08-02T11:30:00.000Z",
+            rawSignificantHeightFt: 3.2,
+            breakingHeightScale: 1,
+            estimatedBreakingHeightFt: 3.2,
+            derivation: "nws_coastal_grid_spot_scale"
+          }
+        }))
+      });
+    const aging = adaptForecastResponse(legacy(350), spot, "3h");
+    const late = adaptForecastResponse(legacy(400), spot, "3h");
+    // 240 + 120 = 360 preserves the historical boundary: aging renders as
+    // quiet-fresh; only late renders stale.
+    expect(sourceHealthForWindow(aging.windows[0]!)[0]?.status).toBe("fresh");
+    expect(sourceHealthForWindow(late.windows[0]!)[0]?.status).toBe("stale");
+  });
+});

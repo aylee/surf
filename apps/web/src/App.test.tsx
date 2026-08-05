@@ -365,6 +365,199 @@ describe("App", () => {
     expect(await screen.findByText("Source data 3h old")).toBeTruthy();
   });
 
+  it("renders a genuine chip range when ages format differently", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    const spreadForecast = ForecastResponseSchema.parse({
+      ...forecast,
+      generatedAt: new Date().toISOString(),
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshnessMinutes: index === 0 ? 45 : 300
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(spreadForecast);
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Sources 45m–5h old")).toBeTruthy();
+  });
+
+  it("keeps the delayed banner's last-good time anchored across failing refresh cycles", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2026-08-05T15:00:00") });
+    try {
+      window.history.replaceState({}, "", "/?spot=test-break");
+      const forecast = fixtureForecast();
+      let failRefreshes = false;
+      let forecastRequests = 0;
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) {
+          forecastRequests += 1;
+          return failRefreshes
+            ? jsonResponse({ error: "forecast_temporarily_unavailable" }, 503)
+            : jsonResponse(forecast);
+        }
+        if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+        return jsonResponse({ error: "not found" }, 404);
+      }));
+
+      render(<App />);
+      expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+
+      failRefreshes = true;
+      vi.setSystemTime(new Date("2026-08-05T15:20:00"));
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      const banner = await screen.findByText(/Test Break is refreshing — showing data from/);
+      const anchoredText = banner.textContent;
+      expect(anchoredText).toContain("3:00");
+
+      vi.setSystemTime(new Date("2026-08-05T15:40:00"));
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      await waitFor(() => expect(forecastRequests).toBe(3));
+
+      // The time must stay anchored at the retained forecast's real fetch
+      // time — never drift toward the latest failing refresh pass.
+      const persistent = await screen.findByText(/Test Break is refreshing — showing data from/);
+      expect(persistent.textContent).toBe(anchoredText);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names multiple delayed spots with a counted subject", async () => {
+    const spotB = { ...spot, id: "second-break", name: "Second Break" } satisfies ApiSpot;
+    const twoSpots = { spots: [spot, spotB], sourceNote: "DOM-test catalog." } satisfies SpotsResponse;
+    const forecast = fixtureForecast();
+    const forecastB = fixtureForecast(spotB);
+    let failRefreshes = false;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(twoSpots);
+      if (path === `/api/forecast/${spot.id}`) {
+        return failRefreshes ? jsonResponse({ error: "unavailable" }, 503) : jsonResponse(forecast);
+      }
+      if (path === `/api/forecast/${spotB.id}`) {
+        return failRefreshes ? jsonResponse({ error: "unavailable" }, 503) : jsonResponse(forecastB);
+      }
+      if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+    expect((await screen.findAllByRole("link", { name: /Second Break/ })).length).toBeGreaterThan(0);
+
+    failRefreshes = true;
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(
+      await screen.findByText(/Test Break \+ 1 other are refreshing — showing data from/)
+    ).toBeTruthy();
+  });
+
+  it("banners the worst late source and renders non-hourly cadence labels", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    const lateForecast = ForecastResponseSchema.parse({
+      ...forecast,
+      generatedAt: new Date().toISOString(),
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshness: index === 0
+          ? [
+              {
+                capability: "wind",
+                sourceId: "nws:point-forecast-alerts",
+                sourceRunId: "wind-run",
+                updatedAt: new Date(Date.now() - 900 * 60_000).toISOString(),
+                freshnessMinutes: 900,
+                status: "stale",
+                expectedCadenceMinutes: 360,
+                graceMinutes: 180
+              },
+              {
+                capability: "observed_wave",
+                sourceId: "ndbc-46237",
+                sourceRunId: "obs-run",
+                updatedAt: new Date(Date.now() - 186 * 60_000).toISOString(),
+                freshnessMinutes: 186,
+                status: "stale",
+                expectedCadenceMinutes: 60,
+                graceMinutes: 60
+              }
+            ]
+          : window.sourceFreshness
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(lateForecast);
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    // Wind at 900/540 (ratio 1.67) beats the buoy at 186/120 (ratio 1.55).
+    expect(await screen.findByText("Wind forecast 15h old; expected every 6 hours.")).toBeTruthy();
+  });
+
+  it("never banners null-age placeholders or pre-cadence entries", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = fixtureForecast();
+    const quietForecast = ForecastResponseSchema.parse({
+      ...forecast,
+      generatedAt: new Date().toISOString(),
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshness: index === 0
+          ? [
+              {
+                // Placeholder: a source that never produced data.
+                capability: "observed_wave",
+                sourceId: "ndbc:preferred",
+                sourceRunId: null,
+                updatedAt: null,
+                freshnessMinutes: null,
+                status: "missing",
+                expectedCadenceMinutes: 60,
+                graceMinutes: 60
+              },
+              {
+                // Pre-cadence legacy entry: ancient but ships no expectations.
+                capability: "wind",
+                sourceId: "nws:point-forecast-alerts",
+                sourceRunId: "wind-run",
+                updatedAt: "2026-08-01T00:00:00.000Z",
+                freshnessMinutes: 5000,
+                status: "stale"
+              }
+            ]
+          : window.sourceFreshness
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(quietForecast);
+      if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(container.querySelector(".noticeBanner")).toBeNull();
+  });
+
   it("keeps the table, graph, interval, and selected timestamp in the URL", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     const fetchMock = installSuccessfulApi();

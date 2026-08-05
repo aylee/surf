@@ -191,8 +191,22 @@ describe("forecast read model repository", () => {
 
   it("keeps production-shaped five-day forecast rows inside the conservative byte budgets", async () => {
     const fixture = fixtureResponses();
-    const threeHour = expandForecast(fixture.threeHour, "3h", 41);
-    const hourly = expandForecast(fixture.threeHour, "1h", 121);
+    // Production windows each carry four cadence-bearing source entries; the
+    // budget guard must exercise that shape, not slimmer fixture rows.
+    const withCadenceEntries = <T extends { windows: object[] }>(forecast: T): T => ({
+      ...forecast,
+      windows: forecast.windows.map((window) => ({
+        ...window,
+        sourceFreshness: [
+          { capability: "forecast_wave_nearshore", sourceId: "cdip:mop-forecast", sourceRunId: "run-wave", updatedAt: "2026-08-02T12:00:00.000Z", freshnessMinutes: 53, status: "fresh", expectedCadenceMinutes: 360, graceMinutes: 180 },
+          { capability: "wind", sourceId: "nws:point-forecast-alerts", sourceRunId: "run-wind", updatedAt: "2026-08-02T12:00:00.000Z", freshnessMinutes: 8, status: "fresh", expectedCadenceMinutes: 360, graceMinutes: 180 },
+          { capability: "tide", sourceId: "coops:tide-predictions", sourceRunId: "run-tide", updatedAt: "2026-08-02T12:00:00.000Z", freshnessMinutes: 0, status: "fresh", expectedCadenceMinutes: 1440, graceMinutes: 360 },
+          { capability: "observed_wave", sourceId: "ndbc-46026", sourceRunId: "run-obs", updatedAt: "2026-08-02T12:00:00.000Z", freshnessMinutes: 29, status: "fresh", expectedCadenceMinutes: 60, graceMinutes: 60 }
+        ]
+      }))
+    });
+    const threeHour = withCadenceEntries(expandForecast(fixture.threeHour, "3h", 41));
+    const hourly = withCadenceEntries(expandForecast(fixture.threeHour, "1h", 121));
     const localDates = [
       ...new Set(
         threeHour.windows.map((window) =>

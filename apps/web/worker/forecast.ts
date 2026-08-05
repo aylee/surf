@@ -932,10 +932,29 @@ async function loadForecastSourceRows(
     ),
     preparedQuery(
       db,
+      // The recent-runs window alone can evict a still-referenced old run:
+      // five runs land per hourly cycle, so 100 rows span ~20 hours, while
+      // the slowest declared late boundary (tide, cadence+grace) is 30 hours.
+      // The union keeps every source's newest successful run resolvable so a
+      // single-source outage ages to "late" instead of flipping to "missing".
       `select id, source_id, status, completed_at
        from source_runs
-       order by completed_at desc
-       limit 100`
+       where id in (
+         select id from source_runs order by completed_at desc limit 100
+       )
+       or id in (
+         select runs.id
+         from source_runs runs
+         join (
+           select source_id, max(completed_at) as newest_completed_at
+           from source_runs
+           where status = 'success' and completed_at is not null
+           group by source_id
+         ) newest
+           on newest.source_id = runs.source_id
+          and newest.newest_completed_at = runs.completed_at
+         where runs.status = 'success'
+       )`
     ),
     preparedQuery(
       db,

@@ -995,6 +995,30 @@ describe("forecast assembly", () => {
       expectedCadenceMinutes: 60,
       graceMinutes: 60
     });
+    expect(first.find((entry) => entry.capability.startsWith("forecast_wave"))).toMatchObject({
+      sourceId: "nws:mtr-grid-wave",
+      expectedCadenceMinutes: 720,
+      graceMinutes: 240
+    });
+  });
+
+  it("declares the CDIP cadence when the selected wave row is a MOP forecast", async () => {
+    const rows = liveRows();
+    rows.wave[0] = { ...(rows.wave[0] as object), source_id: "cdip:mop-forecast" };
+
+    const response = await buildForecastResponse(
+      env(queryDb(rows)),
+      "bolinas",
+      new Date("2026-07-10T02:53:00.000Z")
+    );
+
+    expect(
+      response.windows[0]?.sourceFreshness?.find((entry) => entry.capability.startsWith("forecast_wave"))
+    ).toMatchObject({
+      sourceId: "cdip:mop-forecast",
+      expectedCadenceMinutes: 360,
+      graceMinutes: 180
+    });
   });
 
   it("summarizes changes between the latest two persisted deterministic issues", async () => {

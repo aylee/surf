@@ -39,7 +39,7 @@ import {
 } from "./features/workbench/forecast-health";
 
 type ForecastResult =
-  | { status: "ready"; data: ForecastResponse }
+  | { status: "ready"; data: ForecastResponse; fetchedAt: string }
   | { status: "error"; error: string };
 
 type DashboardState = {
@@ -142,6 +142,9 @@ function formatClockTime(value: string): string {
 
 function formatBannerAge(minutes: number): string {
   if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
+  // Day tier mirrors the header chip so both surfaces describe a multi-day
+  // outage with the same unit.
+  if (minutes >= 24 * 60) return `${Math.round(minutes / (24 * 60))}d`;
   const hours = minutes / 60;
   return `${hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10}h`;
 }
@@ -170,6 +173,10 @@ function lateSourceNotice(forecasts: Partial<Record<SpotId, ForecastResult>>): s
     if (result?.status !== "ready") continue;
     const window = result.data.windows[0];
     for (const entry of window?.sourceFreshness ?? []) {
+      // Placeholder entries (a source that never produced data) carry a null
+      // age; their absence is caveat/panel territory, and bannering them
+      // would render a nonsense "1m old". Pre-cadence entries return a null
+      // verdict and stay with their shipped status.
       if (entry.freshnessMinutes === null) continue;
       if (entry.expectedCadenceMinutes === null || entry.expectedCadenceMinutes === undefined) continue;
       if (sourceFreshnessVerdict(entry) !== "late") continue;
@@ -534,7 +541,10 @@ export function App() {
         spotsPayload.spots.map(async (spot) => {
           try {
             const data = await fetchForecastJson(`/api/forecast/${spot.id}`, controller.signal);
-            return [spot.id, { status: "ready", data } satisfies ForecastResult] as const;
+            return [
+              spot.id,
+              { status: "ready", data, fetchedAt: new Date().toISOString() } satisfies ForecastResult
+            ] as const;
           } catch (error) {
             return [spot.id, { status: "error", error: errorMessage(error) } satisfies ForecastResult] as const;
           }
@@ -561,10 +571,21 @@ export function App() {
         const delayedSpotNames = delayedSpotIds.map(
           (spotId) => spotsPayload.spots.find((spot) => spot.id === spotId)?.name ?? spotId
         );
+        // The "showing data from" time is the oldest per-spot fetch time among
+        // the retained forecasts for the delayed spots — never the dashboard
+        // clock, which advances on every refresh pass while retained data
+        // stays frozen at its real last success.
+        const retainedFetchTimes = delayedSpotIds.flatMap((spotId) => {
+          const previous = current.forecasts[spotId];
+          return previous?.status === "ready" ? [previous.fetchedAt] : [];
+        });
+        const oldestRetainedAt = retainedFetchTimes.length > 0
+          ? retainedFetchTimes.reduce((oldest, candidate) => (candidate < oldest ? candidate : oldest))
+          : null;
         const notice = failedForecastCount === 0
           ? lateSourceNotice(forecasts)
           : retainedForecastCount > 0
-            ? delayedSpotsNotice(delayedSpotNames, current.fetchedAt)
+            ? delayedSpotsNotice(delayedSpotNames, oldestRetainedAt)
             : "Some forecasts are temporarily unavailable. We'll try again automatically.";
         return {
           loading: false,
@@ -611,7 +632,7 @@ export function App() {
         ...current,
         forecasts: {
           ...current.forecasts,
-          [spotId]: { status: "ready", data: forecast }
+          [spotId]: { status: "ready", data: forecast, fetchedAt: new Date().toISOString() }
         },
         notice: shouldClearForecastNotice ? null : current.notice,
         delayedSpotIds,
