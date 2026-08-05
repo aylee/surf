@@ -48,6 +48,10 @@ tabs. Everything ships against the existing schema.
 - Analysis-tab growth (issued-forecast history, accuracy evals).
 - Retention/pruning work.
 - Any new D1 migration, spot-catalog change, or paid data source.
+  *(Amended 2026-08-04 by OD-11: the owner added a spot-catalog expansion as its own
+  sequential Phase D / PR-D leg strictly after PR-C — the exclusion still holds inside
+  PRs A–C, and the no-paid-source rule is unchanged. Phase D tasks reconcile into this plan
+  via x-impl before that leg starts.)*
 
 ## Mental Model
 
@@ -190,10 +194,10 @@ Documented RCA from the planning session — do not re-litigate; do close OI-2:
 |-------|------|-------------|------|--------|--------------|
 | 0 | T-0.1: Production state snapshot | Deploy timeline, 12-row read-model state, DLQ depth (evidence in Log) | S | done | OI-1 approval |
 | 0 | T-0.2: Pin the 23:23Z flapping cause | OI-2 verdict + chosen smallest corrective for PR-A | S | done | T-0.1 |
-| A | T-A.1: Structured pipeline logging | Silent 503 logged; one line per publish/skip/supersede/failure; corrective folded in | M | in progress — corrective review DRY; local degraded-path proof pending | T-0.2 |
-| A | T-A.2: Tracing beta + OTLP → Logfire | wrangler config + operator-assisted destination/token; correlated traces visible | M | in progress — repo half done; OI-4 operator action pending | T-0.2 |
+| A | T-A.1: Structured pipeline logging | Silent 503 logged; one line per publish/skip/supersede/failure; corrective folded in | M | done — healthy/degraded/recovery local proofs complete (2026-08-04 Log) | T-0.2 |
+| A | T-A.2: Tracing beta + OTLP → Logfire | wrangler config + operator-assisted destination/token; correlated traces visible | M | in progress — repo half + destinations done (OI-4 resolved 2026-08-05); Logfire correlation proof lands with T-A.5 | T-0.2 |
 | A | T-A.3: `pnpm ops:status` + post-merge runbook | Read-only status script + tests + `docs/runtime-operations.md` routine | M | done — final review DRY | — (parallel-safe with T-A.1/A.2) |
-| A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | in progress — review DRY; local listener/canonical gate missing | T-A.1–A.3 |
+| A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | in progress — review DRY; local + exact-head CI gates green; awaiting OI-4 | T-A.1–A.3 |
 | A | T-A.5: Ship + live-verify PR-A | Deployed; one full hourly cycle as one Logfire trace; `ops:status` all-ready | S | — | T-A.4 |
 | B | T-B.1: Contracts cadence + verdict | `expectedCadenceMinutes`/grace fields + pure verdict fn + matrix tests | M | — | T-A.5 |
 | B | T-B.2: Adapters declare cadence | Documented cadence flows into payload source entries at materialization | M | — | T-B.1 |
@@ -204,6 +208,8 @@ Documented RCA from the planning session — do not re-litigate; do close OI-2:
 | C | T-C.2: Tab behavior tests | Tab rendering, param round-trip, empty-state, a11y roles | M | — | T-C.1 |
 | C | T-C.3: PR-C gate | Adversarial review clean, `pnpm verify` green, ready PR | M | — | T-C.2 |
 | C | T-C.4: Ship + live-verify PR-C | Deployed; Playwright checks on surf.alexlee.ai pass | S | — | T-C.3 |
+| D | T-D.1: Spot catalog expansion (OD-11) | +5 spots (Rodeo Beach, Steamer Lane, Pleasure Point, Cowell's, 38th Ave) with full data/scoring/test/ops parity | L | — | T-C.4 |
+| D | T-D.2: PR-D gate + ship + live-verify | Review dry; verify green; deployed; catalog-driven ops/smoke proof; new spots live | M | — | T-D.1 |
 
 **Size guide:** S = single file/function · M = multiple files, clear boundaries · L = cross-cutting.
 **Status values:** — (not started) · `done` · `in progress` · `blocked` · `re-scoped`
@@ -1397,3 +1403,38 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
   API tests pass 24/24; serial web unit is 263 passed +1 skipped; scripts are 182/182; web
   type/config check and `git diff --check` pass. An isolated-temp-D1 CLI rehearsal still hit
   this sandbox's known listener `EPERM`; neither the degraded path nor local e2e is claimed.
+
+### 2026-08-04 — Local + exact-head CI gates closed (Claude runtime); OI-4 is the last pre-ready gate
+
+- **Runtime:** Codex hit its usage limit at the recorded boundary; Claude resumed from the
+  manifest with no state loss. This shell is the operator's machine (no listener sandbox), so
+  the previously unrunnable local gates executed directly.
+- **Exact-head CI:** Verify run `30896164337` green in 1m21s at pushed head `4e43384` —
+  fresh isolated D1, repo/package checks, scripts, web unit, full workerd suite, Python,
+  production build, secretless bundle. This satisfies the boundary refuter's current-head
+  requirement (previous green `30895038090` proved only `5787482`).
+- **T-A.1 local proof (now done):**
+  - Canonical `pnpm verify` exit 0.
+  - Healthy path: `pnpm ingest:local` published 12/12 (zero errors; known NDBC partial
+    caveat); `pnpm smoke:local` 6 spots/12 ready/0 pending/scored. Dev-log assertion: exactly
+    one `source_ingest_published` terminal (`a066a2f0-5895-4f47-801a-b9ba6a8bfb83`, reason
+    `inline_source_persistence_completed_with_caveats`) + exactly 12 unique spot/interval
+    `forecast_materialization_published` terminals, all `outcome: publish`, nonempty
+    `generationId`, reason `forecast_generation_published`, same `ingestId`.
+  - Degraded path: dev stopped (port freed), local-only delete of `obsf-central`/`3h`,
+    restart → `GET /api/forecast/obsf-central?interval=3h` returned HTTP 503 +
+    `Retry-After: 300` + typed retryable body, and the dev log carried exactly one bounded
+    `{"event":"forecast_read_model_missing","message":"forecast read model missing",
+    "spotId":"obsf-central","interval":"3h","reasonCode":"read_model_missing"}` line.
+  - Recovery: `pnpm ingest:local` (`935915d4-4e96-4827-998a-ac0774e7bfe1`) republished 12/12
+    with the full one-source/12-terminal set; `pnpm smoke:local` green.
+- **Production:** read-only `deployments status` — unchanged, `04e3ace7…` at 100%.
+- **Ship readiness:** root `.env` supplies `SURF_INGEST_TOKEN`/`SURF_BASE_URL`/
+  `SURF_WRANGLER_CONFIG`; the ignored overlay already names `surf-logfire-traces`/
+  `surf-logfire-logs`. Remaining order once OI-4 exists: refresh PR body → ready → exact-head
+  Verify recheck → merge → one supported `pnpm deploy` → wait the next actual `:17` →
+  OI-6 Logfire verdict + `ops:status` 12-ready + dual-origin smoke + browser proof.
+- **Scope:** owner kickoff added OD-11 (five-spot catalog expansion) as Phase D / PR-D after
+  PR-C; task rows added above; detailed Phase D section reconciles via x-impl before that leg.
+- **Next:** OI-4 operator action (destinations per `docs/runtime-operations.md` §Logfire OTLP
+  destinations), then the recorded ship ladder. PR-B untouched until PR-A is live-green.

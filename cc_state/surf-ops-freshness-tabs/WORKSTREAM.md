@@ -133,6 +133,20 @@ The owner's 2026-08-03 browser-quality amendment (OD-9) raises PR-B/C's UI bar: 
 v2's visual identity but remove duplicate decision content, keep the freshness signal visible
 on mobile, put forecast data in the first viewport, and prove every changed page in the code
 browser at desktop and phone sizes.
+On 2026-08-04 the runtime handed off Codex → Claude at the recorded boundary (Codex usage
+limit). The two evidence gaps Codex could not close are now closed: GitHub Verify run
+`30896164337` is green at the exact pushed head `4e433843fb8df9cbe1d9f2b0f833152eaabbb595`,
+and the operator-machine shell (no listener sandbox) completed the full local gate — canonical
+`pnpm verify` exit 0; healthy e2e with one `source_ingest_published` terminal plus exactly 12
+unique spot/interval `publish` terminals under one `ingestId`; the reversible
+`obsf-central`/`3h` missing-read-model proof (503 + `Retry-After: 300` + exact
+`forecast_read_model_missing`/`read_model_missing` line); and a fully asserted recovery
+ingest/smoke. Read-only `deployments status` confirms production is unchanged on `04e3ace7…`
+at 100%. Root `.env` supplies `SURF_INGEST_TOKEN`/`SURF_BASE_URL`/`SURF_WRANGLER_CONFIG`, so
+the supported deploy is executable from this runtime at ship time. T-A.1 is done and T-A.4
+lacks only OI-4 — the operator-side Logfire destinations — before ready/merge/deploy. The
+owner's kickoff also added scope: five new spots with full parity (OD-11), sequenced as a
+fourth leg (PR-D) strictly after PR-C is live-green.
 
 ## Open Items & Decisions Ledger
 
@@ -144,8 +158,8 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 
 | ID | Item | Owner | Status | Resolves in |
 |---|---|---|---|---|
-| OI-4 | Logfire OTLP destination + token provisioning (Cloudflare dashboard/API side; operator-assisted; secrets never in repo) | alex + agent | OPEN | PR-A, stop-and-ask step with named rollback |
 | OI-6 | Native automatic trace continuity across durable Queue producer→consumer boundaries is undocumented; verify the locked one-trace criterion on the PR-A :17 cycle | agent | OPEN | PR-A live gate; `ingestId` remains the cross-trace fallback, not a silent acceptance rewrite |
+| OI-7 | Rotate the Logfire write token: the Cloudflare destinations GET echoes the `Authorization` header, so the token entered the agent transcript while completing OI-4. Rotate in Logfire, PATCH both destinations with the new value, confirm export still works | alex + agent | OPEN | after the PR-A live gate is green (config-only, fully reversible) |
 
 ### Resolved (this workstream)
 
@@ -154,6 +168,7 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | OI-1 | RESOLVED — owner approved the manifest and 16-task implementation plan by pasting the one-shot kickoff; execution is authorized under OD-8 | 2026-08-03 | Owner kickoff → `session-brief-oneshot-full-workstream.md` |
 | OI-2 | RESOLVED — PR #16 was never deployed; production stayed on the pre-read-model rollback version, so 23:23Z flapping was request-time `exceededCpu`/1102, not transient D1 reads or deploy churn. Corrective: deploy the already-merged per-spot fix, then make PR-A ops status prove active deployment + queue 1/1 + 12 rows | 2026-08-03 | Phase 0 evidence → `implementation-plan.md` Log; corrective deploy OI-5 + PR-A T-A.3 |
 | OI-3 | RESOLVED — Wrangler 4.118.0/current CF docs confirm explicit `observability.traces.{enabled,head_sampling_rate,persist,destinations}` and signal-specific log destinations; no beta compatibility flag | 2026-08-03 | CF docs + local schema → PR-A T-A.2 |
+| OI-4 | RESOLVED — both account-level destinations exist and are enabled with auth headers: `surf-logfire-traces` (opentelemetry-traces → logfire-us `/v1/traces`, created 2026-08-05T01:33:37Z, operator-created in dashboard) and `surf-logfire-logs` (opentelemetry-logs → `/v1/logs`, created 2026-08-05T01:37:58Z, agent-created via authorized Cloudflare API MCP mirroring the traces auth header). Creation preflight passed, proving Logfire accepts the credential. `LOGFIRE_READ_TOKEN` in gitignored root `.env` verified against the Logfire query API (HTTP 200). Named rollback: disable/delete destinations + remove names from the ignored overlay (config-only) | 2026-08-05 (UTC) | Cloudflare account config + `.env`; see OI-7 for the follow-up token rotation |
 | OI-5 | RESOLVED — PR #22 made deploy publication cron-safe and atomically verifiable. One supported deploy activated exact Worker `04e3ace7…` at 100%; after the guarded `07:27Z` handoff, all 12 rows switched to that one lineage, Queue stayed 1/1 at batch/concurrency 1, strict dual-origin smoke passed, and independent desktop/phone browser checks were clean | 2026-08-04 | PR #22 (`334c907`) + Worker `04e3ace7…`; recovery live checkpoint in Session Log / implementation-plan Log |
 | OD-1 | Freshness UX is two-tier and cadence-aware: chip always visible (min–max label bug fixed); banner only for actionable causes, naming them. One verdict authority: a pure contracts function computing `fresh \| aging \| late` from adapter-declared `expectedCadenceMinutes` (+ grace) shipped in the payload; web never re-judges | 2026-08-03 | Runtime plan → `implementation-plan.md` PR-B |
 | OD-2 | Spot page restructures to Forecast \| Analysis tabs: Forecast (default) = slim deterministic header + workbench first, zero AI content; Analysis = Daily Forecaster prose, tradeoffs, data-gaps, provenance accordion; forecaster with no reliable call collapses to one quiet line; daily-report page hero unchanged | 2026-08-03 | Runtime plan → `implementation-plan.md` PR-C |
@@ -165,6 +180,7 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | OD-8 | One-shot execution authorized: a single run executes the full workstream (Phase 0 → PR-A → PR-B → PR-C), including merging each PR once its adversarial review is dry and GitHub Verify is green, and deploying via the supported `pnpm deploy` per leg. OD-5 sequencing and per-PR adversarial gates are unchanged; stop-and-ask points (OD-4) survive one-shot mode. Owner pasting the one-shot kickoff prompt constitutes OI-1 approval | 2026-08-03 | `session-brief-oneshot-full-workstream.md` |
 | OD-9 | Browser-led signal-to-noise is a ship criterion: retain v2's visual identity, remove repeated content instead of adding chrome, keep the authoritative freshness chip visible on every viewport, make Forecast data visible in the first viewport, move AI/explanation/provenance to Analysis, and collect semantic + screenshot evidence at desktop and phone sizes. This narrowly amends OD-2's “daily-report untouched” clause to permit de-duplicating its shortlist and weak source-count label while preserving its hero | 2026-08-03 | Owner quality direction → PR-B T-B.3/B.5 + PR-C T-C.1–C.4 |
 | OD-10 | Owner delegated autonomous end-to-end execution while away and requires an evidence-backed OODA checkpoint at every recovery/PR boundary. Each checkpoint records Observe (repo/prod truth), Orient (full workstream + personal surf-planning/learning intent), Decide (alternatives/tradeoffs), and Act (change, queue-safe failure recovery, verification). Decision traces belong in this manifest + implementation-plan Log so review can reconstruct why, not only what | 2026-08-03 | Owner handoff while away → all remaining checkpoints |
+| OD-11 | Owner-directed catalog expansion: add Rodeo Beach (Fort Cronkhite, Marin Headlands) plus Santa Cruz — Steamer Lane, Pleasure Point, Cowell's, 38th Ave (Jack's) — as a fourth sequential leg (PR-D) after PR-C is live-green. No functional changes; full data/scoring/test/ops parity with the existing six spots. Narrowly amends OD-7's "no spot-catalog change" to apply to PRs A–C only; no-paid-source and no-unreviewed-migration rules unchanged | 2026-08-04 | Owner kickoff (Claude handoff session) → impl-plan Phase D (reconcile via x-impl before the leg starts) |
 
 ## Deliverables & Working Files (index)
 
@@ -180,9 +196,10 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | Track | Status | Where (code) | Next action |
 |---|---|---|---|
 | Phase 0 — production diagnostic (read-only) | DONE — OI-2 pinned, OI-5 corrective live | prod: deployment status, D1 read-model/source-run queries, live tail, queue config | Complete |
-| PR-A — observability + ops foundation | ACTIVE — repo implementation DRY; canonical/local listener gate + OI-4 remain | `apps/web/worker/` (index, ingest, read-model), `apps/web/wrangler.jsonc`, `scripts/`, `docs/runtime-operations.md` | Checkpoint manifest, publish incomplete branch safely, obtain GitHub + operator-shell local evidence; then ready/merge/deploy only after OI-4 |
+| PR-A — observability + ops foundation | ACTIVE — review DRY; local + exact-head CI gates green; only OI-4 remains | `apps/web/worker/` (index, ingest, read-model), `apps/web/wrangler.jsonc`, `scripts/`, `docs/runtime-operations.md` | OI-4 (operator) → refresh PR body → ready → merge → one supported deploy → next actual `:17` live proof (OI-6) |
 | PR-B — cadence-aware freshness | OPEN | `packages/contracts/`, worker materialization, `apps/web/src/App.tsx`, `features/workbench/` | After PR-A verified live |
 | PR-C — Forecast \| Analysis tabs | OPEN | `apps/web/src/features/workbench/ForecastWorkbench.tsx`, `App.tsx`, `src/components/ui/tabs.tsx` | After PR-B verified live |
+| PR-D — spot catalog expansion (OD-11) | QUEUED | `packages/db` catalog/seed, worker adapter config, `scripts/`, tests, docs | After PR-C verified live |
 
 ## Decisions
 
@@ -243,18 +260,14 @@ and no production mutation have been performed for PR-A.
 
 ## Next Action
 
-**Keep PR-A incomplete while the local canonical/e2e gate is unavailable; use GitHub Verify
-to execute the listener/workerd portion without claiming it replaces the required
-operator-shell local proof. Alex's exact healthy-path commands are `!pnpm verify`, then
-`!pnpm dev` in one terminal and `!pnpm ingest:local && pnpm smoke:local` in another. He must
-also execute `docs/runtime-operations.md` §Local missing-read-model proof: local-only exact-row
-delete → asserted 503 + bounded log → normal ingest/smoke recovery. Separately complete OI-4
-by creating the two named Logfire destinations/tokens in
-Cloudflare (instructions are in `docs/runtime-operations.md`; never paste the token into chat or
-the repo). Only after review stays DRY, both canonical/local gates are green, and OI-4 exists:
-ready PR → GitHub Verify → merge → one supported `pnpm deploy` → wait for the next actual `:17`
-cycle → Logfire correlation + `pnpm ops:status` 12-ready + dual-origin smoke/live browser proof.
-Do not begin PR-B until PR-A is live-green and OI-6 has an evidence-backed one-trace verdict.**
+**All pre-ready gates are green (OI-4 resolved 2026-08-05T01:38Z). Execute the ship ladder:
+commit/push the cc_state checkpoint, confirm GitHub Verify green at the exact new head, flip
+PR #23 ready, merge, run one supported `pnpm deploy` (root `.env` supplies
+`SURF_INGEST_TOKEN`), wait for the next actual `:17` cycle, then close OI-6 with a Logfire
+one-correlated-trace verdict (or the documented `ingestId` cross-trace limitation) +
+`pnpm ops:status` 12-ready + dual-origin strict smoke + desktop/phone browser proof. Then
+rotate the Logfire write token (OI-7). Do not begin PR-B until PR-A is live-green and OI-6
+has its evidence-backed verdict. PR-D (OD-11 spots) stays queued behind PR-C.**
 
 ## Closeout Path
 
@@ -895,3 +908,39 @@ The corrective's second independent refutation is DRY; focused Worker 24/24, ser
 progress until that procedure runs in Alex's ordinary shell. The last green CI is
 evidence for `5787482`, not the later docs/corrective head; require exact-head Verify. OI-4
 remains open, production is unchanged, and PR-B/C remain untouched.
+
+_2026-08-04_ — **Runtime handoff Codex → Claude; PR-A local + exact-head CI gates closed;
+OI-4 is the last pre-ready gate; owner added PR-D spot scope (OD-11).** GitHub Verify run
+`30896164337` completed green in 1m21s at the exact pushed head `4e43384` (fresh isolated D1,
+repo/package checks, scripts, web unit, full workerd suite, Python, build, secretless bundle),
+closing the current-head CI gap the boundary refuter required. The operator-machine shell then
+closed the local gate end to end: canonical `pnpm verify` exit 0; healthy e2e (`pnpm dev` +
+`pnpm ingest:local` published 12/12 with zero errors and the known NDBC partial caveat;
+`pnpm smoke:local` 6 spots/12 ready/0 pending/scored) with dev-log proof of exactly one
+`source_ingest_published` terminal (`a066a2f0-5895-4f47-801a-b9ba6a8bfb83`, reason
+`inline_source_persistence_completed_with_caveats`) plus 12 unique spot/interval
+`forecast_materialization_published` terminals, all `publish` with nonempty `generationId`s
+and reason `forecast_generation_published`; the reversible degraded proof (dev stopped,
+local-only `obsf-central`/`3h` delete, restart → HTTP 503 + `Retry-After: 300` + exact bounded
+`{"event":"forecast_read_model_missing","reasonCode":"read_model_missing"}` line); and the
+recovery ingest `935915d4-4e96-4827-998a-ac0774e7bfe1` republishing 12/12 with the full
+one-source/12-terminal set and green smoke. T-A.1 is done; T-A.4 awaits only OI-4. Read-only
+`deployments status` shows production unchanged on `04e3ace7…` at 100%. Root `.env` carries
+`SURF_INGEST_TOKEN`/`SURF_BASE_URL`/`SURF_WRANGLER_CONFIG`, so the ship-time deploy runs from
+this runtime without new secrets handling. The owner's kickoff added the five-spot catalog
+expansion (Rodeo Beach/Fort Cronkhite; Steamer Lane; Pleasure Point; Cowell's; 38th Ave/Jack's)
+locked as OD-11 → PR-D strictly after PR-C; read-only parity scouting started in parallel.
+No production state changed this session so far.
+
+_2026-08-05 (UTC)_ — **OI-4 closed; OI-7 opened; ship ladder authorized.** Alex authorized the
+Cloudflare API MCP and created `surf-logfire-traces` in the dashboard (the earlier Bad Request
+was the destination preflight failing on an empty custom-header row). The agent verified via
+the authorized API that only the traces destination existed, then created `surf-logfire-logs`
+(opentelemetry-logs → logfire-us `/v1/logs`) mirroring the traces auth header
+programmatically; both destinations are enabled with passing preflights. `LOGFIRE_READ_TOKEN`
+landed in gitignored root `.env` and returned HTTP 200 on the Logfire query API, so the OI-6
+`:17` verification can run autonomously. One cost: the destinations GET echoes the
+`Authorization` header, so the Logfire write token entered the agent transcript — recorded as
+OI-7 (rotate token + PATCH destinations after the live gate; config-only rollback). Next: the
+recorded ship ladder (checkpoint commit → exact-head Verify → ready → merge → deploy → `:17`
+proof).
