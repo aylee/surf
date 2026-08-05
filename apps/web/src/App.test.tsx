@@ -510,6 +510,48 @@ describe("App", () => {
     expect(await screen.findByText("Wind forecast 15h old; expected every 6 hours.")).toBeTruthy();
   });
 
+  it("scopes the late banner to the affected spot when other spots' sources are fresh", async () => {
+    const spotB = { ...spot, id: "second-break", name: "Second Break" } satisfies ApiSpot;
+    const twoSpots = { spots: [spot, spotB], sourceNote: "DOM-test catalog." } satisfies SpotsResponse;
+    const entry = (freshnessMinutes: number, status: "fresh" | "stale") => ({
+      capability: "observed_wave" as const,
+      sourceId: "ndbc-46237",
+      sourceRunId: "obs-run",
+      updatedAt: new Date(Date.now() - freshnessMinutes * 60_000).toISOString(),
+      freshnessMinutes,
+      status,
+      expectedCadenceMinutes: 60,
+      graceMinutes: 60
+    });
+    const withEntry = (forecast: ForecastResponse, freshnessMinutes: number, status: "fresh" | "stale") =>
+      ForecastResponseSchema.parse({
+        ...forecast,
+        generatedAt: new Date().toISOString(),
+        windows: forecast.windows.map((window, index) => ({
+          ...window,
+          sourceFreshness: index === 0 ? [entry(freshnessMinutes, status)] : window.sourceFreshness
+        }))
+      });
+    const lateForecast = withEntry(fixtureForecast(), 186, "stale");
+    const freshForecast = withEntry(fixtureForecast(spotB), 20, "fresh");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(twoSpots);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(lateForecast);
+      if (path === `/api/forecast/${spotB.id}`) return jsonResponse(freshForecast);
+      if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    // The buoy is late for Test Break only, so the banner names the spot
+    // instead of contradicting Second Break's fresh source panel.
+    expect(
+      await screen.findByText("Buoy observations at Test Break 3.1h old; expected hourly.")
+    ).toBeTruthy();
+  });
+
   it("never banners null-age placeholders or pre-cadence entries", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     const forecast = fixtureForecast();

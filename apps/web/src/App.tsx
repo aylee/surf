@@ -140,6 +140,14 @@ function formatClockTime(value: string): string {
   }).format(new Date(value));
 }
 
+// A retained forecast can outlive the calendar day during a long outage; a
+// bare clock time would then read as "today" and understate the data's age.
+function formatLastGoodTime(value: string): string {
+  return new Date(value).toDateString() === new Date().toDateString()
+    ? formatClockTime(value)
+    : formatFetchedAt(value);
+}
+
 function formatBannerAge(minutes: number): string {
   if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
   // Day tier mirrors the header chip so both surfaces describe a multi-day
@@ -167,10 +175,16 @@ const lateSourceLabels: Partial<Record<SourceCapability, string>> = {
 // contracts verdict over its own shipped cadence says "late"; fresh and aging
 // sources stay quiet. Whole-source absence (null age) belongs to per-window
 // caveats and the data-health panel, not the dashboard banner.
-function lateSourceNotice(forecasts: Partial<Record<SpotId, ForecastResult>>): string | null {
-  let worst: { entry: SourceFreshness; ratio: number } | null = null;
-  for (const result of Object.values(forecasts)) {
+function lateSourceNotice(
+  forecasts: Partial<Record<SpotId, ForecastResult>>,
+  spots: ApiSpot[]
+): string | null {
+  let worst: { entry: SourceFreshness; ratio: number; spotId: string } | null = null;
+  let readySpotCount = 0;
+  const lateSpotsBySource = new Map<string, Set<string>>();
+  for (const [spotId, result] of Object.entries(forecasts)) {
     if (result?.status !== "ready") continue;
+    readySpotCount += 1;
     const window = result.data.windows[0];
     for (const entry of window?.sourceFreshness ?? []) {
       // Placeholder entries (a source that never produced data) carry a null
@@ -180,13 +194,23 @@ function lateSourceNotice(forecasts: Partial<Record<SpotId, ForecastResult>>): s
       if (entry.freshnessMinutes === null) continue;
       if (entry.expectedCadenceMinutes === null || entry.expectedCadenceMinutes === undefined) continue;
       if (sourceFreshnessVerdict(entry) !== "late") continue;
+      const lateSpots = lateSpotsBySource.get(entry.sourceId) ?? new Set<string>();
+      lateSpots.add(spotId);
+      lateSpotsBySource.set(entry.sourceId, lateSpots);
       const ratio = entry.freshnessMinutes / (entry.expectedCadenceMinutes + (entry.graceMinutes ?? 0));
-      if (!worst || ratio > worst.ratio) worst = { entry, ratio };
+      if (!worst || ratio > worst.ratio) worst = { entry, ratio, spotId };
     }
   }
   if (!worst) return null;
   const label = lateSourceLabels[worst.entry.capability] ?? "Source data";
-  return `${label} ${formatBannerAge(worst.entry.freshnessMinutes ?? 0)} old; expected ${formatCadence(
+  // A source that is late for only some spots names the worst one so the
+  // banner cannot contradict another spot's fresh source panel; a source
+  // late everywhere states the regional truth without singling a spot out.
+  const affectedSpots = lateSpotsBySource.get(worst.entry.sourceId)?.size ?? 0;
+  const scope = affectedSpots < readySpotCount
+    ? ` at ${spots.find((spot) => spot.id === worst.spotId)?.name ?? worst.spotId}`
+    : "";
+  return `${label}${scope} ${formatBannerAge(worst.entry.freshnessMinutes ?? 0)} old; expected ${formatCadence(
     worst.entry.expectedCadenceMinutes ?? 0
   )}.`;
 }
@@ -197,7 +221,7 @@ function delayedSpotsNotice(names: string[], lastGoodAt: string | null): string 
   const subject = others <= 0 ? first : `${first} + ${others} other${others === 1 ? "" : "s"}`;
   const verb = others <= 0 ? "is" : "are";
   return lastGoodAt
-    ? `${subject} ${verb} refreshing — showing data from ${formatClockTime(lastGoodAt)}.`
+    ? `${subject} ${verb} refreshing — showing data from ${formatLastGoodTime(lastGoodAt)}.`
     : `${subject} ${verb} refreshing.`;
 }
 
@@ -583,7 +607,7 @@ export function App() {
           ? retainedFetchTimes.reduce((oldest, candidate) => (candidate < oldest ? candidate : oldest))
           : null;
         const notice = failedForecastCount === 0
-          ? lateSourceNotice(forecasts)
+          ? lateSourceNotice(forecasts, spotsPayload.spots)
           : retainedForecastCount > 0
             ? delayedSpotsNotice(delayedSpotNames, oldestRetainedAt)
             : "Some forecasts are temporarily unavailable. We'll try again automatically.";
@@ -624,17 +648,31 @@ export function App() {
     setState((current) => {
       const wasDelayed = current.delayedSpotIds.includes(spotId);
       const delayedSpotIds = current.delayedSpotIds.filter((candidate) => candidate !== spotId);
-      const shouldClearForecastNotice =
-        wasDelayed &&
-        delayedSpotIds.length === 0 &&
-        current.notice !== CATALOG_REFRESH_DELAY_NOTICE;
+      // A recovery changes the delayed set, so a delayed-spots notice must be
+      // recomputed for the REMAINING spots — never left naming the recovered
+      // one. The catalog-refresh warning is not ours to clear here.
+      const remainingNames = delayedSpotIds.map(
+        (candidate) => current.spots.find((spot) => spot.id === candidate)?.name ?? candidate
+      );
+      const remainingRetainedTimes = delayedSpotIds.flatMap((candidate) => {
+        const previous = current.forecasts[candidate];
+        return previous?.status === "ready" ? [previous.fetchedAt] : [];
+      });
+      const oldestRemainingAt = remainingRetainedTimes.length > 0
+        ? remainingRetainedTimes.reduce((oldest, candidate) => (candidate < oldest ? candidate : oldest))
+        : null;
+      const notice = !wasDelayed || current.notice === CATALOG_REFRESH_DELAY_NOTICE
+        ? current.notice
+        : delayedSpotIds.length === 0
+          ? null
+          : delayedSpotsNotice(remainingNames, oldestRemainingAt);
       return {
         ...current,
         forecasts: {
           ...current.forecasts,
           [spotId]: { status: "ready", data: forecast, fetchedAt: new Date().toISOString() }
         },
-        notice: shouldClearForecastNotice ? null : current.notice,
+        notice,
         delayedSpotIds,
         fetchedAt: new Date().toISOString()
       };
