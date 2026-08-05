@@ -195,10 +195,10 @@ Documented RCA from the planning session — do not re-litigate; do close OI-2:
 | 0 | T-0.1: Production state snapshot | Deploy timeline, 12-row read-model state, DLQ depth (evidence in Log) | S | done | OI-1 approval |
 | 0 | T-0.2: Pin the 23:23Z flapping cause | OI-2 verdict + chosen smallest corrective for PR-A | S | done | T-0.1 |
 | A | T-A.1: Structured pipeline logging | Silent 503 logged; one line per publish/skip/supersede/failure; corrective folded in | M | done — healthy/degraded/recovery local proofs complete (2026-08-04 Log) | T-0.2 |
-| A | T-A.2: Tracing beta + OTLP → Logfire | wrangler config + operator-assisted destination/token; correlated traces visible | M | in progress — repo half + destinations done (OI-4 resolved 2026-08-05); Logfire correlation proof lands with T-A.5 | T-0.2 |
+| A | T-A.2: Tracing beta + OTLP → Logfire | wrangler config + operator-assisted destination/token; correlated traces visible | M | done — traces+logs live in Logfire; OI-6 closed as documented split-trace limitation with ingestId correlation | T-0.2 |
 | A | T-A.3: `pnpm ops:status` + post-merge runbook | Read-only status script + tests + `docs/runtime-operations.md` routine | M | done — final review DRY | — (parallel-safe with T-A.1/A.2) |
-| A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | in progress — review DRY; local + exact-head CI gates green; awaiting OI-4 | T-A.1–A.3 |
-| A | T-A.5: Ship + live-verify PR-A | Deployed; one full hourly cycle as one Logfire trace; `ops:status` all-ready | S | — | T-A.4 |
+| A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | done — PR #23 merged `284b25f` (2026-08-05) | T-A.1–A.3 |
+| A | T-A.5: Ship + live-verify PR-A | Deployed; one full hourly cycle as one Logfire trace; `ops:status` all-ready | S | done — Worker `53084465…` @100%; 02:17Z cycle verified (1 source + 12 publishes, ingestId-correlated traces); ops 4/4; dual-origin smoke; browser clean. OI-8 deploy-window fault recorded | T-A.4 |
 | B | T-B.1: Contracts cadence + verdict | `expectedCadenceMinutes`/grace fields + pure verdict fn + matrix tests | M | — | T-A.5 |
 | B | T-B.2: Adapters declare cadence | Documented cadence flows into payload source entries at materialization | M | — | T-B.1 |
 | B | T-B.3: Web consumes one verdict | Chip fix + banner rework + workbench/`forecast-health` subordination + tests | M | — | T-B.2 |
@@ -1438,3 +1438,25 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
   PR-C; task rows added above; detailed Phase D section reconciles via x-impl before that leg.
 - **Next:** OI-4 operator action (destinations per `docs/runtime-operations.md` §Logfire OTLP
   destinations), then the recorded ship ladder. PR-B untouched until PR-A is live-green.
+
+### 2026-08-05 — Phase A complete: PR #23 merged, deployed, live-verified
+
+- **Merge/deploy:** PR #23 → `284b25f` (01:43:32Z). Operator-run `pnpm deploy` (agent-side
+  execution is classifier-blocked; recorded as the standing operator step). Worker
+  `53084465-66e6-4bf1-ba1d-1fff32cef209` active at 100%, deployment `19361955…`. Pre-deploy
+  bookmark `000003a7-00000000-000050be-6c0138cacaa371054793ca7638da7d3f`.
+- **Deploy-window fault (new OI-8):** handoff cycle published 5/6 spots (232–395 ms CPU
+  children); sixth serialized child (bolinas) killed `exceededCpu` at ~50–85 ms CPU on 4
+  attempts → DLQ; verifier failed closed with `bolinas:1h|3h` pending; fix-forward held;
+  users saw last-good bolinas data. Twice-reproduced pattern (matches PR #21). Cron cycles
+  unaffected. Corrective decision checkpoint: T-B.5.
+- **Live gate (02:17Z cron):** all 12 rows converged to generation `02:17:14.356Z`.
+  `ops:status` 4/4 PASS. Strict smoke green on custom + workers.dev with exact version.
+  Logfire query API: cron (3 spans) → source job (205 spans) → six children (22–24 spans),
+  exactly 1 `source_ingest_published` + 12 `forecast_materialization_published` under
+  `ingestId af39a489…`. OI-6 closed: no native cross-Queue trace continuity; ingestId is the
+  documented correlation key. Browser: desktop + 390×844 phone, zero
+  alerts/console-messages/overflow on report + bolinas pages.
+- **Also live:** both Logfire destinations exporting (traces + logs); `LOGFIRE_READ_TOKEN`
+  verified for autonomous gate checks; OI-7 (write-token rotation) pending operator.
+- **Next:** Phase B from `284b25f` on `aylee/surf-freshness-cadence`.

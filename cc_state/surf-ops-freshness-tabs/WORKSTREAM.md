@@ -158,8 +158,8 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 
 | ID | Item | Owner | Status | Resolves in |
 |---|---|---|---|---|
-| OI-6 | Native automatic trace continuity across durable Queue producer→consumer boundaries is undocumented; verify the locked one-trace criterion on the PR-A :17 cycle | agent | OPEN | PR-A live gate; `ingestId` remains the cross-trace fallback, not a silent acceptance rewrite |
-| OI-7 | Rotate the Logfire write token: the Cloudflare destinations GET echoes the `Authorization` header, so the token entered the agent transcript while completing OI-4. Rotate in Logfire, PATCH both destinations with the new value, confirm export still works | alex + agent | OPEN | after the PR-A live gate is green (config-only, fully reversible) |
+| OI-7 | Rotate the Logfire write token: the Cloudflare destinations GET echoes the `Authorization` header, so the token entered the agent transcript while completing OI-4. Rotate in Logfire, update both destinations (operator dashboard edit keeps the new token out of transcripts), confirm export still works | alex + agent | OPEN | PR-A live gate is now green — rotate at next operator touch (config-only, fully reversible) |
+| OI-8 | Deploy-window sixth-child kill, now twice reproduced (PR #21 deploy of `8ce5bdf1…`; PR-A deploy of `53084465…` at 01:51Z): during the immediate post-activation handoff cycle, the last serialized Queue child (bolinas) is killed `exceededCpu` at ~50–85 ms CPU across 4 delivery attempts while healthy siblings use 196–395 ms; the message lands in `surf-ingest-dlq` (no consumer; left parked per no-replay policy). Cron cycles on the same version are unaffected (bolinas published 02:17:14 with 22-span healthy trace). Working theory: cold-version isolate contention (fresh HTTP-poller isolates + five just-signaled brief Agent DOs + queue consumer on a seconds-old version). Corrective candidates: quiet-down the verifier polling during fan-out, stagger/handoff-delay the enqueue, or verifier tolerance for one cron-cycle convergence. Decide at the PR-B ship boundary — if PR-B's deploy reproduces it, the corrective becomes mandatory before PR-C | agent | OPEN | dedicated corrective, decision checkpoint at T-B.5 |
 
 ### Resolved (this workstream)
 
@@ -170,6 +170,7 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | OI-3 | RESOLVED — Wrangler 4.118.0/current CF docs confirm explicit `observability.traces.{enabled,head_sampling_rate,persist,destinations}` and signal-specific log destinations; no beta compatibility flag | 2026-08-03 | CF docs + local schema → PR-A T-A.2 |
 | OI-4 | RESOLVED — both account-level destinations exist and are enabled with auth headers: `surf-logfire-traces` (opentelemetry-traces → logfire-us `/v1/traces`, created 2026-08-05T01:33:37Z, operator-created in dashboard) and `surf-logfire-logs` (opentelemetry-logs → `/v1/logs`, created 2026-08-05T01:37:58Z, agent-created via authorized Cloudflare API MCP mirroring the traces auth header). Creation preflight passed, proving Logfire accepts the credential. `LOGFIRE_READ_TOKEN` in gitignored root `.env` verified against the Logfire query API (HTTP 200). Named rollback: disable/delete destinations + remove names from the ignored overlay (config-only) | 2026-08-05 (UTC) | Cloudflare account config + `.env`; see OI-7 for the follow-up token rotation |
 | OI-5 | RESOLVED — PR #22 made deploy publication cron-safe and atomically verifiable. One supported deploy activated exact Worker `04e3ace7…` at 100%; after the guarded `07:27Z` handoff, all 12 rows switched to that one lineage, Queue stayed 1/1 at batch/concurrency 1, strict dual-origin smoke passed, and independent desktop/phone browser checks were clean | 2026-08-04 | PR #22 (`334c907`) + Worker `04e3ace7…`; recovery live checkpoint in Session Log / implementation-plan Log |
+| OI-6 | RESOLVED — verdict: Cloudflare automatic tracing does NOT propagate one trace across the Queue producer→consumer boundary. The live 02:17Z cycle exported as separate Logfire traces (cron 3-span → source job 205-span → six spot children 22–24 spans each), every span/event carrying the shared `ingestId af39a489…`; exactly 1 source + 12 publish terminal events verified via the Logfire query API. `ingestId` is the documented cross-trace correlation key; the one-trace criterion is closed as a platform limitation with evidence, not silently rewritten | 2026-08-05 | Logfire records query (02:16:55–02:20:00Z window) → Session Log; runbook already documents the fallback |
 | OD-1 | Freshness UX is two-tier and cadence-aware: chip always visible (min–max label bug fixed); banner only for actionable causes, naming them. One verdict authority: a pure contracts function computing `fresh \| aging \| late` from adapter-declared `expectedCadenceMinutes` (+ grace) shipped in the payload; web never re-judges | 2026-08-03 | Runtime plan → `implementation-plan.md` PR-B |
 | OD-2 | Spot page restructures to Forecast \| Analysis tabs: Forecast (default) = slim deterministic header + workbench first, zero AI content; Analysis = Daily Forecaster prose, tradeoffs, data-gaps, provenance accordion; forecaster with no reliable call collapses to one quiet line; daily-report page hero unchanged | 2026-08-03 | Runtime plan → `implementation-plan.md` PR-C |
 | OD-3 | Telemetry is CF-native: keep Workers Logs, enable automatic-tracing beta, native OTLP export of traces + logs → Logfire as the pane of glass; spans/logs carry `ingestId`/`spotId`/`generationId` | 2026-08-03 | Runtime plan → `implementation-plan.md` PR-A |
@@ -196,8 +197,8 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | Track | Status | Where (code) | Next action |
 |---|---|---|---|
 | Phase 0 — production diagnostic (read-only) | DONE — OI-2 pinned, OI-5 corrective live | prod: deployment status, D1 read-model/source-run queries, live tail, queue config | Complete |
-| PR-A — observability + ops foundation | ACTIVE — review DRY; local + exact-head CI gates green; only OI-4 remains | `apps/web/worker/` (index, ingest, read-model), `apps/web/wrangler.jsonc`, `scripts/`, `docs/runtime-operations.md` | OI-4 (operator) → refresh PR body → ready → merge → one supported deploy → next actual `:17` live proof (OI-6) |
-| PR-B — cadence-aware freshness | OPEN | `packages/contracts/`, worker materialization, `apps/web/src/App.tsx`, `features/workbench/` | After PR-A verified live |
+| PR-A — observability + ops foundation | DONE — PR #23 merged (`284b25f`), deployed (`53084465…` @100%), live-verified on the 02:17Z cycle | `apps/web/worker/` (index, ingest, read-model), `apps/web/wrangler.jsonc`, `scripts/`, `docs/runtime-operations.md` | Complete; OI-7 rotation + OI-8 corrective tracked in ledger |
+| PR-B — cadence-aware freshness | ACTIVE | `packages/contracts/`, worker materialization, `apps/web/src/App.tsx`, `features/workbench/` | T-B.1 contracts verdict fn → T-B.2 adapter cadence → T-B.3 web single-verdict → gate → ship |
 | PR-C — Forecast \| Analysis tabs | OPEN | `apps/web/src/features/workbench/ForecastWorkbench.tsx`, `App.tsx`, `src/components/ui/tabs.tsx` | After PR-B verified live |
 | PR-D — spot catalog expansion (OD-11) | QUEUED | `packages/db` catalog/seed, worker adapter config, `scripts/`, tests, docs | After PR-C verified live |
 
@@ -260,14 +261,16 @@ and no production mutation have been performed for PR-A.
 
 ## Next Action
 
-**All pre-ready gates are green (OI-4 resolved 2026-08-05T01:38Z). Execute the ship ladder:
-commit/push the cc_state checkpoint, confirm GitHub Verify green at the exact new head, flip
-PR #23 ready, merge, run one supported `pnpm deploy` (root `.env` supplies
-`SURF_INGEST_TOKEN`), wait for the next actual `:17` cycle, then close OI-6 with a Logfire
-one-correlated-trace verdict (or the documented `ingestId` cross-trace limitation) +
-`pnpm ops:status` 12-ready + dual-origin strict smoke + desktop/phone browser proof. Then
-rotate the Logfire write token (OI-7). Do not begin PR-B until PR-A is live-green and OI-6
-has its evidence-backed verdict. PR-D (OD-11 spots) stays queued behind PR-C.**
+**PR-A is live-green; begin PR-B on a fresh branch from `284b25f`
+(`aylee/surf-freshness-cadence`): T-B.1 pure contracts verdict + cadence fields (confirm the
+cadence table against `docs/feed-adapters.md` + observed `source_runs` history), T-B.2 wire
+adapter-declared cadence through materialization into payload source entries, T-B.3 single
+verdict consumption in web (chip fix, actionable-only banner, workbench subordination,
+OD-9 mobile chip visibility) — then the ultracode adversarial review workflow until dry,
+`pnpm verify` + local e2e incl. degraded/late states + browser evidence at 1280/390, ready
+PR → Verify → merge → deploy (watch for OI-8 recurrence at the handoff; decide its
+corrective there) → `:17` live proof of quiet chip/no banner. Ask Alex to rotate the Logfire
+write token (OI-7) at the next operator touch. PR-D (OD-11 spots) stays queued behind PR-C.**
 
 ## Closeout Path
 
@@ -944,3 +947,33 @@ landed in gitignored root `.env` and returned HTTP 200 on the Logfire query API,
 OI-7 (rotate token + PATCH destinations after the live gate; config-only rollback). Next: the
 recorded ship ladder (checkpoint commit → exact-head Verify → ready → merge → deploy → `:17`
 proof).
+
+_2026-08-05 (UTC)_ — **PR-A shipped and live-verified; OI-6 closed with a split-trace verdict;
+one new bounded fault recorded (OI-8).** Ready PR #23 merged as `284b25f` at 01:43:32Z. Alex
+ran the supported deploy (runtime permission classifier blocks agent-initiated `pnpm deploy`;
+recorded as the expected operator step). Pre-deploy D1 bookmark
+`000003a7-00000000-000050be-6c0138cacaa371054793ca7638da7d3f`. The deploy activated Worker
+`53084465-66e6-4bf1-ba1d-1fff32cef209` in deployment `19361955…` at exactly 100% and passed
+exact + 3-consecutive readiness; the handoff source job and five spot children published 10
+rows on the deploy lineage (232–395 ms CPU each), but the sixth serialized child (bolinas)
+was killed `exceededCpu` at ~50–85 ms CPU on all four delivery attempts — no terminal event
+could run, the message parked in the DLQ, and the verifier correctly failed closed with
+exactly `bolinas:1h|3h` pending, leaving the new version active for fix-forward. Production
+stayed user-healthy throughout (bolinas served last-good 01:17 data; `ops:status` PASSed with
+the pair un-split). PR-A telemetry turned the previously blind PR #21-class fault into exact
+evidence (queue-child outcomes + CPU/wall per attempt) — recorded as OI-8 with a corrective
+decision checkpoint at T-B.5.
+
+**OODA — Observe:** the 02:17Z cron on the same version published all six spots including
+bolinas (22-span healthy child trace, 02:17:53Z), converging all 12 rows to one generation
+`02:17:14.356Z`. Live gate evidence: `ops:status` 4/4 PASS · strict smoke green on
+surf.alexlee.ai and workers.dev with exact Worker identity · Logfire query API returned the
+cycle as cron→source (205 spans)→six children traces with exactly 1 source + 12 publish
+terminal events under `ingestId af39a489…` · desktop + 390×844 phone browser passes with zero
+alerts/console errors/overflow. **Orient:** the failure mode moved from invisible to
+diagnosable in one release — precisely the workstream's purpose; the deploy-window kill is an
+operational annoyance, not a data-integrity risk (fail-closed held twice). **Decide:** close
+T-A.5/Phase A; do not block PR-B on OI-8 (UI-only leg; watch its deploy for recurrence);
+keep the DLQ message parked per no-replay policy; rotate the write token (OI-7) at next
+operator touch. **Act:** ledger close-looped (OI-6 → resolved, OI-8 → open), impl-plan Phase A
+marked done, PR-B branch starts from `284b25f`.
