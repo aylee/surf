@@ -28,6 +28,7 @@ import { CDIP_MOP_SOURCE_ID } from "./adapters/cdip-mop";
 import { NDBC_STALE_AFTER_MINUTES } from "./adapters/ndbc";
 import { NWS_GRID_WAVE_SOURCE_ID } from "./adapters/nws-grid-wave";
 import type { Env } from "./index";
+import { boundedErrorName } from "./logging";
 import {
   localDateForTime,
   solarPhasesForDates,
@@ -1423,14 +1424,17 @@ export async function buildForecastResponse(
       issueDelta: issueDelta(forecastIssues, forecastSnapshotRows)
     });
   } catch (error) {
+    if (options.failOnReadError) throw error;
     console.error(
       JSON.stringify({
+        event: "forecast_assembly_failed",
         message: "forecast assembly failed",
         spotId,
-        error: error instanceof Error ? error.message : String(error)
+        interval,
+        reasonCode: "forecast_assembly_failed",
+        errorName: boundedErrorName(error)
       })
     );
-    if (options.failOnReadError) throw error;
     return unavailableForecast(
       spotId,
       now,
@@ -1492,9 +1496,11 @@ export async function buildSynchronizedForecastResponses(
   } catch (error) {
     console.error(
       JSON.stringify({
+        event: "synchronized_forecast_assembly_failed",
         message: "synchronized forecast assembly failed",
         spotId,
-        error: error instanceof Error ? error.message : String(error)
+        reasonCode: "synchronized_forecast_assembly_failed",
+        errorName: boundedErrorName(error)
       })
     );
     if (options.failOnReadError) throw error;

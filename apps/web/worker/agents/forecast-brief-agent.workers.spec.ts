@@ -5,7 +5,7 @@ import { evictDurableObject, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildForecastFactBundle } from "../brief/facts";
 import { briefForecastFixture, validDraftFor } from "../brief/test-helpers";
-import type { ForecastFactBundle } from "../brief/types";
+import { ForecastFactBundleSchema, type ForecastFactBundle } from "../brief/types";
 import {
   FORECAST_BRIEF_FINAL_RECOVERY_COOLDOWN_MS,
   FORECAST_BRIEF_GENERATION_LEASE_MS,
@@ -66,6 +66,27 @@ async function refreshedBundleFor(
   });
 }
 
+async function materiallyChangedBundleAt(
+  bundle: ForecastFactBundle,
+  generatedAt: string
+): Promise<ForecastFactBundle> {
+  const forecast = briefForecastFixture();
+  forecast.spot = {
+    ...forecast.spot,
+    id: bundle.input.spotId,
+    name: bundle.input.spotName
+  };
+  forecast.generatedAt = generatedAt;
+  forecast.windows[0] = {
+    ...forecast.windows[0]!,
+    qualityLabel: "poor"
+  };
+  return buildForecastFactBundle(forecast, {
+    localDate: bundle.input.localDate,
+    recommendationWindowIds: bundle.input.recommendationWindowIds
+  });
+}
+
 afterEach(async () => {
   vi.restoreAllMocks();
   await reset();
@@ -101,8 +122,12 @@ describe("ForecastBriefAgent in workerd", () => {
     });
   });
 
-  it("rolls back an unsubmitted job so an identical signal can recover", async () => {
+  it("rolls back an unsubmitted job but preserves high-water for an identical retry", async () => {
     const bundle = await bundleForSpot("linda-mar", "Linda Mar");
+    const older = await materiallyChangedBundleAt(
+      bundle,
+      new Date(Date.parse(bundle.input.generatedAt) - 60 * 1000).toISOString()
+    );
     const stub = env.FORECAST_BRIEF_AGENT.getByName("linda-mar");
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
@@ -124,6 +149,16 @@ describe("ForecastBriefAgent in workerd", () => {
 
       await expect(instance.signal(bundle)).rejects.toThrow("queue storage unavailable");
       expect(await instance.getCoordinationState(bundle.input.localDate)).toBeNull();
+      await expect(instance.signal(older)).resolves.toMatchObject({ status: "superseded" });
+      expect(submissionCount).toBe(1);
+      expect(await instance.getCoordinationState(bundle.input.localDate)).toBeNull();
+      expect(
+        instance.sql<{ generated_at: string }>`
+          select generated_at
+          from forecast_brief_generation_high_water
+          where local_date = ${bundle.input.localDate}
+        `[0]?.generated_at
+      ).toBe(bundle.input.generatedAt);
 
       await expect(instance.signal(bundle)).resolves.toMatchObject({ status: "accepted" });
       expect(submissionCount).toBe(2);
@@ -136,6 +171,15 @@ describe("ForecastBriefAgent in workerd", () => {
     });
 
     expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "forecast_brief_queue_submission_failed",
+      message: "forecast brief queue submission failed",
+      spotId: "linda-mar",
+      localDate: bundle.input.localDate,
+      reasonCode: "brief_queue_submission_failed",
+      errorName: "Error"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain("queue storage unavailable");
   });
 
   it("isolates spot instances and rejects a cross-spot bundle", async () => {
@@ -155,7 +199,7 @@ describe("ForecastBriefAgent in workerd", () => {
     });
   });
 
-  it("coalesces concurrent identical signals but queues a material revision", async () => {
+  it("coalesces concurrent identical signals but queues an equal-timestamp material revision", async () => {
     const first = await bundleForSpot("bolinas", "Bolinas");
     const changedForecast = briefForecastFixture();
     changedForecast.spot = { ...changedForecast.spot, id: "bolinas", name: "Bolinas" };
@@ -164,6 +208,7 @@ describe("ForecastBriefAgent in workerd", () => {
       qualityLabel: "poor"
     };
     const changed = await buildForecastFactBundle(changedForecast);
+    expect(changed.input.generatedAt).toBe(first.input.generatedAt);
     const stub = env.FORECAST_BRIEF_AGENT.getByName("bolinas");
 
     await withSuppressedQueue(stub, async (instance, queued) => {
@@ -179,6 +224,97 @@ describe("ForecastBriefAgent in workerd", () => {
         status: "queued"
       });
     });
+  });
+
+  it("rejects intermediate A after newer same-material B coalesces over queued X", async () => {
+    const oldestX = await bundleForSpot("bolinas", "Bolinas");
+    const newestB = await refreshedBundleFor(oldestX);
+    const intermediateA = await materiallyChangedBundleAt(
+      oldestX,
+      new Date(
+        (Date.parse(oldestX.input.generatedAt) + Date.parse(newestB.input.generatedAt)) / 2
+      ).toISOString()
+    );
+    expect(newestB.materialFingerprint).toBe(oldestX.materialFingerprint);
+    expect(intermediateA.materialFingerprint).not.toBe(oldestX.materialFingerprint);
+    expect(Date.parse(intermediateA.input.generatedAt)).toBeGreaterThan(
+      Date.parse(oldestX.input.generatedAt)
+    );
+    expect(Date.parse(intermediateA.input.generatedAt)).toBeLessThan(
+      Date.parse(newestB.input.generatedAt)
+    );
+    const stub = env.FORECAST_BRIEF_AGENT.getByName("bolinas");
+
+    await withSuppressedQueue(stub, async (instance, queued) => {
+      await expect(instance.signal(oldestX)).resolves.toMatchObject({ status: "accepted" });
+      await expect(instance.signal(newestB)).resolves.toMatchObject({ status: "duplicate" });
+      const before = instance.sql<{ generation_token: string; bundle_json: string }>`
+        select generation_token, bundle_json
+        from forecast_brief_jobs
+        where local_date = ${oldestX.input.localDate}
+      `[0]!;
+      expect(
+        instance.sql<{ generated_at: string }>`
+          select generated_at
+          from forecast_brief_generation_high_water
+          where local_date = ${oldestX.input.localDate}
+        `[0]?.generated_at
+      ).toBe(newestB.input.generatedAt);
+
+      await expect(instance.signal(intermediateA)).resolves.toEqual({
+        status: "superseded",
+        inputFingerprint: intermediateA.inputFingerprint,
+        materialFingerprint: intermediateA.materialFingerprint
+      });
+
+      expect(queued).toHaveLength(1);
+      expect(await instance.getCoordinationState(oldestX.input.localDate)).toMatchObject({
+        status: "queued",
+        lastSeenFingerprint: oldestX.inputFingerprint,
+        materialFingerprint: oldestX.materialFingerprint
+      });
+      const after = instance.sql<{ generation_token: string; bundle_json: string }>`
+        select generation_token, bundle_json
+        from forecast_brief_jobs
+        where local_date = ${oldestX.input.localDate}
+      `[0]!;
+      expect(after.generation_token).toBe(before.generation_token);
+      expect(
+        ForecastFactBundleSchema.parse(JSON.parse(after.bundle_json)).input.generatedAt
+      ).toBe(oldestX.input.generatedAt);
+    });
+  });
+
+  it("fails closed before replacement when persisted bundle state cannot be parsed", async () => {
+    const current = await bundleForSpot("bolinas", "Bolinas");
+    const newer = await refreshedBundleFor(current);
+    const stub = env.FORECAST_BRIEF_AGENT.getByName("bolinas");
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await withSuppressedQueue(stub, async (instance, queued) => {
+      await expect(instance.signal(current)).resolves.toMatchObject({ status: "accepted" });
+      instance.sql`
+        delete from forecast_brief_generation_high_water
+        where local_date = ${current.input.localDate}
+      `;
+      instance.sql`
+        update forecast_brief_jobs
+        set bundle_json = ${'{"credential":"private-value-that-must-not-leak"'}
+        where local_date = ${current.input.localDate}
+      `;
+
+      await expect(instance.signal(newer)).rejects.toThrow(
+        "Stored forecast fact bundle is invalid"
+      );
+      expect(queued).toHaveLength(1);
+      expect(await instance.getCoordinationState(current.input.localDate)).toMatchObject({
+        status: "queued",
+        lastSeenFingerprint: current.inputFingerprint,
+        materialFingerprint: current.materialFingerprint
+      });
+    });
+
+    expect(errorLog).not.toHaveBeenCalled();
   });
 
   it("validates and publishes a generated revision to D1", async () => {
@@ -279,6 +415,17 @@ describe("ForecastBriefAgent in workerd", () => {
           publishedFingerprint: null
         });
       });
+      expect(errorLog).toHaveBeenCalledTimes(4);
+      const entries = errorLog.mock.calls.map(([entry]) => JSON.parse(String(entry)));
+      expect(
+        entries.every(
+          ({ event, reasonCode, errorName }) =>
+            event === "forecast_brief_generation_failed" &&
+            reasonCode === "brief_generation_failed" &&
+            errorName === "Error"
+        )
+      ).toBe(true);
+      expect(JSON.stringify(entries)).not.toContain("provider quota exhausted");
     } finally {
       errorLog.mockRestore();
     }
@@ -334,8 +481,9 @@ describe("ForecastBriefAgent in workerd", () => {
         where local_date = ${bundle.input.localDate}
       `;
 
-      // Even after the cooldown, the exact failed input stays suppressed.
-      await expect(instance.signal(bundle)).resolves.toMatchObject({ status: "terminal" });
+      // The later same-material observation advanced the durable high-water,
+      // so this exact older failed input remains suppressed as superseded.
+      await expect(instance.signal(bundle)).resolves.toMatchObject({ status: "superseded" });
       expect(queued).toHaveLength(1);
 
       Object.defineProperty(instance, "generateDraft", {
@@ -357,6 +505,14 @@ describe("ForecastBriefAgent in workerd", () => {
     });
 
     expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual(
+      expect.objectContaining({
+        event: "forecast_brief_generation_failed",
+        reasonCode: "brief_generation_failed",
+        errorName: "Error"
+      })
+    );
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain("provider rejected credentials");
   });
 
   it("reclaims an interrupted generating lease and invalidates the old callback token", async () => {
@@ -460,7 +616,8 @@ describe("ForecastBriefAgent in workerd", () => {
   it("treats a corrupt stored fact bundle as terminal before model invocation", async () => {
     const bundle = await bundleForSpot("bolinas", "Bolinas");
     const stub = env.FORECAST_BRIEF_AGENT.getByName("bolinas");
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const corruptBundle = '{"credential":"private-value-that-must-not-leak"';
 
     await withSuppressedQueue(stub, async (instance, queued) => {
       let generationCalls = 0;
@@ -483,7 +640,7 @@ describe("ForecastBriefAgent in workerd", () => {
       const payload = queued[0]?.[1] as ProcessPayload;
       instance.sql`
         update forecast_brief_jobs
-        set bundle_json = ${"{"}
+        set bundle_json = ${corruptBundle}
         where local_date = ${bundle.input.localDate}
       `;
       await instance.processPending(payload);
@@ -495,7 +652,27 @@ describe("ForecastBriefAgent in workerd", () => {
         attemptCount: 1,
         publishedFingerprint: null
       });
+      const stored = instance.sql<{ last_error: string | null }>`
+        select last_error
+        from forecast_brief_jobs
+        where local_date = ${bundle.input.localDate}
+      `[0];
+      expect(stored?.last_error).toBe("Stored forecast fact bundle is invalid");
     });
+
+    expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "forecast_brief_generation_failed",
+      message: "forecast brief generation failed",
+      spotId: "bolinas",
+      localDate: bundle.input.localDate,
+      attemptCount: 1,
+      disposition: "terminal",
+      retryInSeconds: null,
+      reasonCode: "brief_generation_failed",
+      errorName: "OtherError"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain("private-value-that-must-not-leak");
   });
 
   it("fails closed when retry scheduling throws and never collapses the backoff", async () => {
@@ -537,6 +714,17 @@ describe("ForecastBriefAgent in workerd", () => {
     });
 
     expect(errorLog).toHaveBeenCalledTimes(2);
+    const entries = errorLog.mock.calls.map(([entry]) => JSON.parse(String(entry)));
+    expect(entries.map(({ event }) => event)).toEqual([
+      "forecast_brief_generation_failed",
+      "forecast_brief_retry_scheduling_failed"
+    ]);
+    expect(entries.map(({ reasonCode }) => reasonCode)).toEqual([
+      "brief_generation_failed",
+      "brief_retry_scheduling_failed"
+    ]);
+    expect(entries.every(({ errorName }) => errorName === "Error")).toBe(true);
+    expect(JSON.stringify(entries)).not.toMatch(/provider unavailable|alarm storage unavailable/);
   });
 
   it("fails closed before creating job state when generation is disabled", async () => {

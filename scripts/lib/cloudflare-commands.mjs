@@ -11,6 +11,12 @@ import {
 
 loadRootEnv();
 
+// A versioned deploy can deliberately wait through the hourly :17 cron settle
+// window before spending its 10-minute publication budget. Keep the shared
+// ceiling above that supported path while still making every pnpm/Wrangler
+// child finite. Read-only callers may choose a shorter timeout.
+export const CLOUDFLARE_COMMAND_TIMEOUT_MS = 45 * 60_000;
+
 export const wranglerConfigPath = fileURLToPath(
   new URL("../../apps/web/wrangler.jsonc", import.meta.url)
 );
@@ -25,11 +31,33 @@ function displayCommand(args) {
   return ["pnpm", ...args].join(" ");
 }
 
+export function resolveCloudflareCommandTimeout(options = {}) {
+  const timeoutPolicy = options.timeoutPolicy ?? "finite";
+  if (timeoutPolicy === "unbounded") {
+    if (options.timeoutMs !== undefined) {
+      throw new Error(
+        "An unbounded Cloudflare command cannot also configure timeoutMs."
+      );
+    }
+    return undefined;
+  }
+  if (timeoutPolicy !== "finite") {
+    throw new Error("Cloudflare command timeoutPolicy must be finite or unbounded.");
+  }
+  const timeoutMs = options.timeoutMs ?? CLOUDFLARE_COMMAND_TIMEOUT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("Cloudflare command timeout must be a positive integer in milliseconds.");
+  }
+  return timeoutMs;
+}
+
 function invokePnpm(args, options = {}) {
   const capture = options.capture ?? false;
+  const timeoutMs = resolveCloudflareCommandTimeout(options);
   const result = spawnSync("pnpm", args, {
     cwd: repoRoot,
     encoding: "utf8",
+    ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }),
     env: {
       ...process.env,
       WRANGLER_SEND_METRICS: "false",
@@ -39,6 +67,13 @@ function invokePnpm(args, options = {}) {
   });
 
   if (result.error) {
+    if (result.error.code === "ETIMEDOUT") {
+      const error = new Error(
+        `pnpm subprocess exceeded its ${timeoutMs}ms timeout; captured output was suppressed.`
+      );
+      error.name = "TimeoutError";
+      throw error;
+    }
     throw result.error;
   }
 
@@ -46,6 +81,7 @@ function invokePnpm(args, options = {}) {
 }
 
 export function runPnpm(args, options = {}) {
+  resolveCloudflareCommandTimeout(options);
   console.log(`\n> ${displayCommand(args)}`);
   const result = invokePnpm(args, options);
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
@@ -75,8 +111,8 @@ export function runWrangler(args, options = {}) {
   return runPnpm(wranglerPnpmArgs(args), options);
 }
 
-export function probeWrangler(args) {
-  return invokePnpm(wranglerPnpmArgs(args), { capture: true });
+export function probeWrangler(args, options = {}) {
+  return invokePnpm(wranglerPnpmArgs(args), { ...options, capture: true });
 }
 
 export function readWranglerConfig(path = activeWranglerConfigPath) {

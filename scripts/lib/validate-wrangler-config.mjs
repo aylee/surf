@@ -129,8 +129,35 @@ export function wranglerStructureFailures(config, configPath) {
   if (config?.vars?.GEMINI_API_KEY !== undefined) {
     failures.push("GEMINI_API_KEY must be a Wrangler secret, never a tracked Worker var.");
   }
-  if (config?.observability?.logs?.enabled !== true) {
-    failures.push("Worker observability logs must be enabled.");
+  if (config?.observability?.enabled !== true) {
+    failures.push("Worker observability must be enabled at the top level.");
+  }
+  const logs = config?.observability?.logs;
+  if (
+    logs?.enabled !== true ||
+    logs?.head_sampling_rate !== 1 ||
+    logs?.invocation_logs !== true ||
+    logs?.persist !== true
+  ) {
+    failures.push(
+      "Worker observability logs must be enabled, persisted, invocation-complete, and sampled at 100%."
+    );
+  }
+  const traces = config?.observability?.traces;
+  if (
+    traces?.enabled !== true ||
+    traces?.head_sampling_rate !== 1 ||
+    traces?.persist !== true
+  ) {
+    failures.push("Worker automatic traces must be enabled, persisted, and sampled at 100%.");
+  }
+  if (
+    isTrackedCanonicalConfig &&
+    ((logs?.destinations?.length ?? 0) > 0 || (traces?.destinations?.length ?? 0) > 0)
+  ) {
+    failures.push(
+      "The tracked Wrangler config must remain destination-neutral; account-scoped telemetry destination names belong only in the ignored instance overlay."
+    );
   }
   if (config?.cache?.enabled !== true || config?.cache?.cross_version_cache !== false) {
     failures.push("Worker response caching must be enabled with version-scoped cache keys.");

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { compareForecastBriefGeneratedAt } from "./forecast-brief-agent";
 import {
   classifyForecastBriefFailure,
   retryDelaySecondsAfterFailure,
@@ -6,6 +7,30 @@ import {
 } from "./retry-policy";
 
 describe("ForecastBriefAgent retry policy", () => {
+  it("orders generated-at instants while preserving equal-timestamp revisions", () => {
+    expect(
+      compareForecastBriefGeneratedAt(
+        "2026-08-02T12:59:59.999Z",
+        "2026-08-02T13:00:00.000Z"
+      )
+    ).toBe("older");
+    expect(
+      compareForecastBriefGeneratedAt(
+        "2026-08-02T06:00:00.000-07:00",
+        "2026-08-02T13:00:00.000Z"
+      )
+    ).toBe("equal");
+    expect(
+      compareForecastBriefGeneratedAt(
+        "2026-08-02T13:00:00.001Z",
+        "2026-08-02T13:00:00.000Z"
+      )
+    ).toBe("newer");
+    expect(() =>
+      compareForecastBriefGeneratedAt("persisted-secret-value", "2026-08-02T13:00:00.000Z")
+    ).toThrow("Stored forecast fact bundle is invalid");
+  });
+
   it("uses bounded delayed retries for transient provider failures", () => {
     expect(retryDelaySecondsAfterFailure(1)).toBe(5 * 60);
     expect(retryDelaySecondsAfterFailure(2)).toBe(30 * 60);

@@ -55,7 +55,7 @@ describe("forecast brief public response", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const db = {
       prepare() {
-        throw new Error("table unavailable");
+        throw new Error("table unavailable token=should-not-appear");
       }
     } as unknown as D1Database;
     const bundle = await buildForecastFactBundle(briefForecastFixture());
@@ -67,8 +67,15 @@ describe("forecast brief public response", () => {
     expect(response.fallbackReason).toBeNull();
     expect(response.availableRevisions).toBe(0);
     expect(warning).toHaveBeenCalledOnce();
-    expect(warning.mock.calls[0]?.[0]).toContain('"errorName":"Error"');
-    expect(warning.mock.calls[0]?.[0]).toContain('"errorMessage":"table unavailable"');
+    expect(JSON.parse(String(warning.mock.calls[0]![0]))).toEqual({
+      event: "forecast_brief_storage_read_failed",
+      message: "forecast brief storage read used the fact-based summary",
+      spotId: bundle.input.spotId,
+      localDate: bundle.input.localDate,
+      errorName: "Error",
+      reasonCode: "brief_storage_read_failed"
+    });
+    expect(String(warning.mock.calls[0]![0])).not.toContain("should-not-appear");
     expect(JSON.stringify(response)).not.toContain("table unavailable");
     warning.mockRestore();
   });
@@ -293,7 +300,16 @@ describe("forecast brief public response", () => {
       });
       expect(JSON.stringify(response)).not.toMatch(/claim references|validation metadata/i);
       expect(warning).toHaveBeenCalledOnce();
-      expect(warning.mock.calls[0]?.[0]).toContain("claim references do not match");
+      expect(JSON.parse(String(warning.mock.calls[0]![0]))).toEqual(
+        expect.objectContaining({
+          event: "forecast_brief_storage_read_failed",
+          reasonCode: "brief_storage_read_failed",
+          errorName: "Error"
+        })
+      );
+      expect(String(warning.mock.calls[0]![0])).not.toContain(
+        "claim references do not match"
+      );
     } finally {
       warning.mockRestore();
     }
@@ -342,7 +358,14 @@ describe("forecast brief public response", () => {
       });
       expect(JSON.stringify(response)).not.toContain("not-an-iso-timestamp");
       expect(warning).toHaveBeenCalledOnce();
-      expect(warning.mock.calls[0]?.[0]).toContain("expiration is invalid");
+      expect(JSON.parse(String(warning.mock.calls[0]![0]))).toEqual(
+        expect.objectContaining({
+          event: "forecast_brief_storage_read_failed",
+          reasonCode: "brief_storage_read_failed",
+          errorName: "Error"
+        })
+      );
+      expect(String(warning.mock.calls[0]![0])).not.toContain("expiration is invalid");
     } finally {
       warning.mockRestore();
     }

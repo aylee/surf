@@ -26,6 +26,7 @@
     "deploy": "node scripts/cf-deploy.mjs deploy",
     "check:cloudflare": "node scripts/cf-deploy.mjs setup --dry-run",
     "wrangler": "node scripts/wrangler.mjs",
+    "ops:status": "node scripts/ops-status.mjs",
     "smoke:local": "node scripts/smoke-local.mjs",
     "smoke:cloudflare": "pnpm --filter @surf/web smoke:cloudflare",
     "spots:sync": "pnpm --filter @surf/db seed:generate",

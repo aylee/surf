@@ -8,6 +8,7 @@ import {
 } from "./brief";
 import {
   FORECAST_READ_MODEL_SCHEMA_VERSION,
+  getActiveMaterializedForecastFactBundle,
   getMaterializedForecastFactBundle,
   getMaterializedForecastJson,
   MAX_FORECAST_FACT_BUNDLE_BYTES,
@@ -32,7 +33,7 @@ function fixtureResponses() {
   };
 }
 
-function writeDb() {
+function writeDb(changesByWrite: number[] = []) {
   const preparedSql: string[] = [];
   const writes: Array<{ sql: string; values: unknown[] }> = [];
   const db = {
@@ -43,7 +44,10 @@ function writeDb() {
           return {
             async run() {
               writes.push({ sql, values });
-              return { success: true, meta: { changes: 1 } };
+              return {
+                success: true,
+                meta: { changes: changesByWrite[writes.length - 1] ?? 1 }
+              };
             }
           };
         }
@@ -132,12 +136,33 @@ describe("forecast read model repository", () => {
       materializedAt: "2026-08-02T13:05:00.000Z"
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       rowsWritten: 2 + localDates.length,
       forecastRowsWritten: 2,
       factBundleRowsWritten: localDates.length,
       errors: []
     });
+    expect(result.forecastOutcomes).toEqual([
+      expect.objectContaining({
+        ingestId: null,
+        spotId: "obsf-north",
+        interval: "3h",
+        generationId: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        outcome: "publish",
+        reasonCode: "forecast_generation_published",
+        retryable: false
+      }),
+      expect.objectContaining({
+        ingestId: null,
+        spotId: "obsf-north",
+        interval: "1h",
+        generationId: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+        outcome: "publish",
+        reasonCode: "forecast_generation_published",
+        retryable: false
+      })
+    ]);
+    expect(new Set(result.forecastOutcomes.map(({ generationId }) => generationId)).size).toBe(1);
     expect(writes.filter((write) => /insert into forecast_read_models/i.test(write.sql))).toHaveLength(2);
     expect(writes.find((write) => /insert into forecast_read_models/i.test(write.sql))?.sql).toContain(
       "excluded.generated_at >= forecast_read_models.generated_at"
@@ -232,6 +257,20 @@ describe("forecast read model repository", () => {
     expect(result.errors[0]).toContain("serialized 1h forecast payload");
     expect(result.errors[0]).toContain(`limit ${MAX_FORECAST_READ_MODEL_BYTES}`);
     expect(result.errors[0]).toContain("previous materialization remains active");
+    expect(result.forecastOutcomes).toEqual([
+      expect.objectContaining({
+        interval: "3h",
+        outcome: "skip",
+        reasonCode: "synchronized_generation_rejected",
+        retryable: false
+      }),
+      expect.objectContaining({
+        interval: "1h",
+        outcome: "skip",
+        reasonCode: "forecast_payload_too_large",
+        retryable: false
+      })
+    ]);
     expect(preparedSql).toEqual([]);
     expect(writes).toEqual([]);
   });
@@ -262,6 +301,16 @@ describe("forecast read model repository", () => {
     expect(result.errors[0]).toContain(`serialized ${localDate} fact bundle payload`);
     expect(result.errors[0]).toContain(`limit ${MAX_FORECAST_FACT_BUNDLE_BYTES}`);
     expect(result.errors[0]).toContain("previous materialization remains active");
+    expect(result.forecastOutcomes).toEqual(
+      ["3h", "1h"].map((interval) =>
+        expect.objectContaining({
+          interval,
+          outcome: "skip",
+          reasonCode: "fact_bundle_payload_too_large",
+          retryable: false
+        })
+      )
+    );
     expect(preparedSql).toEqual([]);
     expect(writes).toEqual([]);
   });
@@ -326,7 +375,110 @@ describe("forecast read model repository", () => {
     expect(result.errors).toEqual([
       "Forecast read model publication rejected because 1h contained no scored windows; the previous materialization remains active."
     ]);
+    expect(result.forecastOutcomes).toEqual([
+      expect.objectContaining({
+        interval: "3h",
+        generationId: null,
+        outcome: "skip",
+        reasonCode: "synchronized_generation_rejected",
+        retryable: false
+      }),
+      expect.objectContaining({
+        interval: "1h",
+        generationId: null,
+        outcome: "skip",
+        reasonCode: "no_scored_windows",
+        retryable: false
+      })
+    ]);
     expect(writes).toEqual([]);
+  });
+
+  it("reports conditional D1 no-ops as interval supersessions instead of publishes", async () => {
+    const { threeHour, hourly } = fixtureResponses();
+    const localDate = localDateForTime(
+      threeHour.windows[0]!.forecastAt,
+      threeHour.spot.timezone
+    );
+    const factBundles = [await buildForecastFactBundle(threeHour, { localDate })];
+    const { db } = writeDb([0, 0, 0]);
+
+    const result = await persistForecastMaterialization({
+      db,
+      threeHour,
+      hourly,
+      factBundles,
+      sourceIssueFingerprint: "older-source-fingerprint",
+      materializedAt: "2026-08-02T13:05:00.000Z",
+      ingestId: "older-ingest"
+    });
+
+    expect(result.rowsWritten).toBe(0);
+    expect(result.forecastRowsWritten).toBe(0);
+    expect(result.forecastOutcomes).toEqual([
+      expect.objectContaining({
+        ingestId: "older-ingest",
+        interval: "3h",
+        generationId: expect.stringMatching(
+          /^sha256:[a-f0-9]{64}:ingest:older-ingest$/
+        ),
+        outcome: "supersede",
+        reasonCode: "newer_generation_active",
+        retryable: false
+      }),
+      expect.objectContaining({
+        ingestId: "older-ingest",
+        interval: "1h",
+        generationId: expect.stringMatching(
+          /^sha256:[a-f0-9]{64}:ingest:older-ingest$/
+        ),
+        outcome: "supersede",
+        reasonCode: "newer_generation_active",
+        retryable: false
+      })
+    ]);
+  });
+
+  it("preserves mixed per-interval D1 publication truth for an already-mixed table", async () => {
+    const { threeHour, hourly } = fixtureResponses();
+    const localDate = localDateForTime(
+      threeHour.windows[0]!.forecastAt,
+      threeHour.spot.timezone
+    );
+    const factBundles = [await buildForecastFactBundle(threeHour, { localDate })];
+    const { db } = writeDb([1, 0, 0]);
+
+    const result = await persistForecastMaterialization({
+      db,
+      threeHour,
+      hourly,
+      factBundles,
+      sourceIssueFingerprint: "mixed-table-source-fingerprint",
+      materializedAt: "2026-08-02T13:05:00.000Z",
+      ingestId: "mixed-table-ingest"
+    });
+
+    expect(result).toMatchObject({
+      rowsWritten: 1,
+      forecastRowsWritten: 1,
+      factBundleRowsWritten: 0,
+      errors: []
+    });
+    expect(result.forecastOutcomes).toEqual([
+      expect.objectContaining({
+        interval: "3h",
+        outcome: "publish",
+        reasonCode: "forecast_generation_published",
+        retryable: false
+      }),
+      expect.objectContaining({
+        interval: "1h",
+        outcome: "supersede",
+        reasonCode: "newer_generation_active",
+        retryable: false
+      })
+    ]);
+    expect(new Set(result.forecastOutcomes.map(({ generationId }) => generationId)).size).toBe(1);
   });
 
   it("publishes healthy spots when another spot cannot produce a scored generation", async () => {
@@ -434,7 +586,40 @@ describe("forecast read model repository", () => {
     );
   });
 
-  it("reads a future local-date brief bundle tied to the active 3h generation", async () => {
+  it("does not capture history for a mixed publish and supersession", async () => {
+    const generatedAt = new Date("2026-08-02T13:00:00.000Z");
+    const spotId = "obsf-north";
+    vi.mocked(buildSynchronizedForecastResponses).mockClear();
+    vi.mocked(buildSynchronizedForecastResponses).mockImplementation(async () => {
+      const fixture = buildFixtureForecast(spotId, generatedAt);
+      return {
+        threeHour: { ...fixture, interval: "3h" },
+        hourly: { ...fixture, interval: "1h" }
+      };
+    });
+    const { db, preparedSql } = writeDb([1, 0, ...Array<number>(20).fill(0)]);
+
+    const result = await materializeForecastReadModelForSpot(
+      { DB: db } as never,
+      spotId,
+      generatedAt,
+      {
+        materializedAt: "2026-08-02T13:05:00.000Z",
+        ingestId: "mixed-table-ingest",
+        captureHistory: true
+      }
+    );
+
+    expect(result.forecastOutcomes.map(({ outcome }) => outcome)).toEqual([
+      "publish",
+      "supersede"
+    ]);
+    expect(result.snapshotRowsWritten).toBeUndefined();
+    expect(result.historyErrors).toBeUndefined();
+    expect(preparedSql.some((sql) => /forecast_(configs|issues|snapshots)/i.test(sql))).toBe(false);
+  });
+
+  it("reads a future local-date brief bundle and its active 3h generation", async () => {
     const { threeHour } = fixtureResponses();
     const futureDate = localDateForTime(threeHour.windows.at(-1)!.forecastAt, threeHour.spot.timezone);
     const bundle = await buildForecastFactBundle(threeHour, { localDate: futureDate });
@@ -458,8 +643,15 @@ describe("forecast read model repository", () => {
       }
     } as unknown as D1Database;
 
+    const active = await getActiveMaterializedForecastFactBundle(
+      db,
+      "obsf-north",
+      futureDate
+    );
     const stored = await getMaterializedForecastFactBundle(db, "obsf-north", futureDate);
 
+    expect(active?.generationId).toBe("sha256:generation");
+    expect(active?.bundle.inputFingerprint).toBe(bundle.inputFingerprint);
     expect(stored?.input.localDate).toBe(futureDate);
     expect(stored?.input.spotId).toBe("obsf-north");
     expect(stored?.inputFingerprint).toBe(bundle.inputFingerprint);

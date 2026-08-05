@@ -155,7 +155,8 @@ function withMaterializedRows(
   fallback: D1Database,
   forecasts: ForecastResponse[],
   factBundles: ForecastFactBundle[] = [],
-  ingestId?: string
+  ingestId?: string,
+  factBundleGenerationId?: string | (() => string)
 ): D1Database {
   return {
     prepare(sql: string) {
@@ -168,15 +169,20 @@ function withMaterializedRows(
                   (candidate) =>
                     candidate.input.spotId === spotId && candidate.input.localDate === localDate
                 );
-                return bundle
-                  ? {
-                      generation_id: ingestId
-                        ? `sha256:${"a".repeat(64)}:ingest:${ingestId}`
-                        : "sha256:test-generation",
-                      schema_version: FORECAST_READ_MODEL_SCHEMA_VERSION,
-                      fact_bundle_json: JSON.stringify(bundle)
-                    }
-                  : null;
+                if (!bundle) return null;
+                const selectedGenerationId =
+                  typeof factBundleGenerationId === "function"
+                    ? factBundleGenerationId()
+                    : factBundleGenerationId;
+                return {
+                  generation_id:
+                    selectedGenerationId ??
+                    (ingestId
+                      ? `sha256:${"a".repeat(64)}:ingest:${ingestId}`
+                      : "sha256:test-generation"),
+                  schema_version: FORECAST_READ_MODEL_SCHEMA_VERSION,
+                  fact_bundle_json: JSON.stringify(bundle)
+                };
               }
             };
           }
@@ -209,6 +215,15 @@ function withMaterializedRows(
       return fallback.prepare(sql);
     }
   } as unknown as D1Database;
+}
+
+function writtenForecastGenerationId(runs: unknown[][], sqls: string[]): string {
+  const writeIndex = sqls.findIndex((sql) => sql.includes("insert into forecast_read_models"));
+  const generationId = runs[writeIndex]?.[2];
+  if (typeof generationId !== "string") {
+    throw new Error("test fixture did not capture a forecast generation ID");
+  }
+  return generationId;
 }
 
 describe("worker api", () => {
@@ -324,6 +339,7 @@ describe("worker api", () => {
   });
 
   it("returns a recoverable 503 when no materialized forecast is available", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const request = new Request("http://surf.test/api/forecast/obsf-central") as unknown as Parameters<
       typeof worker.fetch
     >[0];
@@ -339,6 +355,45 @@ describe("worker api", () => {
       spotId: "obsf-central",
       interval: "3h"
     });
+    expect(error).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(error.mock.calls[0]![0]))).toEqual({
+      event: "forecast_read_model_missing",
+      message: "forecast read model missing",
+      spotId: "obsf-central",
+      interval: "3h",
+      reasonCode: "read_model_missing"
+    });
+    error.mockRestore();
+  });
+
+  it("logs only stable diagnostics when a forecast read-model lookup throws", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const failingDb = {
+      prepare() {
+        throw new Error("D1 query leaked token=should-not-appear");
+      }
+    } as unknown as D1Database;
+
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/forecast/obsf-central") as unknown as Parameters<
+        typeof worker.fetch
+      >[0],
+      env(failingDb),
+      {} as ExecutionContext
+    );
+
+    expect(response.status).toBe(503);
+    expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "forecast_read_model_lookup_failed",
+      message: "forecast read model lookup failed",
+      spotId: "obsf-central",
+      interval: "3h",
+      reasonCode: "read_model_lookup_failed",
+      errorName: "Error"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain("should-not-appear");
+    errorLog.mockRestore();
   });
 
   it("supports explicit hourly forecast responses without changing the default interval", async () => {
@@ -505,8 +560,9 @@ describe("worker api", () => {
     });
     expect(warning).toHaveBeenCalledOnce();
     const logged = warning.mock.calls[0]?.[0];
-    expect(logged).toContain('"reason":"requested_date_unavailable"');
+    expect(logged).toContain('"reasonCode":"requested_date_unavailable"');
     expect(logged).not.toContain("Forecast has no windows");
+    warning.mockRestore();
   });
 
   it("keeps brief and core forecast GETs independent from the Agent", async () => {
@@ -577,11 +633,23 @@ describe("worker api", () => {
     });
     expect(JSON.stringify(body)).not.toContain("internal D1 failure details");
     expect(JSON.stringify(body)).not.toMatch(/database|storage|exception/i);
-    expect(failureLog).toHaveBeenCalled();
+    expect(failureLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(failureLog.mock.calls[0]![0]))).toEqual(
+      expect.objectContaining({
+        event: "forecast_brief_fallback_used",
+        message: "forecast brief response used the safe summary",
+        spotId: "obsf-central",
+        reasonCode: "brief_assembly_failed",
+        errorName: "Error"
+      })
+    );
+    expect(String(failureLog.mock.calls[0]![0])).not.toContain("internal D1 failure details");
     failureLog.mockRestore();
   });
 
   it("runs manual ingest and records source-run-like D1 rows", async () => {
+    const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const now = new Date("2026-07-08T15:00:00.000Z");
     vi.useFakeTimers();
     vi.setSystemTime(now);
@@ -776,6 +844,33 @@ describe("worker api", () => {
     ]);
     expect(body.sourceRuns.every((run) => run.recorded)).toBe(true);
     expect(body.errors).toEqual([]);
+    const terminalEntries = infoLog.mock.calls
+      .map(([entry]) => JSON.parse(String(entry)))
+      .filter(({ outcome }) => outcome !== undefined);
+    const sourceEntries = terminalEntries.filter(({ event }) => event === "source_ingest_published");
+    const forecastEntries = terminalEntries.filter(({ event }) =>
+      String(event).startsWith("forecast_materialization_")
+    );
+    expect(sourceEntries).toHaveLength(1);
+    expect(sourceEntries[0]).toEqual(
+      expect.objectContaining({
+        outcome: "publish",
+        reasonCode: "inline_source_persistence_completed"
+      })
+    );
+    expect(forecastEntries).toHaveLength(NORCAL_SPOTS.length * 2);
+    expect(new Set(forecastEntries.map(({ ingestId }) => ingestId))).toEqual(
+      new Set([sourceEntries[0]!.ingestId])
+    );
+    expect(new Set(forecastEntries.map(({ spotId, interval }) => `${spotId}:${interval}`))).toEqual(
+      new Set(
+        NORCAL_SPOTS.flatMap((spot) => ["3h", "1h"].map((interval) => `${spot.id}:${interval}`))
+      )
+    );
+    expect(forecastEntries.every(({ generationId }) => typeof generationId === "string")).toBe(
+      true
+    );
+    expect(errorLog).not.toHaveBeenCalled();
     expect(runs.length).toBeGreaterThan(286);
     expect(runs[0]).toHaveLength(14);
     expect(runs.some((values) => values[1] === "nws:mtr-grid-wave")).toBe(true);
@@ -832,6 +927,8 @@ describe("worker api", () => {
       expect.arrayContaining([expect.stringContaining("simulated D1 failure")])
     );
     expect(failedSummary.counts.forecastReadModelRows).toBe(0);
+    infoLog.mockRestore();
+    errorLog.mockRestore();
   });
 
   it("protects manual ingest in production", async () => {
@@ -1139,14 +1236,166 @@ describe("worker api", () => {
     expect(new Set(forecastWrites.map((values) => values[0]))).toEqual(
       new Set(["obsf-north"])
     );
-    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("ingest queue message failed"));
+    expect(errorLog).toHaveBeenCalledOnce();
+    expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
+      event: "ingest_queue_retry_scheduled",
+      message: "ingest queue message failed",
+      messageId: "invalid-materialization",
+      attempts: 1,
+      reasonCode: "queue_message_processing_failed",
+      errorName: "Error"
+    });
+    expect(String(errorLog.mock.calls[0]![0])).not.toContain(
+      "Forecast materialization queue message is invalid"
+    );
     errorLog.mockRestore();
+  });
+
+  it("signals a published fact bundle only when its active generation matches", async () => {
+    const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { db, runs, sqls } = dbMock({ forecastAssemblyRows: true });
+    const generatedAt = "2026-07-08T15:00:00.000Z";
+    const forecast = buildFixtureForecast("obsf-north", new Date(generatedAt));
+    const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-07-08" });
+    const signal = vi.fn(async () => undefined);
+    const getByName = vi.fn(() => ({ signal }));
+    const ack = vi.fn();
+    const retry = vi.fn();
+    const agentEnv: Env = {
+      ...env(
+        withMaterializedRows(db, [], [bundle], undefined, () =>
+          writtenForecastGenerationId(runs, sqls)
+        )
+      ),
+      FORECAST_BRIEF_ENABLED: "true",
+      GEMINI_API_KEY: "test-key-never-sent",
+      FORECAST_BRIEF_AGENT: {
+        getByName
+      } as unknown as NonNullable<Env["FORECAST_BRIEF_AGENT"]>
+    };
+
+    try {
+      await worker.queue(
+        {
+          queue: "surf-ingest",
+          messages: [
+            {
+              id: "materialize-obsf-north",
+              timestamp: new Date("2026-07-08T15:05:00.000Z"),
+              attempts: 1,
+              body: {
+                job: "forecast-materialization",
+                ingestId: "ingest-test-id",
+                spotId: "obsf-north",
+                requestedAt: generatedAt,
+                region: "norcal",
+                generatedAt,
+                sourceCompletedAt: "2026-07-08T15:05:00.000Z",
+                captureHistory: false
+              },
+              ack,
+              retry
+            }
+          ]
+        } as unknown as MessageBatch,
+        agentEnv
+      );
+
+      expect(getByName).toHaveBeenCalledWith("obsf-north");
+      expect(signal).toHaveBeenCalledOnce();
+      expect(signal).toHaveBeenCalledWith(bundle);
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(
+        infoLog.mock.calls
+          .map(([entry]) => JSON.parse(String(entry)))
+          .some(({ event }) => event === "forecast_brief_signal_superseded")
+      ).toBe(false);
+      expect(errorLog).not.toHaveBeenCalled();
+    } finally {
+      infoLog.mockRestore();
+      errorLog.mockRestore();
+    }
+  });
+
+  it("acks but does not signal when a newer fact-bundle generation is active", async () => {
+    const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { db } = dbMock({ forecastAssemblyRows: true });
+    const generatedAt = "2026-07-08T15:00:00.000Z";
+    const forecast = buildFixtureForecast("obsf-north", new Date(generatedAt));
+    const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-07-08" });
+    const signal = vi.fn(async () => undefined);
+    const getByName = vi.fn(() => ({ signal }));
+    const ack = vi.fn();
+    const retry = vi.fn();
+    const agentEnv: Env = {
+      ...env(withMaterializedRows(db, [], [bundle])),
+      FORECAST_BRIEF_ENABLED: "true",
+      GEMINI_API_KEY: "test-key-never-sent",
+      FORECAST_BRIEF_AGENT: {
+        getByName
+      } as unknown as NonNullable<Env["FORECAST_BRIEF_AGENT"]>
+    };
+
+    try {
+      await worker.queue(
+        {
+          queue: "surf-ingest",
+          messages: [
+            {
+              id: "materialize-obsf-north",
+              timestamp: new Date("2026-07-08T15:05:00.000Z"),
+              attempts: 1,
+              body: {
+                job: "forecast-materialization",
+                ingestId: "ingest-test-id",
+                spotId: "obsf-north",
+                requestedAt: generatedAt,
+                region: "norcal",
+                generatedAt,
+                sourceCompletedAt: "2026-07-08T15:05:00.000Z",
+                captureHistory: false
+              },
+              ack,
+              retry
+            }
+          ]
+        } as unknown as MessageBatch,
+        agentEnv
+      );
+
+      expect(getByName).not.toHaveBeenCalled();
+      expect(signal).not.toHaveBeenCalled();
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(infoLog.mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual({
+        event: "forecast_brief_signal_superseded",
+        message: "forecast brief signal superseded before Agent RPC",
+        phase: "brief_signal",
+        ingestId: "ingest-test-id",
+        spotId: "obsf-north",
+        generationId: expect.stringMatching(
+          /^sha256:[a-f0-9]{64}:ingest:ingest-test-id$/
+        ),
+        generatedAt,
+        materializedAt: expect.any(String),
+        outcome: "supersede",
+        reasonCode: "forecast_generation_no_longer_active",
+        retryable: false
+      });
+      expect(errorLog).not.toHaveBeenCalled();
+    } finally {
+      infoLog.mockRestore();
+      errorLog.mockRestore();
+    }
   });
 
   it("acks a published materialization when the production brief signal fails", async () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const { db } = dbMock({ forecastAssemblyRows: true });
+    const { db, runs, sqls } = dbMock({ forecastAssemblyRows: true });
     const generatedAt = "2026-07-08T15:00:00.000Z";
     const forecast = buildFixtureForecast("obsf-north", new Date(generatedAt));
     const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-07-08" });
@@ -1157,7 +1406,11 @@ describe("worker api", () => {
     const ack = vi.fn();
     const retry = vi.fn();
     const agentEnv: Env = {
-      ...env(withMaterializedRows(db, [], [bundle])),
+      ...env(
+        withMaterializedRows(db, [], [bundle], undefined, () =>
+          writtenForecastGenerationId(runs, sqls)
+        )
+      ),
       FORECAST_BRIEF_ENABLED: "true",
       GEMINI_API_KEY: "test-key-never-sent",
       FORECAST_BRIEF_AGENT: {
@@ -1211,11 +1464,15 @@ describe("worker api", () => {
         phase: "brief_signal",
         ingestId: "ingest-test-id",
         spotId: "obsf-north",
+        generationId: expect.stringMatching(
+          /^sha256:[a-f0-9]{64}:ingest:ingest-test-id$/
+        ),
         generatedAt,
         materializedAt: expect.any(String),
+        reasonCode: "brief_signal_failed",
         errorName: "Error",
-        error: "brief agent unavailable"
       });
+      expect(String(errorLog.mock.calls[0]![0])).not.toContain("brief agent unavailable");
       expect(errorLog).not.toHaveBeenCalledWith(
         expect.stringContaining("ingest queue message failed")
       );

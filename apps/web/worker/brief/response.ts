@@ -9,6 +9,7 @@ import {
   type ForecastBriefResponse,
   type ForecastFactBundle
 } from "./types";
+import { boundedErrorName } from "../logging";
 
 export async function buildForecastBriefResponse(
   db: D1Database,
@@ -56,17 +57,14 @@ export async function buildForecastBriefResponse(
       availableRevisions
     });
   } catch (error) {
-    const errorName = error instanceof Error && error.name ? error.name : "UnknownError";
-    const errorMessage = (error instanceof Error ? error.message : String(error))
-      .replace(/\s+/g, " ")
-      .slice(0, 240);
     console.warn(
       JSON.stringify({
+        event: "forecast_brief_storage_read_failed",
         message: "forecast brief storage read used the fact-based summary",
         spotId: bundle.input.spotId,
         localDate: bundle.input.localDate,
-        errorName,
-        errorMessage
+        errorName: boundedErrorName(error),
+        reasonCode: "brief_storage_read_failed"
       })
     );
     return ForecastBriefResponseSchema.parse({
