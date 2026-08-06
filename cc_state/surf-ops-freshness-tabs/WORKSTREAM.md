@@ -1114,3 +1114,29 @@ Two new pins cover brief reachability on an elapsed day and the outage copy; one
 was corrected because it had encoded defect 3 as expected behavior. `pnpm verify` green: web
 285 (+1 skip), workerd 19. Owner also reported a production UI nit (repeated best-window
 statement) → tracked as OI-9, deliberately not folded into PR-C's reviewed diff.
+
+_2026-08-06 (UTC)_ — **PR-C round 3 caught an overcorrection plus three AnalysisPanel gaps;
+all fixed in `4e7e0fc`; scoped delta check running.**
+(1) **P1 — my round-2 fix was wrong.** Filtering the badge by the window's `activeCapabilities`
+looked principled but inverted the failure: `NDBC_STALE_AFTER_MINUTES` *equals*
+cadence + grace, so "buoy verdict is late" and "worker drops observed_wave from
+activeCapabilities" are the same boundary. Every late buoy therefore became an unqualified
+"Data fresh" in the header while the banner named that exact source as late and the provenance
+panel labelled it Stale — a worse contradiction than the original. The badge is back on the
+banner's rule (non-null age + declared cadence, worst wins) and is now pinned on the exclusion
+path, which the shared fixture could not previously reach because it hardcodes `observed_wave`
+into `activeCapabilities`. Recorded as a lesson: two rounds disagreed about this surface, and
+the tie-breaker is cross-surface consistency, not per-window input purity.
+(2) **P2:** the date-scoped outlook had no day context once the day picker moved to the
+Forecast tab — a Saturday brief read as today's call beside a hero keyed to another date.
+Analysis now renders "Outlook for <weekday, Mon D>" from the selected local date key.
+(3) **P2:** the quiet line announced "No daylight recommendation for this day" through
+`role="status"` for the whole in-flight window and then silently retracted it — worst on a cold
+Worker or slow link, and repeated on every tab re-entry since Radix remounts the panel. An
+in-flight request now shows a neutral `aria-busy` loading status instead.
+(4) **P2:** dropping `fallbackBrief` from the effect deps removed the only refetch path, so a
+mounted Analysis tab kept a superseded outlook through refreshes while every other surface
+advanced. The deps now include `canonicalGeneratedAt` — a stable string that moves only when
+the payload really does.
+Four new pins cover the badge exclusion path, the day label, the loading state, and the
+refresh-driven refetch. `pnpm verify` green: web 287 (+1 skip), workerd 19, Python 45.
