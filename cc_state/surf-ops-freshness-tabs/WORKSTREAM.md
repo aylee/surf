@@ -1166,3 +1166,31 @@ label; the adapter pins date-key validation. `pnpm verify` green: web 290 (+1 sk
 patch a fifth time, the next pass is an explicit convergence check that must also judge whether
 the panel's state model (three booleans + a ref) should be restructured — e.g. a scope-keyed
 remount or a single discriminated status union — instead of accumulating more instance fixes.
+
+_2026-08-06 (UTC)_ — **Convergence check said "not converging"; restructured the Analysis
+state model instead of patching a fifth time (`5497101`).** The checker's diagnosis, which I
+accepted: the panel encoded a four-state request machine in `serverBrief` + `briefLoading` +
+a `loadedScope` ref, then intersected it at render time with a prop pair (`forecast`,
+`forecastErrored`) that *structurally cannot* distinguish "not fetched yet" from "fetch
+failed". Every pass rebalanced precedence among `hasBriefContent`, `awaitingBrief`, and
+`forecastUnavailable`, and each rebalance moved the falsehood to a different cell — round 3
+fixed the pre-request denial, the delta pass fixed the refresh teardown and in doing so broke
+loading-vs-outage, the live-region truth, and the boundary's recovery. Three defects were
+still open at that point (outage claimed during a healthy in-flight hourly request; provenance
+unmounting mid-read on an hourly refresh; "Daily outlook updated." announced for a refetch
+that returned nothing).
+**The restructure:** the parent derives one `ForecastStatus` (`loading | ready | error`) from
+state it already had; the brief moved into a `DailyOutlook` child keyed `spot:date` so a scope
+change *remounts* rather than being cleared by hand; that child owns one `OutlookState`
+(`loading | ready | empty`); the render is an exhaustive walk with no precedence to get wrong;
+a failed or empty refetch keeps its `ready` state so nothing is torn down or falsely announced;
+and provenance renders from `forecast ?? canonicalForecast` so the disclosure survives an
+interval refetch. Deleted outright: `serverBrief`, `briefLoading`, `loadedScope`, `briefScope`,
+`hasBriefContent`, `awaitingBrief`, `forecastUnavailable`, the clear-on-scope branch, and the
+boundary-key tradeoff.
+All 293 web tests (incl. every pin from rounds 1–3 and the delta) pass unchanged through the
+restructure, which is the evidence that behavior was preserved rather than redefined; three new
+pins cover loading-vs-outage, provenance survival, and the absent false-update announcement.
+Browser-verified at 390: Analysis renders day label → card → tools → provenance with exactly
+one `/brief` request and `aria-busy=false`; Forecast default has zero `/brief` requests, no AI
+content, no auto-expanded row, first row in the first viewport, no overflow.
