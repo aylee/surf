@@ -573,7 +573,9 @@ export function readWorkbenchUrl(search: string): {
     interval: params.get("interval") === "1h" ? "1h" : "3h",
     view: params.get("view") === "graph" ? "graph" : "table",
     tab: params.get("tab") === "analysis" ? "analysis" : "forecast",
-    date: params.get("date"),
+    // Only a well-formed date key may become workbench state; anything else is
+    // discarded so the normal date-selection effect picks a real day.
+    date: /^\d{4}-\d{2}-\d{2}$/.test(params.get("date") ?? "") ? params.get("date") : null,
     at: params.get("at")
   };
 }

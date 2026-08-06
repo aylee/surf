@@ -616,6 +616,61 @@ describe("ForecastWorkbench", () => {
     expect(briefRequests).toBe(2);
   });
 
+  it("keeps the published outlook on screen through a refresh and a failed refetch", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        // The refetch triggered by the refreshed payload fails.
+        if (briefRequests > 1) return jsonResponse({ error: "brief unavailable" }, 503);
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "A published outlook",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T08:00:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+
+    await waitFor(() => expect(briefRequests).toBe(2));
+    // A generation-driven refresh must not blank the card, and a failed
+    // refetch must not erase a good published outlook or deny it.
+    expect(screen.getByRole("heading", { name: "A published outlook" })).toBeTruthy();
+    expect(screen.queryByText("Loading the daily outlook…")).toBeNull();
+    expect(screen.queryByText(/No daylight recommendation for this day/)).toBeNull();
+  });
+
+  it("omits the outlook day label when the URL date is not a real calendar day", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&date=2026-02-31");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({}, 503)));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={null} initialError="forecast failed" now={now} />);
+
+    // Feb 31 must not be rendered as a confident "Tuesday, Mar 3".
+    await screen.findByText(/Forecast data for this spot is temporarily unavailable/);
+    expect(screen.queryByText(/^Outlook for /)).toBeNull();
+    expect(screen.queryByText(/Mar 3/)).toBeNull();
+  });
+
   it("says so on Analysis when the forecast request itself failed", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "unavailable" }, 503)));

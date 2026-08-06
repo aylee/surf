@@ -86,11 +86,24 @@ function formatTimestamp(value: string, timezone: string): string {
   }
 }
 
-// Formats a local date key (YYYY-MM-DD) for display. Noon UTC keeps the day
-// stable across every North American offset instead of shifting at midnight.
-function formatLocalDateKey(dateKey: string, timezone: string): string {
+// Formats a local date key (YYYY-MM-DD) for display, or returns null when the
+// key is not a real calendar date. Noon UTC keeps the day stable across every
+// North American offset instead of shifting at midnight. The round-trip check
+// matters because JS rolls impossible dates forward — "2026-02-31" would
+// otherwise render as a confident "Tuesday, Mar 3" that nobody asked for.
+function formatLocalDateKey(dateKey: string, timezone: string): string | null {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
+  if (!parts) return null;
+  const [, year, month, day] = parts;
   const parsed = new Date(`${dateKey}T12:00:00.000Z`);
-  if (!Number.isFinite(parsed.getTime())) return dateKey;
+  if (!Number.isFinite(parsed.getTime())) return null;
+  if (
+    parsed.getUTCFullYear() !== Number(year) ||
+    parsed.getUTCMonth() + 1 !== Number(month) ||
+    parsed.getUTCDate() !== Number(day)
+  ) {
+    return null;
+  }
   try {
     return new Intl.DateTimeFormat(undefined, {
       weekday: "long",
@@ -99,7 +112,7 @@ function formatLocalDateKey(dateKey: string, timezone: string): string {
       timeZone: timezone
     }).format(parsed);
   } catch {
-    return dateKey;
+    return null;
   }
 }
 
@@ -1087,11 +1100,20 @@ function AnalysisPanel({
   selected?: WorkbenchWindow;
 }) {
   const [serverBrief, setServerBrief] = useState<DailyBrief | null>(null);
-  const [briefLoading, setBriefLoading] = useState(false);
+  // A mount with a date already selected has a request coming, so the first
+  // committed paint must not be a recommendation denial issued before the
+  // Worker was even asked.
+  const [briefLoading, setBriefLoading] = useState(() => Boolean(selectedDate));
   const fallbackBrief = useMemo(
     () => deterministicBrief(spot, selectedDate, canonicalDayBest ?? undefined, canonicalGeneratedAt),
     [canonicalDayBest, canonicalGeneratedAt, selectedDate, spot]
   );
+  // The brief is scoped to a spot and a date; the payload generation only
+  // decides when to re-ask. Discarding the current brief is therefore correct
+  // when the scope changes and wrong when a refresh merely advances the
+  // generation — that would blank a published outlook mid-read.
+  const briefScope = `${spot.id}:${selectedDate ?? "none"}`;
+  const loadedScope = useRef<string | null>(null);
 
   // The request is gated only on the selected date and the payload generation
   // (and on this panel being mounted, i.e. Analysis selected). A published
@@ -1104,7 +1126,10 @@ function AnalysisPanel({
   useEffect(() => {
     if (!selectedDate) return;
     const controller = new AbortController();
-    setServerBrief(null);
+    if (loadedScope.current !== briefScope) {
+      setServerBrief(null);
+      loadedScope.current = briefScope;
+    }
     setBriefLoading(true);
     void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
       headers: { Accept: "application/json" },
@@ -1116,36 +1141,43 @@ function AnalysisPanel({
       })
       .then((value) => {
         if (controller.signal.aborted) return;
-        setServerBrief(value);
+        // Replace only on success: a refresh whose brief request fails keeps
+        // the published outlook it already had rather than erasing it.
+        if (value) setServerBrief(value);
         setBriefLoading(false);
       })
       .catch(() => {
         if (controller.signal.aborted) return;
-        setServerBrief(null);
         setBriefLoading(false);
       });
     return () => controller.abort();
-  }, [canonicalGeneratedAt, selectedDate, spot.id]);
+  }, [briefScope, canonicalGeneratedAt, selectedDate, spot.id]);
 
+  const dayLabel = selectedDate ? formatLocalDateKey(selectedDate, spot.timezone) : null;
   const brief = serverBrief ?? fallbackBrief;
   // Collapse to one quiet line only when there is genuinely nothing to say:
-  // no published brief and no local recommendation either. An in-flight
-  // request is not yet nothing — denying a recommendation before the Worker
-  // has answered would announce a false negative and then quietly retract it.
+  // no published brief and no local recommendation either. An in-flight or
+  // not-yet-issued request is not yet nothing — denying a recommendation
+  // before the Worker has answered would announce a false negative and then
+  // quietly retract it.
   const hasBriefContent = Boolean(serverBrief) || fallbackBrief.picks.length > 0;
-  const awaitingBrief = briefLoading && !hasBriefContent;
+  const forecastUnavailable = forecastErrored || !forecast;
+  const awaitingBrief = !hasBriefContent && !forecastUnavailable && (briefLoading || !selectedDate);
 
   return (
     <div className="analysisPanel">
-      {selectedDate && (
+      {dayLabel && (
         // The day picker lives on the Forecast tab, so the date-scoped outlook
         // must name its own day here — otherwise a Saturday brief reads as
-        // today's call beside a hero keyed to a different date.
-        <p className="analysisDayLabel">Outlook for {formatLocalDateKey(selectedDate, spot.timezone)}</p>
+        // today's call beside a hero keyed to a different date. An unparseable
+        // date key gets no label rather than a fabricated one.
+        <p className="analysisDayLabel">Outlook for {dayLabel}</p>
       )}
       {hasBriefContent ? (
+        // Keyed by scope only: a generation-driven refresh must not remount the
+        // card and collapse disclosures the reader has open.
         <DailyBriefErrorBoundary
-          key={`${spot.id}:${selectedDate ?? "none"}:${brief.generatedAt ?? brief.headline}`}
+          key={briefScope}
           fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}
         >
           <DailyBriefCard brief={brief} loading={briefLoading} spot={spot} />
@@ -1156,7 +1188,7 @@ function AnalysisPanel({
         </p>
       ) : (
         <p className="quietBriefLine" role="status">
-          {forecastErrored || !forecast
+          {forecastUnavailable
             ? "Forecast data for this spot is temporarily unavailable, so there is no analysis to show yet."
             : "No daylight recommendation for this day. Every available public input is still listed on the Forecast tab."}
         </p>
