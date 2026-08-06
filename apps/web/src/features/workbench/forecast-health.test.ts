@@ -22,7 +22,9 @@ function forecastWithSourceFreshness() {
           sourceRunId: "wave-run",
           updatedAt: "2026-08-02T11:30:00.000Z",
           freshnessMinutes: 30,
-          status: "fresh"
+          status: "fresh",
+          expectedCadenceMinutes: 360,
+          graceMinutes: 180
         },
         {
           capability: "wind",
@@ -30,7 +32,9 @@ function forecastWithSourceFreshness() {
           sourceRunId: "wind-run",
           updatedAt: "2026-08-02T11:30:00.000Z",
           freshnessMinutes: 30,
-          status: "fresh"
+          status: "fresh",
+          expectedCadenceMinutes: 360,
+          graceMinutes: 180
         }
       ]
     })),
@@ -71,6 +75,32 @@ describe("forecast response health", () => {
       "stale"
     ]);
     expect(afterThirteenHours.observation?.sourceFreshnessMinutes).toBe(800);
+  });
+
+  it("keeps the shipped status for pre-cadence entries instead of re-judging locally", () => {
+    const stored = forecastWithSourceFreshness();
+    const legacy = ForecastResponseSchema.parse({
+      ...stored,
+      windows: stored.windows.map((window) => ({
+        ...window,
+        sourceFreshness: window.sourceFreshness?.map(
+          ({ expectedCadenceMinutes: _cadence, graceMinutes: _grace, ...entry }) => entry
+        )
+      }))
+    });
+
+    const afterThirteenHours = parseUsableForecastResponse(
+      legacy,
+      new Date("2026-08-03T01:00:00.000Z")
+    );
+
+    // No cadence shipped → the client must not substitute its own threshold;
+    // the Worker's shipped status stands while the age still advances.
+    expect(afterThirteenHours.windows[0]?.sourceFreshness?.map((source) => source.status)).toEqual([
+      "fresh",
+      "fresh"
+    ]);
+    expect(afterThirteenHours.windows[0]?.sourceFreshness?.[0]?.freshnessMinutes).toBe(810);
   });
 
   it("does not mutate or make source ages younger when the browser clock is behind", () => {

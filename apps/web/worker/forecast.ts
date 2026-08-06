@@ -1,5 +1,6 @@
 import {
   ForecastResponseSchema,
+  freshnessVerdict,
   type CalibrationStatus,
   type FieldResolution,
   type ForecastInterval,
@@ -24,9 +25,31 @@ import {
   surfaceConditionForWind,
   type NorcalSpotProfile
 } from "@surf/forecast-core";
-import { CDIP_MOP_SOURCE_ID } from "./adapters/cdip-mop";
-import { NDBC_STALE_AFTER_MINUTES } from "./adapters/ndbc";
-import { NWS_GRID_WAVE_SOURCE_ID } from "./adapters/nws-grid-wave";
+import {
+  CDIP_MOP_EXPECTED_CADENCE_MINUTES,
+  CDIP_MOP_GRACE_MINUTES,
+  CDIP_MOP_SOURCE_ID
+} from "./adapters/cdip-mop";
+import {
+  COOPS_TIDE_EXPECTED_CADENCE_MINUTES,
+  COOPS_TIDE_GRACE_MINUTES,
+  COOPS_TIDE_SOURCE_ID
+} from "./adapters/coops";
+import {
+  NDBC_EXPECTED_CADENCE_MINUTES,
+  NDBC_GRACE_MINUTES,
+  NDBC_STALE_AFTER_MINUTES
+} from "./adapters/ndbc";
+import {
+  NWS_POINT_EXPECTED_CADENCE_MINUTES,
+  NWS_POINT_GRACE_MINUTES,
+  NWS_POINT_SOURCE_ID
+} from "./adapters/nws";
+import {
+  NWS_GRID_WAVE_EXPECTED_CADENCE_MINUTES,
+  NWS_GRID_WAVE_GRACE_MINUTES,
+  NWS_GRID_WAVE_SOURCE_ID
+} from "./adapters/nws-grid-wave";
 import type { Env } from "./index";
 import { boundedErrorName } from "./logging";
 import {
@@ -444,17 +467,28 @@ function sourceFreshnessEntry(input: {
   sourceRunId: string | null | undefined;
   updatedAt: string | null | undefined;
   now: Date;
-  staleAfterMinutes: number;
+  expectedCadenceMinutes: number;
+  graceMinutes: number;
 }): SourceFreshness {
   const updatedAt = input.updatedAt ?? null;
   const freshness = ageMinutes(updatedAt, input.now);
+  // The status enum stays fresh|stale|missing for existing consumers; its
+  // boundary now derives from the same contracts verdict every surface uses
+  // ("late" is surfaced as "stale"; "aging" remains quiet-fresh).
+  const verdict = freshnessVerdict({
+    ageMinutes: freshness,
+    expectedCadenceMinutes: input.expectedCadenceMinutes,
+    graceMinutes: input.graceMinutes
+  });
   return {
     capability: input.capability,
     sourceId: input.sourceId,
     sourceRunId: input.sourceRunId ?? null,
     updatedAt,
     freshnessMinutes: freshness,
-    status: freshness === null ? "missing" : freshness <= input.staleAfterMinutes ? "fresh" : "stale"
+    status: freshness === null ? "missing" : verdict === "late" ? "stale" : "fresh",
+    expectedCadenceMinutes: input.expectedCadenceMinutes,
+    graceMinutes: input.graceMinutes
   };
 }
 
@@ -928,8 +962,39 @@ async function loadForecastSourceRows(
   const waveRows = asRows(results[3] as D1Result<WaveRow>);
   const observationRows = asRows(results[4] as D1Result<ObservationRow>);
   const hazardRows = asRows(results[5] as D1Result<HazardRow>);
-  const sourceRuns = asRows(results[6] as D1Result<SourceRunRow>);
+  const recentSourceRuns = asRows(results[6] as D1Result<SourceRunRow>);
   const forecastIssues = asRows(results[7] as D1Result<ForecastIssueRow>);
+  // Retention is reference-driven, not window-guessed: served rows stay
+  // pinned to the run that wrote them, and during a single-source or
+  // per-station outage that run can outlive the recent-100 window (five runs
+  // land per hour; the slowest declared late boundary — tide, cadence+grace —
+  // is 30 hours). Any referenced run the window missed is fetched exactly, so
+  // freshness ages honestly to "late" instead of flipping to "missing".
+  // Steady state resolves every reference from the window and skips the
+  // follow-up query entirely.
+  const presentRunIds = new Set(recentSourceRuns.map((run) => run.id));
+  const referencedRunIds = [
+    ...new Set(
+      [
+        ...tideRows.map((row) => row.source_run_id),
+        ...tideEventRows.map((row) => row.source_run_id),
+        ...windRows.map((row) => row.source_run_id),
+        ...waveRows.map((row) => row.source_run_id),
+        ...observationRows.map((row) => row.source_run_id),
+        ...hazardRows.map((row) => row.source_run_id)
+      ].filter((id): id is string => typeof id === "string" && id.length > 0 && !presentRunIds.has(id))
+    )
+  ].slice(0, 40);
+  const referencedSourceRuns = referencedRunIds.length > 0
+    ? await queryRows<SourceRunRow>(
+        db,
+        `select id, source_id, status, completed_at
+         from source_runs
+         where id in (${referencedRunIds.map(() => "?").join(", ")})`,
+        ...referencedRunIds
+      )
+    : [];
+  const sourceRuns = [...recentSourceRuns, ...referencedSourceRuns];
   const forecastSnapshotRows = forecastIssues.length >= 2
     ? await queryRows<ForecastSnapshotRow>(
         db,
@@ -1042,7 +1107,8 @@ export async function buildForecastResponse(
         input.sourceId,
         input.sourceRunId ?? "",
         input.updatedAt ?? "",
-        input.staleAfterMinutes
+        input.expectedCadenceMinutes,
+        input.graceMinutes
       ].join("\u0000");
       const cached = sourceFreshnessCache.get(key);
       if (cached) return cached;
@@ -1121,6 +1187,10 @@ export async function buildForecastResponse(
         observationSupportsWindow ? observation?.row.source_run_id : null,
         hazard?.source_run_id
       );
+      // Wave cadence follows the selected source; a window with no wave row
+      // declares the CDIP expectation so its missing/late judgment reflects
+      // the preferred source for the spot.
+      const waveIsGridSource = selectedWave?.source_id === NWS_GRID_WAVE_SOURCE_ID;
       const sourceFreshness: SourceFreshness[] = [
         cachedSourceFreshness({
           capability:
@@ -1133,29 +1203,35 @@ export async function buildForecastResponse(
           sourceRunId: selectedWave?.source_run_id,
           updatedAt:
             waveSourceUpdatedAt ?? sourceRunUpdatedAt(sourceRunIndex, selectedWave?.source_run_id),
-          staleAfterMinutes: 12 * 60
+          expectedCadenceMinutes: waveIsGridSource
+            ? NWS_GRID_WAVE_EXPECTED_CADENCE_MINUTES
+            : CDIP_MOP_EXPECTED_CADENCE_MINUTES,
+          graceMinutes: waveIsGridSource ? NWS_GRID_WAVE_GRACE_MINUTES : CDIP_MOP_GRACE_MINUTES
         }),
         cachedSourceFreshness({
           capability: "wind",
-          sourceId: "nws:point-forecast-alerts",
+          sourceId: NWS_POINT_SOURCE_ID,
           sourceRunId: wind?.source_run_id,
           updatedAt:
             wind?.model_cycle_at ?? sourceRunUpdatedAt(sourceRunIndex, wind?.source_run_id),
-          staleAfterMinutes: 6 * 60
+          expectedCadenceMinutes: NWS_POINT_EXPECTED_CADENCE_MINUTES,
+          graceMinutes: NWS_POINT_GRACE_MINUTES
         }),
         cachedSourceFreshness({
           capability: "tide",
-          sourceId: "coops:tide-predictions",
+          sourceId: COOPS_TIDE_SOURCE_ID,
           sourceRunId: tide?.source_run_id,
           updatedAt: sourceRunUpdatedAt(sourceRunIndex, tide?.source_run_id),
-          staleAfterMinutes: 12 * 60
+          expectedCadenceMinutes: COOPS_TIDE_EXPECTED_CADENCE_MINUTES,
+          graceMinutes: COOPS_TIDE_GRACE_MINUTES
         }),
         cachedSourceFreshness({
           capability: "observed_wave",
           sourceId: observation ? `ndbc-${observation.summary.stationId}` : "ndbc:preferred",
           sourceRunId: observation?.row.source_run_id,
           updatedAt: observation?.row.observed_at,
-          staleAfterMinutes: NDBC_STALE_AFTER_MINUTES
+          expectedCadenceMinutes: NDBC_EXPECTED_CADENCE_MINUTES,
+          graceMinutes: NDBC_GRACE_MINUTES
         })
       ];
       const availableFreshness = sourceFreshness.flatMap((item) =>

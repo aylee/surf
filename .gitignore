@@ -25,3 +25,4 @@ data/tmp/
 
 # Local planning and agent session state are not part of the public product.
 /cc_state/
+pr-b-*.png

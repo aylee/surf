@@ -41,6 +41,14 @@ export type CoopsTideMetadata = {
   windowEnd: string;
 };
 
+export const COOPS_TIDE_SOURCE_ID = "coops:tide-predictions";
+// CO-OPS tide predictions are precomputed astronomical tables: the data does
+// not change between fetches, so the declared cadence tracks fetch recency
+// (ingest health), not provider updates. The scheduled ingest is hourly; a
+// full day of missed fetches plus grace marks the source late.
+export const COOPS_TIDE_EXPECTED_CADENCE_MINUTES = 1440;
+export const COOPS_TIDE_GRACE_MINUTES = 360;
+
 const COOPS_DATAGETTER_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter";
 
 function coopsDate(date: Date): string {

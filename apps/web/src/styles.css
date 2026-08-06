@@ -956,8 +956,12 @@ footer {
     min-height: 66px;
   }
 
+  /* The freshness chip stays visible on phones (OD-9); it compacts instead
+     of hiding so the header still fits beside the icon-only refresh button. */
   .updateLabel {
-    display: none;
+    font-size: 0.72rem;
+    gap: 4px;
+    white-space: nowrap;
   }
 
   .refreshButton {

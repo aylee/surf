@@ -977,3 +977,43 @@ T-A.5/Phase A; do not block PR-B on OI-8 (UI-only leg; watch its deploy for recu
 keep the DLQ message parked per no-replay policy; rotate the write token (OI-7) at next
 operator touch. **Act:** ledger close-looped (OI-6 → resolved, OI-8 → open), impl-plan Phase A
 marked done, PR-B branch starts from `284b25f`.
+
+_2026-08-05 (UTC)_ — **PR-B implemented; adversarial round 1 confirmed real defects; fixes
+landed; round 2 in flight.** Branch `aylee/surf-freshness-cadence` from `284b25f`. T-B.1:
+`freshnessVerdict` pure/total in contracts (+11-test matrix, new contracts vitest harness);
+additive `expectedCadenceMinutes`/`graceMinutes` on `SourceFreshnessSchema`; status enum
+deliberately unwidened ("late" renders stale, "aging" stays quiet-fresh). T-B.2: cadence+grace
+exported beside each adapter's source ID with citations (CO-OPS 1440/360 fetch-recency; NWS
+point 360/180; NWS grid 720/240; CDIP 360/180 against the file-update timestamp, cycle stays
+lead-hour authority; NDBC 60/60 ≡ the existing 120-minute boundary); worker entries carry
+them; `docs/feed-adapters.md` gains the Declared Freshness Cadence table. T-B.3: chip compares
+formatted labels; banner = named unavailability or named late source only; forecast-health
+and forecast-adapter judgments subordinated (legacy fallback boundary preserved via contracts
+constants); phone chip un-hidden (OD-9). Local e2e: 12/12 ingest, all 41×4 payload entries
+carry cadence, quiet desktop, visible 390px chip, clean console, screenshots banked.
+**Round 1 (5 finder lenses → 3 refuters each, 53 agents): 16 findings → 14 survived; root
+causes: (P1) delayed-banner "showing data from" drifted with the dashboard clock — fixed with
+per-spot fetch times + anchored-drift regression; (P2) tide's 30h late verdict unreachable —
+the 100-row source_runs window evicts referenced runs at ~20h — fixed with a
+newest-success-per-source union; plus restored null-age banner guards (an interim edit had
+dropped them), banner day tier, byte-budget fixture realism, and seven pinned test gaps.
+Canonical `pnpm verify` green again at `24a97a1`. Note: 7 round-1 refuters died on the
+owner's individual spend limit; round 2 runs leaner (3 lenses × 2 refuters).**
+
+_2026-08-05 (UTC)_ — **PR-B review reached DRY after three rounds + a scoped delta check.**
+Round 2 (3 lenses; all 18 refuters died on the owner spend limit, agent-adjudicated by the
+orchestrator with the finders' SQLite reproductions): (P2) the round-1 union rescued only
+`success` runs while `partial` runs also own referenced rows — fixed; (P2) cross-day
+"showing data from" times — date-aware format; (P2) recovery left a stale named banner —
+notice recomputed for remaining delayed spots; (P2) unscoped late banner could contradict a
+fresh spot's panel — worst-spot scoping when not late everywhere; (P3×3) the retention SQL
+was executed by zero tests (finders proved invalid SQL passed both suites) — new real-D1
+workerd spec; plus removal of refuter probe files/root screenshots a blanket `git add -A`
+had swept in (also the source of the interim `lateSourceNotice` guard regression). Round 3
+(single fresh-eyes finder) found the residual: newer partial runs evict a spot's OLDER
+pinned run from the newest-per-source branch — replaced the union with reference-driven
+retention (exact follow-up fetch of referenced run ids; zero extra queries steady-state),
+pinned by the spec's newer-partial scenario. Scoped delta check: DRY. `pnpm verify` green at
+`b1122fd` (contracts 11, core 21, db 10, web 277+1skip incl. 20 App tests, workerd 19,
+Python 45). Next: ready PR → Verify → merge → operator deploy → `:17` quiet-steady-state
+live proof (watch OI-8 at the handoff).

@@ -57,6 +57,23 @@ the official high/low event rows for labels and keeps the hourly series for the
 tide curve and per-window trend. It does not infer every extremum from sparse
 samples, and both products retain their station, source run, and validity time.
 
+## Declared Freshness Cadence
+
+The Adapter Contract above requires each adapter to declare a freshness
+cadence. The declarations live as exported constants beside each adapter's
+source ID, flow into every materialized payload source entry
+(`expectedCadenceMinutes` + `graceMinutes`), and feed the single pure
+`freshnessVerdict` in `@surf/contracts` (`fresh` ≤ cadence < `aging` ≤
+cadence + grace < `late`). No other module may define a freshness threshold.
+
+| Adapter | Cadence (min) | Grace (min) | Justification |
+|---|---|---|---|
+| NOAA CO-OPS tide predictions | 1440 | 360 | Predictions are precomputed astronomical tables — the data does not change between fetches, so cadence tracks fetch recency (ingest health). Scheduled ingest is hourly (observed `source_runs` gap ≈ 56 min); a missed day of fetches plus grace marks the feed late. |
+| NWS point forecast and alerts | 360 | 180 | Point forecasts refresh with each office forecast package — issued at least twice daily and amended between packages, in practice every 2–6 h. `updateTime` on the hourly product is the observed update signal, persisted as `wind_forecasts.model_cycle_at`. |
+| NWS MTR coastal grid waves | 720 | 240 | Grid `properties.updateTime` advances with office grid refreshes, observed every several hours; as the fallback wave source it is declared late only well past a full package cycle. |
+| CDIP/MOP nearshore forecast | 360 | 180 | MOP forecast files are rewritten with each model run, several times daily. The cadence applies to the source-file update timestamp (HTTP `Last-Modified`, retained as `http_last_modified_source_update_not_model_cycle`); the physics `model_cycle_at` remains the lead-hour authority and is never re-judged as freshness. |
+| NDBC realtime observations | 60 | 60 | Standard meteorological buoys report roughly hourly; grace tolerates one missed report. Cadence + grace equals the existing `NDBC_STALE_AFTER_MINUTES` (120) fresh-buoy preference boundary by construction. |
+
 ## CDIP MOP Forecast Semantics
 
 The [CDIP MOP documentation](https://cdip.ucsd.edu/documents/index/product_docs/mops/mop_intro.html)

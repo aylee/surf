@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type {
-  ApiSpot,
-  ForecastResponse,
-  ScoredForecastWindow,
-  SpotId,
-  SpotsResponse
+import {
+  sourceFreshnessVerdict,
+  type ApiSpot,
+  type ForecastResponse,
+  type ScoredForecastWindow,
+  type SourceCapability,
+  type SourceFreshness,
+  type SpotId,
+  type SpotsResponse
 } from "@surf/contracts";
 import {
   ArrowLeft,
@@ -36,7 +39,7 @@ import {
 } from "./features/workbench/forecast-health";
 
 type ForecastResult =
-  | { status: "ready"; data: ForecastResponse }
+  | { status: "ready"; data: ForecastResponse; fetchedAt: string }
   | { status: "error"; error: string };
 
 type DashboardState = {
@@ -106,16 +109,18 @@ function formatNumber(value: number | null, suffix: string, digits = 0): string 
 
 function formatSourceAgeRange(values: number[]): string {
   if (values.length === 0) return "Source ages unavailable";
-  const minimum = Math.min(...values);
-  const maximum = Math.max(...values);
   const formatAge = (minutes: number) => {
     if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
     if (minutes < 24 * 60) return `${Math.round(minutes / 60)}h`;
     return `${Math.round(minutes / (24 * 60))}d`;
   };
-  return minimum === maximum
-    ? `Source data ${formatAge(maximum)} old`
-    : `Sources ${formatAge(minimum)}–${formatAge(maximum)} old`;
+  const minimumLabel = formatAge(Math.min(...values));
+  const maximumLabel = formatAge(Math.max(...values));
+  // Compare the formatted labels, not the raw minutes: distinct ages that
+  // round to the same label collapse to one value instead of "3h–3h".
+  return minimumLabel === maximumLabel
+    ? `Source data ${maximumLabel} old`
+    : `Sources ${minimumLabel}–${maximumLabel} old`;
 }
 
 function formatFetchedAt(value: string | null): string {
@@ -126,6 +131,98 @@ function formatFetchedAt(value: string | null): string {
     hour: "numeric",
     minute: "2-digit"
   }).format(new Date(value));
+}
+
+function formatClockTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(value));
+}
+
+// A retained forecast can outlive the calendar day during a long outage; a
+// bare clock time would then read as "today" and understate the data's age.
+function formatLastGoodTime(value: string): string {
+  return new Date(value).toDateString() === new Date().toDateString()
+    ? formatClockTime(value)
+    : formatFetchedAt(value);
+}
+
+function formatBannerAge(minutes: number): string {
+  if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
+  // Day tier mirrors the header chip so both surfaces describe a multi-day
+  // outage with the same unit.
+  if (minutes >= 24 * 60) return `${Math.round(minutes / (24 * 60))}d`;
+  const hours = minutes / 60;
+  return `${hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10}h`;
+}
+
+function formatCadence(expectedCadenceMinutes: number): string {
+  if (expectedCadenceMinutes <= 90) return "hourly";
+  if (expectedCadenceMinutes >= 1440) return "daily";
+  return `every ${Math.round(expectedCadenceMinutes / 60)} hours`;
+}
+
+const lateSourceLabels: Partial<Record<SourceCapability, string>> = {
+  observed_wave: "Buoy observations",
+  wind: "Wind forecast",
+  tide: "Tide predictions",
+  forecast_wave_nearshore: "Wave model data",
+  forecast_wave_offshore: "Wave model data"
+};
+
+// The banner names actionable causes only. A source is actionable when the
+// contracts verdict over its own shipped cadence says "late"; fresh and aging
+// sources stay quiet. Whole-source absence (null age) belongs to per-window
+// caveats and the data-health panel, not the dashboard banner.
+function lateSourceNotice(
+  forecasts: Partial<Record<SpotId, ForecastResult>>,
+  spots: ApiSpot[]
+): string | null {
+  let worst: { entry: SourceFreshness; ratio: number; spotId: string } | null = null;
+  let readySpotCount = 0;
+  const lateSpotsBySource = new Map<string, Set<string>>();
+  for (const [spotId, result] of Object.entries(forecasts)) {
+    if (result?.status !== "ready") continue;
+    readySpotCount += 1;
+    const window = result.data.windows[0];
+    for (const entry of window?.sourceFreshness ?? []) {
+      // Placeholder entries (a source that never produced data) carry a null
+      // age; their absence is caveat/panel territory, and bannering them
+      // would render a nonsense "1m old". Pre-cadence entries return a null
+      // verdict and stay with their shipped status.
+      if (entry.freshnessMinutes === null) continue;
+      if (entry.expectedCadenceMinutes === null || entry.expectedCadenceMinutes === undefined) continue;
+      if (sourceFreshnessVerdict(entry) !== "late") continue;
+      const lateSpots = lateSpotsBySource.get(entry.sourceId) ?? new Set<string>();
+      lateSpots.add(spotId);
+      lateSpotsBySource.set(entry.sourceId, lateSpots);
+      const ratio = entry.freshnessMinutes / (entry.expectedCadenceMinutes + (entry.graceMinutes ?? 0));
+      if (!worst || ratio > worst.ratio) worst = { entry, ratio, spotId };
+    }
+  }
+  if (!worst) return null;
+  const label = lateSourceLabels[worst.entry.capability] ?? "Source data";
+  // A source that is late for only some spots names the worst one so the
+  // banner cannot contradict another spot's fresh source panel; a source
+  // late everywhere states the regional truth without singling a spot out.
+  const affectedSpots = lateSpotsBySource.get(worst.entry.sourceId)?.size ?? 0;
+  const scope = affectedSpots < readySpotCount
+    ? ` at ${spots.find((spot) => spot.id === worst.spotId)?.name ?? worst.spotId}`
+    : "";
+  return `${label}${scope} ${formatBannerAge(worst.entry.freshnessMinutes ?? 0)} old; expected ${formatCadence(
+    worst.entry.expectedCadenceMinutes ?? 0
+  )}.`;
+}
+
+function delayedSpotsNotice(names: string[], lastGoodAt: string | null): string {
+  const first = names[0] ?? "Some spots";
+  const others = names.length - 1;
+  const subject = others <= 0 ? first : `${first} + ${others} other${others === 1 ? "" : "s"}`;
+  const verb = others <= 0 ? "is" : "are";
+  return lastGoodAt
+    ? `${subject} ${verb} refreshing — showing data from ${formatLastGoodTime(lastGoodAt)}.`
+    : `${subject} ${verb} refreshing.`;
 }
 
 function forecastHref(spotId: SpotId): string {
@@ -468,7 +565,10 @@ export function App() {
         spotsPayload.spots.map(async (spot) => {
           try {
             const data = await fetchForecastJson(`/api/forecast/${spot.id}`, controller.signal);
-            return [spot.id, { status: "ready", data } satisfies ForecastResult] as const;
+            return [
+              spot.id,
+              { status: "ready", data, fetchedAt: new Date().toISOString() } satisfies ForecastResult
+            ] as const;
           } catch (error) {
             return [spot.id, { status: "error", error: errorMessage(error) } satisfies ForecastResult] as const;
           }
@@ -492,10 +592,24 @@ export function App() {
         const delayedSpotIds = forecastEntries.flatMap(([spotId, result]) =>
           result.status === "error" ? [spotId] : []
         );
+        const delayedSpotNames = delayedSpotIds.map(
+          (spotId) => spotsPayload.spots.find((spot) => spot.id === spotId)?.name ?? spotId
+        );
+        // The "showing data from" time is the oldest per-spot fetch time among
+        // the retained forecasts for the delayed spots — never the dashboard
+        // clock, which advances on every refresh pass while retained data
+        // stays frozen at its real last success.
+        const retainedFetchTimes = delayedSpotIds.flatMap((spotId) => {
+          const previous = current.forecasts[spotId];
+          return previous?.status === "ready" ? [previous.fetchedAt] : [];
+        });
+        const oldestRetainedAt = retainedFetchTimes.length > 0
+          ? retainedFetchTimes.reduce((oldest, candidate) => (candidate < oldest ? candidate : oldest))
+          : null;
         const notice = failedForecastCount === 0
-          ? null
+          ? lateSourceNotice(forecasts, spotsPayload.spots)
           : retainedForecastCount > 0
-            ? "Some forecast updates are delayed. Showing the last forecast we loaded."
+            ? delayedSpotsNotice(delayedSpotNames, oldestRetainedAt)
             : "Some forecasts are temporarily unavailable. We'll try again automatically.";
         return {
           loading: false,
@@ -534,17 +648,31 @@ export function App() {
     setState((current) => {
       const wasDelayed = current.delayedSpotIds.includes(spotId);
       const delayedSpotIds = current.delayedSpotIds.filter((candidate) => candidate !== spotId);
-      const shouldClearForecastNotice =
-        wasDelayed &&
-        delayedSpotIds.length === 0 &&
-        current.notice !== CATALOG_REFRESH_DELAY_NOTICE;
+      // A recovery changes the delayed set, so a delayed-spots notice must be
+      // recomputed for the REMAINING spots — never left naming the recovered
+      // one. The catalog-refresh warning is not ours to clear here.
+      const remainingNames = delayedSpotIds.map(
+        (candidate) => current.spots.find((spot) => spot.id === candidate)?.name ?? candidate
+      );
+      const remainingRetainedTimes = delayedSpotIds.flatMap((candidate) => {
+        const previous = current.forecasts[candidate];
+        return previous?.status === "ready" ? [previous.fetchedAt] : [];
+      });
+      const oldestRemainingAt = remainingRetainedTimes.length > 0
+        ? remainingRetainedTimes.reduce((oldest, candidate) => (candidate < oldest ? candidate : oldest))
+        : null;
+      const notice = !wasDelayed || current.notice === CATALOG_REFRESH_DELAY_NOTICE
+        ? current.notice
+        : delayedSpotIds.length === 0
+          ? null
+          : delayedSpotsNotice(remainingNames, oldestRemainingAt);
       return {
         ...current,
         forecasts: {
           ...current.forecasts,
-          [spotId]: { status: "ready", data: forecast }
+          [spotId]: { status: "ready", data: forecast, fetchedAt: new Date().toISOString() }
         },
-        notice: shouldClearForecastNotice ? null : current.notice,
+        notice,
         delayedSpotIds,
         fetchedAt: new Date().toISOString()
       };

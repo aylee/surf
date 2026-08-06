@@ -39,7 +39,13 @@ type StationFetchResult = {
 
 const NDBC_REALTIME2_BASE_URL = "https://www.ndbc.noaa.gov/data/realtime2";
 const NDBC_DOCUMENTATION_URL = "https://www.ndbc.noaa.gov/measdes.shtml";
-export const NDBC_STALE_AFTER_MINUTES = 120;
+// Standard meteorological buoys report roughly hourly; grace tolerates one
+// missed report before the feed is late. cadence + grace deliberately equals
+// NDBC_STALE_AFTER_MINUTES so the fresh-station preference and the payload
+// verdict share one boundary.
+export const NDBC_EXPECTED_CADENCE_MINUTES = 60;
+export const NDBC_GRACE_MINUTES = 60;
+export const NDBC_STALE_AFTER_MINUTES = NDBC_EXPECTED_CADENCE_MINUTES + NDBC_GRACE_MINUTES;
 // realtime2 files contain 45 days of rows and can exceed 500 KB. They are
 // newest-first, so a bounded prefix contains the header and current reading.
 const MAX_PREFIX_BYTES = 128 * 1024;
