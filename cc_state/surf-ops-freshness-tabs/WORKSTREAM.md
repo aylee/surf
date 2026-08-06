@@ -158,6 +158,7 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 
 | ID | Item | Owner | Status | Resolves in |
 |---|---|---|---|---|
+| OI-9 | Brief headline restates content the page already shows: on the spot page the model-authored headline names both the pick time and the spot name that the `h1` already carries (owner-reported from production, 2026-08-06). PR-C removes the hero↔brief duplication by tabbing them apart; the residual is worker-side brief prompt/validator wording, deliberately kept out of PR-C's UI-only reviewed diff | agent | OPEN | small worker-side polish PR after PR-D, or fold into PR-D's gate |
 | OI-7 | Rotate the Logfire write token: the Cloudflare destinations GET echoes the `Authorization` header, so the token entered the agent transcript while completing OI-4. Rotate in Logfire, update both destinations (operator dashboard edit keeps the new token out of transcripts), confirm export still works | alex + agent | OPEN | PR-A live gate is now green — rotate at next operator touch (config-only, fully reversible) |
 | OI-8 | Deploy-window sixth-child kill, now twice reproduced (PR #21 deploy of `8ce5bdf1…`; PR-A deploy of `53084465…` at 01:51Z): during the immediate post-activation handoff cycle, the last serialized Queue child (bolinas) is killed `exceededCpu` at ~50–85 ms CPU across 4 delivery attempts while healthy siblings use 196–395 ms; the message lands in `surf-ingest-dlq` (no consumer; left parked per no-replay policy). Cron cycles on the same version are unaffected (bolinas published 02:17:14 with 22-span healthy trace). Working theory: cold-version isolate contention (fresh HTTP-poller isolates + five just-signaled brief Agent DOs + queue consumer on a seconds-old version). Corrective candidates: quiet-down the verifier polling during fan-out, stagger/handoff-delay the enqueue, or verifier tolerance for one cron-cycle convergence. Decide at the PR-B ship boundary — if PR-B's deploy reproduces it, the corrective becomes mandatory before PR-C | agent | OPEN | dedicated corrective, decision checkpoint at T-B.5 |
 
@@ -1083,3 +1084,33 @@ finders proved both survived mutation with all tests green. Added four badge-sta
 (fresh/aging/late/absent, including the null-age case that fails without fix 1) and a desktop
 pin (no auto-expand on load, click expands with `aria-expanded`, second click collapses,
 resolution change clears it). `pnpm verify` green: web 284 (+1 skip), workerd 19.
+
+_2026-08-06 (UTC)_ — **PR-C round 2 found four more real defects (all fixed in `6738f0f`);
+round 3 running; owner UI nit logged as OI-9.** Subagents work again on the Opus session, so
+round 2 ran with real fresh-eyes lenses (two, no refuter panel — budget-lean):
+(1) **P1:** the round-1 badge fix was incomplete. It excluded null-age entries but still
+reduced over an `observed_wave` entry whose observation is too far from the featured window to
+support it — a state the worker itself excludes from `activeCapabilities` and from the
+window's freshness scalar. A buoy 2–24h stale therefore made the header claim "Data late"
+while every row read High confidence and the provenance panel showed three Fresh sources
+(reproduced by probe). The badge now judges only the window's own `activeCapabilities`,
+mirroring the worker exactly.
+(2) **P2, found twice:** the round-1 night-decoding fix was desktop-only — the Time-column
+tooltip lives inside `.forecastTableViewport`, which is `display: none` below 800px (and Radix
+tooltips do not open on touch), so phone users still had an undecoded moon glyph. Night
+semantics now also appear in `WindowExpandedDetails` (rendered by both the desktop table and
+the mobile accordion, so tapping a moon row explains it in context) and as a field-guide entry.
+(3) **P2 regression:** `hasReliableCall` gated the brief *fetch* on `canonicalDayBest`, which
+`selectCanonicalRecommendationIds` limits to current-or-future daylight windows — so selecting
+a day whose windows had merely elapsed issued zero `/brief` requests and made the Worker's
+published outlook, its bust factors, and its lesson unreachable from any surface. The fetch is
+gated on `selectedDate` again; the quiet line now appears only when the server has no brief
+*and* the local read has no pick.
+(4) **P2:** the quiet line asserted "the Forecast tab still shows every available public
+input" even when that tab was showing a `role="alert"` outage, and Analysis carried no status
+of its own. It now states the real state with `role="status"` and only makes the sibling-tab
+claim when a forecast actually exists.
+Two new pins cover brief reachability on an elapsed day and the outage copy; one earlier pin
+was corrected because it had encoded defect 3 as expected behavior. `pnpm verify` green: web
+285 (+1 skip), workerd 19. Owner also reported a production UI nit (repeated best-window
+statement) → tracked as OI-9, deliberately not folded into PR-C's reviewed diff.
