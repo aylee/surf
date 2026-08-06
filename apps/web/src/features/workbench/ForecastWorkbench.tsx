@@ -500,7 +500,9 @@ function DesktopForecastTable({
         <caption className="srOnly">{interval === "1h" ? "One-hour" : "Three-hour"} surf-planning inputs for {spot.name}</caption>
         <thead>
           <tr>
-            <th scope="col">Time</th>
+            <th scope="col">
+              <span>Time <InfoTooltip label="What do the moon icons mean?">A moon marks a night window. Night rows stay visible as context but are excluded from the daylight recommendation.</InfoTooltip></span>
+            </th>
             <th scope="col">
               <span>Modeled wave <InfoTooltip label="What does modeled wave mean?">Nearshore significant wave height (Hs), not measured breaking wave-face height.</InfoTooltip></span>
             </th>
@@ -539,7 +541,7 @@ function DesktopForecastTable({
                       onToggleExpand(window.forecastAt);
                     }}
                   >
-                    {!window.isDaylight && <Moon size={13} aria-hidden="true" />}
+                    {!window.isDaylight && <Moon size={13} aria-label="Night window" role="img" />}
                     <span>{formatClock(window.forecastAt, spot.timezone)}</span>
                   </button>
                 </th>
@@ -599,7 +601,7 @@ function MobileForecastRows({
           key={window.forecastAt}
         >
           <AccordionTrigger>
-            <span className="mobileTime">{!window.isDaylight && <Moon size={13} aria-hidden="true" />}{formatClock(window.forecastAt, spot.timezone)}</span>
+            <span className="mobileTime">{!window.isDaylight && <Moon size={13} aria-label="Night window" role="img" />}{formatClock(window.forecastAt, spot.timezone)}</span>
             <span className="mobileWave"><strong>{formatModeledHeight(window.modeledHeightFt)}</strong><small>{formatNumber(window.periodSec, "s")} · {cardinalDirection(window.directionDeg)}</small></span>
             <ConditionBadge window={window} />
           </AccordionTrigger>

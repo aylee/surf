@@ -1079,7 +1079,8 @@ footer {
     font-size: clamp(2.4rem, 14vw, 3.7rem);
   }
 
-  .spotHero > .conditionPill {
+  .spotHero > .conditionPill,
+  .spotHero > .freshnessBadge {
     justify-self: start;
     margin-top: 0;
   }
@@ -2656,21 +2657,38 @@ footer {
   margin: 0 0 6px;
 }
 
+/* The badge sits on the dark hero (and inside its teal glow), so it needs a
+   light-on-dark recipe: an opaque deep fill plus a light tint that clears
+   WCAG 1.4.3 text and 1.4.11 boundary contrast in every state. */
 .freshnessBadge {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 5px 12px;
+  border: 1px solid;
   border-radius: 999px;
   font-size: 0.78rem;
   font-weight: 700;
   white-space: nowrap;
-  text-transform: capitalize;
 }
 
-.freshnessBadge.fresh { background: rgba(38, 135, 96, 0.14); color: #1d7a54; }
-.freshnessBadge.aging { background: rgba(180, 130, 20, 0.14); color: #8a6413; }
-.freshnessBadge.late { background: rgba(190, 70, 50, 0.16); color: #a63a24; }
+.freshnessBadge.fresh {
+  border-color: #7fd8b4;
+  background: #06382c;
+  color: #b6f0d7;
+}
+
+.freshnessBadge.aging {
+  border-color: #f0cf7a;
+  background: #3d2f06;
+  color: #fbe7ae;
+}
+
+.freshnessBadge.late {
+  border-color: #f3a08c;
+  background: #45140c;
+  color: #ffd2c6;
+}
 
 .analysisPanel {
   display: flex;

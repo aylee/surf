@@ -1041,3 +1041,19 @@ Phase C starts from `c39f151` on `aylee/surf-forecast-analysis-tabs`; the tabs-s
 in hand (AnalysisPanel extraction for lazy brief fetch; `tab` param null-on-default; the
 exact-match `readWorkbenchUrl` test; ~20 moving assertions; OD-9 deletion list; S-2
 provenance surfaces move intact).
+
+_2026-08-06 (UTC)_ — **PR-C implemented and locally proven; adversarial round 1 in flight.**
+Commit `3918354` on `aylee/surf-forecast-analysis-tabs`: outer Spot-view tabs (Forecast
+default | Analysis) with the brief fetch owned by an extracted AnalysisPanel (zero /brief
+requests until Analysis mounts — verified in-browser), `tab=analysis` deep link with
+null-on-default URL writes, slim deterministic header (kicker gone, duplicate ConditionPill
+gone, PR-B verdict badge added), OD-9 deletions (workbench heading/blurb/legend, auto-expanded
+row explanation — expansion now click-driven and decoupled from selection), quiet one-line
+no-reliable-call collapse (fetch skipped), home de-dup (shortlist + source-count removed →
+exactly 6 unique spot links), phone compare-row CSS pairing. Provenance/learning-guide moved
+intact to Analysis (S-2). `pnpm verify` green (web 282 incl. 22 App + 12 workbench tests;
+workerd 19). Local browser e2e at 1280/390: default-tab semantics, deep link (exactly 1 brief
+request on Analysis), distinct tablist names, no auto-expanded detail, no overflow, home
+6-unique-links — plus PR-B's banner observed live-firing on stale local buoy data with spot
+scoping, day tier, and cadence copy ("Buoy observations at Linda Mar / Pacifica 1d old;
+expected hourly."). Review round 1 (3 lenses × 2 refuters) running.

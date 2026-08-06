@@ -237,6 +237,59 @@ describe("App", () => {
     expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
   });
 
+  it("renders the slim-header freshness badge from the worst cadence-bearing source", async () => {
+    const badgeCase = async (
+      entries: Array<Record<string, unknown>>
+    ): Promise<string | null> => {
+      cleanup();
+      window.history.replaceState({}, "", "/?spot=test-break");
+      const base = fixtureForecast();
+      const forecast = ForecastResponseSchema.parse({
+        ...base,
+        generatedAt: new Date().toISOString(),
+        windows: base.windows.map((window) => ({ ...window, sourceFreshness: entries }))
+      });
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+        if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
+        return jsonResponse({ error: "not found" }, 404);
+      }));
+      const { container } = render(<App />);
+      await screen.findByRole("heading", { level: 1, name: "Test Break" });
+      return container.querySelector(".freshnessBadge")?.textContent?.trim() ?? null;
+    };
+
+    const entry = (overrides: Record<string, unknown>) => ({
+      capability: "wind",
+      sourceId: "nws:point-forecast-alerts",
+      sourceRunId: "run",
+      updatedAt: "2026-08-05T12:00:00.000Z",
+      freshnessMinutes: 30,
+      status: "fresh",
+      expectedCadenceMinutes: 360,
+      graceMinutes: 180,
+      ...overrides
+    });
+
+    // All fresh → fresh; one aging → aging; one late → late (worst wins).
+    expect(await badgeCase([entry({}), entry({ capability: "tide", sourceId: "coops:tide-predictions" })])).toBe("Data fresh");
+    expect(await badgeCase([entry({}), entry({ capability: "tide", sourceId: "coops:tide-predictions", freshnessMinutes: 500 })])).toBe("Data aging");
+    expect(await badgeCase([entry({ freshnessMinutes: 900 }), entry({ capability: "tide", sourceId: "coops:tide-predictions" })])).toBe("Data late");
+
+    // A whole-source absence is "missing", not late: the badge must agree with
+    // the banner's exclusion and the provenance panel's "Missing" label.
+    expect(
+      await badgeCase([entry({}), entry({ capability: "observed_wave", sourceId: "ndbc:preferred", updatedAt: null, freshnessMinutes: null, status: "missing" })])
+    ).toBe("Data fresh");
+
+    // No cadence anywhere → no badge rather than a re-judged guess.
+    expect(
+      await badgeCase([entry({ expectedCadenceMinutes: undefined, graceMinutes: undefined })])
+    ).toBeNull();
+  });
+
   it("renders exactly one home link per catalog spot with no shortlist or source-count claim", async () => {
     installSuccessfulApi();
 

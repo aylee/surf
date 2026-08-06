@@ -432,6 +432,51 @@ describe("ForecastWorkbench", () => {
     expect(screen.getByText(/1 of 2 expected 3h windows are available/i)).toBeTruthy();
   });
 
+  it("never auto-expands a desktop row and toggles the explanation on click", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas");
+    const threeHour = fixtureForecast();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("interval=1h")) return jsonResponse(hourlyForecastWithLocalChallenger(threeHour));
+      if (url.includes("interval=3h")) return jsonResponse(threeHour);
+      return jsonResponse({}, 503);
+    }));
+
+    const { container } = render(<ForecastWorkbench spot={spot} initialForecast={threeHour} now={now} />);
+
+    // A window is auto-SELECTED, but OD-9 forbids an auto-EXPANDED explanation.
+    await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ });
+    await waitFor(() => {
+      expect(container.querySelector(".forecastTable .selectedRow")).toBeTruthy();
+    });
+    expect(container.querySelector(".forecastTable .selectedDetailRow")).toBeNull();
+
+    const rowButton = container.querySelector<HTMLButtonElement>(".forecastTable tbody th button");
+    expect(rowButton?.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(rowButton!);
+    await waitFor(() => {
+      expect(container.querySelector(".forecastTable .selectedDetailRow")).toBeTruthy();
+    });
+    expect(rowButton?.getAttribute("aria-expanded")).toBe("true");
+
+    // A second click collapses it again.
+    fireEvent.click(rowButton!);
+    await waitFor(() => {
+      expect(container.querySelector(".forecastTable .selectedDetailRow")).toBeNull();
+    });
+    expect(rowButton?.getAttribute("aria-expanded")).toBe("false");
+
+    // Re-expand, then prove a resolution change clears the expansion.
+    fireEvent.click(rowButton!);
+    await waitFor(() => expect(container.querySelector(".forecastTable .selectedDetailRow")).toBeTruthy());
+    fireEvent.click(screen.getByRole("radio", { name: "One-hour resolution" }));
+    await screen.findByRole("table", { name: /One-hour surf-planning inputs/ });
+    await waitFor(() => {
+      expect(container.querySelector(".forecastTable .selectedDetailRow")).toBeNull();
+    });
+  });
+
   it("collapses a forecaster with no reliable call to one quiet line and skips the brief fetch", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     let briefRequests = 0;

@@ -479,9 +479,13 @@ function SpotDetail({
   const featured = dayBest ?? current;
   const hazards = activeHazardMessages(windows);
   // The slim header's freshness badge is PR-B's verdict over the featured
-  // window's own shipped cadence — worst source wins; entries without cadence
-  // stay silent rather than being re-judged.
+  // window's own shipped cadence — worst source wins. It applies the same
+  // exclusions as the dashboard banner: an entry with no cadence is never
+  // re-judged, and a whole-source absence (null age) is missing rather than
+  // late — that state belongs to the caveats and the provenance panel, which
+  // label it "Missing". Judging it here would contradict both surfaces.
   const featuredVerdicts = (featured?.sourceFreshness ?? [])
+    .filter((entry) => entry.freshnessMinutes !== null)
     .map((entry) => sourceFreshnessVerdict(entry))
     .filter((verdict): verdict is Exclude<ReturnType<typeof sourceFreshnessVerdict>, null> => verdict !== null);
   const spotFreshness = featuredVerdicts.length === 0
