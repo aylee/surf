@@ -40,6 +40,7 @@ import {
   sourceHealthForWindow,
   type DailyBrief,
   type ForecastInterval,
+  type SpotTab,
   type WorkbenchForecast,
   type WorkbenchView,
   type WorkbenchWindow
@@ -479,15 +480,19 @@ function WindowExpandedDetails({ window, spot }: { window: WorkbenchWindow; spot
 function DesktopForecastTable({
   windows,
   selectedAt,
+  expandedAt,
   spot,
   interval,
-  onSelect
+  onSelect,
+  onToggleExpand
 }: {
   windows: WorkbenchWindow[];
   selectedAt: string | null;
+  expandedAt: string | null;
   spot: ApiSpot;
   interval: ForecastInterval;
   onSelect: (value: string) => void;
+  onToggleExpand: (value: string | null) => void;
 }) {
   return (
     <div className="forecastTableViewport">
@@ -517,6 +522,7 @@ function DesktopForecastTable({
         <tbody>
           {windows.map((window) => {
             const selected = selectedAt === window.forecastAt;
+            const expanded = expandedAt === window.forecastAt;
             return [
               <tr
                 className={`${window.isDaylight ? "" : "nightRow"}${selected ? " selectedRow" : ""}${window.dataHealth === "limited" ? " gapRow" : ""}`}
@@ -524,7 +530,15 @@ function DesktopForecastTable({
                 data-testid={`forecast-row-${window.forecastAt}`}
               >
                 <th scope="row">
-                  <button type="button" aria-pressed={selected} onClick={() => onSelect(window.forecastAt)}>
+                  <button
+                    type="button"
+                    aria-pressed={selected}
+                    aria-expanded={expanded}
+                    onClick={() => {
+                      onSelect(window.forecastAt);
+                      onToggleExpand(window.forecastAt);
+                    }}
+                  >
                     {!window.isDaylight && <Moon size={13} aria-hidden="true" />}
                     <span>{formatClock(window.forecastAt, spot.timezone)}</span>
                   </button>
@@ -536,7 +550,7 @@ function DesktopForecastTable({
                 <td><ConditionBadge window={window} /></td>
                 <td><div className="trustCell"><strong>{window.confidenceLabel}</strong><HealthBadge window={window} /></div></td>
               </tr>,
-              selected ? (
+              expanded ? (
                 <tr className="selectedDetailRow" key={`${window.forecastAt}-details`}>
                   <td colSpan={7}><WindowExpandedDetails window={window} spot={spot} /></td>
                 </tr>
@@ -552,30 +566,28 @@ function DesktopForecastTable({
 function MobileForecastRows({
   windows,
   selectedAt,
+  expandedAt,
   spot,
   interval,
-  onSelect
+  onSelect,
+  onToggleExpand
 }: {
   windows: WorkbenchWindow[];
   selectedAt: string | null;
+  expandedAt: string | null;
   spot: ApiSpot;
   interval: ForecastInterval;
   onSelect: (value: string) => void;
+  onToggleExpand: (value: string | null) => void;
 }) {
-  const [expandedAt, setExpandedAt] = useState(selectedAt ?? "");
-
-  useEffect(() => {
-    setExpandedAt(selectedAt ?? "");
-  }, [selectedAt]);
-
   return (
     <Accordion
       className="mobileForecastRows"
       type="single"
       collapsible
-      value={expandedAt}
+      value={expandedAt ?? ""}
       onValueChange={(value) => {
-        setExpandedAt(value);
+        onToggleExpand(value || null);
         if (value) onSelect(value);
       }}
       aria-label={`${interval === "1h" ? "One-hour" : "Three-hour"} surf-planning inputs for ${spot.name}`}
@@ -697,14 +709,14 @@ export function ForecastWorkbench({
   const [view, setView] = useState<WorkbenchView>(initialUrl.view);
   const [selectedDate, setSelectedDate] = useState<string | null>(initialUrl.date);
   const [selectedAt, setSelectedAt] = useState<string | null>(initialUrl.at);
+  const [tab, setTab] = useState<SpotTab>(initialUrl.tab);
+  const [expandedAt, setExpandedAt] = useState<string | null>(null);
   const [cache, setCache] = useState<ForecastCache>(() => (
     isUsableForecastResponse(initialForecast) ? { "3h": initialForecast } : {}
   ));
   const [intervalLoading, setIntervalLoading] = useState(initialUrl.interval === "1h");
   const [intervalError, setIntervalError] = useState<string | null>(null);
   const [intervalNotice, setIntervalNotice] = useState<string | null>(null);
-  const [brief, setBrief] = useState<DailyBrief | null>(null);
-  const [briefLoading, setBriefLoading] = useState(false);
   const fetchController = useRef<AbortController | null>(null);
   const cacheRef = useRef(cache);
   const hourlyFailurePending = useRef(false);
@@ -882,46 +894,12 @@ export function ForecastWorkbench({
   }, [dayBest, dayWindows, selectedAt]);
 
   const selected = dayWindows.find((window) => window.forecastAt === selectedAt) ?? dayBest ?? dayWindows[0];
-  const fallbackBrief = useMemo(
-    () => deterministicBrief(
-      spot,
-      selectedDate,
-      canonicalDayBest,
-      canonicalForecast?.generatedAt ?? null
-    ),
-    [canonicalDayBest, canonicalForecast?.generatedAt, selectedDate, spot]
-  );
-
-  useEffect(() => {
-    if (!selectedDate) return;
-    const controller = new AbortController();
-    setBrief(fallbackBrief);
-    setBriefLoading(true);
-    void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
-      headers: { Accept: "application/json" },
-      signal: controller.signal
-    })
-      .then(async (response) => {
-        if (!response.ok) return null;
-        return parseBriefResponse(await response.json());
-      })
-      .then((value) => {
-        if (controller.signal.aborted) return;
-        setBrief(value ?? fallbackBrief);
-        setBriefLoading(false);
-      })
-      .catch(() => {
-        if (controller.signal.aborted) return;
-        setBrief(fallbackBrief);
-        setBriefLoading(false);
-      });
-    return () => controller.abort();
-  }, [fallbackBrief, selectedDate, spot.id]);
 
   const selectDate = useCallback((date: string) => {
     explicitTimestampSelection.current = false;
     setSelectedDate(date);
     setSelectedAt(null);
+    setExpandedAt(null);
     replaceWorkbenchUrl({ date, at: null });
   }, []);
 
@@ -939,6 +917,7 @@ export function ForecastWorkbench({
     setIntervalNotice(null);
     setIntervalError(null);
     setSelectedAt(null);
+    setExpandedAt(null);
     replaceWorkbenchUrl({ interval: value, at: null });
   }, []);
 
@@ -946,6 +925,18 @@ export function ForecastWorkbench({
     if (value !== "table" && value !== "graph") return;
     setView(value);
     replaceWorkbenchUrl({ view: value });
+  }, []);
+
+  const changeTab = useCallback((value: string) => {
+    if (value !== "forecast" && value !== "analysis") return;
+    setTab(value);
+    // The default tab stays out of the URL so existing deep links keep their
+    // exact shape; only the Analysis selection is serialized.
+    replaceWorkbenchUrl({ tab: value === "analysis" ? "analysis" : null });
+  }, []);
+
+  const toggleExpandedAt = useCallback((value: string | null) => {
+    setExpandedAt((current) => (value === null || current === value ? null : value));
   }, []);
 
   const currentDateKey = localDateParts(now, spot.timezone).key;
@@ -962,29 +953,14 @@ export function ForecastWorkbench({
 
   return (
     <TooltipProvider delayDuration={180}>
-      <DailyBriefErrorBoundary
-        key={`${spot.id}:${selectedDate ?? "none"}:${brief?.generatedAt ?? brief?.headline ?? "local"}`}
-        fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}
-      >
-        <DailyBriefCard brief={brief ?? fallbackBrief} loading={briefLoading} spot={spot} />
-      </DailyBriefErrorBoundary>
+      <Tabs value={tab} onValueChange={changeTab} className="spotViewTabs">
+        <TabsList aria-label="Spot view" className="spotViewTabsList">
+          <TabsTrigger value="forecast">Forecast</TabsTrigger>
+          <TabsTrigger value="analysis">Analysis</TabsTrigger>
+        </TabsList>
 
-      <section className="workbenchSection" aria-labelledby="forecast-workbench-heading">
-        <div className="workbenchHeading">
-          <div>
-            <p className="kicker">24-hour detail</p>
-            <h2 id="forecast-workbench-heading">Forecast workbench</h2>
-            <p>Read the exact inputs, then switch to the graph to see how they move together.</p>
-          </div>
-          <div className="workbenchHeadingTools">
-            <div className="workbenchLegend" aria-label="Forecast display notes">
-              <span><i className="daylightDot" /> Daylight recommendation</span>
-              <span><Moon size={13} aria-hidden="true" /> Night context</span>
-            </div>
-            <ForecastLearningGuide />
-          </div>
-        </div>
-
+        <TabsContent value="forecast">
+      <section className="workbenchSection" aria-label="Forecast workbench">
         {forecast && dates.length > 0 && (
           <DayPicker dates={dates} selectedDate={selectedDate} windows={canonicalForecast?.windows ?? []} spot={spot} now={now} onSelect={selectDate} />
         )}
@@ -1030,8 +1006,8 @@ export function ForecastWorkbench({
                 <div className="coverageNotice" role="status"><Info size={15} aria-hidden="true" /> {coveredRows} of {expectedRows} expected {interval} windows are available. Gaps remain visible and are not filled.</div>
               )}
               <TabsContent value="table">
-                <DesktopForecastTable windows={dayWindows} selectedAt={selectedAt} spot={spot} interval={interval} onSelect={selectAt} />
-                <MobileForecastRows windows={dayWindows} selectedAt={selectedAt} spot={spot} interval={interval} onSelect={selectAt} />
+                <DesktopForecastTable windows={dayWindows} selectedAt={selectedAt} expandedAt={expandedAt} spot={spot} interval={interval} onSelect={selectAt} onToggleExpand={toggleExpandedAt} />
+                <MobileForecastRows windows={dayWindows} selectedAt={selectedAt} expandedAt={expandedAt} spot={spot} interval={interval} onSelect={selectAt} onToggleExpand={toggleExpandedAt} />
               </TabsContent>
               <TabsContent value="graph">
                 <Suspense fallback={<div className="graphLoading" role="status" aria-live="polite" aria-label="Loading forecast graphs"><span className="srOnly">Loading forecast graphs.</span><Skeleton /></div>}>
@@ -1042,13 +1018,96 @@ export function ForecastWorkbench({
           )}
         </Tabs>
 
-        {forecast && (
-          <>
-            <TideEvents forecast={forecast} selectedDate={selectedDate} spot={spot} />
-            <DataHealthPanel forecast={forecast} selected={selected} spot={spot} />
-          </>
-        )}
+        {forecast && <TideEvents forecast={forecast} selectedDate={selectedDate} spot={spot} />}
       </section>
+        </TabsContent>
+
+        <TabsContent value="analysis">
+          <AnalysisPanel
+            spot={spot}
+            selectedDate={selectedDate}
+            canonicalDayBest={canonicalDayBest}
+            canonicalGeneratedAt={canonicalForecast?.generatedAt ?? null}
+            forecast={forecast}
+            selected={selected}
+          />
+        </TabsContent>
+      </Tabs>
     </TooltipProvider>
+  );
+}
+
+// Analysis owns the Daily Forecaster prose, the learning guide, and the
+// provenance accordion. It also owns the brief request lifecycle: the fetch
+// can only begin once this panel mounts, i.e. when the Analysis tab is
+// selected — the Forecast tab issues no /brief requests.
+function AnalysisPanel({
+  spot,
+  selectedDate,
+  canonicalDayBest,
+  canonicalGeneratedAt,
+  forecast,
+  selected
+}: {
+  spot: ApiSpot;
+  selectedDate: string | null;
+  canonicalDayBest: WorkbenchWindow | null | undefined;
+  canonicalGeneratedAt: string | null;
+  forecast: WorkbenchForecast | null;
+  selected?: WorkbenchWindow;
+}) {
+  const [brief, setBrief] = useState<DailyBrief | null>(null);
+  const [briefLoading, setBriefLoading] = useState(false);
+  const fallbackBrief = useMemo(
+    () => deterministicBrief(spot, selectedDate, canonicalDayBest ?? undefined, canonicalGeneratedAt),
+    [canonicalDayBest, canonicalGeneratedAt, selectedDate, spot]
+  );
+  const hasReliableCall = Boolean(selectedDate && canonicalDayBest);
+
+  useEffect(() => {
+    if (!selectedDate || !hasReliableCall) return;
+    const controller = new AbortController();
+    setBrief(fallbackBrief);
+    setBriefLoading(true);
+    void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    })
+      .then(async (response) => {
+        if (!response.ok) return null;
+        return parseBriefResponse(await response.json());
+      })
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        setBrief(value ?? fallbackBrief);
+        setBriefLoading(false);
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setBrief(fallbackBrief);
+        setBriefLoading(false);
+      });
+    return () => controller.abort();
+  }, [fallbackBrief, hasReliableCall, selectedDate, spot.id]);
+
+  return (
+    <div className="analysisPanel">
+      {hasReliableCall ? (
+        <DailyBriefErrorBoundary
+          key={`${spot.id}:${selectedDate ?? "none"}:${brief?.generatedAt ?? brief?.headline ?? "local"}`}
+          fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}
+        >
+          <DailyBriefCard brief={brief ?? fallbackBrief} loading={briefLoading} spot={spot} />
+        </DailyBriefErrorBoundary>
+      ) : (
+        <p className="quietBriefLine">
+          No reliable daylight recommendation yet — the Forecast tab still shows every available public input.
+        </p>
+      )}
+      <div className="analysisTools">
+        <ForecastLearningGuide />
+      </div>
+      {forecast && <DataHealthPanel forecast={forecast} selected={selected} spot={spot} />}
+    </div>
   );
 }

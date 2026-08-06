@@ -375,10 +375,6 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
     }))
     .sort(sortDailyRows);
   const report = regionalReport(rows, reportDateKey);
-  const topRows = rows.filter((row) => row.window).slice(0, 3);
-  const sourceUpdates = unique(
-    rows.flatMap((row) => (row.window?.waveProvenance ? [row.window.waveProvenance.sourceUpdatedAt] : []))
-  );
   const hazards = activeHazardMessages(rows.map((row) => row.window));
 
   return (
@@ -387,20 +383,6 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
         <p className="kicker">NorCal daily surf report</p>
         <h1 id="daily-report-title">{report.title}</h1>
         <p className="reportLead">{report.body}</p>
-        {topRows.length > 0 && (
-          <div className="shortlist" aria-label="Quick spot shortlist">
-            {topRows.map((row) => (
-              <a className="shortlistItem" href={forecastHref(row.spot.id)} key={row.spot.id}>
-                <span>
-                  <strong>{row.spot.name}</strong>
-                  <small>{formatWindowSpan(row.window!.forecastAt, row.spot.timezone)}</small>
-                </span>
-                <span className="shortlistSize">{surfHeightRange(row.window!.waveHeightFt)}</span>
-                <ChevronRight size={17} aria-hidden="true" />
-              </a>
-            ))}
-          </div>
-        )}
       </section>
 
       <HazardNotice messages={hazards} />
@@ -453,7 +435,6 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
       <details className="dataDisclosure">
         <summary>
           <span><Database size={17} aria-hidden="true" /> Data &amp; confidence</span>
-          <span>{sourceUpdates.length > 0 ? `${sourceUpdates.length} coastal source update${sourceUpdates.length === 1 ? "" : "s"}` : "Wave source pending"}</span>
         </summary>
         <div className="disclosureBody">
           <p>
@@ -497,6 +478,19 @@ function SpotDetail({
     )[0];
   const featured = dayBest ?? current;
   const hazards = activeHazardMessages(windows);
+  // The slim header's freshness badge is PR-B's verdict over the featured
+  // window's own shipped cadence — worst source wins; entries without cadence
+  // stay silent rather than being re-judged.
+  const featuredVerdicts = (featured?.sourceFreshness ?? [])
+    .map((entry) => sourceFreshnessVerdict(entry))
+    .filter((verdict): verdict is Exclude<ReturnType<typeof sourceFreshnessVerdict>, null> => verdict !== null);
+  const spotFreshness = featuredVerdicts.length === 0
+    ? null
+    : featuredVerdicts.includes("late")
+      ? "late"
+      : featuredVerdicts.includes("aging")
+        ? "aging"
+        : "fresh";
 
   return (
     <>
@@ -511,9 +505,8 @@ function SpotDetail({
         </div>
       </nav>
 
-      <section className="spotHero">
+      <section className="spotHero spotHeroSlim">
         <div>
-          <p className="kicker">Trust-first spot report</p>
           <h1>{spot.name}</h1>
           {featured ? (
             <p className="spotCall">
@@ -524,7 +517,11 @@ function SpotDetail({
             <p className="spotCall">No reliable wave call yet. Wind and tide may still be available below.</p>
           )}
         </div>
-        {featured && <ConditionPill spot={spot} window={featured} />}
+        {spotFreshness && (
+          <span className={`freshnessBadge ${spotFreshness}`}>
+            Data {spotFreshness}
+          </span>
+        )}
       </section>
 
       <HazardNotice messages={hazards} />

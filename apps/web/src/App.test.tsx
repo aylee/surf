@@ -201,12 +201,54 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { level: 1, name: "Test Break" })).toBeTruthy();
-    expect(screen.getByRole("heading", { name: "Forecast workbench" })).toBeTruthy();
+    // Forecast is the default tab: deterministic data first, zero AI content,
+    // and no /brief request until Analysis is selected.
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
-    expect(screen.getByText("Daily outlook")).toBeTruthy();
+    expect(screen.getByRole("tablist", { name: "Spot view" })).toBeTruthy();
+    expect(screen.getByRole("tablist", { name: "Forecast view" })).toBeTruthy();
+    expect(screen.queryByText("Daily outlook")).toBeNull();
     expect(screen.queryByText(/AI-assisted|Gemini|Google/i)).toBeNull();
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.getByRole("link", { name: /Daily report/ }).getAttribute("href")).toBe("/");
+    expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
+  });
+
+  it("deep-links to Analysis, fetches the brief only there, and round-trips the tab param", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const fetchMock = installSuccessfulApi();
+
+    render(<App />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    const briefCalls = () =>
+      fetchMock.mock.calls.filter(([input]) => requestPath(input).includes("/brief?")).length;
+    expect(briefCalls()).toBe(0);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
+    expect(await screen.findByText("Daily outlook")).toBeTruthy();
+    expect(screen.getByText("Data, confidence & provenance")).toBeTruthy();
+    await waitFor(() => expect(briefCalls()).toBeGreaterThan(0));
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("analysis");
+    // The forecast table is unmounted while Analysis is active.
+    expect(screen.queryByRole("table", { name: /surf-planning inputs/ })).toBeNull();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
+  });
+
+  it("renders exactly one home link per catalog spot with no shortlist or source-count claim", async () => {
+    installSuccessfulApi();
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
+    const spotLinks = screen
+      .getAllByRole("link")
+      .filter((link) => (link.getAttribute("href") ?? "").includes("spot="));
+    expect(spotLinks).toHaveLength(1); // one catalog spot in the fixture
+    expect(screen.queryByLabelText("Quick spot shortlist")).toBeNull();
+    expect(screen.queryByText(/coastal source update/)).toBeNull();
   });
 
   it("keeps the last good forecast visible when a background refresh fails", async () => {
@@ -606,7 +648,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Forecast workbench" })).toBeTruthy();
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     const graphTab = screen.getByRole("tab", { name: "Graph" });
     fireEvent.mouseDown(graphTab, { button: 0, ctrlKey: false });
     await waitFor(() => {

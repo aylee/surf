@@ -188,12 +188,19 @@ describe("ForecastWorkbench", () => {
 
     render(<ForecastWorkbench spot={spot} initialForecast={threeHour} now={now} />);
 
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
     expect(await screen.findByRole("heading", { name: "9:00 AM is the leading daylight window" })).toBeTruthy();
     await waitFor(() => {
-      expect(new URLSearchParams(window.location.search).get("at")).toBe(canonicalThreeHourAt);
+      const params = new URLSearchParams(window.location.search);
+      expect(params.get("at")).toBe(canonicalThreeHourAt);
+      expect(params.get("tab")).toBe("analysis");
     });
 
-    fireEvent.click(screen.getByRole("radio", { name: "One-hour resolution" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
+    await waitFor(() => {
+      expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: "One-hour resolution" }));
 
     expect(await screen.findByRole("table", { name: /One-hour surf-planning inputs for Bolinas/ })).toBeTruthy();
     await waitFor(() => {
@@ -203,11 +210,12 @@ describe("ForecastWorkbench", () => {
       expect(params.get("interval")).toBe("1h");
       expect(params.get("at")).toBe(canonicalThreeHourAt);
     });
-    expect(screen.getByRole("heading", { name: "9:00 AM is the leading daylight window" })).toBeTruthy();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("heading", { name: "9:00 AM is the leading daylight window" })).toBeTruthy();
   });
 
   it("hides stale-brief internals, shows selected-source states, and lets a phone row collapse", async () => {
-    window.history.replaceState({}, "", "/?spot=bolinas");
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({
       status: "stale",
       fallbackReason: "Forecast inputs changed materially.",
@@ -248,15 +256,20 @@ describe("ForecastWorkbench", () => {
     expect(await screen.findByText("Fresh")).toBeTruthy();
     expect(screen.getByText("Missing")).toBeTruthy();
 
-    let expandedTrigger: HTMLButtonElement | null = null;
+    // Rows never auto-expand (OD-9); a phone row opens on tap and collapses
+    // on a second tap while the selection highlight stays.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
     await waitFor(() => {
-      expandedTrigger = container.querySelector(
-        ".mobileForecastRows .uiAccordionTrigger[data-state='open']"
-      );
-      expect(expandedTrigger).toBeTruthy();
+      expect(container.querySelector(".mobileForecastRows .uiAccordionTrigger[data-state='open']")).toBeNull();
     });
-    fireEvent.click(expandedTrigger!);
-    await waitFor(() => expect(expandedTrigger?.getAttribute("data-state")).toBe("closed"));
+    const collapsedTrigger = container.querySelector<HTMLButtonElement>(
+      ".mobileForecastRows .uiAccordionTrigger"
+    );
+    expect(collapsedTrigger).toBeTruthy();
+    fireEvent.click(collapsedTrigger!);
+    await waitFor(() => expect(collapsedTrigger?.getAttribute("data-state")).toBe("open"));
+    fireEvent.click(collapsedTrigger!);
+    await waitFor(() => expect(collapsedTrigger?.getAttribute("data-state")).toBe("closed"));
     expect(container.querySelector(".mobileForecastRows .uiAccordionItem.selectedRow")).toBeTruthy();
   });
 
@@ -272,12 +285,14 @@ describe("ForecastWorkbench", () => {
 
     render(<ForecastWorkbench spot={spot} initialForecast={choppyForecast} now={now} />);
 
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
     expect(await screen.findByRole("heading", { name: /leading daylight window/ })).toBeTruthy();
     expect(screen.queryByText(/clearest daylight window/i)).toBeNull();
     expect(screen.getByText(/Outlook updated Aug 2/)).toBeTruthy();
-    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.queryByText(/provider unavailable/i)).toBeNull();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
@@ -300,7 +315,7 @@ describe("ForecastWorkbench", () => {
     const [bestPick, alternatePick] = modelBrief.picks;
     expect(bestPick).toBeDefined();
     expect(alternatePick).toBeDefined();
-    window.history.replaceState({}, "", "/?spot=bolinas");
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({
       status: "model",
       brief: modelBrief
@@ -329,7 +344,7 @@ describe("ForecastWorkbench", () => {
   });
 
   it("ignores malformed brief timestamps without collapsing forecast detail", async () => {
-    window.history.replaceState({}, "", "/?spot=bolinas");
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({
       status: "model",
       brief: {
@@ -347,7 +362,8 @@ describe("ForecastWorkbench", () => {
     expect(await screen.findByRole("heading", { name: "A validated daily read" })).toBeTruthy();
     expect(screen.queryByText("AI-assisted")).toBeNull();
     expect(screen.queryByText(/time unavailable/i)).toBeNull();
-    expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
   });
 
   it("returns to the last good three-hour view when hourly detail has no usable windows", async () => {
@@ -416,6 +432,29 @@ describe("ForecastWorkbench", () => {
     expect(screen.getByText(/1 of 2 expected 3h windows are available/i)).toBeTruthy();
   });
 
+  it("collapses a forecaster with no reliable call to one quiet line and skips the brief fetch", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) briefRequests += 1;
+      return jsonResponse({}, 503);
+    }));
+
+    const { container } = render(
+      <ForecastWorkbench spot={spot} initialForecast={unavailableForecast(fixtureForecast())} now={now} />
+    );
+
+    expect(
+      await screen.findByText(/No reliable daylight recommendation yet — the Forecast tab still shows every available public input\./)
+    ).toBeTruthy();
+    // One quiet line, not a billboard: no brief headline, picks, or lesson.
+    expect(container.querySelector(".dailyBrief")).toBeNull();
+    expect(screen.queryByText("What this teaches you")).toBeNull();
+    expect(screen.queryByText("Daily outlook")).toBeNull();
+    expect(briefRequests).toBe(0);
+  });
+
   it("uses one hourly request while a cold three-hour fallback arrives", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas&interval=1h");
     const threeHour = fixtureForecast();
@@ -482,9 +521,11 @@ describe("ForecastWorkbench", () => {
     expect(canonicalRequests).toBe(1);
     releaseCanonical();
 
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
     await waitFor(() => expect(screen.getByRole("heading", { name: /leading daylight window/ })).toBeTruthy());
     expect(canonicalRequests).toBe(1);
-    expect(screen.getByRole("table", { name: /One-hour surf-planning inputs/ })).toBeTruthy();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("table", { name: /One-hour surf-planning inputs/ })).toBeTruthy();
     expect(new URLSearchParams(window.location.search).get("interval")).toBe("1h");
   });
 

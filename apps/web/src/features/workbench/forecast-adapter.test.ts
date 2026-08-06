@@ -217,13 +217,20 @@ describe("forecast workbench adapter", () => {
     });
   });
 
-  it("defaults URL state to a three-hour table", () => {
+  it("defaults URL state to a three-hour table on the Forecast tab", () => {
     expect(readWorkbenchUrl("?spot=bolinas")).toEqual({
       interval: "3h",
       view: "table",
+      tab: "forecast",
       date: null,
       at: null
     });
+  });
+
+  it("reads the analysis tab from a deep link and rejects unknown tab values", () => {
+    expect(readWorkbenchUrl("?spot=bolinas&tab=analysis").tab).toBe("analysis");
+    expect(readWorkbenchUrl("?spot=bolinas&tab=bogus").tab).toBe("forecast");
+    expect(readWorkbenchUrl("?spot=bolinas&tab=").tab).toBe("forecast");
   });
 });
 

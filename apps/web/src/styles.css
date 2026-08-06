@@ -2628,3 +2628,93 @@ footer {
     display: none;
   }
 }
+
+/* ── PR-C: Forecast | Analysis spot tabs ─────────────────────────────── */
+
+.spotViewTabs {
+  display: block;
+}
+
+.spotViewTabsList {
+  margin-bottom: 14px;
+}
+
+.spotViewTabsList .uiTabsTrigger {
+  min-width: 108px;
+  justify-content: center;
+}
+
+/* Slim deterministic spot header: data reaches the first viewport. */
+.spotHeroSlim {
+  padding: clamp(18px, 2.6vw, 26px);
+  border-radius: 18px;
+  align-items: center;
+}
+
+.spotHeroSlim h1 {
+  font-size: clamp(1.7rem, 3.2vw, 2.4rem);
+  margin: 0 0 6px;
+}
+
+.freshnessBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+  text-transform: capitalize;
+}
+
+.freshnessBadge.fresh { background: rgba(38, 135, 96, 0.14); color: #1d7a54; }
+.freshnessBadge.aging { background: rgba(180, 130, 20, 0.14); color: #8a6413; }
+.freshnessBadge.late { background: rgba(190, 70, 50, 0.16); color: #a63a24; }
+
+.analysisPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.analysisTools {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.quietBriefLine {
+  margin: 0;
+  padding: 14px 18px;
+  border: 1px solid var(--line, #dbe3e4);
+  border-radius: 14px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+@media (max-width: 680px) {
+  .spotHeroSlim {
+    padding: 16px;
+  }
+
+  .spotHeroSlim h1 {
+    font-size: clamp(1.5rem, 7vw, 1.9rem);
+  }
+
+  /* Compress comparison rows: pair labeled fields two per line instead of
+     five stacked full-width rows, without dropping any field. */
+  .compareRow > [data-label] {
+    grid-column: auto / span 1;
+  }
+
+  .compareRow > [data-label]::before {
+    display: block;
+    min-width: 0;
+    margin-right: 0;
+  }
+
+  .compareRow > [data-label="Calmest window"],
+  .compareRow > [data-label="Wind / surface"] {
+    grid-column: 1 / span 1;
+  }
+}
