@@ -86,6 +86,23 @@ function formatTimestamp(value: string, timezone: string): string {
   }
 }
 
+// Formats a local date key (YYYY-MM-DD) for display. Noon UTC keeps the day
+// stable across every North American offset instead of shifting at midnight.
+function formatLocalDateKey(dateKey: string, timezone: string): string {
+  const parsed = new Date(`${dateKey}T12:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime())) return dateKey;
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      weekday: "long",
+      month: "short",
+      day: "numeric",
+      timeZone: timezone
+    }).format(parsed);
+  } catch {
+    return dateKey;
+  }
+}
+
 function formatClock(value: string, timezone: string): string {
   return new Intl.DateTimeFormat(undefined, {
     hour: "numeric",
@@ -1076,11 +1093,14 @@ function AnalysisPanel({
     [canonicalDayBest, canonicalGeneratedAt, selectedDate, spot]
   );
 
-  // The request is gated only on the selected date (and on this panel being
-  // mounted, i.e. Analysis selected). A published outlook must stay reachable
-  // for any date that has one — including a day whose daylight windows have
-  // merely elapsed, where the local fallback has no pick but the Worker's
-  // brief and its caveats still exist.
+  // The request is gated only on the selected date and the payload generation
+  // (and on this panel being mounted, i.e. Analysis selected). A published
+  // outlook must stay reachable for any date that has one — including a day
+  // whose daylight windows have merely elapsed, where the local fallback has
+  // no pick but the Worker's brief and its caveats still exist. Keying on the
+  // canonical generation (a stable string) means a refresh that advances the
+  // payload also picks up a newer brief revision while this tab stays open,
+  // without the identity churn a memo object in the deps would cause.
   useEffect(() => {
     if (!selectedDate) return;
     const controller = new AbortController();
@@ -1105,15 +1125,24 @@ function AnalysisPanel({
         setBriefLoading(false);
       });
     return () => controller.abort();
-  }, [selectedDate, spot.id]);
+  }, [canonicalGeneratedAt, selectedDate, spot.id]);
 
   const brief = serverBrief ?? fallbackBrief;
   // Collapse to one quiet line only when there is genuinely nothing to say:
-  // no published brief and no local recommendation either.
+  // no published brief and no local recommendation either. An in-flight
+  // request is not yet nothing — denying a recommendation before the Worker
+  // has answered would announce a false negative and then quietly retract it.
   const hasBriefContent = Boolean(serverBrief) || fallbackBrief.picks.length > 0;
+  const awaitingBrief = briefLoading && !hasBriefContent;
 
   return (
     <div className="analysisPanel">
+      {selectedDate && (
+        // The day picker lives on the Forecast tab, so the date-scoped outlook
+        // must name its own day here — otherwise a Saturday brief reads as
+        // today's call beside a hero keyed to a different date.
+        <p className="analysisDayLabel">Outlook for {formatLocalDateKey(selectedDate, spot.timezone)}</p>
+      )}
       {hasBriefContent ? (
         <DailyBriefErrorBoundary
           key={`${spot.id}:${selectedDate ?? "none"}:${brief.generatedAt ?? brief.headline}`}
@@ -1121,6 +1150,10 @@ function AnalysisPanel({
         >
           <DailyBriefCard brief={brief} loading={briefLoading} spot={spot} />
         </DailyBriefErrorBoundary>
+      ) : awaitingBrief ? (
+        <p className="quietBriefLine" role="status" aria-busy="true">
+          Loading the daily outlook…
+        </p>
       ) : (
         <p className="quietBriefLine" role="status">
           {forecastErrored || !forecast

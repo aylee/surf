@@ -479,16 +479,19 @@ function SpotDetail({
   const featured = dayBest ?? current;
   const hazards = activeHazardMessages(windows);
   // The slim header's freshness badge is PR-B's verdict over the featured
-  // window's own shipped cadence — worst source wins — and it judges only the
-  // sources that actually fed that window. `activeCapabilities` is the
-  // worker's own inclusion set: it omits absent sources and an observation
-  // too far from the window to support it, exactly as the worker omits them
-  // from the window's own freshness scalar. Judging an excluded source here
-  // would claim the forecast is late because of data it never used, while the
-  // banner stayed silent and the provenance panel said Missing or Stale.
-  const featuredCapabilities = new Set(featured?.activeCapabilities ?? []);
+  // window's own shipped cadence, worst source wins, using exactly the
+  // dashboard banner's rule: judge every entry that has a real age and a
+  // declared cadence.
+  //
+  // Deliberately NOT filtered by `activeCapabilities`. A stale buoy leaves
+  // that set at precisely the age its verdict turns late — the worker's
+  // freshness cutoff and the declared cadence + grace are the same constant —
+  // so filtering by it would convert every late buoy into an unqualified
+  // "Data fresh" while the banner names that same source as late and the
+  // provenance panel labels it Stale. A null age stays excluded: absence is
+  // "Missing" in the panel, and the banner skips it too.
   const featuredVerdicts = (featured?.sourceFreshness ?? [])
-    .filter((entry) => featuredCapabilities.has(entry.capability) && entry.freshnessMinutes !== null)
+    .filter((entry) => entry.freshnessMinutes !== null)
     .map((entry) => sourceFreshnessVerdict(entry))
     .filter((verdict): verdict is Exclude<ReturnType<typeof sourceFreshnessVerdict>, null> => verdict !== null);
   const spotFreshness = featuredVerdicts.length === 0

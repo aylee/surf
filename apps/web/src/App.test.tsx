@@ -239,7 +239,8 @@ describe("App", () => {
 
   it("renders the slim-header freshness badge from the worst cadence-bearing source", async () => {
     const badgeCase = async (
-      entries: Array<Record<string, unknown>>
+      entries: Array<Record<string, unknown>>,
+      activeCapabilities?: string[]
     ): Promise<string | null> => {
       cleanup();
       window.history.replaceState({}, "", "/?spot=test-break");
@@ -247,7 +248,11 @@ describe("App", () => {
       const forecast = ForecastResponseSchema.parse({
         ...base,
         generatedAt: new Date().toISOString(),
-        windows: base.windows.map((window) => ({ ...window, sourceFreshness: entries }))
+        windows: base.windows.map((window) => ({
+          ...window,
+          sourceFreshness: entries,
+          ...(activeCapabilities ? { activeCapabilities } : {})
+        }))
       });
       vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
         const path = requestPath(input);
@@ -288,6 +293,27 @@ describe("App", () => {
     expect(
       await badgeCase([entry({ expectedCadenceMinutes: undefined, graceMinutes: undefined })])
     ).toBeNull();
+
+    // A late buoy leaves the worker's activeCapabilities set at exactly the age
+    // its verdict turns late. The badge must still report it, because the
+    // banner names that source and the provenance panel labels it Stale —
+    // silently upgrading it to "Data fresh" would be the contradiction.
+    expect(
+      await badgeCase(
+        [
+          entry({}),
+          entry({
+            capability: "observed_wave",
+            sourceId: "ndbc-46237",
+            freshnessMinutes: 180,
+            status: "stale",
+            expectedCadenceMinutes: 60,
+            graceMinutes: 60
+          })
+        ],
+        ["forecast_wave_nearshore", "wind", "tide"]
+      )
+    ).toBe("Data late");
   });
 
   it("renders exactly one home link per catalog spot with no shortlist or source-count claim", async () => {

@@ -539,6 +539,83 @@ describe("ForecastWorkbench", () => {
     expect(screen.queryByText(/No daylight recommendation for this day/)).toBeNull();
   });
 
+  it("labels the outlook with its own day and never denies a recommendation while the brief is in flight", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let releaseBrief!: () => void;
+    const briefGate = new Promise<void>((resolve) => { releaseBrief = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        await briefGate;
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "A published outlook",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />);
+
+    // The day picker lives on the Forecast tab, so Analysis must name its day.
+    expect(await screen.findByText(/^Outlook for /)).toBeTruthy();
+    // In flight: a neutral loading status, never the "no recommendation" denial.
+    expect(await screen.findByText("Loading the daily outlook…")).toBeTruthy();
+    expect(screen.queryByText(/No daylight recommendation for this day/)).toBeNull();
+
+    releaseBrief();
+    expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();
+    expect(screen.queryByText("Loading the daily outlook…")).toBeNull();
+  });
+
+  it("refetches the brief when a refreshed payload advances the canonical generation", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: `Revision ${briefRequests}`,
+            setup: "Public inputs support the read.",
+            revision: briefRequests,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    expect(await screen.findByRole("heading", { name: "Revision 1" })).toBeTruthy();
+
+    // A dashboard refresh that advances the payload must pick up a newer brief
+    // revision while this tab stays open.
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T08:00:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+
+    expect(await screen.findByRole("heading", { name: "Revision 2" })).toBeTruthy();
+    expect(briefRequests).toBe(2);
+  });
+
   it("says so on Analysis when the forecast request itself failed", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "unavailable" }, 503)));
