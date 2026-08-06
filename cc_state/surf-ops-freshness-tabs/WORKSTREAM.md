@@ -198,8 +198,8 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 |---|---|---|---|
 | Phase 0 — production diagnostic (read-only) | DONE — OI-2 pinned, OI-5 corrective live | prod: deployment status, D1 read-model/source-run queries, live tail, queue config | Complete |
 | PR-A — observability + ops foundation | DONE — PR #23 merged (`284b25f`), deployed (`53084465…` @100%), live-verified on the 02:17Z cycle | `apps/web/worker/` (index, ingest, read-model), `apps/web/wrangler.jsonc`, `scripts/`, `docs/runtime-operations.md` | Complete; OI-7 rotation + OI-8 corrective tracked in ledger |
-| PR-B — cadence-aware freshness | ACTIVE | `packages/contracts/`, worker materialization, `apps/web/src/App.tsx`, `features/workbench/` | T-B.1 contracts verdict fn → T-B.2 adapter cadence → T-B.3 web single-verdict → gate → ship |
-| PR-C — Forecast \| Analysis tabs | OPEN | `apps/web/src/features/workbench/ForecastWorkbench.tsx`, `App.tsx`, `src/components/ui/tabs.tsx` | After PR-B verified live |
+| PR-B — cadence-aware freshness | DONE — PR #27 live-verified 2026-08-06 | `packages/contracts/`, worker materialization, `apps/web/src/App.tsx`, `features/workbench/` | T-B.1 contracts verdict fn → T-B.2 adapter cadence → T-B.3 web single-verdict → gate → ship |
+| PR-C — Forecast \| Analysis tabs | ACTIVE | `apps/web/src/features/workbench/ForecastWorkbench.tsx`, `App.tsx`, `src/components/ui/tabs.tsx` | After PR-B verified live |
 | PR-D — spot catalog expansion (OD-11) | QUEUED | `packages/db` catalog/seed, worker adapter config, `scripts/`, tests, docs | After PR-C verified live |
 
 ## Decisions
@@ -1017,3 +1017,27 @@ pinned by the spec's newer-partial scenario. Scoped delta check: DRY. `pnpm veri
 `b1122fd` (contracts 11, core 21, db 10, web 277+1skip incl. 20 App tests, workerd 19,
 Python 45). Next: ready PR → Verify → merge → operator deploy → `:17` quiet-steady-state
 live proof (watch OI-8 at the handoff).
+
+_2026-08-06 (UTC)_ — **PR-B merged and deployed; live UI verification green; awaiting the
+03:17Z scheduled-cycle proof.** PR #27 merged as `c39f151` after exact-head Verify (1m31s).
+Pre-deploy bookmark `000003cf-00000000-000050bf-b3532ca26d4380b4c83ed7c161b38319`.
+Operator-run supported deploy activated Worker `18eba224-79ac-4b53-9045-af0f82d3cbb0` in
+deployment `8a966cae…` at 100%; the handoff published **all 12 rows including bolinas — no
+OI-8 recurrence** (1 affinity session, 1 authenticated attempt); strict smoke green on
+workers.dev, post-smoke control plane unchanged. OI-8 verdict at this checkpoint:
+intermittent (1 of 2 deploys), stays open, does not block PR-C; re-evaluate at PR-C's deploy.
+Live verification on the new version: `ops:status` 4/4 with 12/12 on one `02:27:01Z`
+generation; custom-domain smoke green; live payloads carry cadence+grace on every source
+entry (all fresh); production browser at 1280×720 and 390×844 — honest chip
+("Sources 33m–7h old", the grid-wave age quiet inside its declared cadence), **no banner**,
+phone chip visible for the first time (OD-9), zero console messages, no overflow. Remaining
+for T-B.5: the 03:17Z cron republishing 12/12 with the steady state staying quiet (watcher
+armed). PR-C scouting started read-only in parallel; implementation stays gated on live-green.
+
+_2026-08-06 (UTC)_ — **PR-B live-green; Phase B closed; Phase C begins.** The 03:17Z cron
+republished all 12 rows (`generated 03:17:14.351Z`, ops 4/4). T-B.5 acceptance held: quiet
+chip, no banner, correct collapsed-range copy, mobile chip visible, smoke green both origins.
+Phase C starts from `c39f151` on `aylee/surf-forecast-analysis-tabs`; the tabs-scout map is
+in hand (AnalysisPanel extraction for lazy brief fetch; `tab` param null-on-default; the
+exact-match `readWorkbenchUrl` test; ~20 moving assertions; OD-9 deletion list; S-2
+provenance surfaces move intact).

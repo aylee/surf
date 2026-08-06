@@ -199,11 +199,11 @@ Documented RCA from the planning session — do not re-litigate; do close OI-2:
 | A | T-A.3: `pnpm ops:status` + post-merge runbook | Read-only status script + tests + `docs/runtime-operations.md` routine | M | done — final review DRY | — (parallel-safe with T-A.1/A.2) |
 | A | T-A.4: PR-A gate | Adversarial review clean, `pnpm verify` green, ready PR | M | done — PR #23 merged `284b25f` (2026-08-05) | T-A.1–A.3 |
 | A | T-A.5: Ship + live-verify PR-A | Deployed; one full hourly cycle as one Logfire trace; `ops:status` all-ready | S | done — Worker `53084465…` @100%; 02:17Z cycle verified (1 source + 12 publishes, ingestId-correlated traces); ops 4/4; dual-origin smoke; browser clean. OI-8 deploy-window fault recorded | T-A.4 |
-| B | T-B.1: Contracts cadence + verdict | `expectedCadenceMinutes`/grace fields + pure verdict fn + matrix tests | M | — | T-A.5 |
-| B | T-B.2: Adapters declare cadence | Documented cadence flows into payload source entries at materialization | M | — | T-B.1 |
-| B | T-B.3: Web consumes one verdict | Chip fix + banner rework + workbench/`forecast-health` subordination + tests | M | — | T-B.2 |
-| B | T-B.4: PR-B gate | Adversarial review clean, `pnpm verify` green, ready PR | M | — | T-B.3 |
-| B | T-B.5: Ship + live-verify PR-B | Deployed; steady state = quiet chip, no banner, correct collapsed-range copy | S | — | T-B.4 |
+| B | T-B.1: Contracts cadence + verdict | `expectedCadenceMinutes`/grace fields + pure verdict fn + matrix tests | M | done — 11-test matrix, new contracts vitest harness | T-A.5 |
+| B | T-B.2: Adapters declare cadence | Documented cadence flows into payload source entries at materialization | M | done — constants beside source IDs; feed-adapters cadence table | T-B.1 |
+| B | T-B.3: Web consumes one verdict | Chip fix + banner rework + workbench/`forecast-health` subordination + tests | M | done — all client thresholds deleted; OD-9 mobile chip | T-B.2 |
+| B | T-B.4: PR-B gate | Adversarial review clean, `pnpm verify` green, ready PR | M | done — DRY after 3 rounds + delta check; PR #27 | T-B.3 |
+| B | T-B.5: Ship + live-verify PR-B | Deployed; steady state = quiet chip, no banner, correct collapsed-range copy | S | done — `18eba224…` @100%; 03:17Z cycle 12/12; quiet chip/no banner live at 1280+390 | T-B.4 |
 | C | T-C.1: High-signal Forecast \| Analysis restructure | Tabbed spot view, slim deterministic header, home de-duplication, `tab` URL param, empty-state collapse | L | — | T-B.5 |
 | C | T-C.2: Tab behavior tests | Tab rendering, param round-trip, empty-state, a11y roles | M | — | T-C.1 |
 | C | T-C.3: PR-C gate | Adversarial review clean, `pnpm verify` green, ready PR | M | — | T-C.2 |
@@ -1460,3 +1460,14 @@ Append-only. Each session adds an entry; keep the Task Overview status column in
 - **Also live:** both Logfire destinations exporting (traces + logs); `LOGFIRE_READ_TOKEN`
   verified for autonomous gate checks; OI-7 (write-token rotation) pending operator.
 - **Next:** Phase B from `284b25f` on `aylee/surf-freshness-cadence`.
+
+### 2026-08-06 — Phase B complete: PR #27 merged, deployed, live-verified
+
+- PR #27 merged `c39f151`; operator deploy activated `18eba224…` @100%; handoff published
+  12/12 including bolinas (no OI-8 recurrence — fault confirmed intermittent, non-blocking).
+- Live: ops 4/4; dual-origin smoke; payload cadence on every entry; production browser at
+  1280×720 + 390×844 — honest chip, no banner, phone chip visible (OD-9), zero console
+  messages; 03:17Z cron republished 12/12 (`03:17:14.351Z` single generation).
+- Review trail: 3 adversarial rounds + scoped delta check → DRY (14 + 7 + 1 findings fixed;
+  details in WORKSTREAM Session Log). Spend-limit degradation of rounds 2–3 refuters recorded.
+- **Next:** Phase C on `aylee/surf-forecast-analysis-tabs`.
