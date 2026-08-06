@@ -671,6 +671,97 @@ describe("ForecastWorkbench", () => {
     expect(screen.queryByText(/Mar 3/)).toBeNull();
   });
 
+  it("reports loading, not an outage, while a healthy interval request is in flight", async () => {
+    // Hourly resolution with no cached 1h payload: the panel has no forecast
+    // yet, but nothing has failed. Claiming an outage here is the state the
+    // convergence pass rejected.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&interval=1h");
+    let releaseHourly!: () => void;
+    const hourlyGate = new Promise<void>((resolve) => { releaseHourly = resolve; });
+    const threeHour = fixtureForecast();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("interval=1h")) {
+        await hourlyGate;
+        return jsonResponse(hourlyForecastWithLocalChallenger(threeHour));
+      }
+      if (url.includes("interval=3h")) return jsonResponse(threeHour);
+      return jsonResponse({}, 503);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={null} now={elapsedDayNow} />);
+
+    expect(await screen.findByText("Loading the daily outlook…")).toBeTruthy();
+    expect(screen.queryByText(/temporarily unavailable/)).toBeNull();
+    releaseHourly();
+  });
+
+  it("keeps the provenance disclosure mounted while an hourly payload refetches", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&interval=1h");
+    const threeHour = fixtureForecast();
+    let releaseHourly!: () => void;
+    const hourlyGate = new Promise<void>((resolve) => { releaseHourly = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("interval=1h")) {
+        await hourlyGate;
+        return jsonResponse(hourlyForecastWithLocalChallenger(threeHour));
+      }
+      if (url.includes("interval=3h")) return jsonResponse(threeHour);
+      return jsonResponse({}, 503);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={threeHour} now={now} />);
+
+    // The active-interval payload is still in flight, but the canonical one is
+    // in hand — provenance must not vanish from the tab.
+    expect(await screen.findByText("Data, confidence & provenance")).toBeTruthy();
+    releaseHourly();
+    expect(await screen.findByText("Data, confidence & provenance")).toBeTruthy();
+  });
+
+  it("does not announce an update when a brief refetch returns nothing", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        if (briefRequests > 1) return jsonResponse({ error: "brief unavailable" }, 503);
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "A published outlook",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { container, rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    await screen.findByRole("heading", { name: "A published outlook" });
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T08:00:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+    await waitFor(() => expect(briefRequests).toBe(2));
+
+    // The retained card must never claim it updated, and must not flip to busy
+    // for a refresh that changed nothing.
+    expect(screen.queryByText("Updating the daily outlook.")).toBeNull();
+    expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("false");
+    expect(screen.getByRole("heading", { name: "A published outlook" })).toBeTruthy();
+  });
+
   it("says so on Analysis when the forecast request itself failed", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "unavailable" }, 503)));

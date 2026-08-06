@@ -990,6 +990,14 @@ export function ForecastWorkbench({
     ? dayWindows.length
     : dayWindows.filter((window) => new Date(window.forecastAt).getTime() >= coverageFloor).length;
   const hasCoverageGap = expectedRows > 0 && coveredRows < expectedRows;
+  // One status for the active interval's payload. "loading" and "error" are
+  // distinct states: a panel that cannot tell them apart will eventually claim
+  // an outage during a healthy in-flight request.
+  const forecastStatus: ForecastStatus = forecast
+    ? "ready"
+    : intervalError || (initialError && !rawForecast)
+      ? "error"
+      : "loading";
 
   return (
     <TooltipProvider delayDuration={180}>
@@ -1068,8 +1076,10 @@ export function ForecastWorkbench({
             selectedDate={selectedDate}
             canonicalDayBest={canonicalDayBest}
             canonicalGeneratedAt={canonicalForecast?.generatedAt ?? null}
-            forecast={forecast}
-            forecastErrored={Boolean(intervalError || (initialError && !rawForecast))}
+            forecastStatus={forecastStatus}
+            // Provenance falls back to the canonical payload so the disclosure
+            // does not vanish mid-read while an hourly refetch is in flight.
+            provenanceForecast={forecast ?? canonicalForecast}
             selected={selected}
           />
         </TabsContent>
@@ -1077,6 +1087,11 @@ export function ForecastWorkbench({
     </TooltipProvider>
   );
 }
+
+// The active interval's payload has three distinguishable states. Collapsing
+// "not fetched yet" into "unavailable" is what made earlier versions of this
+// panel announce an outage during a healthy request.
+type ForecastStatus = "loading" | "ready" | "error";
 
 // Analysis owns the Daily Forecaster prose, the learning guide, and the
 // provenance accordion. It also owns the brief request lifecycle: the fetch
@@ -1087,82 +1102,23 @@ function AnalysisPanel({
   selectedDate,
   canonicalDayBest,
   canonicalGeneratedAt,
-  forecast,
-  forecastErrored,
+  forecastStatus,
+  provenanceForecast,
   selected
 }: {
   spot: ApiSpot;
   selectedDate: string | null;
   canonicalDayBest: WorkbenchWindow | null | undefined;
   canonicalGeneratedAt: string | null;
-  forecast: WorkbenchForecast | null;
-  forecastErrored: boolean;
+  forecastStatus: ForecastStatus;
+  provenanceForecast: WorkbenchForecast | null;
   selected?: WorkbenchWindow;
 }) {
-  const [serverBrief, setServerBrief] = useState<DailyBrief | null>(null);
-  // A mount with a date already selected has a request coming, so the first
-  // committed paint must not be a recommendation denial issued before the
-  // Worker was even asked.
-  const [briefLoading, setBriefLoading] = useState(() => Boolean(selectedDate));
   const fallbackBrief = useMemo(
     () => deterministicBrief(spot, selectedDate, canonicalDayBest ?? undefined, canonicalGeneratedAt),
     [canonicalDayBest, canonicalGeneratedAt, selectedDate, spot]
   );
-  // The brief is scoped to a spot and a date; the payload generation only
-  // decides when to re-ask. Discarding the current brief is therefore correct
-  // when the scope changes and wrong when a refresh merely advances the
-  // generation — that would blank a published outlook mid-read.
-  const briefScope = `${spot.id}:${selectedDate ?? "none"}`;
-  const loadedScope = useRef<string | null>(null);
-
-  // The request is gated only on the selected date and the payload generation
-  // (and on this panel being mounted, i.e. Analysis selected). A published
-  // outlook must stay reachable for any date that has one — including a day
-  // whose daylight windows have merely elapsed, where the local fallback has
-  // no pick but the Worker's brief and its caveats still exist. Keying on the
-  // canonical generation (a stable string) means a refresh that advances the
-  // payload also picks up a newer brief revision while this tab stays open,
-  // without the identity churn a memo object in the deps would cause.
-  useEffect(() => {
-    if (!selectedDate) return;
-    const controller = new AbortController();
-    if (loadedScope.current !== briefScope) {
-      setServerBrief(null);
-      loadedScope.current = briefScope;
-    }
-    setBriefLoading(true);
-    void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
-      headers: { Accept: "application/json" },
-      signal: controller.signal
-    })
-      .then(async (response) => {
-        if (!response.ok) return null;
-        return parseBriefResponse(await response.json());
-      })
-      .then((value) => {
-        if (controller.signal.aborted) return;
-        // Replace only on success: a refresh whose brief request fails keeps
-        // the published outlook it already had rather than erasing it.
-        if (value) setServerBrief(value);
-        setBriefLoading(false);
-      })
-      .catch(() => {
-        if (controller.signal.aborted) return;
-        setBriefLoading(false);
-      });
-    return () => controller.abort();
-  }, [briefScope, canonicalGeneratedAt, selectedDate, spot.id]);
-
   const dayLabel = selectedDate ? formatLocalDateKey(selectedDate, spot.timezone) : null;
-  const brief = serverBrief ?? fallbackBrief;
-  // Collapse to one quiet line only when there is genuinely nothing to say:
-  // no published brief and no local recommendation either. An in-flight or
-  // not-yet-issued request is not yet nothing — denying a recommendation
-  // before the Worker has answered would announce a false negative and then
-  // quietly retract it.
-  const hasBriefContent = Boolean(serverBrief) || fallbackBrief.picks.length > 0;
-  const forecastUnavailable = forecastErrored || !forecast;
-  const awaitingBrief = !hasBriefContent && !forecastUnavailable && (briefLoading || !selectedDate);
 
   return (
     <div className="analysisPanel">
@@ -1173,30 +1129,115 @@ function AnalysisPanel({
         // date key gets no label rather than a fabricated one.
         <p className="analysisDayLabel">Outlook for {dayLabel}</p>
       )}
-      {hasBriefContent ? (
-        // Keyed by scope only: a generation-driven refresh must not remount the
-        // card and collapse disclosures the reader has open.
-        <DailyBriefErrorBoundary
-          key={briefScope}
-          fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}
-        >
-          <DailyBriefCard brief={brief} loading={briefLoading} spot={spot} />
-        </DailyBriefErrorBoundary>
-      ) : awaitingBrief ? (
-        <p className="quietBriefLine" role="status" aria-busy="true">
-          Loading the daily outlook…
-        </p>
-      ) : (
-        <p className="quietBriefLine" role="status">
-          {forecastUnavailable
-            ? "Forecast data for this spot is temporarily unavailable, so there is no analysis to show yet."
-            : "No daylight recommendation for this day. Every available public input is still listed on the Forecast tab."}
-        </p>
-      )}
+      {/* Keyed by scope: a new spot or day remounts the outlook, so its request
+          state resets structurally instead of through clearing logic, and the
+          previous day's brief can never paint under the new day's label. A
+          generation-driven refresh keeps the same key, so nothing the reader
+          has open is torn down. The key stops at this child so the provenance
+          disclosure below is unaffected. */}
+      <DailyOutlook
+        key={`${spot.id}:${selectedDate ?? "none"}`}
+        spot={spot}
+        selectedDate={selectedDate}
+        canonicalGeneratedAt={canonicalGeneratedAt}
+        fallbackBrief={fallbackBrief}
+        forecastStatus={forecastStatus}
+      />
       <div className="analysisTools">
         <ForecastLearningGuide />
       </div>
-      {forecast && <DataHealthPanel forecast={forecast} selected={selected} spot={spot} />}
+      {provenanceForecast && (
+        <DataHealthPanel forecast={provenanceForecast} selected={selected} spot={spot} />
+      )}
     </div>
+  );
+}
+
+// One request state, not a set of booleans to intersect at render time.
+// "empty" means the Worker was asked and published nothing; "loading" means it
+// has not answered yet. A refresh that fails leaves a rendered brief in place
+// and never re-enters "loading", so nothing is torn down or re-announced.
+type OutlookState =
+  | { status: "loading" }
+  | { status: "ready"; brief: DailyBrief }
+  | { status: "empty" };
+
+function DailyOutlook({
+  spot,
+  selectedDate,
+  canonicalGeneratedAt,
+  fallbackBrief,
+  forecastStatus
+}: {
+  spot: ApiSpot;
+  selectedDate: string | null;
+  canonicalGeneratedAt: string | null;
+  fallbackBrief: DailyBrief;
+  forecastStatus: ForecastStatus;
+}) {
+  const [state, setState] = useState<OutlookState>({ status: "loading" });
+
+  // Gated on the selected date and the payload generation. A published outlook
+  // must stay reachable for any date that has one — including a day whose
+  // daylight windows have merely elapsed, where the local read has no pick but
+  // the Worker's brief and its caveats still exist.
+  useEffect(() => {
+    if (!selectedDate) return;
+    const controller = new AbortController();
+    void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    })
+      .then(async (response) => (response.ok ? parseBriefResponse(await response.json()) : null))
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        setState((current) =>
+          value
+            ? { status: "ready", brief: value }
+            : current.status === "ready"
+              ? current
+              : { status: "empty" }
+        );
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setState((current) => (current.status === "ready" ? current : { status: "empty" }));
+      });
+    return () => controller.abort();
+  }, [canonicalGeneratedAt, selectedDate, spot.id]);
+
+  // A local read with a pick is real content, so it renders while the Worker is
+  // still answering instead of leaving the panel empty.
+  const content = state.status === "ready"
+    ? state.brief
+    : fallbackBrief.picks.length > 0
+      ? fallbackBrief
+      : null;
+
+  if (content) {
+    return (
+      <DailyBriefErrorBoundary fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}>
+        <DailyBriefCard brief={content} loading={state.status === "loading"} spot={spot} />
+      </DailyBriefErrorBoundary>
+    );
+  }
+  if (forecastStatus === "error") {
+    return (
+      <p className="quietBriefLine" role="status">
+        Forecast data for this spot is temporarily unavailable, so there is no analysis to show yet.
+      </p>
+    );
+  }
+  if (state.status === "loading" || forecastStatus === "loading" || !selectedDate) {
+    return (
+      <p className="quietBriefLine" role="status" aria-busy="true">
+        Loading the daily outlook…
+      </p>
+    );
+  }
+  return (
+    <p className="quietBriefLine" role="status">
+      No daylight recommendation for this day. Every available public input is still listed on the Forecast tab.
+    </p>
   );
 }
