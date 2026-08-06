@@ -204,9 +204,9 @@ Documented RCA from the planning session — do not re-litigate; do close OI-2:
 | B | T-B.3: Web consumes one verdict | Chip fix + banner rework + workbench/`forecast-health` subordination + tests | M | done — all client thresholds deleted; OD-9 mobile chip | T-B.2 |
 | B | T-B.4: PR-B gate | Adversarial review clean, `pnpm verify` green, ready PR | M | done — DRY after 3 rounds + delta check; PR #27 | T-B.3 |
 | B | T-B.5: Ship + live-verify PR-B | Deployed; steady state = quiet chip, no banner, correct collapsed-range copy | S | done — `18eba224…` @100%; 03:17Z cycle 12/12; quiet chip/no banner live at 1280+390 | T-B.4 |
-| C | T-C.1: High-signal Forecast \| Analysis restructure | Tabbed spot view, slim deterministic header, home de-duplication, `tab` URL param, empty-state collapse | L | — | T-B.5 |
-| C | T-C.2: Tab behavior tests | Tab rendering, param round-trip, empty-state, a11y roles | M | — | T-C.1 |
-| C | T-C.3: PR-C gate | Adversarial review clean, `pnpm verify` green, ready PR | M | — | T-C.2 |
+| C | T-C.1: High-signal Forecast \| Analysis restructure | Tabbed spot view, slim deterministic header, home de-duplication, `tab` URL param, empty-state collapse | L | done — `3918354` + round-1 fixes `7717677` | T-B.5 |
+| C | T-C.2: Tab behavior tests | Tab rendering, param round-trip, empty-state, a11y roles | M | done — 23 App + 13 workbench tests incl. badge states and desktop expand pins | T-C.1 |
+| C | T-C.3: PR-C gate | Adversarial review clean, `pnpm verify` green, ready PR | M | in progress — round 1 fixed (9 findings, self-adjudicated: refuters lost to spend limit); round 2 running | T-C.2 |
 | C | T-C.4: Ship + live-verify PR-C | Deployed; Playwright checks on surf.alexlee.ai pass | S | — | T-C.3 |
 | D | T-D.1: Spot catalog expansion (OD-11) | +5 spots (Rodeo Beach, Steamer Lane, Pleasure Point, Cowell's, 38th Ave) with full data/scoring/test/ops parity | L | — | T-C.4 |
 | D | T-D.2: PR-D gate + ship + live-verify | Review dry; verify green; deployed; catalog-driven ops/smoke proof; new spots live | M | — | T-D.1 |

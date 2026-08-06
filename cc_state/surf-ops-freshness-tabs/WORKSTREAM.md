@@ -1057,3 +1057,29 @@ request on Analysis), distinct tablist names, no auto-expanded detail, no overfl
 6-unique-links — plus PR-B's banner observed live-firing on stale local buoy data with spot
 scoping, day tier, and cadence copy ("Buoy observations at Linda Mar / Pacifica 1d old;
 expected hourly."). Review round 1 (3 lenses × 2 refuters) running.
+
+_2026-08-06 (UTC)_ — **Runtime handoff Fable → Opus (owner spend limit); PR-C round-1
+findings fixed and self-adjudicated.** The owner's Fable 5 monthly spend limit terminated all
+18 round-1 refuters, so the orchestrator adjudicated the 9 findings by reading the code
+directly — recorded as a degraded protocol, not a clean refuted/confirmed split. Four
+substantive issues were **confirmed and fixed** in `7717677`:
+(1) **P2, twice-found:** the new hero badge mapped null-age placeholder entries through
+`sourceFreshnessVerdict`, which returns `late` when cadence exists — so one absent source
+(e.g. a buoy with no observation row; the worker always ships all four entries with cadence)
+pinned every spot to "Data late" while the banner deliberately stayed silent and the
+provenance panel said "Missing". The badge now applies the banner's exact null-age exclusion.
+(2) **P1:** the badge used a light-surface color recipe on the deep `.spotHero` (measured
+1.0–2.3:1); it is now light-on-dark — in-page measurement gives text 10.21/10.66/11.25:1 and
+border-vs-glow 3.76/4.22/3.10:1 for fresh/aging/late, clearing WCAG 1.4.3 and 1.4.11 in the
+worst case. `text-transform: capitalize` (which rendered the locked copy as "Data Late") is
+gone, and the phone grid no longer stretches the pill (82 px, `justify-self: start`).
+(3) **P2 (S-2):** the deleted legend was the only decoder for the moon icon and night-row
+dimming on the default view — the learning guide never covered it and moved to Analysis
+anyway. Night semantics are restored in place via a Time-column `InfoTooltip` and
+`aria-label="Night window"` on both desktop and mobile moon icons — information preserved
+without re-adding always-visible chrome.
+(4) **P3×4:** the badge aggregation and the desktop expand/toggle/reset logic had zero pins —
+finders proved both survived mutation with all tests green. Added four badge-state pins
+(fresh/aging/late/absent, including the null-age case that fails without fix 1) and a desktop
+pin (no auto-expand on load, click expands with `aria-expanded`, second click collapses,
+resolution change clears it). `pnpm verify` green: web 284 (+1 skip), workerd 19.
