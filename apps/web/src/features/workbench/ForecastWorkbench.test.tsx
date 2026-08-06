@@ -17,6 +17,10 @@ import { ForecastWorkbench } from "./ForecastWorkbench";
 const now = new Date("2026-08-02T07:00:00.000Z");
 const canonicalThreeHourAt = "2026-08-02T16:00:00.000Z";
 const hourlyChallengerAt = "2026-08-02T17:00:00.000Z";
+// Past the fixture's entire five-day horizon: every daylight window has
+// elapsed, so the local canonical recommendation is empty while the forecast
+// payload itself stays healthy and usable.
+const elapsedDayNow = new Date("2026-08-12T23:00:00.000Z");
 const profile = getSpotProfile("bolinas");
 const spot = {
   ...profile,
@@ -477,7 +481,7 @@ describe("ForecastWorkbench", () => {
     });
   });
 
-  it("collapses a forecaster with no reliable call to one quiet line and skips the brief fetch", async () => {
+  it("collapses to one quiet line when neither the Worker nor the local read has a call", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     let briefRequests = 0;
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
@@ -487,17 +491,69 @@ describe("ForecastWorkbench", () => {
     }));
 
     const { container } = render(
-      <ForecastWorkbench spot={spot} initialForecast={unavailableForecast(fixtureForecast())} now={now} />
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />
     );
 
     expect(
-      await screen.findByText(/No reliable daylight recommendation yet — the Forecast tab still shows every available public input\./)
+      await screen.findByText(/No daylight recommendation for this day\. Every available public input is still listed on the Forecast tab\./)
     ).toBeTruthy();
-    // One quiet line, not a billboard: no brief headline, picks, or lesson.
+    // One quiet line, not a billboard: no headline, picks, or lesson.
     expect(container.querySelector(".dailyBrief")).toBeNull();
     expect(screen.queryByText("What this teaches you")).toBeNull();
     expect(screen.queryByText("Daily outlook")).toBeNull();
-    expect(briefRequests).toBe(0);
+    // The request still fires — a published brief must stay reachable even
+    // when the local read has no pick; only its absence collapses the panel.
+    await waitFor(() => expect(briefRequests).toBeGreaterThan(0));
+  });
+
+  it("keeps a published brief reachable on a day whose daylight windows have elapsed", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "Yesterday's window has closed",
+            setup: "The published outlook and its caveats remain available for review.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [{ text: "Afternoon wind arrived early.", factRefs: ["wind:1"] }],
+            lesson: { topic: "Timing", text: "A closed window still teaches what moved the call.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    render(
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />
+    );
+
+    // No local pick exists, but the Worker's brief must still render rather
+    // than being suppressed behind the quiet line.
+    expect(await screen.findByRole("heading", { name: "Yesterday's window has closed" })).toBeTruthy();
+    expect(screen.getByText("What could change the call")).toBeTruthy();
+    expect(screen.queryByText(/No daylight recommendation for this day/)).toBeNull();
+  });
+
+  it("says so on Analysis when the forecast request itself failed", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({ error: "unavailable" }, 503)));
+
+    render(
+      <ForecastWorkbench spot={spot} initialForecast={null} initialError="forecast failed" now={now} />
+    );
+
+    // The panel must not claim the sibling tab has data when it is showing an
+    // error, and the state must be announced.
+    const line = await screen.findByText(
+      /Forecast data for this spot is temporarily unavailable, so there is no analysis to show yet\./
+    );
+    expect(line.getAttribute("role")).toBe("status");
+    expect(screen.queryByText(/still listed on the Forecast tab/)).toBeNull();
   });
 
   it("uses one hourly request while a cold three-hour fallback arrives", async () => {

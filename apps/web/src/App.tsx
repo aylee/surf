@@ -479,13 +479,16 @@ function SpotDetail({
   const featured = dayBest ?? current;
   const hazards = activeHazardMessages(windows);
   // The slim header's freshness badge is PR-B's verdict over the featured
-  // window's own shipped cadence — worst source wins. It applies the same
-  // exclusions as the dashboard banner: an entry with no cadence is never
-  // re-judged, and a whole-source absence (null age) is missing rather than
-  // late — that state belongs to the caveats and the provenance panel, which
-  // label it "Missing". Judging it here would contradict both surfaces.
+  // window's own shipped cadence — worst source wins — and it judges only the
+  // sources that actually fed that window. `activeCapabilities` is the
+  // worker's own inclusion set: it omits absent sources and an observation
+  // too far from the window to support it, exactly as the worker omits them
+  // from the window's own freshness scalar. Judging an excluded source here
+  // would claim the forecast is late because of data it never used, while the
+  // banner stayed silent and the provenance panel said Missing or Stale.
+  const featuredCapabilities = new Set(featured?.activeCapabilities ?? []);
   const featuredVerdicts = (featured?.sourceFreshness ?? [])
-    .filter((entry) => entry.freshnessMinutes !== null)
+    .filter((entry) => featuredCapabilities.has(entry.capability) && entry.freshnessMinutes !== null)
     .map((entry) => sourceFreshnessVerdict(entry))
     .filter((verdict): verdict is Exclude<ReturnType<typeof sourceFreshnessVerdict>, null> => verdict !== null);
   const spotFreshness = featuredVerdicts.length === 0

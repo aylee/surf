@@ -220,6 +220,7 @@ function LearningGuideContents() {
       <div><dt>Tide trend</dt><dd>Rising and falling describe movement between official high and low events; the same swell can break differently as depth changes.</dd></div>
       <div><dt>Confidence</dt><dd>A deterministic read of availability, calibration, lead time, and source health. It is not a promise that conditions will match.</dd></div>
       <div><dt>Freshness</dt><dd>Age is shown per source and selected timestamp. One fresh feed cannot make every input fresh.</dd></div>
+      <div><dt>Night windows</dt><dd>A moon marks a window outside daylight. Night rows stay visible as context but are excluded from the daylight recommendation.</dd></div>
     </dl>
   );
 }
@@ -473,6 +474,13 @@ function WindowExpandedDetails({ window, spot }: { window: WorkbenchWindow; spot
         <strong>{window.confidenceLabel} confidence · {formatFreshness(window.sourceFreshnessMinutes)}</strong>
         <p>{window.weatherSummary ?? "Weather summary unavailable."}</p>
       </div>
+      {!window.isDaylight && (
+        <div>
+          <span>Night window</span>
+          <strong>Shown as context only</strong>
+          <p>Rows marked with a moon fall outside daylight, so they stay visible but are excluded from the daylight recommendation.</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -1031,6 +1039,7 @@ export function ForecastWorkbench({
             canonicalDayBest={canonicalDayBest}
             canonicalGeneratedAt={canonicalForecast?.generatedAt ?? null}
             forecast={forecast}
+            forecastErrored={Boolean(intervalError || (initialError && !rawForecast))}
             selected={selected}
           />
         </TabsContent>
@@ -1049,6 +1058,7 @@ function AnalysisPanel({
   canonicalDayBest,
   canonicalGeneratedAt,
   forecast,
+  forecastErrored,
   selected
 }: {
   spot: ApiSpot;
@@ -1056,20 +1066,25 @@ function AnalysisPanel({
   canonicalDayBest: WorkbenchWindow | null | undefined;
   canonicalGeneratedAt: string | null;
   forecast: WorkbenchForecast | null;
+  forecastErrored: boolean;
   selected?: WorkbenchWindow;
 }) {
-  const [brief, setBrief] = useState<DailyBrief | null>(null);
+  const [serverBrief, setServerBrief] = useState<DailyBrief | null>(null);
   const [briefLoading, setBriefLoading] = useState(false);
   const fallbackBrief = useMemo(
     () => deterministicBrief(spot, selectedDate, canonicalDayBest ?? undefined, canonicalGeneratedAt),
     [canonicalDayBest, canonicalGeneratedAt, selectedDate, spot]
   );
-  const hasReliableCall = Boolean(selectedDate && canonicalDayBest);
 
+  // The request is gated only on the selected date (and on this panel being
+  // mounted, i.e. Analysis selected). A published outlook must stay reachable
+  // for any date that has one — including a day whose daylight windows have
+  // merely elapsed, where the local fallback has no pick but the Worker's
+  // brief and its caveats still exist.
   useEffect(() => {
-    if (!selectedDate || !hasReliableCall) return;
+    if (!selectedDate) return;
     const controller = new AbortController();
-    setBrief(fallbackBrief);
+    setServerBrief(null);
     setBriefLoading(true);
     void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
       headers: { Accept: "application/json" },
@@ -1081,29 +1096,36 @@ function AnalysisPanel({
       })
       .then((value) => {
         if (controller.signal.aborted) return;
-        setBrief(value ?? fallbackBrief);
+        setServerBrief(value);
         setBriefLoading(false);
       })
       .catch(() => {
         if (controller.signal.aborted) return;
-        setBrief(fallbackBrief);
+        setServerBrief(null);
         setBriefLoading(false);
       });
     return () => controller.abort();
-  }, [fallbackBrief, hasReliableCall, selectedDate, spot.id]);
+  }, [selectedDate, spot.id]);
+
+  const brief = serverBrief ?? fallbackBrief;
+  // Collapse to one quiet line only when there is genuinely nothing to say:
+  // no published brief and no local recommendation either.
+  const hasBriefContent = Boolean(serverBrief) || fallbackBrief.picks.length > 0;
 
   return (
     <div className="analysisPanel">
-      {hasReliableCall ? (
+      {hasBriefContent ? (
         <DailyBriefErrorBoundary
-          key={`${spot.id}:${selectedDate ?? "none"}:${brief?.generatedAt ?? brief?.headline ?? "local"}`}
+          key={`${spot.id}:${selectedDate ?? "none"}:${brief.generatedAt ?? brief.headline}`}
           fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}
         >
-          <DailyBriefCard brief={brief ?? fallbackBrief} loading={briefLoading} spot={spot} />
+          <DailyBriefCard brief={brief} loading={briefLoading} spot={spot} />
         </DailyBriefErrorBoundary>
       ) : (
-        <p className="quietBriefLine">
-          No reliable daylight recommendation yet — the Forecast tab still shows every available public input.
+        <p className="quietBriefLine" role="status">
+          {forecastErrored || !forecast
+            ? "Forecast data for this spot is temporarily unavailable, so there is no analysis to show yet."
+            : "No daylight recommendation for this day. Every available public input is still listed on the Forecast tab."}
         </p>
       )}
       <div className="analysisTools">
