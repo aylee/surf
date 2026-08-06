@@ -1140,3 +1140,29 @@ advanced. The deps now include `canonicalGeneratedAt` — a stable string that m
 the payload really does.
 Four new pins cover the badge exclusion path, the day label, the loading state, and the
 refresh-driven refetch. `pnpm verify` green: web 287 (+1 skip), workerd 19, Python 45.
+
+_2026-08-06 (UTC)_ — **PR-C delta check found three fix-induced defects (fixed in `eca25f1`);
+a convergence check is now running on the churned component.** All three came from my own
+round-3 fixes, which is the signal that matters:
+(1) **P1:** adding `canonicalGeneratedAt` to the brief effect deps without touching the
+`setServerBrief(null)` at the top of the effect body meant every refresh *tore down* the
+outlook it was refreshing — and a transient refetch failure erased a good published brief
+outright. The clear is now scoped to a `spot:date` change via a ref, replacement happens only
+on success, and the error boundary is keyed by scope so a refresh no longer remounts the card
+and collapses disclosures the reader has open.
+(2) **P2:** `briefLoading` started false and was only set inside the effect, so the first
+committed paint on an elapsed day was the recommendation *denial* — announced through a live
+region — before the request had even been issued, repeating on every tab re-entry. It is now
+initialized from the selected date, and the outage copy takes precedence in the render order.
+(3) **P2:** the new day label interpolated an unvalidated URL date key, and JS rolls impossible
+dates forward, so `?date=2026-02-31` rendered a confident "Tuesday, Mar 3" nobody asked for
+(and `?date=hello` echoed "hello"). The formatter now round-trips its parts and returns null
+for anything that is not a real calendar day, the label is omitted rather than fabricated, and
+malformed date params are discarded at the URL boundary.
+Three new pins cover refresh-keeps-outlook, failed-refetch-keeps-outlook, and the bogus-date
+label; the adapter pins date-key validation. `pnpm verify` green: web 290 (+1 skip), workerd 19.
+**Process note:** rounds 1–3 plus the delta check found 4/4/4/3 defects, increasingly
+*introduced by the previous fix* and concentrated in the extracted `AnalysisPanel`. Rather than
+patch a fifth time, the next pass is an explicit convergence check that must also judge whether
+the panel's state model (three booleans + a ref) should be restructured — e.g. a scope-keyed
+remount or a single discriminated status union — instead of accumulating more instance fixes.
