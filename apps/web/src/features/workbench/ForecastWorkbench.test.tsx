@@ -481,12 +481,17 @@ describe("ForecastWorkbench", () => {
     });
   });
 
-  it("collapses to one quiet line when neither the Worker nor the local read has a call", async () => {
+  it("collapses to one quiet line when the Worker answers with no outlook to publish", async () => {
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     let briefRequests = 0;
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("/brief?")) briefRequests += 1;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        // A 2xx answer carrying nothing publishable: the deterministic "no
+        // recommendation" case, distinct from a request that never landed.
+        return jsonResponse({ status: "unavailable", brief: null });
+      }
       return jsonResponse({}, 503);
     }));
 
@@ -504,6 +509,68 @@ describe("ForecastWorkbench", () => {
     // The request still fires — a published brief must stay reachable even
     // when the local read has no pick; only its absence collapses the panel.
     await waitFor(() => expect(briefRequests).toBeGreaterThan(0));
+  });
+
+  it("distinguishes a failed outlook request from a deterministic no-recommendation", async () => {
+    // Elapsed day, healthy cached payload, brief endpoint down. Presenting this
+    // as "no daylight recommendation" would state an editorial judgment the
+    // Worker never made — and would hide a published brief behind a transport
+    // failure.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) briefRequests += 1;
+      return jsonResponse({}, 503);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />);
+
+    expect(
+      await screen.findByText(/The daily outlook could not be loaded\. Every available public input is still listed on the Forecast tab\./)
+    ).toBeTruthy();
+    expect(screen.queryByText(/No daylight recommendation for this day/)).toBeNull();
+    await waitFor(() => expect(briefRequests).toBeGreaterThan(0));
+  });
+
+  it("never claims an outage while its own brief request is still in flight", async () => {
+    // The brief is a separate endpoint that answers even when the forecast read
+    // is failing, so the outage line must not preempt an in-flight request it
+    // would have to retract one round trip later.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&date=2026-08-02");
+    let releaseBrief!: () => void;
+    const briefGate = new Promise<void>((resolve) => { releaseBrief = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        await briefGate;
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "The outlook survived the outage",
+            setup: "The brief endpoint answered while the forecast read was failing.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    render(
+      <ForecastWorkbench spot={spot} initialForecast={null} initialError="forecast failed" now={now} />
+    );
+
+    expect(await screen.findByText("Loading the daily outlook…")).toBeTruthy();
+    expect(screen.queryByText(/Forecast data for this spot is temporarily unavailable/)).toBeNull();
+
+    releaseBrief();
+    expect(await screen.findByRole("heading", { name: "The outlook survived the outage" })).toBeTruthy();
+    expect(screen.queryByText(/Forecast data for this spot is temporarily unavailable/)).toBeNull();
   });
 
   it("keeps a published brief reachable on a day whose daylight windows have elapsed", async () => {
@@ -760,6 +827,51 @@ describe("ForecastWorkbench", () => {
     expect(screen.queryByText("Updating the daily outlook.")).toBeNull();
     expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("false");
     expect(screen.getByRole("heading", { name: "A published outlook" })).toBeTruthy();
+  });
+
+  it("announces a genuine revision by changing the live region's text", async () => {
+    // Suppressing the false announcements must not silence the real ones: a
+    // polite live region only speaks when its text changes, so a revision that
+    // rewrites the card has to rewrite the message too.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: `Revision ${briefRequests}`,
+            setup: "Public inputs support the read.",
+            revision: briefRequests,
+            generatedAt: briefRequests > 1 ? "2026-08-02T09:20:00.000Z" : "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { container, rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    await screen.findByRole("heading", { name: "Revision 1" });
+    const announced = () => container.querySelector(".dailyBrief > .srOnly")?.textContent ?? "";
+    const firstAnnouncement = announced();
+    expect(firstAnnouncement).toMatch(/^Daily outlook updated /);
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T09:15:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+    await screen.findByRole("heading", { name: "Revision 2" });
+
+    expect(announced()).toMatch(/^Daily outlook updated /);
+    expect(announced()).not.toBe(firstAnnouncement);
+    expect(briefRequests).toBe(2);
   });
 
   it("says so on Analysis when the forecast request itself failed", async () => {

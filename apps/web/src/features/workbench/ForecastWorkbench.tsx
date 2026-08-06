@@ -289,10 +289,19 @@ function ForecastLearningGuide() {
 
 function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: boolean; spot: ApiSpot }) {
   const [bestPick, ...alternatePicks] = brief.picks;
+  // A live region only announces when its text changes, so the message carries
+  // the publication stamp the card already shows. A fixed string would announce
+  // the first outlook and then stay silent through every genuine revision,
+  // which is the same failure as announcing revisions that never happened.
+  const publishedAt = brief.generatedAt ? formatTimestamp(brief.generatedAt, spot.timezone) : null;
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={loading}>
       <span className="srOnly" role="status" aria-live="polite">
-        {loading ? "Updating the daily outlook." : "Daily outlook updated."}
+        {loading
+          ? "Updating the daily outlook."
+          : publishedAt
+            ? `Daily outlook updated ${publishedAt}.`
+            : "Daily outlook updated."}
       </span>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
@@ -1153,14 +1162,19 @@ function AnalysisPanel({
   );
 }
 
-// One request state, not a set of booleans to intersect at render time.
-// "empty" means the Worker was asked and published nothing; "loading" means it
-// has not answered yet. A refresh that fails leaves a rendered brief in place
+// One request state, not a set of booleans to intersect at render time. The
+// four cells are distinct answers rather than shades of one: "loading" means
+// the Worker has not answered, "ready" means it published something to render,
+// "empty" means it answered and had nothing publishable, and "failed" means we
+// could not get an answer at all. Merging the last two would present a
+// transport failure as a deterministic editorial judgment that no
+// recommendation exists. A refresh that fails leaves a rendered brief in place
 // and never re-enters "loading", so nothing is torn down or re-announced.
 type OutlookState =
   | { status: "loading" }
   | { status: "ready"; brief: DailyBrief }
-  | { status: "empty" };
+  | { status: "empty" }
+  | { status: "failed" };
 
 function DailyOutlook({
   spot,
@@ -1188,20 +1202,27 @@ function DailyOutlook({
       headers: { Accept: "application/json" },
       signal: controller.signal
     })
-      .then(async (response) => (response.ok ? parseBriefResponse(await response.json()) : null))
-      .then((value) => {
+      // A non-2xx status means the question went unanswered, which is not the
+      // same fact as an answer with no outlook in it. An unreadable body throws
+      // past this and lands in the catch below, where it is also a failure to
+      // get an answer rather than an answer of "none".
+      .then(async (response) =>
+        response.ok
+          ? { answered: true as const, brief: parseBriefResponse(await response.json()) }
+          : { answered: false as const, brief: null }
+      )
+      .then((result) => {
         if (controller.signal.aborted) return;
-        setState((current) =>
-          value
-            ? { status: "ready", brief: value }
-            : current.status === "ready"
-              ? current
-              : { status: "empty" }
-        );
+        setState((current) => {
+          if (result.brief) return { status: "ready", brief: result.brief };
+          // A failed or empty refresh never evicts what the reader already has.
+          if (current.status === "ready") return current;
+          return result.answered ? { status: "empty" } : { status: "failed" };
+        });
       })
       .catch(() => {
         if (controller.signal.aborted) return;
-        setState((current) => (current.status === "ready" ? current : { status: "empty" }));
+        setState((current) => (current.status === "ready" ? current : { status: "failed" }));
       });
     return () => controller.abort();
   }, [canonicalGeneratedAt, selectedDate, spot.id]);
@@ -1221,6 +1242,16 @@ function DailyOutlook({
       </DailyBriefErrorBoundary>
     );
   }
+  const loadingLine = (
+    <p className="quietBriefLine" role="status" aria-busy="true">
+      Loading the daily outlook…
+    </p>
+  );
+  // This panel's own request outranks the parent's forecast status. The brief
+  // is a separate endpoint that answers even when the forecast read is failing,
+  // so announcing an outage — or a denial — while it is still in flight states
+  // something that is retracted one round trip later.
+  if (state.status === "loading" && selectedDate) return loadingLine;
   if (forecastStatus === "error") {
     return (
       <p className="quietBriefLine" role="status">
@@ -1228,13 +1259,16 @@ function DailyOutlook({
       </p>
     );
   }
-  if (state.status === "loading" || forecastStatus === "loading" || !selectedDate) {
+  if (state.status === "failed") {
     return (
-      <p className="quietBriefLine" role="status" aria-busy="true">
-        Loading the daily outlook…
+      <p className="quietBriefLine" role="status">
+        The daily outlook could not be loaded. Every available public input is still listed on the Forecast tab.
       </p>
     );
   }
+  if (forecastStatus === "loading" || !selectedDate) return loadingLine;
+  // Reached only when the Worker answered and had no outlook to publish, so
+  // this reads as the deterministic finding it is.
   return (
     <p className="quietBriefLine" role="status">
       No daylight recommendation for this day. Every available public input is still listed on the Forecast tab.
