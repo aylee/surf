@@ -289,19 +289,20 @@ function ForecastLearningGuide() {
 
 function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: boolean; spot: ApiSpot }) {
   const [bestPick, ...alternatePicks] = brief.picks;
-  // A live region only announces when its text changes, so the message carries
-  // the publication stamp the card already shows. A fixed string would announce
-  // the first outlook and then stay silent through every genuine revision,
-  // which is the same failure as announcing revisions that never happened.
-  const publishedAt = brief.generatedAt ? formatTimestamp(brief.generatedAt, spot.timezone) : null;
+  // A live region only announces when its text changes, so the message has to
+  // carry something that moves on a real revision — a fixed string would speak
+  // once and then stay silent through every rewrite. It must not move for
+  // anything else: the publication stamp looks like the right signal but is a
+  // materialization or request clock on both deterministic paths, so keying on
+  // it would announce a revision on every payload refresh of byte-identical
+  // prose. The headline is derived from the content itself, so it moves when
+  // the call moves and not otherwise. Known limit: a revision that rewrites the
+  // body while keeping the same headline is not announced.
+  const announcement = presentBriefCopy(brief.headline);
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={loading}>
       <span className="srOnly" role="status" aria-live="polite">
-        {loading
-          ? "Updating the daily outlook."
-          : publishedAt
-            ? `Daily outlook updated ${publishedAt}.`
-            : "Daily outlook updated."}
+        {loading ? "Updating the daily outlook." : `Daily outlook updated. ${announcement}`}
       </span>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
@@ -1203,9 +1204,11 @@ function DailyOutlook({
       signal: controller.signal
     })
       // A non-2xx status means the question went unanswered, which is not the
-      // same fact as an answer with no outlook in it. An unreadable body throws
-      // past this and lands in the catch below, where it is also a failure to
-      // get an answer rather than an answer of "none".
+      // same fact as an answer with no outlook in it. A body that is not valid
+      // JSON throws past this into the catch below, which is also a failure to
+      // get an answer. A 2xx whose JSON the adapter cannot read is still
+      // treated as "answered with nothing" — unreachable against today's
+      // handler, and the honest split there needs the envelope to say so.
       .then(async (response) =>
         response.ok
           ? { answered: true as const, brief: parseBriefResponse(await response.json()) }
@@ -1247,11 +1250,22 @@ function DailyOutlook({
       Loading the daily outlook…
     </p>
   );
-  // This panel's own request outranks the parent's forecast status. The brief
-  // is a separate endpoint that answers even when the forecast read is failing,
-  // so announcing an outage — or a denial — while it is still in flight states
-  // something that is retracted one round trip later.
+  // Ordered so that nothing definitive is said while either request that could
+  // still produce content is outstanding. Two sources are pending until they
+  // are not: this panel's brief, and the parent's forecast payload.
+  //
+  // 1. The brief is a separate endpoint that answers even when the forecast
+  //    read is failing, so an outage or a denial announced over an in-flight
+  //    request would be retracted one round trip later. Guarded on a selected
+  //    date so that a request which was never started cannot outrank the
+  //    settled lines below; with no date there is nothing in flight to defer to.
   if (state.status === "loading" && selectedDate) return loadingLine;
+  // 2. Symmetrically, a failed brief says nothing about a forecast payload that
+  //    has not landed yet — that payload may still carry a local pick, and both
+  //    settled lines below would claim inputs are listed on a tab still empty.
+  if (forecastStatus === "loading") return loadingLine;
+  // 3. Both requests have settled. A forecast outage is the broader fact, so it
+  //    outranks whatever the brief request did.
   if (forecastStatus === "error") {
     return (
       <p className="quietBriefLine" role="status">
@@ -1266,7 +1280,8 @@ function DailyOutlook({
       </p>
     );
   }
-  if (forecastStatus === "loading" || !selectedDate) return loadingLine;
+  // 4. A ready forecast with no day selected has nothing to deny yet.
+  if (!selectedDate) return loadingLine;
   // Reached only when the Worker answered and had no outlook to publish, so
   // this reads as the deterministic finding it is.
   return (

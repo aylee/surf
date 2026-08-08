@@ -533,6 +533,32 @@ describe("ForecastWorkbench", () => {
     await waitFor(() => expect(briefRequests).toBeGreaterThan(0));
   });
 
+  it("never claims a failed outlook while the forecast payload is still in flight", async () => {
+    // The mirror of the outage case: a brief that failed says nothing about a
+    // payload that has not landed, and the failure copy would claim inputs are
+    // listed on a Forecast tab that is still empty.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&date=2026-08-02");
+    let releaseForecast!: () => void;
+    const forecastGate = new Promise<void>((resolve) => { releaseForecast = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) return jsonResponse({}, 503);
+      await forecastGate;
+      return jsonResponse(fixtureForecast());
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={null} now={now} />);
+
+    expect(await screen.findByText("Loading the daily outlook…")).toBeTruthy();
+    expect(screen.queryByText(/still listed on the Forecast tab/)).toBeNull();
+
+    releaseForecast();
+    // The payload carries a daylight pick, so the panel resolves to content —
+    // proving the failure line would have been retracted had it been shown.
+    expect(await screen.findByRole("heading", { name: /leading daylight window/ })).toBeTruthy();
+    expect(screen.queryByText(/could not be loaded/)).toBeNull();
+  });
+
   it("never claims an outage while its own brief request is still in flight", async () => {
     // The brief is a separate endpoint that answers even when the forecast read
     // is failing, so the outage line must not preempt an in-flight request it
@@ -861,17 +887,124 @@ describe("ForecastWorkbench", () => {
       <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
     );
     await screen.findByRole("heading", { name: "Revision 1" });
-    const announced = () => container.querySelector(".dailyBrief > .srOnly")?.textContent ?? "";
+    const region = () => container.querySelector(".dailyBrief > .srOnly");
+    const announced = () => region()?.textContent ?? "";
     const firstAnnouncement = announced();
-    expect(firstAnnouncement).toMatch(/^Daily outlook updated /);
+    expect(firstAnnouncement).toMatch(/^Daily outlook updated\./);
+    // Changing text only announces if the node is actually a live region.
+    expect(region()?.getAttribute("role")).toBe("status");
+    expect(region()?.getAttribute("aria-live")).toBe("polite");
 
     const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T09:15:00.000Z" });
     rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
     await screen.findByRole("heading", { name: "Revision 2" });
 
-    expect(announced()).toMatch(/^Daily outlook updated /);
+    expect(announced()).toMatch(/^Daily outlook updated\./);
     expect(announced()).not.toBe(firstAnnouncement);
     expect(briefRequests).toBe(2);
+  });
+
+  it("stays silent when a refresh republishes the same outlook", async () => {
+    // The deterministic paths stamp generatedAt with a materialization or
+    // request clock, so keying the announcement on it would announce a revision
+    // every time the payload generation moved under identical prose.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        return jsonResponse({
+          status: "deterministic_fallback",
+          brief: {
+            provider: "deterministic",
+            headline: "Bolinas daily summary is refreshing",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            // Same prose, later clock: a re-materialization, not a revision.
+            generatedAt: briefRequests > 1 ? "2026-08-02T09:20:00.000Z" : "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { container, rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    await screen.findByRole("heading", { name: "Bolinas daily summary is refreshing" });
+    const announced = () => container.querySelector(".dailyBrief > .srOnly")?.textContent ?? "";
+    const before = announced();
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T09:15:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+    await waitFor(() => expect(briefRequests).toBe(2));
+
+    expect(announced()).toBe(before);
+  });
+
+  it("treats a network failure as a failed outlook, not a published nothing", async () => {
+    // The catch arm is the likelier trigger in a browser than a 503: offline,
+    // DNS, TLS reset, dropped connection.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) throw new TypeError("Failed to fetch");
+      return jsonResponse(fixtureForecast());
+    }));
+
+    render(
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />
+    );
+
+    const line = await screen.findByText(/The daily outlook could not be loaded\./);
+    expect(screen.queryByText(/No daylight recommendation for this day/)).toBeNull();
+    // A transport failure has to be audible, not just visible.
+    expect(line.getAttribute("role")).toBe("status");
+  });
+
+  it("keeps a rendered outlook when a later refresh drops the connection", async () => {
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        if (briefRequests > 1) throw new TypeError("Failed to fetch");
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "A published outlook",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    await screen.findByRole("heading", { name: "A published outlook" });
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T08:00:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+    await waitFor(() => expect(briefRequests).toBe(2));
+
+    // A dropped refresh must not evict what the reader is already reading.
+    expect(screen.getByRole("heading", { name: "A published outlook" })).toBeTruthy();
+    expect(screen.queryByText(/could not be loaded/)).toBeNull();
   });
 
   it("says so on Analysis when the forecast request itself failed", async () => {
