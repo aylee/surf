@@ -201,12 +201,136 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { level: 1, name: "Test Break" })).toBeTruthy();
-    expect(screen.getByRole("heading", { name: "Forecast workbench" })).toBeTruthy();
+    // Forecast is the default tab: deterministic data first, zero AI content,
+    // and no /brief request until Analysis is selected.
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
-    expect(screen.getByText("Daily outlook")).toBeTruthy();
+    expect(screen.getByRole("tablist", { name: "Spot view" })).toBeTruthy();
+    expect(screen.getByRole("tablist", { name: "Forecast view" })).toBeTruthy();
+    expect(screen.queryByText("Daily outlook")).toBeNull();
     expect(screen.queryByText(/AI-assisted|Gemini|Google/i)).toBeNull();
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.getByRole("link", { name: /Daily report/ }).getAttribute("href")).toBe("/");
+    expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
+  });
+
+  it("deep-links to Analysis, fetches the brief only there, and round-trips the tab param", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const fetchMock = installSuccessfulApi();
+
+    render(<App />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    const briefCalls = () =>
+      fetchMock.mock.calls.filter(([input]) => requestPath(input).includes("/brief?")).length;
+    expect(briefCalls()).toBe(0);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
+    // The Worker publishes no brief here (404), so the card is the local
+    // forecast read and must be labelled as one rather than as an outlook.
+    expect(await screen.findByText("Forecast read")).toBeTruthy();
+    expect(screen.queryByText("Daily outlook")).toBeNull();
+    expect(screen.getByText("Data, confidence & provenance")).toBeTruthy();
+    await waitFor(() => expect(briefCalls()).toBeGreaterThan(0));
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("analysis");
+    // The forecast table is unmounted while Analysis is active.
+    expect(screen.queryByRole("table", { name: /surf-planning inputs/ })).toBeNull();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
+  });
+
+  it("renders the slim-header freshness badge from the worst cadence-bearing source", async () => {
+    const badgeCase = async (
+      entries: Array<Record<string, unknown>>,
+      activeCapabilities?: string[]
+    ): Promise<string | null> => {
+      cleanup();
+      window.history.replaceState({}, "", "/?spot=test-break");
+      const base = fixtureForecast();
+      const forecast = ForecastResponseSchema.parse({
+        ...base,
+        generatedAt: new Date().toISOString(),
+        windows: base.windows.map((window) => ({
+          ...window,
+          sourceFreshness: entries,
+          ...(activeCapabilities ? { activeCapabilities } : {})
+        }))
+      });
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+        if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
+        return jsonResponse({ error: "not found" }, 404);
+      }));
+      const { container } = render(<App />);
+      await screen.findByRole("heading", { level: 1, name: "Test Break" });
+      return container.querySelector(".freshnessBadge")?.textContent?.trim() ?? null;
+    };
+
+    const entry = (overrides: Record<string, unknown>) => ({
+      capability: "wind",
+      sourceId: "nws:point-forecast-alerts",
+      sourceRunId: "run",
+      updatedAt: "2026-08-05T12:00:00.000Z",
+      freshnessMinutes: 30,
+      status: "fresh",
+      expectedCadenceMinutes: 360,
+      graceMinutes: 180,
+      ...overrides
+    });
+
+    // All fresh → fresh; one aging → aging; one late → late (worst wins).
+    expect(await badgeCase([entry({}), entry({ capability: "tide", sourceId: "coops:tide-predictions" })])).toBe("Data fresh");
+    expect(await badgeCase([entry({}), entry({ capability: "tide", sourceId: "coops:tide-predictions", freshnessMinutes: 500 })])).toBe("Data aging");
+    expect(await badgeCase([entry({ freshnessMinutes: 900 }), entry({ capability: "tide", sourceId: "coops:tide-predictions" })])).toBe("Data late");
+
+    // A whole-source absence is "missing", not late: the badge must agree with
+    // the banner's exclusion and the provenance panel's "Missing" label.
+    expect(
+      await badgeCase([entry({}), entry({ capability: "observed_wave", sourceId: "ndbc:preferred", updatedAt: null, freshnessMinutes: null, status: "missing" })])
+    ).toBe("Data fresh");
+
+    // No cadence anywhere → no badge rather than a re-judged guess.
+    expect(
+      await badgeCase([entry({ expectedCadenceMinutes: undefined, graceMinutes: undefined })])
+    ).toBeNull();
+
+    // A late buoy leaves the worker's activeCapabilities set at exactly the age
+    // its verdict turns late. The badge must still report it, because the
+    // banner names that source and the provenance panel labels it Stale —
+    // silently upgrading it to "Data fresh" would be the contradiction.
+    expect(
+      await badgeCase(
+        [
+          entry({}),
+          entry({
+            capability: "observed_wave",
+            sourceId: "ndbc-46237",
+            freshnessMinutes: 180,
+            status: "stale",
+            expectedCadenceMinutes: 60,
+            graceMinutes: 60
+          })
+        ],
+        ["forecast_wave_nearshore", "wind", "tide"]
+      )
+    ).toBe("Data late");
+  });
+
+  it("renders exactly one home link per catalog spot with no shortlist or source-count claim", async () => {
+    installSuccessfulApi();
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
+    const spotLinks = screen
+      .getAllByRole("link")
+      .filter((link) => (link.getAttribute("href") ?? "").includes("spot="));
+    expect(spotLinks).toHaveLength(1); // one catalog spot in the fixture
+    expect(screen.queryByLabelText("Quick spot shortlist")).toBeNull();
+    expect(screen.queryByText(/coastal source update/)).toBeNull();
   });
 
   it("keeps the last good forecast visible when a background refresh fails", async () => {
@@ -606,7 +730,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Forecast workbench" })).toBeTruthy();
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
     const graphTab = screen.getByRole("tab", { name: "Graph" });
     fireEvent.mouseDown(graphTab, { button: 0, ctrlKey: false });
     await waitFor(() => {

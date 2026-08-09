@@ -158,6 +158,9 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 
 | ID | Item | Owner | Status | Resolves in |
 |---|---|---|---|---|
+| OI-9 | Brief headline restates content the page already shows: on the spot page the model-authored headline names both the pick time and the spot name that the `h1` already carries (owner-reported from production, 2026-08-06). PR-C removes the hero↔brief duplication by tabbing them apart; the residual is worker-side brief prompt/validator wording, deliberately kept out of PR-C's UI-only reviewed diff | agent | OPEN | small worker-side polish PR after PR-D, or fold into PR-D's gate |
+| OI-10 | The Analysis outlook's `/brief` fetch has no timeout, so a hung (as opposed to failed) request pins the panel on the loading line while a forecast outage the parent already knows about goes unstated. Pre-existing — the pre-restructure walk also returned the loading line unconditionally — so not a PR-C regression. Bounded in practice by Cloudflare's ~100s 524. Fix candidate: a timeout signal distinct from the unmount abort, so the request resolves to `failed` in bounded time | agent | OPEN | small UI PR after PR-D; needs a timeout path that does not collide with the abort-on-unmount check |
+| OI-11 | A 2xx `/brief` response whose JSON the adapter cannot read is classified `empty` ("answered with nothing") rather than `failed`, so envelope drift would surface as a deterministic "no daylight recommendation" instead of a load failure. Unreachable against today's handler: `ForecastBriefReferencedProseSchema` requires a non-empty headline, so every published brief parses. The honest split needs the envelope to state emptiness explicitly | agent | OPEN | fold into the next brief-contract change; comment at the call site records the current behavior |
 | OI-7 | Rotate the Logfire write token: the Cloudflare destinations GET echoes the `Authorization` header, so the token entered the agent transcript while completing OI-4. Rotate in Logfire, update both destinations (operator dashboard edit keeps the new token out of transcripts), confirm export still works | alex + agent | OPEN | PR-A live gate is now green — rotate at next operator touch (config-only, fully reversible) |
 | OI-8 | Deploy-window sixth-child kill, now twice reproduced (PR #21 deploy of `8ce5bdf1…`; PR-A deploy of `53084465…` at 01:51Z): during the immediate post-activation handoff cycle, the last serialized Queue child (bolinas) is killed `exceededCpu` at ~50–85 ms CPU across 4 delivery attempts while healthy siblings use 196–395 ms; the message lands in `surf-ingest-dlq` (no consumer; left parked per no-replay policy). Cron cycles on the same version are unaffected (bolinas published 02:17:14 with 22-span healthy trace). Working theory: cold-version isolate contention (fresh HTTP-poller isolates + five just-signaled brief Agent DOs + queue consumer on a seconds-old version). Corrective candidates: quiet-down the verifier polling during fan-out, stagger/handoff-delay the enqueue, or verifier tolerance for one cron-cycle convergence. Decide at the PR-B ship boundary — if PR-B's deploy reproduces it, the corrective becomes mandatory before PR-C | agent | OPEN | dedicated corrective, decision checkpoint at T-B.5 |
 
@@ -198,8 +201,8 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 |---|---|---|---|
 | Phase 0 — production diagnostic (read-only) | DONE — OI-2 pinned, OI-5 corrective live | prod: deployment status, D1 read-model/source-run queries, live tail, queue config | Complete |
 | PR-A — observability + ops foundation | DONE — PR #23 merged (`284b25f`), deployed (`53084465…` @100%), live-verified on the 02:17Z cycle | `apps/web/worker/` (index, ingest, read-model), `apps/web/wrangler.jsonc`, `scripts/`, `docs/runtime-operations.md` | Complete; OI-7 rotation + OI-8 corrective tracked in ledger |
-| PR-B — cadence-aware freshness | ACTIVE | `packages/contracts/`, worker materialization, `apps/web/src/App.tsx`, `features/workbench/` | T-B.1 contracts verdict fn → T-B.2 adapter cadence → T-B.3 web single-verdict → gate → ship |
-| PR-C — Forecast \| Analysis tabs | OPEN | `apps/web/src/features/workbench/ForecastWorkbench.tsx`, `App.tsx`, `src/components/ui/tabs.tsx` | After PR-B verified live |
+| PR-B — cadence-aware freshness | DONE — PR #27 live-verified 2026-08-06 | `packages/contracts/`, worker materialization, `apps/web/src/App.tsx`, `features/workbench/` | T-B.1 contracts verdict fn → T-B.2 adapter cadence → T-B.3 web single-verdict → gate → ship |
+| PR-C — Forecast \| Analysis tabs | ACTIVE | `apps/web/src/features/workbench/ForecastWorkbench.tsx`, `App.tsx`, `src/components/ui/tabs.tsx` | After PR-B verified live |
 | PR-D — spot catalog expansion (OD-11) | QUEUED | `packages/db` catalog/seed, worker adapter config, `scripts/`, tests, docs | After PR-C verified live |
 
 ## Decisions
@@ -1017,3 +1020,230 @@ pinned by the spec's newer-partial scenario. Scoped delta check: DRY. `pnpm veri
 `b1122fd` (contracts 11, core 21, db 10, web 277+1skip incl. 20 App tests, workerd 19,
 Python 45). Next: ready PR → Verify → merge → operator deploy → `:17` quiet-steady-state
 live proof (watch OI-8 at the handoff).
+
+_2026-08-06 (UTC)_ — **PR-B merged and deployed; live UI verification green; awaiting the
+03:17Z scheduled-cycle proof.** PR #27 merged as `c39f151` after exact-head Verify (1m31s).
+Pre-deploy bookmark `000003cf-00000000-000050bf-b3532ca26d4380b4c83ed7c161b38319`.
+Operator-run supported deploy activated Worker `18eba224-79ac-4b53-9045-af0f82d3cbb0` in
+deployment `8a966cae…` at 100%; the handoff published **all 12 rows including bolinas — no
+OI-8 recurrence** (1 affinity session, 1 authenticated attempt); strict smoke green on
+workers.dev, post-smoke control plane unchanged. OI-8 verdict at this checkpoint:
+intermittent (1 of 2 deploys), stays open, does not block PR-C; re-evaluate at PR-C's deploy.
+Live verification on the new version: `ops:status` 4/4 with 12/12 on one `02:27:01Z`
+generation; custom-domain smoke green; live payloads carry cadence+grace on every source
+entry (all fresh); production browser at 1280×720 and 390×844 — honest chip
+("Sources 33m–7h old", the grid-wave age quiet inside its declared cadence), **no banner**,
+phone chip visible for the first time (OD-9), zero console messages, no overflow. Remaining
+for T-B.5: the 03:17Z cron republishing 12/12 with the steady state staying quiet (watcher
+armed). PR-C scouting started read-only in parallel; implementation stays gated on live-green.
+
+_2026-08-06 (UTC)_ — **PR-B live-green; Phase B closed; Phase C begins.** The 03:17Z cron
+republished all 12 rows (`generated 03:17:14.351Z`, ops 4/4). T-B.5 acceptance held: quiet
+chip, no banner, correct collapsed-range copy, mobile chip visible, smoke green both origins.
+Phase C starts from `c39f151` on `aylee/surf-forecast-analysis-tabs`; the tabs-scout map is
+in hand (AnalysisPanel extraction for lazy brief fetch; `tab` param null-on-default; the
+exact-match `readWorkbenchUrl` test; ~20 moving assertions; OD-9 deletion list; S-2
+provenance surfaces move intact).
+
+_2026-08-06 (UTC)_ — **PR-C implemented and locally proven; adversarial round 1 in flight.**
+Commit `3918354` on `aylee/surf-forecast-analysis-tabs`: outer Spot-view tabs (Forecast
+default | Analysis) with the brief fetch owned by an extracted AnalysisPanel (zero /brief
+requests until Analysis mounts — verified in-browser), `tab=analysis` deep link with
+null-on-default URL writes, slim deterministic header (kicker gone, duplicate ConditionPill
+gone, PR-B verdict badge added), OD-9 deletions (workbench heading/blurb/legend, auto-expanded
+row explanation — expansion now click-driven and decoupled from selection), quiet one-line
+no-reliable-call collapse (fetch skipped), home de-dup (shortlist + source-count removed →
+exactly 6 unique spot links), phone compare-row CSS pairing. Provenance/learning-guide moved
+intact to Analysis (S-2). `pnpm verify` green (web 282 incl. 22 App + 12 workbench tests;
+workerd 19). Local browser e2e at 1280/390: default-tab semantics, deep link (exactly 1 brief
+request on Analysis), distinct tablist names, no auto-expanded detail, no overflow, home
+6-unique-links — plus PR-B's banner observed live-firing on stale local buoy data with spot
+scoping, day tier, and cadence copy ("Buoy observations at Linda Mar / Pacifica 1d old;
+expected hourly."). Review round 1 (3 lenses × 2 refuters) running.
+
+_2026-08-06 (UTC)_ — **Runtime handoff Fable → Opus (owner spend limit); PR-C round-1
+findings fixed and self-adjudicated.** The owner's Fable 5 monthly spend limit terminated all
+18 round-1 refuters, so the orchestrator adjudicated the 9 findings by reading the code
+directly — recorded as a degraded protocol, not a clean refuted/confirmed split. Four
+substantive issues were **confirmed and fixed** in `7717677`:
+(1) **P2, twice-found:** the new hero badge mapped null-age placeholder entries through
+`sourceFreshnessVerdict`, which returns `late` when cadence exists — so one absent source
+(e.g. a buoy with no observation row; the worker always ships all four entries with cadence)
+pinned every spot to "Data late" while the banner deliberately stayed silent and the
+provenance panel said "Missing". The badge now applies the banner's exact null-age exclusion.
+(2) **P1:** the badge used a light-surface color recipe on the deep `.spotHero` (measured
+1.0–2.3:1); it is now light-on-dark — in-page measurement gives text 10.21/10.66/11.25:1 and
+border-vs-glow 3.76/4.22/3.10:1 for fresh/aging/late, clearing WCAG 1.4.3 and 1.4.11 in the
+worst case. `text-transform: capitalize` (which rendered the locked copy as "Data Late") is
+gone, and the phone grid no longer stretches the pill (82 px, `justify-self: start`).
+(3) **P2 (S-2):** the deleted legend was the only decoder for the moon icon and night-row
+dimming on the default view — the learning guide never covered it and moved to Analysis
+anyway. Night semantics are restored in place via a Time-column `InfoTooltip` and
+`aria-label="Night window"` on both desktop and mobile moon icons — information preserved
+without re-adding always-visible chrome.
+(4) **P3×4:** the badge aggregation and the desktop expand/toggle/reset logic had zero pins —
+finders proved both survived mutation with all tests green. Added four badge-state pins
+(fresh/aging/late/absent, including the null-age case that fails without fix 1) and a desktop
+pin (no auto-expand on load, click expands with `aria-expanded`, second click collapses,
+resolution change clears it). `pnpm verify` green: web 284 (+1 skip), workerd 19.
+
+_2026-08-06 (UTC)_ — **PR-C round 2 found four more real defects (all fixed in `6738f0f`);
+round 3 running; owner UI nit logged as OI-9.** Subagents work again on the Opus session, so
+round 2 ran with real fresh-eyes lenses (two, no refuter panel — budget-lean):
+(1) **P1:** the round-1 badge fix was incomplete. It excluded null-age entries but still
+reduced over an `observed_wave` entry whose observation is too far from the featured window to
+support it — a state the worker itself excludes from `activeCapabilities` and from the
+window's freshness scalar. A buoy 2–24h stale therefore made the header claim "Data late"
+while every row read High confidence and the provenance panel showed three Fresh sources
+(reproduced by probe). The badge now judges only the window's own `activeCapabilities`,
+mirroring the worker exactly.
+(2) **P2, found twice:** the round-1 night-decoding fix was desktop-only — the Time-column
+tooltip lives inside `.forecastTableViewport`, which is `display: none` below 800px (and Radix
+tooltips do not open on touch), so phone users still had an undecoded moon glyph. Night
+semantics now also appear in `WindowExpandedDetails` (rendered by both the desktop table and
+the mobile accordion, so tapping a moon row explains it in context) and as a field-guide entry.
+(3) **P2 regression:** `hasReliableCall` gated the brief *fetch* on `canonicalDayBest`, which
+`selectCanonicalRecommendationIds` limits to current-or-future daylight windows — so selecting
+a day whose windows had merely elapsed issued zero `/brief` requests and made the Worker's
+published outlook, its bust factors, and its lesson unreachable from any surface. The fetch is
+gated on `selectedDate` again; the quiet line now appears only when the server has no brief
+*and* the local read has no pick.
+(4) **P2:** the quiet line asserted "the Forecast tab still shows every available public
+input" even when that tab was showing a `role="alert"` outage, and Analysis carried no status
+of its own. It now states the real state with `role="status"` and only makes the sibling-tab
+claim when a forecast actually exists.
+Two new pins cover brief reachability on an elapsed day and the outage copy; one earlier pin
+was corrected because it had encoded defect 3 as expected behavior. `pnpm verify` green: web
+285 (+1 skip), workerd 19. Owner also reported a production UI nit (repeated best-window
+statement) → tracked as OI-9, deliberately not folded into PR-C's reviewed diff.
+
+_2026-08-06 (UTC)_ — **PR-C round 3 caught an overcorrection plus three AnalysisPanel gaps;
+all fixed in `4e7e0fc`; scoped delta check running.**
+(1) **P1 — my round-2 fix was wrong.** Filtering the badge by the window's `activeCapabilities`
+looked principled but inverted the failure: `NDBC_STALE_AFTER_MINUTES` *equals*
+cadence + grace, so "buoy verdict is late" and "worker drops observed_wave from
+activeCapabilities" are the same boundary. Every late buoy therefore became an unqualified
+"Data fresh" in the header while the banner named that exact source as late and the provenance
+panel labelled it Stale — a worse contradiction than the original. The badge is back on the
+banner's rule (non-null age + declared cadence, worst wins) and is now pinned on the exclusion
+path, which the shared fixture could not previously reach because it hardcodes `observed_wave`
+into `activeCapabilities`. Recorded as a lesson: two rounds disagreed about this surface, and
+the tie-breaker is cross-surface consistency, not per-window input purity.
+(2) **P2:** the date-scoped outlook had no day context once the day picker moved to the
+Forecast tab — a Saturday brief read as today's call beside a hero keyed to another date.
+Analysis now renders "Outlook for <weekday, Mon D>" from the selected local date key.
+(3) **P2:** the quiet line announced "No daylight recommendation for this day" through
+`role="status"` for the whole in-flight window and then silently retracted it — worst on a cold
+Worker or slow link, and repeated on every tab re-entry since Radix remounts the panel. An
+in-flight request now shows a neutral `aria-busy` loading status instead.
+(4) **P2:** dropping `fallbackBrief` from the effect deps removed the only refetch path, so a
+mounted Analysis tab kept a superseded outlook through refreshes while every other surface
+advanced. The deps now include `canonicalGeneratedAt` — a stable string that moves only when
+the payload really does.
+Four new pins cover the badge exclusion path, the day label, the loading state, and the
+refresh-driven refetch. `pnpm verify` green: web 287 (+1 skip), workerd 19, Python 45.
+
+_2026-08-06 (UTC)_ — **PR-C delta check found three fix-induced defects (fixed in `eca25f1`);
+a convergence check is now running on the churned component.** All three came from my own
+round-3 fixes, which is the signal that matters:
+(1) **P1:** adding `canonicalGeneratedAt` to the brief effect deps without touching the
+`setServerBrief(null)` at the top of the effect body meant every refresh *tore down* the
+outlook it was refreshing — and a transient refetch failure erased a good published brief
+outright. The clear is now scoped to a `spot:date` change via a ref, replacement happens only
+on success, and the error boundary is keyed by scope so a refresh no longer remounts the card
+and collapses disclosures the reader has open.
+(2) **P2:** `briefLoading` started false and was only set inside the effect, so the first
+committed paint on an elapsed day was the recommendation *denial* — announced through a live
+region — before the request had even been issued, repeating on every tab re-entry. It is now
+initialized from the selected date, and the outage copy takes precedence in the render order.
+(3) **P2:** the new day label interpolated an unvalidated URL date key, and JS rolls impossible
+dates forward, so `?date=2026-02-31` rendered a confident "Tuesday, Mar 3" nobody asked for
+(and `?date=hello` echoed "hello"). The formatter now round-trips its parts and returns null
+for anything that is not a real calendar day, the label is omitted rather than fabricated, and
+malformed date params are discarded at the URL boundary.
+Three new pins cover refresh-keeps-outlook, failed-refetch-keeps-outlook, and the bogus-date
+label; the adapter pins date-key validation. `pnpm verify` green: web 290 (+1 skip), workerd 19.
+**Process note:** rounds 1–3 plus the delta check found 4/4/4/3 defects, increasingly
+*introduced by the previous fix* and concentrated in the extracted `AnalysisPanel`. Rather than
+patch a fifth time, the next pass is an explicit convergence check that must also judge whether
+the panel's state model (three booleans + a ref) should be restructured — e.g. a scope-keyed
+remount or a single discriminated status union — instead of accumulating more instance fixes.
+
+_2026-08-06 (UTC)_ — **Convergence check said "not converging"; restructured the Analysis
+state model instead of patching a fifth time (`5497101`).** The checker's diagnosis, which I
+accepted: the panel encoded a four-state request machine in `serverBrief` + `briefLoading` +
+a `loadedScope` ref, then intersected it at render time with a prop pair (`forecast`,
+`forecastErrored`) that *structurally cannot* distinguish "not fetched yet" from "fetch
+failed". Every pass rebalanced precedence among `hasBriefContent`, `awaitingBrief`, and
+`forecastUnavailable`, and each rebalance moved the falsehood to a different cell — round 3
+fixed the pre-request denial, the delta pass fixed the refresh teardown and in doing so broke
+loading-vs-outage, the live-region truth, and the boundary's recovery. Three defects were
+still open at that point (outage claimed during a healthy in-flight hourly request; provenance
+unmounting mid-read on an hourly refresh; "Daily outlook updated." announced for a refetch
+that returned nothing).
+**The restructure:** the parent derives one `ForecastStatus` (`loading | ready | error`) from
+state it already had; the brief moved into a `DailyOutlook` child keyed `spot:date` so a scope
+change *remounts* rather than being cleared by hand; that child owns one `OutlookState`
+(`loading | ready | empty`); the render is an exhaustive walk with no precedence to get wrong;
+a failed or empty refetch keeps its `ready` state so nothing is torn down or falsely announced;
+and provenance renders from `forecast ?? canonicalForecast` so the disclosure survives an
+interval refetch. Deleted outright: `serverBrief`, `briefLoading`, `loadedScope`, `briefScope`,
+`hasBriefContent`, `awaitingBrief`, `forecastUnavailable`, the clear-on-scope branch, and the
+boundary-key tradeoff.
+All 293 web tests (incl. every pin from rounds 1–3 and the delta) pass unchanged through the
+restructure, which is the evidence that behavior was preserved rather than redefined; three new
+pins cover loading-vs-outage, provenance survival, and the absent false-update announcement.
+Browser-verified at 390: Analysis renders day label → card → tools → provenance with exactly
+one `/brief` request and `aria-busy=false`; Forecast default has zero `/brief` requests, no AI
+content, no auto-expanded row, first row in the first viewport, no overflow.
+
+_2026-08-09 (UTC)_ — **Rounds 5 and 6 on the restructured panel: the class is closed, two
+residual cells were not (`3fd43a0`, `4a16ba7`).** The convergence re-check returned
+`converged: false` but with a materially different verdict than round 4: no P0/P1 across mount,
+tab switch, date change, spot change, interval change, refresh, abort/unmount, elapsed day, or
+missing cadence — the four-boolean intersection is genuinely gone — and three P2s that were
+"residual cells inside the new union, not another overloaded truth table". Fixed all three:
+(1) `OutlookState.empty` documented itself as "the Worker answered and published nothing", but
+the non-2xx branch and the `.catch` both resolved to it, so a transport failure read as a
+deterministic editorial judgment *and hid a brief the Worker was holding*. `failed` is now its
+own cell with its own copy.
+(2) The outage line preempted the panel's own in-flight brief — the brief is a separate endpoint
+that answers even while the forecast read fails, so a reload during an outage denied analysis
+and retracted it one round trip later.
+(3) Suppressing the false update announcements had silenced the real ones: the live region's
+text was fixed, so it spoke once and stayed quiet through every genuine revision.
+
+**Round 6 found that (2)'s fix introduced its mirror, and I had shipped it.** Placing `failed`
+above the parent's loading branch meant a failed brief printed a definitive "could not be
+loaded — every available public input is still listed on the Forecast tab" while the payload
+was still in flight and the tab listed nothing. All three lenses found it independently; a
+surviving refuter reproduced it and verified the fix. The walk now defers to *either*
+outstanding request before rendering anything settled, with the reasoning written per branch.
+Round 6 also killed my own fix (3): `generatedAt` is a materialization or request clock on both
+deterministic paths, so keying the announcement on it re-announced identical prose on every
+payload refresh. The message now derives from the headline — moves when the call moves, not
+otherwise; the same-headline-body-rewrite limit is documented in place.
+
+**Test quality was the real finding.** Five mutations survived the round-5 suite: stripping
+`role`/`aria-live` from the live region, resolving the `.catch` to `empty`, letting the `.catch`
+evict a rendered brief, announcing by clock, and dropping `role` from the failure line. Each is
+now caught by exactly one test, verified by applying each mutation and observing a single
+failure. `pnpm verify` green: web 300 (+1 skip), workerd 19, core 21, contracts 11, db 10,
+Python 45; Cloudflare dry-run clean.
+
+**Protocol degradation (recorded, not hidden):** 13 of 18 round-5 agents died on the Fable/Opus
+individual spend limit, including *every* refuter for two of three lenses — so those lenses'
+findings were dropped as unrefuted rather than refuted. I recovered them from the workflow
+journal and adjudicated them myself; the P1 was the one finding that kept a live refuter.
+**A refuter also left mutation edits in `ForecastWorkbench.tsx` and three probe test files in
+the repo** despite reporting it had reverted — caught by `git status` before commit, tree
+restored to HEAD. Same failure mode as the PR-B R2 probe leak; round 6's prompt now forbids
+repo writes explicitly and directs probes to the scratchpad.
+
+**Deferred, with reasons (not silently dropped):**
+- Hung `/brief` with no timeout pins the loading line while a known outage goes unstated. Real,
+  but *pre-existing* — the pre-restructure walk also returned the loading line unconditionally —
+  so it is not a PR-C regression. Logged as OI-10.
+- A 2xx whose JSON the adapter cannot read is still classified `empty`. Unreachable against
+  today's handler (the schema requires a non-empty headline); becomes reachable on envelope
+  drift. The overclaiming comment was corrected to say exactly this. Logged as OI-11.

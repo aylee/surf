@@ -1079,7 +1079,8 @@ footer {
     font-size: clamp(2.4rem, 14vw, 3.7rem);
   }
 
-  .spotHero > .conditionPill {
+  .spotHero > .conditionPill,
+  .spotHero > .freshnessBadge {
     justify-self: start;
     margin-top: 0;
   }
@@ -2627,4 +2628,120 @@ footer {
   .workbenchDisclosure .uiAccordionTrigger > span:nth-last-child(2) {
     display: none;
   }
+}
+
+/* ── PR-C: Forecast | Analysis spot tabs ─────────────────────────────── */
+
+.spotViewTabs {
+  display: block;
+}
+
+.spotViewTabsList {
+  margin-bottom: 14px;
+}
+
+.spotViewTabsList .uiTabsTrigger {
+  min-width: 108px;
+  justify-content: center;
+}
+
+/* Slim deterministic spot header: data reaches the first viewport. */
+.spotHeroSlim {
+  padding: clamp(18px, 2.6vw, 26px);
+  border-radius: 18px;
+  align-items: center;
+}
+
+.spotHeroSlim h1 {
+  font-size: clamp(1.7rem, 3.2vw, 2.4rem);
+  margin: 0 0 6px;
+}
+
+/* The badge sits on the dark hero (and inside its teal glow), so it needs a
+   light-on-dark recipe: an opaque deep fill plus a light tint that clears
+   WCAG 1.4.3 text and 1.4.11 boundary contrast in every state. */
+.freshnessBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.freshnessBadge.fresh {
+  border-color: #7fd8b4;
+  background: #06382c;
+  color: #b6f0d7;
+}
+
+.freshnessBadge.aging {
+  border-color: #f0cf7a;
+  background: #3d2f06;
+  color: #fbe7ae;
+}
+
+.freshnessBadge.late {
+  border-color: #f3a08c;
+  background: #45140c;
+  color: #ffd2c6;
+}
+
+.analysisPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.analysisTools {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.quietBriefLine {
+  margin: 0;
+  padding: 14px 18px;
+  border: 1px solid var(--line, #dbe3e4);
+  border-radius: 14px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+@media (max-width: 680px) {
+  .spotHeroSlim {
+    padding: 16px;
+  }
+
+  .spotHeroSlim h1 {
+    font-size: clamp(1.5rem, 7vw, 1.9rem);
+  }
+
+  /* Compress comparison rows: pair labeled fields two per line instead of
+     five stacked full-width rows, without dropping any field. */
+  .compareRow > [data-label] {
+    grid-column: auto / span 1;
+  }
+
+  .compareRow > [data-label]::before {
+    display: block;
+    min-width: 0;
+    margin-right: 0;
+  }
+
+  .compareRow > [data-label="Calmest window"],
+  .compareRow > [data-label="Wind / surface"] {
+    grid-column: 1 / span 1;
+  }
+}
+
+.analysisDayLabel {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }

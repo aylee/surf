@@ -40,6 +40,7 @@ import {
   sourceHealthForWindow,
   type DailyBrief,
   type ForecastInterval,
+  type SpotTab,
   type WorkbenchForecast,
   type WorkbenchView,
   type WorkbenchWindow
@@ -82,6 +83,36 @@ function formatTimestamp(value: string, timezone: string): string {
     }).format(timestamp);
   } catch {
     return "time unavailable";
+  }
+}
+
+// Formats a local date key (YYYY-MM-DD) for display, or returns null when the
+// key is not a real calendar date. Noon UTC keeps the day stable across every
+// North American offset instead of shifting at midnight. The round-trip check
+// matters because JS rolls impossible dates forward — "2026-02-31" would
+// otherwise render as a confident "Tuesday, Mar 3" that nobody asked for.
+function formatLocalDateKey(dateKey: string, timezone: string): string | null {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
+  if (!parts) return null;
+  const [, year, month, day] = parts;
+  const parsed = new Date(`${dateKey}T12:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime())) return null;
+  if (
+    parsed.getUTCFullYear() !== Number(year) ||
+    parsed.getUTCMonth() + 1 !== Number(month) ||
+    parsed.getUTCDate() !== Number(day)
+  ) {
+    return null;
+  }
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      weekday: "long",
+      month: "short",
+      day: "numeric",
+      timeZone: timezone
+    }).format(parsed);
+  } catch {
+    return null;
   }
 }
 
@@ -219,6 +250,7 @@ function LearningGuideContents() {
       <div><dt>Tide trend</dt><dd>Rising and falling describe movement between official high and low events; the same swell can break differently as depth changes.</dd></div>
       <div><dt>Confidence</dt><dd>A deterministic read of availability, calibration, lead time, and source health. It is not a promise that conditions will match.</dd></div>
       <div><dt>Freshness</dt><dd>Age is shown per source and selected timestamp. One fresh feed cannot make every input fresh.</dd></div>
+      <div><dt>Night windows</dt><dd>A moon marks a window outside daylight. Night rows stay visible as context but are excluded from the daylight recommendation.</dd></div>
     </dl>
   );
 }
@@ -255,18 +287,60 @@ function ForecastLearningGuide() {
   );
 }
 
-function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: boolean; spot: ApiSpot }) {
+function DailyBriefCard({
+  brief,
+  outcome,
+  spot
+}: { brief: DailyBrief; outcome: OutlookState["status"]; spot: ApiSpot }) {
   const [bestPick, ...alternatePicks] = brief.picks;
+  const loading = outcome === "loading";
+  // A live region only announces when its text changes, so the message has to
+  // carry something that moves on a real revision — a fixed string would speak
+  // once and then stay silent through every rewrite. It must not move for
+  // anything else: the publication stamp looks like the right signal but is a
+  // materialization or request clock on both deterministic paths, so keying on
+  // it would announce a revision on every payload refresh of byte-identical
+  // prose. The headline is derived from the content itself, so it moves when
+  // the call moves and not otherwise. Known limit: a revision that rewrites the
+  // body while keeping the same headline is not announced.
+  const announcement = presentBriefCopy(brief.headline);
+  // The card renders from the local forecast read whenever that read has a
+  // pick, so "no longer loading" is not the same fact as "something was
+  // published". Announcing an update on the request's failure is the worse
+  // half of that conflation, and it is audible only to the readers who cannot
+  // see that nothing on screen changed.
+  // The card renders authored outlooks and the local forecast read through the
+  // same chrome, so the meta line has to say which one this is. Stamping a
+  // forecast read with "Outlook updated" presents the payload's generation time
+  // as a publication time, and told a sighted reader the outlook was current on
+  // exactly the screens where the screen-reader text said it could not be
+  // updated. Both channels now state the same fact.
+  const authored = brief.provider !== "deterministic";
+  const label = authored ? "Daily outlook" : "Forecast read";
+  const stamp = brief.generatedAt ? formatTimestamp(brief.generatedAt, spot.timezone) : null;
+  // The announced label tracks the visible one. The Worker answers with a
+  // deterministic summary whenever it has no authored outlook for the day, so
+  // "ready" means the request succeeded, not that an outlook was written --
+  // announcing one would contradict the card sitting next to it.
+  const message = loading
+    ? "Updating the daily outlook."
+    : outcome === "ready"
+      ? `${label} updated. ${announcement}`
+      : outcome === "failed"
+        ? `The daily outlook could not be updated. Showing the forecast read: ${announcement}`
+        : `No new outlook was published. Showing the forecast read: ${announcement}`;
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={loading}>
       <span className="srOnly" role="status" aria-live="polite">
-        {loading ? "Updating the daily outlook." : "Daily outlook updated."}
+        {message}
       </span>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
-          <p className="kicker">Daily outlook</p>
-          {brief.generatedAt && (
-            <time dateTime={brief.generatedAt}>Outlook updated {formatTimestamp(brief.generatedAt, spot.timezone)}</time>
+          <p className="kicker">{label}</p>
+          {brief.generatedAt && stamp && (
+            <time dateTime={brief.generatedAt}>
+              {authored ? `Outlook updated ${stamp}` : `From the ${stamp} forecast`}
+            </time>
           )}
         </div>
         <h2 id="daily-brief-heading">{presentBriefCopy(brief.headline)}</h2>
@@ -472,6 +546,13 @@ function WindowExpandedDetails({ window, spot }: { window: WorkbenchWindow; spot
         <strong>{window.confidenceLabel} confidence · {formatFreshness(window.sourceFreshnessMinutes)}</strong>
         <p>{window.weatherSummary ?? "Weather summary unavailable."}</p>
       </div>
+      {!window.isDaylight && (
+        <div>
+          <span>Night window</span>
+          <strong>Shown as context only</strong>
+          <p>Rows marked with a moon fall outside daylight, so they stay visible but are excluded from the daylight recommendation.</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -479,15 +560,19 @@ function WindowExpandedDetails({ window, spot }: { window: WorkbenchWindow; spot
 function DesktopForecastTable({
   windows,
   selectedAt,
+  expandedAt,
   spot,
   interval,
-  onSelect
+  onSelect,
+  onToggleExpand
 }: {
   windows: WorkbenchWindow[];
   selectedAt: string | null;
+  expandedAt: string | null;
   spot: ApiSpot;
   interval: ForecastInterval;
   onSelect: (value: string) => void;
+  onToggleExpand: (value: string | null) => void;
 }) {
   return (
     <div className="forecastTableViewport">
@@ -495,7 +580,9 @@ function DesktopForecastTable({
         <caption className="srOnly">{interval === "1h" ? "One-hour" : "Three-hour"} surf-planning inputs for {spot.name}</caption>
         <thead>
           <tr>
-            <th scope="col">Time</th>
+            <th scope="col">
+              <span>Time <InfoTooltip label="What do the moon icons mean?">A moon marks a night window. Night rows stay visible as context but are excluded from the daylight recommendation.</InfoTooltip></span>
+            </th>
             <th scope="col">
               <span>Modeled wave <InfoTooltip label="What does modeled wave mean?">Nearshore significant wave height (Hs), not measured breaking wave-face height.</InfoTooltip></span>
             </th>
@@ -517,6 +604,7 @@ function DesktopForecastTable({
         <tbody>
           {windows.map((window) => {
             const selected = selectedAt === window.forecastAt;
+            const expanded = expandedAt === window.forecastAt;
             return [
               <tr
                 className={`${window.isDaylight ? "" : "nightRow"}${selected ? " selectedRow" : ""}${window.dataHealth === "limited" ? " gapRow" : ""}`}
@@ -524,8 +612,16 @@ function DesktopForecastTable({
                 data-testid={`forecast-row-${window.forecastAt}`}
               >
                 <th scope="row">
-                  <button type="button" aria-pressed={selected} onClick={() => onSelect(window.forecastAt)}>
-                    {!window.isDaylight && <Moon size={13} aria-hidden="true" />}
+                  <button
+                    type="button"
+                    aria-pressed={selected}
+                    aria-expanded={expanded}
+                    onClick={() => {
+                      onSelect(window.forecastAt);
+                      onToggleExpand(window.forecastAt);
+                    }}
+                  >
+                    {!window.isDaylight && <Moon size={13} aria-label="Night window" role="img" />}
                     <span>{formatClock(window.forecastAt, spot.timezone)}</span>
                   </button>
                 </th>
@@ -536,7 +632,7 @@ function DesktopForecastTable({
                 <td><ConditionBadge window={window} /></td>
                 <td><div className="trustCell"><strong>{window.confidenceLabel}</strong><HealthBadge window={window} /></div></td>
               </tr>,
-              selected ? (
+              expanded ? (
                 <tr className="selectedDetailRow" key={`${window.forecastAt}-details`}>
                   <td colSpan={7}><WindowExpandedDetails window={window} spot={spot} /></td>
                 </tr>
@@ -552,30 +648,28 @@ function DesktopForecastTable({
 function MobileForecastRows({
   windows,
   selectedAt,
+  expandedAt,
   spot,
   interval,
-  onSelect
+  onSelect,
+  onToggleExpand
 }: {
   windows: WorkbenchWindow[];
   selectedAt: string | null;
+  expandedAt: string | null;
   spot: ApiSpot;
   interval: ForecastInterval;
   onSelect: (value: string) => void;
+  onToggleExpand: (value: string | null) => void;
 }) {
-  const [expandedAt, setExpandedAt] = useState(selectedAt ?? "");
-
-  useEffect(() => {
-    setExpandedAt(selectedAt ?? "");
-  }, [selectedAt]);
-
   return (
     <Accordion
       className="mobileForecastRows"
       type="single"
       collapsible
-      value={expandedAt}
+      value={expandedAt ?? ""}
       onValueChange={(value) => {
-        setExpandedAt(value);
+        onToggleExpand(value || null);
         if (value) onSelect(value);
       }}
       aria-label={`${interval === "1h" ? "One-hour" : "Three-hour"} surf-planning inputs for ${spot.name}`}
@@ -587,7 +681,7 @@ function MobileForecastRows({
           key={window.forecastAt}
         >
           <AccordionTrigger>
-            <span className="mobileTime">{!window.isDaylight && <Moon size={13} aria-hidden="true" />}{formatClock(window.forecastAt, spot.timezone)}</span>
+            <span className="mobileTime">{!window.isDaylight && <Moon size={13} aria-label="Night window" role="img" />}{formatClock(window.forecastAt, spot.timezone)}</span>
             <span className="mobileWave"><strong>{formatModeledHeight(window.modeledHeightFt)}</strong><small>{formatNumber(window.periodSec, "s")} · {cardinalDirection(window.directionDeg)}</small></span>
             <ConditionBadge window={window} />
           </AccordionTrigger>
@@ -697,20 +791,27 @@ export function ForecastWorkbench({
   const [view, setView] = useState<WorkbenchView>(initialUrl.view);
   const [selectedDate, setSelectedDate] = useState<string | null>(initialUrl.date);
   const [selectedAt, setSelectedAt] = useState<string | null>(initialUrl.at);
+  const [tab, setTab] = useState<SpotTab>(initialUrl.tab);
+  const [expandedAt, setExpandedAt] = useState<string | null>(null);
   const [cache, setCache] = useState<ForecastCache>(() => (
     isUsableForecastResponse(initialForecast) ? { "3h": initialForecast } : {}
   ));
   const [intervalLoading, setIntervalLoading] = useState(initialUrl.interval === "1h");
   const [intervalError, setIntervalError] = useState<string | null>(null);
   const [intervalNotice, setIntervalNotice] = useState<string | null>(null);
-  const [brief, setBrief] = useState<DailyBrief | null>(null);
-  const [briefLoading, setBriefLoading] = useState(false);
   const fetchController = useRef<AbortController | null>(null);
   const cacheRef = useRef(cache);
   const hourlyFailurePending = useRef(false);
   const canonicalRecoveryState = useRef<"idle" | "pending" | "ready" | "failed">(
     isUsableForecastResponse(initialForecast) ? "ready" : "idle"
   );
+  // The ref above drives fetch coordination, but the Analysis panel has to
+  // render off this, and a ref that changes without setting state would leave
+  // it waiting on a request that already gave up.
+  const [canonicalFailed, setCanonicalFailed] = useState(false);
+  // Bumped whenever an external reset aborts the active interval's request,
+  // so the interval effect reissues it instead of leaving it dead.
+  const [reloadToken, setReloadToken] = useState(0);
   const explicitTimestampSelection = useRef(Boolean(initialUrl.at));
   const previousInitialForecast = useRef(initialForecast);
 
@@ -724,6 +825,13 @@ export function ForecastWorkbench({
     hourlyFailurePending.current = false;
     canonicalRecoveryState.current = "ready";
     setCache(nextCache);
+    // This reset aborts whatever the active interval had in flight and drops
+    // its cache entry. At hourly resolution none of the interval effect's other
+    // deps move — the entry was already absent, so `activeIntervalForecast`
+    // stays undefined — and the aborted request would never be reissued,
+    // leaving a spinner that resolves only if the reader switches resolution
+    // twice. Bumping a token the effect depends on makes the reissue automatic.
+    setReloadToken((token) => token + 1);
   }, [initialForecast]);
 
   useEffect(() => {
@@ -790,7 +898,7 @@ export function ForecastWorkbench({
         setIntervalError("Forecast detail is temporarily unavailable. Try refreshing in a moment");
       });
     return () => controller.abort();
-  }, [activeIntervalForecast, interval, onForecastRecovered, spot.id]);
+  }, [activeIntervalForecast, interval, onForecastRecovered, reloadToken, spot.id]);
 
   const canonicalCacheEntry = cache["3h"];
 
@@ -798,6 +906,7 @@ export function ForecastWorkbench({
     if (interval !== "1h" || canonicalCacheEntry) return;
     const controller = new AbortController();
     canonicalRecoveryState.current = "pending";
+    setCanonicalFailed(false);
     void fetchForecast(spot.id, "3h", controller.signal)
       .then((response) => {
         if (!controller.signal.aborted) {
@@ -822,6 +931,7 @@ export function ForecastWorkbench({
       .catch(() => {
         if (controller.signal.aborted) return;
         canonicalRecoveryState.current = "failed";
+        setCanonicalFailed(true);
         if (hourlyFailurePending.current) {
           hourlyFailurePending.current = false;
           setIntervalLoading(false);
@@ -882,46 +992,12 @@ export function ForecastWorkbench({
   }, [dayBest, dayWindows, selectedAt]);
 
   const selected = dayWindows.find((window) => window.forecastAt === selectedAt) ?? dayBest ?? dayWindows[0];
-  const fallbackBrief = useMemo(
-    () => deterministicBrief(
-      spot,
-      selectedDate,
-      canonicalDayBest,
-      canonicalForecast?.generatedAt ?? null
-    ),
-    [canonicalDayBest, canonicalForecast?.generatedAt, selectedDate, spot]
-  );
-
-  useEffect(() => {
-    if (!selectedDate) return;
-    const controller = new AbortController();
-    setBrief(fallbackBrief);
-    setBriefLoading(true);
-    void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
-      headers: { Accept: "application/json" },
-      signal: controller.signal
-    })
-      .then(async (response) => {
-        if (!response.ok) return null;
-        return parseBriefResponse(await response.json());
-      })
-      .then((value) => {
-        if (controller.signal.aborted) return;
-        setBrief(value ?? fallbackBrief);
-        setBriefLoading(false);
-      })
-      .catch(() => {
-        if (controller.signal.aborted) return;
-        setBrief(fallbackBrief);
-        setBriefLoading(false);
-      });
-    return () => controller.abort();
-  }, [fallbackBrief, selectedDate, spot.id]);
 
   const selectDate = useCallback((date: string) => {
     explicitTimestampSelection.current = false;
     setSelectedDate(date);
     setSelectedAt(null);
+    setExpandedAt(null);
     replaceWorkbenchUrl({ date, at: null });
   }, []);
 
@@ -939,6 +1015,7 @@ export function ForecastWorkbench({
     setIntervalNotice(null);
     setIntervalError(null);
     setSelectedAt(null);
+    setExpandedAt(null);
     replaceWorkbenchUrl({ interval: value, at: null });
   }, []);
 
@@ -946,6 +1023,18 @@ export function ForecastWorkbench({
     if (value !== "table" && value !== "graph") return;
     setView(value);
     replaceWorkbenchUrl({ view: value });
+  }, []);
+
+  const changeTab = useCallback((value: string) => {
+    if (value !== "forecast" && value !== "analysis") return;
+    setTab(value);
+    // The default tab stays out of the URL so existing deep links keep their
+    // exact shape; only the Analysis selection is serialized.
+    replaceWorkbenchUrl({ tab: value === "analysis" ? "analysis" : null });
+  }, []);
+
+  const toggleExpandedAt = useCallback((value: string | null) => {
+    setExpandedAt((current) => (value === null || current === value ? null : value));
   }, []);
 
   const currentDateKey = localDateParts(now, spot.timezone).key;
@@ -959,32 +1048,39 @@ export function ForecastWorkbench({
     ? dayWindows.length
     : dayWindows.filter((window) => new Date(window.forecastAt).getTime() >= coverageFloor).length;
   const hasCoverageGap = expectedRows > 0 && coveredRows < expectedRows;
+  // One status for the active interval's payload. "loading" and "error" are
+  // distinct states: a panel that cannot tell them apart will eventually claim
+  // an outage during a healthy in-flight request.
+  //
+  // Deliberately not derived from `initialError`. That is the dashboard's
+  // failure, and this workbench retries on mount whenever its cache is cold —
+  // a retry that usually succeeds, since the dashboard failure it follows is
+  // typically transient. Treating it as an outage would state one over an
+  // in-flight request and retract it a round trip later. The retry sets
+  // `intervalError` on every terminal path of its own, so a genuine outage
+  // still surfaces; `initialError` keeps driving the Forecast tab's banner.
+  const forecastStatus: ForecastStatus = forecast
+    ? "ready"
+    : intervalError
+      ? "error"
+      : "loading";
+  // The local daylight pick comes from the canonical three-hour payload, not
+  // from the active interval, so at hourly resolution they are two different
+  // requests. The hourly one can land first and report "ready" while the
+  // canonical is still outstanding — and it is the canonical that decides
+  // whether there is a pick to render at all.
+  const canonicalPending = interval === "1h" && !canonicalCacheEntry && !canonicalFailed;
 
   return (
     <TooltipProvider delayDuration={180}>
-      <DailyBriefErrorBoundary
-        key={`${spot.id}:${selectedDate ?? "none"}:${brief?.generatedAt ?? brief?.headline ?? "local"}`}
-        fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}
-      >
-        <DailyBriefCard brief={brief ?? fallbackBrief} loading={briefLoading} spot={spot} />
-      </DailyBriefErrorBoundary>
+      <Tabs value={tab} onValueChange={changeTab} className="spotViewTabs">
+        <TabsList aria-label="Spot view" className="spotViewTabsList">
+          <TabsTrigger value="forecast">Forecast</TabsTrigger>
+          <TabsTrigger value="analysis">Analysis</TabsTrigger>
+        </TabsList>
 
-      <section className="workbenchSection" aria-labelledby="forecast-workbench-heading">
-        <div className="workbenchHeading">
-          <div>
-            <p className="kicker">24-hour detail</p>
-            <h2 id="forecast-workbench-heading">Forecast workbench</h2>
-            <p>Read the exact inputs, then switch to the graph to see how they move together.</p>
-          </div>
-          <div className="workbenchHeadingTools">
-            <div className="workbenchLegend" aria-label="Forecast display notes">
-              <span><i className="daylightDot" /> Daylight recommendation</span>
-              <span><Moon size={13} aria-hidden="true" /> Night context</span>
-            </div>
-            <ForecastLearningGuide />
-          </div>
-        </div>
-
+        <TabsContent value="forecast">
+      <section className="workbenchSection" aria-label="Forecast workbench">
         {forecast && dates.length > 0 && (
           <DayPicker dates={dates} selectedDate={selectedDate} windows={canonicalForecast?.windows ?? []} spot={spot} now={now} onSelect={selectDate} />
         )}
@@ -1030,8 +1126,8 @@ export function ForecastWorkbench({
                 <div className="coverageNotice" role="status"><Info size={15} aria-hidden="true" /> {coveredRows} of {expectedRows} expected {interval} windows are available. Gaps remain visible and are not filled.</div>
               )}
               <TabsContent value="table">
-                <DesktopForecastTable windows={dayWindows} selectedAt={selectedAt} spot={spot} interval={interval} onSelect={selectAt} />
-                <MobileForecastRows windows={dayWindows} selectedAt={selectedAt} spot={spot} interval={interval} onSelect={selectAt} />
+                <DesktopForecastTable windows={dayWindows} selectedAt={selectedAt} expandedAt={expandedAt} spot={spot} interval={interval} onSelect={selectAt} onToggleExpand={toggleExpandedAt} />
+                <MobileForecastRows windows={dayWindows} selectedAt={selectedAt} expandedAt={expandedAt} spot={spot} interval={interval} onSelect={selectAt} onToggleExpand={toggleExpandedAt} />
               </TabsContent>
               <TabsContent value="graph">
                 <Suspense fallback={<div className="graphLoading" role="status" aria-live="polite" aria-label="Loading forecast graphs"><span className="srOnly">Loading forecast graphs.</span><Skeleton /></div>}>
@@ -1042,13 +1138,245 @@ export function ForecastWorkbench({
           )}
         </Tabs>
 
-        {forecast && (
-          <>
-            <TideEvents forecast={forecast} selectedDate={selectedDate} spot={spot} />
-            <DataHealthPanel forecast={forecast} selected={selected} spot={spot} />
-          </>
-        )}
+        {forecast && <TideEvents forecast={forecast} selectedDate={selectedDate} spot={spot} />}
       </section>
+        </TabsContent>
+
+        <TabsContent value="analysis">
+          <AnalysisPanel
+            spot={spot}
+            selectedDate={selectedDate}
+            canonicalDayBest={canonicalDayBest}
+            canonicalGeneratedAt={canonicalForecast?.generatedAt ?? null}
+            forecastStatus={forecastStatus}
+            canonicalPending={canonicalPending}
+            // Provenance falls back to the canonical payload so the disclosure
+            // does not vanish mid-read while an hourly refetch is in flight.
+            provenanceForecast={forecast ?? canonicalForecast}
+            selected={selected}
+          />
+        </TabsContent>
+      </Tabs>
     </TooltipProvider>
+  );
+}
+
+// The active interval's payload has three distinguishable states. Collapsing
+// "not fetched yet" into "unavailable" is what made earlier versions of this
+// panel announce an outage during a healthy request.
+type ForecastStatus = "loading" | "ready" | "error";
+
+// Analysis owns the Daily Forecaster prose, the learning guide, and the
+// provenance accordion. It also owns the brief request lifecycle: the fetch
+// can only begin once this panel mounts, i.e. when the Analysis tab is
+// selected — the Forecast tab issues no /brief requests.
+function AnalysisPanel({
+  spot,
+  selectedDate,
+  canonicalDayBest,
+  canonicalGeneratedAt,
+  forecastStatus,
+  canonicalPending,
+  provenanceForecast,
+  selected
+}: {
+  spot: ApiSpot;
+  selectedDate: string | null;
+  canonicalDayBest: WorkbenchWindow | null | undefined;
+  canonicalGeneratedAt: string | null;
+  forecastStatus: ForecastStatus;
+  canonicalPending: boolean;
+  provenanceForecast: WorkbenchForecast | null;
+  selected?: WorkbenchWindow;
+}) {
+  const fallbackBrief = useMemo(
+    () => deterministicBrief(spot, selectedDate, canonicalDayBest ?? undefined, canonicalGeneratedAt),
+    [canonicalDayBest, canonicalGeneratedAt, selectedDate, spot]
+  );
+  const dayLabel = selectedDate ? formatLocalDateKey(selectedDate, spot.timezone) : null;
+
+  return (
+    <div className="analysisPanel">
+      {dayLabel && (
+        // The day picker lives on the Forecast tab, so the date-scoped outlook
+        // must name its own day here — otherwise a Saturday brief reads as
+        // today's call beside a hero keyed to a different date. An unparseable
+        // date key gets no label rather than a fabricated one.
+        <p className="analysisDayLabel">Outlook for {dayLabel}</p>
+      )}
+      {/* Keyed by scope: a new spot or day remounts the outlook, so its request
+          state resets structurally instead of through clearing logic, and the
+          previous day's brief can never paint under the new day's label. A
+          generation-driven refresh keeps the same key, so nothing the reader
+          has open is torn down. The key stops at this child so the provenance
+          disclosure below is unaffected. */}
+      <DailyOutlook
+        key={`${spot.id}:${selectedDate ?? "none"}`}
+        spot={spot}
+        selectedDate={selectedDate}
+        canonicalGeneratedAt={canonicalGeneratedAt}
+        fallbackBrief={fallbackBrief}
+        forecastStatus={forecastStatus}
+        canonicalPending={canonicalPending}
+      />
+      <div className="analysisTools">
+        <ForecastLearningGuide />
+      </div>
+      {provenanceForecast && (
+        <DataHealthPanel forecast={provenanceForecast} selected={selected} spot={spot} />
+      )}
+    </div>
+  );
+}
+
+// One request state, not a set of booleans to intersect at render time. The
+// four cells are distinct answers rather than shades of one: "loading" means
+// the Worker has not answered, "ready" means it published something to render,
+// "empty" means it answered and had nothing publishable, and "failed" means we
+// could not get an answer at all. Merging the last two would present a
+// transport failure as a deterministic editorial judgment that no
+// recommendation exists. A refresh that fails leaves a rendered brief in place
+// and never re-enters "loading", so nothing is torn down or re-announced.
+type OutlookState =
+  | { status: "loading" }
+  | { status: "ready"; brief: DailyBrief }
+  | { status: "empty" }
+  | { status: "failed" };
+
+function DailyOutlook({
+  spot,
+  selectedDate,
+  canonicalGeneratedAt,
+  fallbackBrief,
+  forecastStatus,
+  canonicalPending
+}: {
+  spot: ApiSpot;
+  selectedDate: string | null;
+  canonicalGeneratedAt: string | null;
+  fallbackBrief: DailyBrief;
+  forecastStatus: ForecastStatus;
+  canonicalPending: boolean;
+}) {
+  const [state, setState] = useState<OutlookState>({ status: "loading" });
+  // `state` is the last *settled* answer; it deliberately never returns to
+  // "loading" on a refresh, so a rendered brief is not torn down. That leaves
+  // it silent about whether a request is outstanding right now — and refreshes
+  // are ordinary here, since the canonical payload landing both clears
+  // `canonicalPending` and fires the retry. Without this, the panel asserts the
+  // previous attempt's failure for the whole duration of the next one.
+  const [pending, setPending] = useState(false);
+
+  // Gated on the selected date and the payload generation. A published outlook
+  // must stay reachable for any date that has one — including a day whose
+  // daylight windows have merely elapsed, where the local read has no pick but
+  // the Worker's brief and its caveats still exist.
+  useEffect(() => {
+    if (!selectedDate) return;
+    const controller = new AbortController();
+    setPending(true);
+    void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal
+    })
+      // A non-2xx status means the question went unanswered, which is not the
+      // same fact as an answer with no outlook in it. A body that is not valid
+      // JSON throws past this into the catch below, which is also a failure to
+      // get an answer. A 2xx whose JSON the adapter cannot read is still
+      // treated as "answered with nothing" — unreachable against today's
+      // handler, and the honest split there needs the envelope to say so.
+      .then(async (response) =>
+        response.ok
+          ? { answered: true as const, brief: parseBriefResponse(await response.json()) }
+          : { answered: false as const, brief: null }
+      )
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        setPending(false);
+        setState((current) => {
+          if (result.brief) return { status: "ready", brief: result.brief };
+          // A failed or empty refresh never evicts what the reader already has.
+          if (current.status === "ready") return current;
+          return result.answered ? { status: "empty" } : { status: "failed" };
+        });
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setPending(false);
+        setState((current) => (current.status === "ready" ? current : { status: "failed" }));
+      });
+    return () => controller.abort();
+  }, [canonicalGeneratedAt, selectedDate, spot.id]);
+
+  // A local read with a pick is real content, so it renders while the Worker is
+  // still answering instead of leaving the panel empty.
+  const content = state.status === "ready"
+    ? state.brief
+    : fallbackBrief.picks.length > 0
+      ? fallbackBrief
+      : null;
+
+  if (content) {
+    return (
+      <DailyBriefErrorBoundary fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}>
+        <DailyBriefCard
+          brief={content}
+          // A ready brief keeps reporting ready through a refresh, so a quiet
+          // background refetch neither flips the card to busy nor re-announces.
+          // Any other outcome defers to the request actually in flight.
+          outcome={state.status === "ready" ? "ready" : pending ? "loading" : state.status}
+          spot={spot}
+        />
+      </DailyBriefErrorBoundary>
+    );
+  }
+  const loadingLine = (
+    <p className="quietBriefLine" role="status" aria-busy="true">
+      Loading the daily outlook…
+    </p>
+  );
+  // Ordered so that nothing definitive is said while any request that could
+  // still produce content is outstanding. Three sources are pending until they
+  // are not: this panel's brief, the active interval's payload, and — at hourly
+  // resolution, where it is a separate request — the canonical payload the
+  // local daylight pick is derived from.
+  //
+  // 1. The brief is a separate endpoint that answers even when the forecast
+  //    read is failing, so an outage or a denial announced over an in-flight
+  //    request would be retracted one round trip later. This tracks the live
+  //    request rather than the first one: a retry deserves the same deference,
+  //    and `pending` can only be true once a date has started one.
+  if (pending && state.status !== "ready") return loadingLine;
+  // 2. Symmetrically, a failed brief says nothing about a forecast payload that
+  //    has not landed yet — that payload may still carry a local pick, and both
+  //    settled lines below would claim inputs are listed on a tab still empty.
+  if (forecastStatus === "loading") return loadingLine;
+  // 3. And the local pick comes from the canonical payload, which at hourly
+  //    resolution is a different request from the one forecastStatus tracks.
+  if (canonicalPending) return loadingLine;
+  // 4. Every source has settled. A forecast outage is the broader fact, so it
+  //    outranks whatever the brief request did.
+  if (forecastStatus === "error") {
+    return (
+      <p className="quietBriefLine" role="status">
+        Forecast data for this spot is temporarily unavailable, so there is no analysis to show yet.
+      </p>
+    );
+  }
+  if (state.status === "failed") {
+    return (
+      <p className="quietBriefLine" role="status">
+        The daily outlook could not be loaded. Every available public input is still listed on the Forecast tab.
+      </p>
+    );
+  }
+  // 5. A ready forecast with no day selected has nothing to deny yet.
+  if (!selectedDate) return loadingLine;
+  // Reached only when the Worker answered and had no outlook to publish, so
+  // this reads as the deterministic finding it is.
+  return (
+    <p className="quietBriefLine" role="status">
+      No daylight recommendation for this day. Every available public input is still listed on the Forecast tab.
+    </p>
   );
 }
