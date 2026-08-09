@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { ForecastResponseSchema, type ApiSpot, type ForecastResponse } from "@surf/contracts";
 import { getSpotProfile, selectCanonicalRecommendationIds } from "@surf/forecast-core";
 import { buildFixtureForecast } from "@surf/forecast-core/test-support";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { assembleModelForecastBrief } from "../../../worker/brief/brief";
 import { buildForecastFactBundle } from "../../../worker/brief/facts";
@@ -627,6 +628,61 @@ describe("ForecastWorkbench", () => {
     expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();
   });
 
+  it("does not deny a recommendation on the frame before it asks for one", () => {
+    // The request is started by a passive effect, which React runs after the
+    // commit paints. `render()` wraps everything in act(), which flushes that
+    // effect into the same batch and hides the first frame entirely — so this
+    // asserts the first commit directly, which is the only place the defect
+    // was visible. A denial here is painted and then retracted, and both lines
+    // live in the same role="status" region.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&date=2026-08-02");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async () => jsonResponse({}, 503)));
+
+    const firstFrame = renderToStaticMarkup(
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />
+    );
+
+    expect(firstFrame).toContain("Loading the daily outlook");
+    expect(firstFrame).not.toContain("No daylight recommendation for this day");
+    expect(firstFrame).not.toContain("could not be loaded");
+  });
+
+  it("dates the local read to its forecast but never claims provenance for a Worker summary", async () => {
+    // The Worker emits its last-resort summary precisely because no forecast
+    // bundle existed, and stamps it with the request clock — so "From the <t>
+    // forecast" would assert a provenance that does not exist, in the
+    // machine-readable dateTime as well as the visible text.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        return jsonResponse({
+          status: "deterministic_fallback",
+          brief: {
+            provider: "deterministic",
+            headline: "Bolinas daily summary is refreshing",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-12T23:00:05.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const { container } = render(
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />
+    );
+
+    await screen.findByRole("heading", { name: "Bolinas daily summary is refreshing" });
+    const stamp = container.querySelector(".dailyBriefMeta time")?.textContent ?? "";
+    expect(stamp).toMatch(/^Updated /);
+    expect(stamp).not.toMatch(/forecast$/);
+  });
+
   it("labels a Worker-published deterministic summary the same way in both channels", async () => {
     // The Worker answers with a deterministic summary whenever it has no
     // authored outlook for the day, so the request succeeding does not mean an
@@ -707,8 +763,16 @@ describe("ForecastWorkbench", () => {
     rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={now} />);
     await waitFor(() => expect(briefRequests).toBe(2));
 
-    await waitFor(() => expect(announced()).toBe("Updating the daily outlook."));
-    expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("true");
+    // The retry is signalled by the busy state, not by re-narrating the card.
+    // The dashboard polls on a timer, so a live region that speaks on every
+    // background refresh is noise for exactly the readers who cannot see that
+    // the screen did not change.
+    const duringRetry = announced();
+    await waitFor(() =>
+      expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("true")
+    );
+    expect(duringRetry).toMatch(/could not be updated/);
+    expect(duringRetry).not.toMatch(/Updating the daily outlook/);
 
     releaseSecondBrief();
     expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();

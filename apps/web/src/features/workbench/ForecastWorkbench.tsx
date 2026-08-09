@@ -290,8 +290,16 @@ function ForecastLearningGuide() {
 function DailyBriefCard({
   brief,
   outcome,
+  busy,
+  local,
   spot
-}: { brief: DailyBrief; outcome: OutlookState["status"]; spot: ApiSpot }) {
+}: {
+  brief: DailyBrief;
+  outcome: OutlookState["status"];
+  busy: boolean;
+  local: boolean;
+  spot: ApiSpot;
+}) {
   const [bestPick, ...alternatePicks] = brief.picks;
   const loading = outcome === "loading";
   // A live region only announces when its text changes, so the message has to
@@ -318,6 +326,16 @@ function DailyBriefCard({
   const authored = brief.provider !== "deterministic";
   const label = authored ? "Daily outlook" : "Forecast read";
   const stamp = brief.generatedAt ? formatTimestamp(brief.generatedAt, spot.timezone) : null;
+  // Only the local read's stamp is a forecast issue time. The Worker's
+  // last-resort summary carries the request clock — it is emitted precisely
+  // because no forecast bundle existed — so claiming it came "from the <t>
+  // forecast" would assert provenance that does not exist, in the machine
+  // readable dateTime as well as the text.
+  const stampCopy = authored
+    ? `Outlook updated ${stamp}`
+    : local
+      ? `From the ${stamp} forecast`
+      : `Updated ${stamp}`;
   // The announced label tracks the visible one. The Worker answers with a
   // deterministic summary whenever it has no authored outlook for the day, so
   // "ready" means the request succeeded, not that an outlook was written --
@@ -330,7 +348,7 @@ function DailyBriefCard({
         ? `The daily outlook could not be updated. Showing the forecast read: ${announcement}`
         : `No new outlook was published. Showing the forecast read: ${announcement}`;
   return (
-    <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={loading}>
+    <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={busy}>
       <span className="srOnly" role="status" aria-live="polite">
         {message}
       </span>
@@ -338,9 +356,7 @@ function DailyBriefCard({
         <div className="dailyBriefMeta">
           <p className="kicker">{label}</p>
           {brief.generatedAt && stamp && (
-            <time dateTime={brief.generatedAt}>
-              {authored ? `Outlook updated ${stamp}` : `From the ${stamp} forecast`}
-            </time>
+            <time dateTime={brief.generatedAt}>{stampCopy}</time>
           )}
         </div>
         <h2 id="daily-brief-heading">{presentBriefCopy(brief.headline)}</h2>
@@ -430,7 +446,8 @@ function DailyBriefRecoveryCard({ brief }: { brief: DailyBrief }) {
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-recovery-heading">
       <div className="dailyBriefBody">
-        <div className="dailyBriefMeta"><p className="kicker">Daily outlook</p></div>
+        {/* This card only ever renders the local forecast read. */}
+        <div className="dailyBriefMeta"><p className="kicker">Forecast read</p></div>
         <h2 id="daily-brief-recovery-heading">{presentBriefCopy(brief.headline)}</h2>
         <p className="dailyBriefSetup">{presentBriefCopy(brief.setup)}</p>
       </div>
@@ -1265,7 +1282,12 @@ function DailyOutlook({
   // are ordinary here, since the canonical payload landing both clears
   // `canonicalPending` and fires the retry. Without this, the panel asserts the
   // previous attempt's failure for the whole duration of the next one.
-  const [pending, setPending] = useState(false);
+  // Initialised from the date rather than to false: the effect below is passive
+  // and runs *after* the commit that would start the request, so a false start
+  // lets the walk fall past every deferral for one painted frame and deny a
+  // recommendation before asking for one. The child is keyed on spot:date, so
+  // `selectedDate` cannot change without a remount and this initialiser is exact.
+  const [pending, setPending] = useState(Boolean(selectedDate));
 
   // Gated on the selected date and the payload generation. A published outlook
   // must stay reachable for any date that has one — including a day whose
@@ -1321,10 +1343,18 @@ function DailyOutlook({
       <DailyBriefErrorBoundary fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}>
         <DailyBriefCard
           brief={content}
-          // A ready brief keeps reporting ready through a refresh, so a quiet
-          // background refetch neither flips the card to busy nor re-announces.
-          // Any other outcome defers to the request actually in flight.
-          outcome={state.status === "ready" ? "ready" : pending ? "loading" : state.status}
+          // Two separate facts. The message reports the last settled answer, so
+          // a background refresh of unchanged content says nothing new — the
+          // dashboard polls on a timer, and a live region that re-narrates each
+          // poll is noise only the readers who cannot see the unchanged screen
+          // have to sit through. `busy` reports the request actually in flight,
+          // which is what tells them work is happening without speaking.
+          outcome={state.status}
+          busy={pending}
+          // Whether this is the local forecast read or something the Worker
+          // published — the card cannot infer it from the payload, and only the
+          // local one may claim to have come from a forecast at a given time.
+          local={content === fallbackBrief}
           spot={spot}
         />
       </DailyBriefErrorBoundary>
