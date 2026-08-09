@@ -1247,3 +1247,61 @@ repo writes explicitly and directs probes to the scratchpad.
 - A 2xx whose JSON the adapter cannot read is still classified `empty`. Unreachable against
   today's handler (the schema requires a non-empty headline); becomes reachable on envelope
   drift. The overclaiming comment was corrected to say exactly this. Logged as OI-11.
+
+_2026-08-09 (UTC), later_ — **Rounds 7 and 8: the review walked out of PR-C's blast radius and
+into the repo's (`7046fb9`, `5864cf4`, `b774d7a`).** Round 7 audited the walk's *inputs* and
+found two P1s plus a P2, all reproduced with scratchpad probes:
+(1) `forecastStatus` derived "error" from `initialError` — the *dashboard's* failure, not the
+workbench's. The workbench retries on mount whenever its cache is cold and that retry usually
+succeeds, so the ordinary degraded first paint claimed an outage over a healthy in-flight
+request. Now derived from `intervalError` alone; `initialError` still drives the Forecast tab's
+own banner.
+(2) A **third** pending source the walk could not see: the daylight pick comes from the canonical
+3h payload while `forecastStatus` tracks the active interval — different requests at 1h. The
+hourly can land and report "ready" while the canonical, which decides whether a pick exists at
+all, is still out. `canonicalPending` is now real state (a ref would strand the panel on the
+failure path that sets no state).
+(3) The live region announced "Daily outlook updated" at the instant the request **failed**,
+because the card renders the local read whenever a pick exists, so "not loading" was being read
+as "published". Audible only to screen-reader users. `DailyBriefCard` now takes the outcome.
+
+**Round 7's worst finding predates this PR** — the `initialForecast` reset is from PR #15 and the
+interval effect's deps from PR #12. The reset aborts the active interval's in-flight fetch and
+drops its cache entry; at 1h no other dep moves, so the request is never reissued and the panel
+waits on a dead fetch forever (escape: toggle resolution twice). The variant where an hourly
+outage is awaiting its canonical fallback loses the switch too, turning a failure the app owed
+the reader into an indefinite spinner. Fixed here (`reloadToken`) because PR-C is what makes it
+visible as a permanent "Loading the daily outlook", with the provenance recorded rather than
+quietly absorbed.
+
+Round 7 also found the walk counted every pending source **except the brief's own retry**:
+`OutlookState` holds the last *settled* answer and never re-enters loading on a refresh (so a
+rendered brief is not torn down), meaning from the 2nd request onward the panel asserted the
+previous attempt's outcome for exactly as long as the request overturning it was in flight — and
+the trigger for that retry is the canonical landing, the very event round 6 taught the walk to
+wait for. Pendency is now tracked separately from the settled outcome.
+
+**Two existing assertions were pinning defects rather than catching them** (the card's
+"Outlook updated" stamp on a local read, in both `ForecastWorkbench.test.tsx` and
+`App.test.tsx`) — the third occurrence of that pattern this workstream.
+
+**A browser check found what the tests structurally could not.** After giving the card an
+authored-vs-local distinction, the running page showed the inverse defect: the Worker returns a
+*deterministic summary* when it has no authored outlook (what a stale dataset produces), so the
+request succeeds, state is "ready", and the live region said "Daily outlook updated" beside a
+card correctly labelled "Forecast read". Every unit test in the area either publishes an authored
+brief or publishes nothing, so none of them put a Worker-published deterministic summary on
+screen. One does now. Lesson worth compounding: **a test suite built from the two clean cases
+cannot see the mixed one.**
+
+`pnpm verify` green at each step, ending at web 307 (+1 skip), workerd 19, core 21, contracts 11,
+db 10, Python 45. GitHub Verify green at `7046fb9`, `5864cf4`, and `b774d7a`. Every new pin was
+mutation-verified; two mutations initially survived (a vacuous canonical test that asserted
+before the payload landed, and a retry test that exercised the quiet-line path instead of the
+card path) and both tests were rewritten until they failed against the unfixed code.
+
+**Stopping rule, pre-registered before round 8:** every finding must be classified by `git blame`
+as introduced-by-this-delta, introduced-by-PR-C, or pre-existing. Only the first two block the
+merge; pre-existing findings become ledger items. Rationale: by round 7 the review was returning
+defects from PRs #12 and #15, which is the signal that it has exhausted this PR's own surface and
+is now auditing the surrounding code. Absent a rule, that search does not terminate.
