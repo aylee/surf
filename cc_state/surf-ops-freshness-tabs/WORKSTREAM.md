@@ -161,6 +161,7 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | OI-9 | Brief headline restates content the page already shows: on the spot page the model-authored headline names both the pick time and the spot name that the `h1` already carries (owner-reported from production, 2026-08-06). PR-C removes the hero↔brief duplication by tabbing them apart; the residual is worker-side brief prompt/validator wording, deliberately kept out of PR-C's UI-only reviewed diff | agent | OPEN | small worker-side polish PR after PR-D, or fold into PR-D's gate |
 | OI-10 | The Analysis outlook's `/brief` fetch has no timeout, so a hung (as opposed to failed) request pins the panel on the loading line while a forecast outage the parent already knows about goes unstated. Pre-existing — the pre-restructure walk also returned the loading line unconditionally — so not a PR-C regression. Bounded in practice by Cloudflare's ~100s 524. Fix candidate: a timeout signal distinct from the unmount abort, so the request resolves to `failed` in bounded time | agent | OPEN | small UI PR after PR-D; needs a timeout path that does not collide with the abort-on-unmount check |
 | OI-11 | A 2xx `/brief` response whose JSON the adapter cannot read is classified `empty` ("answered with nothing") rather than `failed`, so envelope drift would surface as a deterministic "no daylight recommendation" instead of a load failure. Unreachable against today's handler: `ForecastBriefReferencedProseSchema` requires a non-empty headline, so every published brief parses. The honest split needs the envelope to state emptiness explicitly | agent | OPEN | fold into the next brief-contract change; comment at the call site records the current behavior |
+| OI-12 | The card's meta stamp demotes a *correct* provenance claim on the common Worker path. `buildDeterministicForecastBrief` stamps `bundle.input.generatedAt` — the forecast's own issue time, the same value the local read uses — but the client cannot distinguish it from `buildUnavailableForecastBriefResponse`, which stamps the request clock, so both render the weaker "Updated <t>" instead of "From the <t> forecast". Nothing rendered is false, only less specific; AGENTS.md asks to preserve issue times. Fix needs the envelope to mark the last-resort case explicitly (it already self-identifies via `inputFingerprint: fallback:<spotId>:<localDate>` and `availableRevisions: 0`) and `parseBriefResponse` to carry the flag | agent | OPEN | fold into the next brief-contract change |
 | OI-7 | Rotate the Logfire write token: the Cloudflare destinations GET echoes the `Authorization` header, so the token entered the agent transcript while completing OI-4. Rotate in Logfire, update both destinations (operator dashboard edit keeps the new token out of transcripts), confirm export still works | alex + agent | OPEN | PR-A live gate is now green — rotate at next operator touch (config-only, fully reversible) |
 | OI-8 | Deploy-window sixth-child kill, now twice reproduced (PR #21 deploy of `8ce5bdf1…`; PR-A deploy of `53084465…` at 01:51Z): during the immediate post-activation handoff cycle, the last serialized Queue child (bolinas) is killed `exceededCpu` at ~50–85 ms CPU across 4 delivery attempts while healthy siblings use 196–395 ms; the message lands in `surf-ingest-dlq` (no consumer; left parked per no-replay policy). Cron cycles on the same version are unaffected (bolinas published 02:17:14 with 22-span healthy trace). Working theory: cold-version isolate contention (fresh HTTP-poller isolates + five just-signaled brief Agent DOs + queue consumer on a seconds-old version). Corrective candidates: quiet-down the verifier polling during fan-out, stagger/handoff-delay the enqueue, or verifier tolerance for one cron-cycle convergence. Decide at the PR-B ship boundary — if PR-B's deploy reproduces it, the corrective becomes mandatory before PR-C | agent | OPEN | dedicated corrective, decision checkpoint at T-B.5 |
 
@@ -1305,3 +1306,87 @@ as introduced-by-this-delta, introduced-by-PR-C, or pre-existing. Only the first
 merge; pre-existing findings become ledger items. Rationale: by round 7 the review was returning
 defects from PRs #12 and #15, which is the signal that it has exhausted this PR's own surface and
 is now auditing the surrounding code. Absent a rule, that search does not terminate.
+
+_2026-08-09 (UTC), evening_ — **Round 8 found four defects in the round-7 fixes; owner merged
+PR #30 mid-round; fixes landed as PR #31 (`2f03f5a`, merged `b28d7d9`).**
+
+Round 8 classified every finding by `git blame` per the pre-registered rule, and all four came
+back `5864cf4` — my own delta — so all four blocked:
+1. **P1 — the panel denied a recommendation on the frame before it asked for one.** `pending`
+initialised `false` while `state` initialised `loading`, and the effect that sets `pending` is
+passive, so it runs *after* the commit paints. The first render of every (spot, date) scope fell
+past every deferral and painted "No daylight recommendation for this day", then retracted it —
+same `role="status"` region, so a screen reader receives both. Now initialised from the date,
+exact because the child is keyed `spot:date`.
+2. **P2 — a failing brief re-narrated itself on every dashboard poll.** Routing the card's message
+through pendency made a persistently failing brief cycle failed → "Updating" → failed forever
+while nothing visible changed. `outcome` (last settled answer → the message) and `busy` (request
+in flight → `aria-busy`) are now separate props. This satisfies round 7 (a busy signal exists)
+*and* round 8 (no text churn) — the two rounds were pulling in opposite directions on one prop.
+3. **P2 — the stamp claimed provenance it did not have.** The Worker's last-resort summary carries
+the *request clock* precisely because no forecast bundle existed, so "From the <t> forecast"
+asserted an issue time for a forecast never issued — in the `dateTime` attribute too. Only the
+local read may make that claim.
+4. **P3 — the error-boundary recovery card labelled the local read "Daily outlook."**
+
+**Why my four round-7 tests passed straight over all of this:** `render()` wraps its work in
+`act()`, which flushes passive effects into the same synchronous batch — exactly the boundary the
+`pending` change moved. Round 8 caught it by recording every *committed frame* with a
+MutationObserver outside `act()`. First-frame coverage now comes from `renderToStaticMarkup`,
+which closes the class of gap structurally rather than case by case. **This is the methodological
+lesson of the whole workstream: a suite that only asserts settled state cannot see a frame that is
+painted and retracted, and four tests written specifically for a change can all miss it.**
+
+**Sequencing deviation, recorded:** the owner merged PR #30 while round 8 was still running, so
+PR-C reached `main` carrying these four defects. No deploy occurred in between, so production
+never saw them. The fixes went out as follow-up PR #31 rather than as more commits on the merged
+branch — which is the correct shape for a defect found after merge, and preserves the "green
+GitHub Verify at the exact head" property for both PRs.
+
+**Dependency note:** merging main pulled dependabot #29's lockfile (TypeScript 6→7, jsdom 29→30,
+vite 8.1→8.2). `pnpm verify` is green on that set — first validation of the upgrade.
+**Dependabot triage (owner asked):** config is already sound (weekly, grouped per ecosystem, PR
+limits). One PR open, #28, touching only `.github/workflows/ci.yml`. The push banner's "25
+vulnerabilities" is stale; the alerts API shows **5 open, all `undici`** (1 high, 4 medium).
+Checked the built Worker bundle rather than the dependency tree: undici's implementation is not
+in it — only the AI SDK's error-classification code that *names* undici (`undiciTimeoutCodes`, a
+string match on `internal/deps/undici`). The three real copies come from miniflare/wrangler (dev),
+jsdom/vitest (test), and the AI SDK's Node path; the Workers runtime uses its own `fetch`. **No
+production exposure**; clears on the weekly grouped bump.
+
+**State:** `main` at `b28d7d9`, `pnpm verify` green (web 309 +1 skip, workerd 19, core 21,
+contracts 11, db 10, Python 45), GitHub Verify green at both merge heads. **Production is still
+running the pre-PR-C build — PR-C is merged but NOT deployed.** Round 9 (frame-level, pre-deploy)
+is running. `pnpm deploy` remains blocked by the permission classifier and needs the owner.
+
+_2026-08-09 (UTC), night_ — **Round 9 (pre-deploy, frame-level): `deployable: true`, zero
+blocking findings — the first dry round of PR-C.** Four follow-ups, none blocking, one worth
+fixing anyway and fixed (`main`, post-merge):
+
+The P2 it did flag was mine by inheritance: round 8's second fix separated "what is true" from
+"what is in flight" **for the card only**, leaving the identical pathology on the adjacent
+quiet-line path. On any day with no local daylight pick, a failing brief still rewrote the same
+`role="status"` node failed → "Loading" → failed on every dashboard poll, indefinitely, while
+nothing visible changed — the exact thing the commit message claimed to have removed. The walk
+now defers only until the **first** answer settles; after that a retry is signalled by
+`aria-busy` on whatever line already stands. Same split, both paths.
+
+Round 9 also caught that `busy={pending}` had dropped half of a property round 6 established:
+a *rendered* brief used to stay un-busy through a quiet background refetch, and I had made it
+flip. Now `busy={pending && state.status !== "ready"}` — the reader who already has the answer
+is not asked to wait on a refresh they did not request. Three mutations verified; `pnpm verify`
+green at web 310 (+1 skip).
+
+Left as follow-ups with reasons: the stamp-specificity regression (**OI-12**, needs an envelope
+flag, current output accurate but less specific), and a pre-existing paint/retract/restate on the
+quiet line that the same walk change resolves.
+
+**Nine rounds is the headline finding of this leg.** The shape: rounds 1–3 inside the panel,
+round 4 restructure, rounds 5–6 residual cells and my own mirror bug, round 7 the walk's
+*inputs*, round 8 the *frame* boundary, round 9 dry. Each round moved one level outward, and by
+round 7 it was returning defects from PRs #12 and #15 — the signal that this PR's own surface was
+exhausted. Two methodological lessons worth compounding: **(1)** a suite that asserts only settled
+state cannot see a frame that is painted and retracted, and `act()` actively hides it — four
+tests written for that exact change all missed it; **(2)** three separate times an existing test
+was found *pinning* a defect rather than catching it, so a green suite over a changed assertion
+deserves suspicion, not comfort.
