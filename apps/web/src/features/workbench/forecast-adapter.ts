@@ -15,6 +15,7 @@ import { cardinalDirection, confidenceLabel, localDateParts, surfaceCondition, w
 
 export type ForecastInterval = "1h" | "3h";
 export type WorkbenchView = "table" | "graph";
+export type SpotTab = "forecast" | "analysis";
 export type WaveSemantics = "direct_nearshore" | "cove_proxy" | "nws_fallback" | "unavailable";
 export type WaveResolutionMethod = "exact" | "held" | "aggregated" | "unavailable";
 
@@ -563,6 +564,7 @@ export function parseBriefResponse(payload: unknown): DailyBrief | null {
 export function readWorkbenchUrl(search: string): {
   interval: ForecastInterval;
   view: WorkbenchView;
+  tab: SpotTab;
   date: string | null;
   at: string | null;
 } {
@@ -570,13 +572,22 @@ export function readWorkbenchUrl(search: string): {
   return {
     interval: params.get("interval") === "1h" ? "1h" : "3h",
     view: params.get("view") === "graph" ? "graph" : "table",
-    date: params.get("date"),
+    tab: params.get("tab") === "analysis" ? "analysis" : "forecast",
+    // Only a well-formed date key may become workbench state; anything else is
+    // discarded so the normal date-selection effect picks a real day.
+    date: /^\d{4}-\d{2}-\d{2}$/.test(params.get("date") ?? "") ? params.get("date") : null,
     at: params.get("at")
   };
 }
 
 export function replaceWorkbenchUrl(
-  patch: Partial<{ interval: ForecastInterval; view: WorkbenchView; date: string | null; at: string | null }>
+  patch: Partial<{
+    interval: ForecastInterval;
+    view: WorkbenchView;
+    tab: string | null;
+    date: string | null;
+    at: string | null;
+  }>
 ): void {
   const url = new URL(window.location.href);
   for (const [key, value] of Object.entries(patch)) {
