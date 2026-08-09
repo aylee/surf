@@ -1350,7 +1350,10 @@ function DailyOutlook({
           // have to sit through. `busy` reports the request actually in flight,
           // which is what tells them work is happening without speaking.
           outcome={state.status}
-          busy={pending}
+          // A rendered brief keeps its calm through a background refresh: the
+          // reader already has the answer and nothing about the refetch is
+          // theirs to wait on. Every other outcome does signal the retry.
+          busy={pending && state.status !== "ready"}
           // Whether this is the local forecast read or something the Worker
           // published — the card cannot infer it from the payload, and only the
           // local one may claim to have come from a forecast at a given time.
@@ -1372,11 +1375,17 @@ function DailyOutlook({
   // local daylight pick is derived from.
   //
   // 1. The brief is a separate endpoint that answers even when the forecast
-  //    read is failing, so an outage or a denial announced over an in-flight
-  //    request would be retracted one round trip later. This tracks the live
-  //    request rather than the first one: a retry deserves the same deference,
-  //    and `pending` can only be true once a date has started one.
-  if (pending && state.status !== "ready") return loadingLine;
+  //    read is failing, so an outage or a denial announced before this panel
+  //    has any answer would be retracted one round trip later.
+  //
+  //    Only until the FIRST answer settles. A retry is signalled by aria-busy
+  //    on whatever line already stands, not by swapping the text out and back:
+  //    these lines share one live region and the dashboard refetches on a
+  //    timer, so retracting and restating a settled claim on every poll would
+  //    narrate three times that nothing changed. That is the same split the
+  //    card got — what is true is separate from what is in flight — applied to
+  //    the path that has no card to carry it.
+  if (pending && state.status === "loading") return loadingLine;
   // 2. Symmetrically, a failed brief says nothing about a forecast payload that
   //    has not landed yet — that payload may still carry a local pick, and both
   //    settled lines below would claim inputs are listed on a tab still empty.
@@ -1388,14 +1397,14 @@ function DailyOutlook({
   //    outranks whatever the brief request did.
   if (forecastStatus === "error") {
     return (
-      <p className="quietBriefLine" role="status">
+      <p className="quietBriefLine" role="status" aria-busy={pending}>
         Forecast data for this spot is temporarily unavailable, so there is no analysis to show yet.
       </p>
     );
   }
   if (state.status === "failed") {
     return (
-      <p className="quietBriefLine" role="status">
+      <p className="quietBriefLine" role="status" aria-busy={pending}>
         The daily outlook could not be loaded. Every available public input is still listed on the Forecast tab.
       </p>
     );
@@ -1405,7 +1414,7 @@ function DailyOutlook({
   // Reached only when the Worker answered and had no outlook to publish, so
   // this reads as the deterministic finding it is.
   return (
-    <p className="quietBriefLine" role="status">
+    <p className="quietBriefLine" role="status" aria-busy={pending}>
       No daylight recommendation for this day. Every available public input is still listed on the Forecast tab.
     </p>
   );

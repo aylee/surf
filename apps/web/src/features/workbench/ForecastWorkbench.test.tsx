@@ -620,12 +620,60 @@ describe("ForecastWorkbench", () => {
     await waitFor(() => expect(briefRequests).toBe(2));
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    // The claim must be withdrawn while the request that overturns it is out.
-    expect(screen.queryByText(/could not be loaded/)).toBeNull();
-    expect(screen.getByText("Loading the daily outlook…")).toBeTruthy();
+    // The retry is signalled on the line that already stands rather than by
+    // swapping the text out and back. These lines share one live region and
+    // the dashboard refetches on a timer, so retracting and restating a
+    // settled claim on every poll would narrate that nothing changed.
+    const settled = screen.getByText(/The daily outlook could not be loaded\./);
+    expect(settled.getAttribute("aria-busy")).toBe("true");
+    expect(screen.queryByText("Loading the daily outlook…")).toBeNull();
 
     releaseSecondBrief();
     expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();
+  });
+
+  it("leaves a rendered outlook calm through a background refresh", async () => {
+    // The reader already has the answer; a refetch they did not ask for is not
+    // theirs to wait on. Only the outcomes with nothing to show signal a retry.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    let releaseSecondBrief!: () => void;
+    const secondBriefGate = new Promise<void>((resolve) => { releaseSecondBrief = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        if (briefRequests > 1) await secondBriefGate;
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "A published outlook",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { container, rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    await screen.findByRole("heading", { name: "A published outlook" });
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T09:15:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+    await waitFor(() => expect(briefRequests).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("false");
+    releaseSecondBrief();
   });
 
   it("does not deny a recommendation on the frame before it asks for one", () => {
