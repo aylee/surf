@@ -309,6 +309,14 @@ function DailyBriefCard({
   // published". Announcing an update on the request's failure is the worse
   // half of that conflation, and it is audible only to the readers who cannot
   // see that nothing on screen changed.
+  // The card renders authored outlooks and the local forecast read through the
+  // same chrome, so the meta line has to say which one this is. Stamping a
+  // forecast read with "Outlook updated" presents the payload's generation time
+  // as a publication time, and told a sighted reader the outlook was current on
+  // exactly the screens where the screen-reader text said it could not be
+  // updated. Both channels now state the same fact.
+  const authored = brief.provider !== "deterministic";
+  const stamp = brief.generatedAt ? formatTimestamp(brief.generatedAt, spot.timezone) : null;
   const message = loading
     ? "Updating the daily outlook."
     : outcome === "ready"
@@ -323,9 +331,11 @@ function DailyBriefCard({
       </span>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
-          <p className="kicker">Daily outlook</p>
-          {brief.generatedAt && (
-            <time dateTime={brief.generatedAt}>Outlook updated {formatTimestamp(brief.generatedAt, spot.timezone)}</time>
+          <p className="kicker">{authored ? "Daily outlook" : "Forecast read"}</p>
+          {brief.generatedAt && stamp && (
+            <time dateTime={brief.generatedAt}>
+              {authored ? `Outlook updated ${stamp}` : `From the ${stamp} forecast`}
+            </time>
           )}
         </div>
         <h2 id="daily-brief-heading">{presentBriefCopy(brief.headline)}</h2>
@@ -794,6 +804,9 @@ export function ForecastWorkbench({
   // render off this, and a ref that changes without setting state would leave
   // it waiting on a request that already gave up.
   const [canonicalFailed, setCanonicalFailed] = useState(false);
+  // Bumped whenever an external reset aborts the active interval's request,
+  // so the interval effect reissues it instead of leaving it dead.
+  const [reloadToken, setReloadToken] = useState(0);
   const explicitTimestampSelection = useRef(Boolean(initialUrl.at));
   const previousInitialForecast = useRef(initialForecast);
 
@@ -807,6 +820,13 @@ export function ForecastWorkbench({
     hourlyFailurePending.current = false;
     canonicalRecoveryState.current = "ready";
     setCache(nextCache);
+    // This reset aborts whatever the active interval had in flight and drops
+    // its cache entry. At hourly resolution none of the interval effect's other
+    // deps move — the entry was already absent, so `activeIntervalForecast`
+    // stays undefined — and the aborted request would never be reissued,
+    // leaving a spinner that resolves only if the reader switches resolution
+    // twice. Bumping a token the effect depends on makes the reissue automatic.
+    setReloadToken((token) => token + 1);
   }, [initialForecast]);
 
   useEffect(() => {
@@ -873,7 +893,7 @@ export function ForecastWorkbench({
         setIntervalError("Forecast detail is temporarily unavailable. Try refreshing in a moment");
       });
     return () => controller.abort();
-  }, [activeIntervalForecast, interval, onForecastRecovered, spot.id]);
+  }, [activeIntervalForecast, interval, onForecastRecovered, reloadToken, spot.id]);
 
   const canonicalCacheEntry = cache["3h"];
 
@@ -1234,6 +1254,13 @@ function DailyOutlook({
   canonicalPending: boolean;
 }) {
   const [state, setState] = useState<OutlookState>({ status: "loading" });
+  // `state` is the last *settled* answer; it deliberately never returns to
+  // "loading" on a refresh, so a rendered brief is not torn down. That leaves
+  // it silent about whether a request is outstanding right now — and refreshes
+  // are ordinary here, since the canonical payload landing both clears
+  // `canonicalPending` and fires the retry. Without this, the panel asserts the
+  // previous attempt's failure for the whole duration of the next one.
+  const [pending, setPending] = useState(false);
 
   // Gated on the selected date and the payload generation. A published outlook
   // must stay reachable for any date that has one — including a day whose
@@ -1242,6 +1269,7 @@ function DailyOutlook({
   useEffect(() => {
     if (!selectedDate) return;
     const controller = new AbortController();
+    setPending(true);
     void fetch(`/api/forecast/${spot.id}/brief?date=${encodeURIComponent(selectedDate)}`, {
       headers: { Accept: "application/json" },
       signal: controller.signal
@@ -1259,6 +1287,7 @@ function DailyOutlook({
       )
       .then((result) => {
         if (controller.signal.aborted) return;
+        setPending(false);
         setState((current) => {
           if (result.brief) return { status: "ready", brief: result.brief };
           // A failed or empty refresh never evicts what the reader already has.
@@ -1268,6 +1297,7 @@ function DailyOutlook({
       })
       .catch(() => {
         if (controller.signal.aborted) return;
+        setPending(false);
         setState((current) => (current.status === "ready" ? current : { status: "failed" }));
       });
     return () => controller.abort();
@@ -1284,7 +1314,14 @@ function DailyOutlook({
   if (content) {
     return (
       <DailyBriefErrorBoundary fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}>
-        <DailyBriefCard brief={content} outcome={state.status} spot={spot} />
+        <DailyBriefCard
+          brief={content}
+          // A ready brief keeps reporting ready through a refresh, so a quiet
+          // background refetch neither flips the card to busy nor re-announces.
+          // Any other outcome defers to the request actually in flight.
+          outcome={state.status === "ready" ? "ready" : pending ? "loading" : state.status}
+          spot={spot}
+        />
       </DailyBriefErrorBoundary>
     );
   }
@@ -1301,10 +1338,10 @@ function DailyOutlook({
   //
   // 1. The brief is a separate endpoint that answers even when the forecast
   //    read is failing, so an outage or a denial announced over an in-flight
-  //    request would be retracted one round trip later. Guarded on a selected
-  //    date so that a request which was never started cannot outrank the
-  //    settled lines below; with no date there is nothing in flight to defer to.
-  if (state.status === "loading" && selectedDate) return loadingLine;
+  //    request would be retracted one round trip later. This tracks the live
+  //    request rather than the first one: a retry deserves the same deference,
+  //    and `pending` can only be true once a date has started one.
+  if (pending && state.status !== "ready") return loadingLine;
   // 2. Symmetrically, a failed brief says nothing about a forecast payload that
   //    has not landed yet — that payload may still carry a local pick, and both
   //    settled lines below would claim inputs are listed on a tab still empty.

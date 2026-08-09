@@ -292,7 +292,13 @@ describe("ForecastWorkbench", () => {
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
     expect(await screen.findByRole("heading", { name: /leading daylight window/ })).toBeTruthy();
     expect(screen.queryByText(/clearest daylight window/i)).toBeNull();
-    expect(screen.getByText(/Outlook updated Aug 2/)).toBeTruthy();
+    // The card is showing the local forecast read, so it must say so and date
+    // itself to the payload it came from. Stamping it "Outlook updated" would
+    // present the payload's generation time as a publication time, and would
+    // contradict the screen-reader text on the same screen.
+    expect(screen.getByText(/From the Aug 2.* forecast/)).toBeTruthy();
+    expect(screen.getByText("Forecast read")).toBeTruthy();
+    expect(screen.queryByText(/Outlook updated/)).toBeNull();
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.queryByText(/provider unavailable/i)).toBeNull();
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Forecast" }), { button: 0, ctrlKey: false });
@@ -531,6 +537,147 @@ describe("ForecastWorkbench", () => {
     ).toBeTruthy();
     expect(screen.queryByText(/No daylight recommendation for this day/)).toBeNull();
     await waitFor(() => expect(briefRequests).toBeGreaterThan(0));
+  });
+
+  it("reissues the active-interval request when a dashboard refresh aborts it", async () => {
+    // The initialForecast reset aborts whatever the active interval had in
+    // flight. At hourly resolution none of the interval effect's other deps
+    // move, so without a reload token the request is dead and the panel waits
+    // on it forever. Every other rerender test runs at 3h, where the cache
+    // entry does change identity and hides the hole.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&interval=1h");
+    const threeHour = fixtureForecast();
+    let hourlyRequests = 0;
+    let releaseHourly!: () => void;
+    const hourlyGate = new Promise<void>((resolve) => { releaseHourly = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) return jsonResponse({}, 503);
+      if (url.includes("interval=1h")) {
+        hourlyRequests += 1;
+        if (hourlyRequests === 1) await hourlyGate;
+        return jsonResponse(hourlyForecastWithLocalChallenger(threeHour));
+      }
+      return jsonResponse(threeHour);
+    }));
+
+    const { rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={null} now={now} />
+    );
+    await waitFor(() => expect(hourlyRequests).toBe(1));
+
+    // A dashboard poll hands down a new payload identity mid-flight.
+    const refreshed = ForecastResponseSchema.parse({ ...threeHour, generatedAt: "2026-08-02T09:15:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={now} />);
+    releaseHourly();
+
+    // The aborted request must be reissued rather than silently dropped.
+    await waitFor(() => expect(hourlyRequests).toBe(2));
+    expect(await screen.findByRole("heading", { name: /leading daylight window/ })).toBeTruthy();
+  });
+
+  it("stops asserting a failed outlook once its retry is in flight", async () => {
+    // The canonical payload landing both clears canonicalPending and fires the
+    // retry, so the settled failure would otherwise be asserted for exactly as
+    // long as the request that overturns it is outstanding.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    let releaseSecondBrief!: () => void;
+    const secondBriefGate = new Promise<void>((resolve) => { releaseSecondBrief = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        if (briefRequests === 1) return jsonResponse({}, 503);
+        await secondBriefGate;
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "A published outlook",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T09:20:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={elapsedDayNow} />
+    );
+    // No local pick on an elapsed day, so the definitive line renders.
+    expect(await screen.findByText(/The daily outlook could not be loaded\./)).toBeTruthy();
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T09:15:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={elapsedDayNow} />);
+    await waitFor(() => expect(briefRequests).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The claim must be withdrawn while the request that overturns it is out.
+    expect(screen.queryByText(/could not be loaded/)).toBeNull();
+    expect(screen.getByText("Loading the daily outlook…")).toBeTruthy();
+
+    releaseSecondBrief();
+    expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();
+  });
+
+  it("reports the card busy while a retry runs instead of repeating the last failure", async () => {
+    // The card path, where a local pick exists so the definitive line never
+    // renders: the previous attempt's failure must not keep speaking, and the
+    // card must show it is working, while the retry is outstanding.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let briefRequests = 0;
+    let releaseSecondBrief!: () => void;
+    const secondBriefGate = new Promise<void>((resolve) => { releaseSecondBrief = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        if (briefRequests === 1) return jsonResponse({}, 503);
+        await secondBriefGate;
+        return jsonResponse({
+          status: "model",
+          brief: {
+            provider: "google",
+            headline: "A published outlook",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T09:20:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const first = fixtureForecast();
+    const { container, rerender } = render(
+      <ForecastWorkbench spot={spot} initialForecast={first} now={now} />
+    );
+    await screen.findByRole("heading", { name: /leading daylight window/ });
+    const announced = () => container.querySelector(".dailyBrief > .srOnly")?.textContent ?? "";
+    await waitFor(() => expect(announced()).toMatch(/could not be updated/));
+
+    const refreshed = ForecastResponseSchema.parse({ ...first, generatedAt: "2026-08-02T09:15:00.000Z" });
+    rerender(<ForecastWorkbench spot={spot} initialForecast={refreshed} now={now} />);
+    await waitFor(() => expect(briefRequests).toBe(2));
+
+    await waitFor(() => expect(announced()).toBe("Updating the daily outlook."));
+    expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("true");
+
+    releaseSecondBrief();
+    expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();
+    await waitFor(() =>
+      expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("false")
+    );
   });
 
   it("does not treat the dashboard's failure as an outage while its own retry is in flight", async () => {

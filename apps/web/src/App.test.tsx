@@ -225,7 +225,10 @@ describe("App", () => {
     expect(briefCalls()).toBe(0);
 
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
-    expect(await screen.findByText("Daily outlook")).toBeTruthy();
+    // The Worker publishes no brief here (404), so the card is the local
+    // forecast read and must be labelled as one rather than as an outlook.
+    expect(await screen.findByText("Forecast read")).toBeTruthy();
+    expect(screen.queryByText("Daily outlook")).toBeNull();
     expect(screen.getByText("Data, confidence & provenance")).toBeTruthy();
     await waitFor(() => expect(briefCalls()).toBeGreaterThan(0));
     expect(new URLSearchParams(window.location.search).get("tab")).toBe("analysis");
