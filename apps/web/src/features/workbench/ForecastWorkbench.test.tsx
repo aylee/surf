@@ -533,6 +533,96 @@ describe("ForecastWorkbench", () => {
     await waitFor(() => expect(briefRequests).toBeGreaterThan(0));
   });
 
+  it("does not treat the dashboard's failure as an outage while its own retry is in flight", async () => {
+    // initialError is the dashboard's result, not this workbench's. The
+    // workbench retries on mount whenever its cache is cold, and that retry
+    // usually succeeds — so reading initialError as an outage states one over
+    // a healthy in-flight request and retracts it a round trip later.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    let releaseForecast!: () => void;
+    const forecastGate = new Promise<void>((resolve) => { releaseForecast = resolve; });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) return jsonResponse({}, 503);
+      await forecastGate;
+      return jsonResponse(fixtureForecast());
+    }));
+
+    render(
+      <ForecastWorkbench spot={spot} initialForecast={null} initialError="dashboard failed" now={now} />
+    );
+
+    expect(await screen.findByText("Loading the daily outlook…")).toBeTruthy();
+    expect(screen.queryByText(/there is no analysis to show yet/)).toBeNull();
+
+    releaseForecast();
+    expect(await screen.findByRole("heading", { name: /leading daylight window/ })).toBeTruthy();
+    expect(screen.queryByText(/there is no analysis to show yet/)).toBeNull();
+  });
+
+  it("waits for the canonical payload the local pick comes from, not just the active interval", async () => {
+    // At hourly resolution these are two different requests, and it is the
+    // canonical one that decides whether a daylight pick exists to render.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis&interval=1h");
+    const threeHour = fixtureForecast();
+    let releaseCanonical!: () => void;
+    const canonicalGate = new Promise<void>((resolve) => { releaseCanonical = resolve; });
+    let briefRequests = 0;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        briefRequests += 1;
+        return jsonResponse({}, 503);
+      }
+      if (url.includes("interval=1h")) return jsonResponse(hourlyForecastWithLocalChallenger(threeHour));
+      await canonicalGate;
+      return jsonResponse(threeHour);
+    }));
+
+    render(<ForecastWorkbench spot={spot} initialForecast={null} now={now} />);
+
+    // Wait until the state under test is actually reached: the hourly payload
+    // has landed (so the day label exists and forecastStatus is "ready") and
+    // the brief request has failed. Asserting before this point would pass on
+    // the mount-time loading line and prove nothing.
+    expect(await screen.findByText(/^Outlook for /)).toBeTruthy();
+    await waitFor(() => expect(briefRequests).toBeGreaterThan(0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The canonical request that decides whether a pick exists is still out.
+    expect(screen.queryByText(/could not be loaded/)).toBeNull();
+    expect(screen.getByText("Loading the daily outlook…")).toBeTruthy();
+
+    releaseCanonical();
+    expect(await screen.findByRole("heading", { name: /leading daylight window/ })).toBeTruthy();
+    expect(screen.queryByText(/could not be loaded/)).toBeNull();
+  });
+
+  it("does not announce an update when the brief request failed under a rendered local read", async () => {
+    // The card renders from the local read whenever that read has a pick, so
+    // "no longer loading" must not be read as "something was published" — this
+    // transition is invisible to sighted users and audible to everyone else.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) return jsonResponse({}, 503);
+      return jsonResponse(fixtureForecast());
+    }));
+
+    const { container } = render(
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />
+    );
+
+    await screen.findByRole("heading", { name: /leading daylight window/ });
+    await waitFor(() =>
+      expect(container.querySelector(".dailyBrief")?.getAttribute("aria-busy")).toBe("false")
+    );
+    const announced = container.querySelector(".dailyBrief > .srOnly")?.textContent ?? "";
+    expect(announced).toMatch(/could not be updated/);
+    expect(announced).not.toMatch(/^Daily outlook updated\./);
+  });
+
   it("never claims a failed outlook while the forecast payload is still in flight", async () => {
     // The mirror of the outage case: a brief that failed says nothing about a
     // payload that has not landed, and the failure copy would claim inputs are

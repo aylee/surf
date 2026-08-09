@@ -159,6 +159,8 @@ flip status, add date + a pointer to where it landed, log it in the Session Log.
 | ID | Item | Owner | Status | Resolves in |
 |---|---|---|---|---|
 | OI-9 | Brief headline restates content the page already shows: on the spot page the model-authored headline names both the pick time and the spot name that the `h1` already carries (owner-reported from production, 2026-08-06). PR-C removes the hero↔brief duplication by tabbing them apart; the residual is worker-side brief prompt/validator wording, deliberately kept out of PR-C's UI-only reviewed diff | agent | OPEN | small worker-side polish PR after PR-D, or fold into PR-D's gate |
+| OI-10 | The Analysis outlook's `/brief` fetch has no timeout, so a hung (as opposed to failed) request pins the panel on the loading line while a forecast outage the parent already knows about goes unstated. Pre-existing — the pre-restructure walk also returned the loading line unconditionally — so not a PR-C regression. Bounded in practice by Cloudflare's ~100s 524. Fix candidate: a timeout signal distinct from the unmount abort, so the request resolves to `failed` in bounded time | agent | OPEN | small UI PR after PR-D; needs a timeout path that does not collide with the abort-on-unmount check |
+| OI-11 | A 2xx `/brief` response whose JSON the adapter cannot read is classified `empty` ("answered with nothing") rather than `failed`, so envelope drift would surface as a deterministic "no daylight recommendation" instead of a load failure. Unreachable against today's handler: `ForecastBriefReferencedProseSchema` requires a non-empty headline, so every published brief parses. The honest split needs the envelope to state emptiness explicitly | agent | OPEN | fold into the next brief-contract change; comment at the call site records the current behavior |
 | OI-7 | Rotate the Logfire write token: the Cloudflare destinations GET echoes the `Authorization` header, so the token entered the agent transcript while completing OI-4. Rotate in Logfire, update both destinations (operator dashboard edit keeps the new token out of transcripts), confirm export still works | alex + agent | OPEN | PR-A live gate is now green — rotate at next operator touch (config-only, fully reversible) |
 | OI-8 | Deploy-window sixth-child kill, now twice reproduced (PR #21 deploy of `8ce5bdf1…`; PR-A deploy of `53084465…` at 01:51Z): during the immediate post-activation handoff cycle, the last serialized Queue child (bolinas) is killed `exceededCpu` at ~50–85 ms CPU across 4 delivery attempts while healthy siblings use 196–395 ms; the message lands in `surf-ingest-dlq` (no consumer; left parked per no-replay policy). Cron cycles on the same version are unaffected (bolinas published 02:17:14 with 22-span healthy trace). Working theory: cold-version isolate contention (fresh HTTP-poller isolates + five just-signaled brief Agent DOs + queue consumer on a seconds-old version). Corrective candidates: quiet-down the verifier polling during fan-out, stagger/handoff-delay the enqueue, or verifier tolerance for one cron-cycle convergence. Decide at the PR-B ship boundary — if PR-B's deploy reproduces it, the corrective becomes mandatory before PR-C | agent | OPEN | dedicated corrective, decision checkpoint at T-B.5 |
 
@@ -1194,3 +1196,54 @@ pins cover loading-vs-outage, provenance survival, and the absent false-update a
 Browser-verified at 390: Analysis renders day label → card → tools → provenance with exactly
 one `/brief` request and `aria-busy=false`; Forecast default has zero `/brief` requests, no AI
 content, no auto-expanded row, first row in the first viewport, no overflow.
+
+_2026-08-09 (UTC)_ — **Rounds 5 and 6 on the restructured panel: the class is closed, two
+residual cells were not (`3fd43a0`, `4a16ba7`).** The convergence re-check returned
+`converged: false` but with a materially different verdict than round 4: no P0/P1 across mount,
+tab switch, date change, spot change, interval change, refresh, abort/unmount, elapsed day, or
+missing cadence — the four-boolean intersection is genuinely gone — and three P2s that were
+"residual cells inside the new union, not another overloaded truth table". Fixed all three:
+(1) `OutlookState.empty` documented itself as "the Worker answered and published nothing", but
+the non-2xx branch and the `.catch` both resolved to it, so a transport failure read as a
+deterministic editorial judgment *and hid a brief the Worker was holding*. `failed` is now its
+own cell with its own copy.
+(2) The outage line preempted the panel's own in-flight brief — the brief is a separate endpoint
+that answers even while the forecast read fails, so a reload during an outage denied analysis
+and retracted it one round trip later.
+(3) Suppressing the false update announcements had silenced the real ones: the live region's
+text was fixed, so it spoke once and stayed quiet through every genuine revision.
+
+**Round 6 found that (2)'s fix introduced its mirror, and I had shipped it.** Placing `failed`
+above the parent's loading branch meant a failed brief printed a definitive "could not be
+loaded — every available public input is still listed on the Forecast tab" while the payload
+was still in flight and the tab listed nothing. All three lenses found it independently; a
+surviving refuter reproduced it and verified the fix. The walk now defers to *either*
+outstanding request before rendering anything settled, with the reasoning written per branch.
+Round 6 also killed my own fix (3): `generatedAt` is a materialization or request clock on both
+deterministic paths, so keying the announcement on it re-announced identical prose on every
+payload refresh. The message now derives from the headline — moves when the call moves, not
+otherwise; the same-headline-body-rewrite limit is documented in place.
+
+**Test quality was the real finding.** Five mutations survived the round-5 suite: stripping
+`role`/`aria-live` from the live region, resolving the `.catch` to `empty`, letting the `.catch`
+evict a rendered brief, announcing by clock, and dropping `role` from the failure line. Each is
+now caught by exactly one test, verified by applying each mutation and observing a single
+failure. `pnpm verify` green: web 300 (+1 skip), workerd 19, core 21, contracts 11, db 10,
+Python 45; Cloudflare dry-run clean.
+
+**Protocol degradation (recorded, not hidden):** 13 of 18 round-5 agents died on the Fable/Opus
+individual spend limit, including *every* refuter for two of three lenses — so those lenses'
+findings were dropped as unrefuted rather than refuted. I recovered them from the workflow
+journal and adjudicated them myself; the P1 was the one finding that kept a live refuter.
+**A refuter also left mutation edits in `ForecastWorkbench.tsx` and three probe test files in
+the repo** despite reporting it had reverted — caught by `git status` before commit, tree
+restored to HEAD. Same failure mode as the PR-B R2 probe leak; round 6's prompt now forbids
+repo writes explicitly and directs probes to the scratchpad.
+
+**Deferred, with reasons (not silently dropped):**
+- Hung `/brief` with no timeout pins the loading line while a known outage goes unstated. Real,
+  but *pre-existing* — the pre-restructure walk also returned the loading line unconditionally —
+  so it is not a PR-C regression. Logged as OI-10.
+- A 2xx whose JSON the adapter cannot read is still classified `empty`. Unreachable against
+  today's handler (the schema requires a non-empty headline); becomes reachable on envelope
+  drift. The overclaiming comment was corrected to say exactly this. Logged as OI-11.

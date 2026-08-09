@@ -287,8 +287,13 @@ function ForecastLearningGuide() {
   );
 }
 
-function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: boolean; spot: ApiSpot }) {
+function DailyBriefCard({
+  brief,
+  outcome,
+  spot
+}: { brief: DailyBrief; outcome: OutlookState["status"]; spot: ApiSpot }) {
   const [bestPick, ...alternatePicks] = brief.picks;
+  const loading = outcome === "loading";
   // A live region only announces when its text changes, so the message has to
   // carry something that moves on a real revision — a fixed string would speak
   // once and then stay silent through every rewrite. It must not move for
@@ -299,10 +304,22 @@ function DailyBriefCard({ brief, loading, spot }: { brief: DailyBrief; loading: 
   // the call moves and not otherwise. Known limit: a revision that rewrites the
   // body while keeping the same headline is not announced.
   const announcement = presentBriefCopy(brief.headline);
+  // The card renders from the local forecast read whenever that read has a
+  // pick, so "no longer loading" is not the same fact as "something was
+  // published". Announcing an update on the request's failure is the worse
+  // half of that conflation, and it is audible only to the readers who cannot
+  // see that nothing on screen changed.
+  const message = loading
+    ? "Updating the daily outlook."
+    : outcome === "ready"
+      ? `Daily outlook updated. ${announcement}`
+      : outcome === "failed"
+        ? `The daily outlook could not be updated. Showing the forecast read: ${announcement}`
+        : `No new outlook was published. Showing the forecast read: ${announcement}`;
   return (
     <section className="dailyBrief" aria-labelledby="daily-brief-heading" aria-busy={loading}>
       <span className="srOnly" role="status" aria-live="polite">
-        {loading ? "Updating the daily outlook." : `Daily outlook updated. ${announcement}`}
+        {message}
       </span>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
@@ -773,6 +790,10 @@ export function ForecastWorkbench({
   const canonicalRecoveryState = useRef<"idle" | "pending" | "ready" | "failed">(
     isUsableForecastResponse(initialForecast) ? "ready" : "idle"
   );
+  // The ref above drives fetch coordination, but the Analysis panel has to
+  // render off this, and a ref that changes without setting state would leave
+  // it waiting on a request that already gave up.
+  const [canonicalFailed, setCanonicalFailed] = useState(false);
   const explicitTimestampSelection = useRef(Boolean(initialUrl.at));
   const previousInitialForecast = useRef(initialForecast);
 
@@ -860,6 +881,7 @@ export function ForecastWorkbench({
     if (interval !== "1h" || canonicalCacheEntry) return;
     const controller = new AbortController();
     canonicalRecoveryState.current = "pending";
+    setCanonicalFailed(false);
     void fetchForecast(spot.id, "3h", controller.signal)
       .then((response) => {
         if (!controller.signal.aborted) {
@@ -884,6 +906,7 @@ export function ForecastWorkbench({
       .catch(() => {
         if (controller.signal.aborted) return;
         canonicalRecoveryState.current = "failed";
+        setCanonicalFailed(true);
         if (hourlyFailurePending.current) {
           hourlyFailurePending.current = false;
           setIntervalLoading(false);
@@ -1003,11 +1026,25 @@ export function ForecastWorkbench({
   // One status for the active interval's payload. "loading" and "error" are
   // distinct states: a panel that cannot tell them apart will eventually claim
   // an outage during a healthy in-flight request.
+  //
+  // Deliberately not derived from `initialError`. That is the dashboard's
+  // failure, and this workbench retries on mount whenever its cache is cold —
+  // a retry that usually succeeds, since the dashboard failure it follows is
+  // typically transient. Treating it as an outage would state one over an
+  // in-flight request and retract it a round trip later. The retry sets
+  // `intervalError` on every terminal path of its own, so a genuine outage
+  // still surfaces; `initialError` keeps driving the Forecast tab's banner.
   const forecastStatus: ForecastStatus = forecast
     ? "ready"
-    : intervalError || (initialError && !rawForecast)
+    : intervalError
       ? "error"
       : "loading";
+  // The local daylight pick comes from the canonical three-hour payload, not
+  // from the active interval, so at hourly resolution they are two different
+  // requests. The hourly one can land first and report "ready" while the
+  // canonical is still outstanding — and it is the canonical that decides
+  // whether there is a pick to render at all.
+  const canonicalPending = interval === "1h" && !canonicalCacheEntry && !canonicalFailed;
 
   return (
     <TooltipProvider delayDuration={180}>
@@ -1087,6 +1124,7 @@ export function ForecastWorkbench({
             canonicalDayBest={canonicalDayBest}
             canonicalGeneratedAt={canonicalForecast?.generatedAt ?? null}
             forecastStatus={forecastStatus}
+            canonicalPending={canonicalPending}
             // Provenance falls back to the canonical payload so the disclosure
             // does not vanish mid-read while an hourly refetch is in flight.
             provenanceForecast={forecast ?? canonicalForecast}
@@ -1113,6 +1151,7 @@ function AnalysisPanel({
   canonicalDayBest,
   canonicalGeneratedAt,
   forecastStatus,
+  canonicalPending,
   provenanceForecast,
   selected
 }: {
@@ -1121,6 +1160,7 @@ function AnalysisPanel({
   canonicalDayBest: WorkbenchWindow | null | undefined;
   canonicalGeneratedAt: string | null;
   forecastStatus: ForecastStatus;
+  canonicalPending: boolean;
   provenanceForecast: WorkbenchForecast | null;
   selected?: WorkbenchWindow;
 }) {
@@ -1152,6 +1192,7 @@ function AnalysisPanel({
         canonicalGeneratedAt={canonicalGeneratedAt}
         fallbackBrief={fallbackBrief}
         forecastStatus={forecastStatus}
+        canonicalPending={canonicalPending}
       />
       <div className="analysisTools">
         <ForecastLearningGuide />
@@ -1182,13 +1223,15 @@ function DailyOutlook({
   selectedDate,
   canonicalGeneratedAt,
   fallbackBrief,
-  forecastStatus
+  forecastStatus,
+  canonicalPending
 }: {
   spot: ApiSpot;
   selectedDate: string | null;
   canonicalGeneratedAt: string | null;
   fallbackBrief: DailyBrief;
   forecastStatus: ForecastStatus;
+  canonicalPending: boolean;
 }) {
   const [state, setState] = useState<OutlookState>({ status: "loading" });
 
@@ -1241,7 +1284,7 @@ function DailyOutlook({
   if (content) {
     return (
       <DailyBriefErrorBoundary fallback={<DailyBriefRecoveryCard brief={fallbackBrief} />}>
-        <DailyBriefCard brief={content} loading={state.status === "loading"} spot={spot} />
+        <DailyBriefCard brief={content} outcome={state.status} spot={spot} />
       </DailyBriefErrorBoundary>
     );
   }
@@ -1250,9 +1293,11 @@ function DailyOutlook({
       Loading the daily outlook…
     </p>
   );
-  // Ordered so that nothing definitive is said while either request that could
-  // still produce content is outstanding. Two sources are pending until they
-  // are not: this panel's brief, and the parent's forecast payload.
+  // Ordered so that nothing definitive is said while any request that could
+  // still produce content is outstanding. Three sources are pending until they
+  // are not: this panel's brief, the active interval's payload, and — at hourly
+  // resolution, where it is a separate request — the canonical payload the
+  // local daylight pick is derived from.
   //
   // 1. The brief is a separate endpoint that answers even when the forecast
   //    read is failing, so an outage or a denial announced over an in-flight
@@ -1264,7 +1309,10 @@ function DailyOutlook({
   //    has not landed yet — that payload may still carry a local pick, and both
   //    settled lines below would claim inputs are listed on a tab still empty.
   if (forecastStatus === "loading") return loadingLine;
-  // 3. Both requests have settled. A forecast outage is the broader fact, so it
+  // 3. And the local pick comes from the canonical payload, which at hourly
+  //    resolution is a different request from the one forecastStatus tracks.
+  if (canonicalPending) return loadingLine;
+  // 4. Every source has settled. A forecast outage is the broader fact, so it
   //    outranks whatever the brief request did.
   if (forecastStatus === "error") {
     return (
@@ -1280,7 +1328,7 @@ function DailyOutlook({
       </p>
     );
   }
-  // 4. A ready forecast with no day selected has nothing to deny yet.
+  // 5. A ready forecast with no day selected has nothing to deny yet.
   if (!selectedDate) return loadingLine;
   // Reached only when the Worker answered and had no outlook to publish, so
   // this reads as the deterministic finding it is.
