@@ -265,16 +265,41 @@ and no production mutation have been performed for PR-A.
 
 ## Next Action
 
-**PR-A is live-green; begin PR-B on a fresh branch from `284b25f`
-(`aylee/surf-freshness-cadence`): T-B.1 pure contracts verdict + cadence fields (confirm the
-cadence table against `docs/feed-adapters.md` + observed `source_runs` history), T-B.2 wire
-adapter-declared cadence through materialization into payload source entries, T-B.3 single
-verdict consumption in web (chip fix, actionable-only banner, workbench subordination,
-OD-9 mobile chip visibility) — then the ultracode adversarial review workflow until dry,
-`pnpm verify` + local e2e incl. degraded/late states + browser evidence at 1280/390, ready
-PR → Verify → merge → deploy (watch for OI-8 recurrence at the handoff; decide its
-corrective there) → `:17` live proof of quiet chip/no banner. Ask Alex to rotate the Logfire
-write token (OI-7) at the next operator touch. PR-D (OD-11 spots) stays queued behind PR-C.**
+**PR-C is merged and green on `main` at `2bff460` but NOT DEPLOYED — production still runs the
+pre-PR-C build. The single blocking step is an operator deploy; `pnpm deploy` is refused by the
+Claude Code permission classifier, so Alex must run it:**
+
+```
+! pnpm deploy
+```
+
+**Then the T-C.4 live gate, in order:**
+1. `pnpm ops:status` → expect **12 ready, 0 pending** (watch the handoff for an OI-8 recurrence:
+   a sixth-child `exceededCpu` kill during the post-activation cycle. Production stays healthy on
+   last-good data if it recurs, and the next `:17` cron converges — but if this deploy reproduces
+   it a third time, the corrective becomes mandatory before PR-D).
+2. `pnpm smoke:cloudflare` → dual-origin green.
+3. Playwright evidence on https://surf.alexlee.ai at 1280 and 390:
+   - a spot page **defaults to Forecast** with the workbench first, **zero `/brief` requests**,
+     no AI-authored text, no auto-expanded row, first table row inside the first viewport;
+   - `?tab=analysis` **deep-links** to Analysis and issues **exactly one** `/brief`; the panel
+     renders day label → card → tools → provenance disclosure;
+   - the card's meta line reads "Daily outlook"/"Outlook updated <t>" only for an authored brief,
+     and "Forecast read"/"From the <t> forecast" (local) or "Updated <t>" (Worker summary)
+     otherwise — the attribution fix from PRs #31/#32;
+   - the hero freshness badge agrees with the banner, and no horizontal overflow at 390.
+4. Confirm one hourly cycle in Logfire as a correlated trace via `ingestId` (PR-A's key).
+
+**Then PR-D (OD-11): +5 spots** — Rodeo Beach (Fort Cronkhite) and Steamer Lane, Pleasure Point,
+Cowell's, 38th Ave. Catalog is `packages/forecast-core/src/spot-registry.ts`; no migration needed
+(`pnpm spots:sync` regenerates the seed, `pnpm deploy` upserts remotely). Known work: ~24
+hardcoded six-spot/12-row assertions to parameterize; Santa Cruz needs its own NWS office/zone
+(the helper pins MTR/PZZ545) plus CDIP MOP points; `norcal-seed-config.ts` needs SourceSeedRows
+for the new stations. **Do not start until the PR-C live gate above is green (OD-5).**
+
+**Operator items outstanding:** rotate the leaked Logfire write token (**OI-7**, dashboard edit
+keeps it out of transcripts); dependabot PR **#28** (CI actions only) is safe to merge — the 5
+open `undici` alerts are not in the shipped Worker bundle and clear on the weekly grouped bump.
 
 ## Closeout Path
 
