@@ -316,11 +316,16 @@ function DailyBriefCard({
   // exactly the screens where the screen-reader text said it could not be
   // updated. Both channels now state the same fact.
   const authored = brief.provider !== "deterministic";
+  const label = authored ? "Daily outlook" : "Forecast read";
   const stamp = brief.generatedAt ? formatTimestamp(brief.generatedAt, spot.timezone) : null;
+  // The announced label tracks the visible one. The Worker answers with a
+  // deterministic summary whenever it has no authored outlook for the day, so
+  // "ready" means the request succeeded, not that an outlook was written --
+  // announcing one would contradict the card sitting next to it.
   const message = loading
     ? "Updating the daily outlook."
     : outcome === "ready"
-      ? `Daily outlook updated. ${announcement}`
+      ? `${label} updated. ${announcement}`
       : outcome === "failed"
         ? `The daily outlook could not be updated. Showing the forecast read: ${announcement}`
         : `No new outlook was published. Showing the forecast read: ${announcement}`;
@@ -331,7 +336,7 @@ function DailyBriefCard({
       </span>
       <div className="dailyBriefBody">
         <div className="dailyBriefMeta">
-          <p className="kicker">{authored ? "Daily outlook" : "Forecast read"}</p>
+          <p className="kicker">{label}</p>
           {brief.generatedAt && stamp && (
             <time dateTime={brief.generatedAt}>
               {authored ? `Outlook updated ${stamp}` : `From the ${stamp} forecast`}

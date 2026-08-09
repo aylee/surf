@@ -627,6 +627,43 @@ describe("ForecastWorkbench", () => {
     expect(await screen.findByRole("heading", { name: "A published outlook" })).toBeTruthy();
   });
 
+  it("labels a Worker-published deterministic summary the same way in both channels", async () => {
+    // The Worker answers with a deterministic summary whenever it has no
+    // authored outlook for the day, so the request succeeding does not mean an
+    // outlook was written. The card and the live region must not disagree
+    // about which of the two the reader is looking at.
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("/brief?")) {
+        return jsonResponse({
+          status: "deterministic_fallback",
+          brief: {
+            provider: "deterministic",
+            headline: "Bolinas daily summary is refreshing",
+            setup: "Public inputs support the read.",
+            revision: 1,
+            generatedAt: "2026-08-02T07:05:00.000Z",
+            picks: [],
+            bustFactors: [],
+            lesson: { topic: "Timing", text: "Windows close.", factRefs: ["wave:1"] }
+          }
+        });
+      }
+      return jsonResponse({}, 503);
+    }));
+
+    const { container } = render(
+      <ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={elapsedDayNow} />
+    );
+
+    await screen.findByRole("heading", { name: "Bolinas daily summary is refreshing" });
+    expect(container.querySelector(".dailyBriefMeta .kicker")?.textContent).toBe("Forecast read");
+    const announced = container.querySelector(".dailyBrief > .srOnly")?.textContent ?? "";
+    expect(announced).toMatch(/^Forecast read updated\./);
+    expect(announced).not.toMatch(/Daily outlook updated/);
+  });
+
   it("reports the card busy while a retry runs instead of repeating the last failure", async () => {
     // The card path, where a local pick exists so the definitive line never
     // renders: the previous attempt's failure must not keep speaking, and the
