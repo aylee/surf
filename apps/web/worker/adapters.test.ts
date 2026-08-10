@@ -180,7 +180,16 @@ describe("NWS adapter", () => {
                 certainty: "Likely",
                 headline: "Sneaker waves possible",
                 effective: "2026-07-08T09:00:00-07:00",
-                expires: "2026-07-08T21:00:00-07:00"
+                expires: "2026-07-08T21:00:00-07:00",
+                ends: "2026-07-10T21:00:00-07:00"
+              }
+            },
+            {
+              properties: {
+                event: "Small Craft Advisory",
+                headline: "Short-lived product without an event end",
+                effective: "2026-07-08T10:00:00-07:00",
+                expires: "2026-07-08T22:00:00-07:00"
               }
             }
           ]
@@ -194,7 +203,7 @@ describe("NWS adapter", () => {
     expect(outcome.status).toBe("success");
     expect(outcome.rows).toHaveLength(1);
     expect(outcome.metadata.windRowCount).toBe(1);
-    expect(outcome.metadata.hazardCount).toBe(1);
+    expect(outcome.metadata.hazardCount).toBe(2);
     expect(outcome.rows[0]?.windForecasts[0]).toMatchObject({
       spotId: "obsf-central",
       issuedAt: "2026-07-08T18:30:00.000Z",
@@ -202,6 +211,62 @@ describe("NWS adapter", () => {
       windDirectionDeg: 315,
       gustKt: 13
     });
-    expect(outcome.rows[0]?.hazards[0]?.event).toBe("Beach Hazards Statement");
+    expect(outcome.rows[0]?.hazards[0]).toMatchObject({
+      event: "Beach Hazards Statement",
+      effectiveAt: "2026-07-08T16:00:00.000Z",
+      // The event end wins over the earlier CAP product expiration.
+      expiresAt: "2026-07-11T04:00:00.000Z"
+    });
+    expect(outcome.rows[0]?.hazards[1]).toMatchObject({
+      event: "Small Craft Advisory",
+      // CAP products that omit `ends` retain the legacy `expires` fallback.
+      expiresAt: "2026-07-09T05:00:00.000Z"
+    });
+    expect(outcome.rows[0]?.alertsFetchSucceeded).toBe(true);
+    expect(outcome.metadata.alertsFetchSucceededSpotIds).toEqual(["obsf-central"]);
   });
+
+  it.each(["http", "malformed"] as const)(
+    "keeps wind context but marks alerts unsuccessful when the alerts request is %s",
+    async (failureMode) => {
+    const forecastUrl = "https://api.weather.gov/gridpoints/MTR/85,105/forecast/hourly";
+    const fetcher: SourceFetch = async (input) => {
+      const url = String(input);
+      if (url.includes("/points/")) {
+        return Response.json({ properties: { forecastHourly: forecastUrl } });
+      }
+      if (url === forecastUrl) {
+        return Response.json({
+          properties: {
+            updated: "2026-07-08T18:30:00Z",
+            periods: [{
+              startTime: "2026-07-08T12:00:00-07:00",
+              endTime: "2026-07-08T13:00:00-07:00",
+              windSpeed: "5 mph",
+              windDirection: "NW",
+              shortForecast: "Mostly Sunny"
+            }]
+          }
+        });
+      }
+      if (url.includes("/alerts/active")) {
+        return failureMode === "http"
+          ? new Response("unavailable", { status: 503 })
+          : Response.json({});
+      }
+      throw new Error(`unexpected URL ${url}`);
+    };
+
+    const outcome = await fetchNwsContextForSpots([NORCAL_SPOTS[1]!], { fetcher });
+
+    expect(outcome.status).toBe("success");
+    expect(outcome.rows[0]?.windForecasts).toHaveLength(1);
+    expect(outcome.rows[0]?.hazards).toEqual([]);
+    expect(outcome.rows[0]?.alertsFetchSucceeded).toBe(false);
+    expect(outcome.metadata.alertsFetchSucceededSpotIds).toEqual([]);
+    expect(outcome.caveats).toContainEqual(
+      expect.objectContaining({ code: "nws_alerts_unavailable" })
+    );
+    }
+  );
 });

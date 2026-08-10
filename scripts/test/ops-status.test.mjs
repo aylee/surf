@@ -10,6 +10,7 @@ import {
   probeHealth,
   runOpsStatus
 } from "../ops-status.mjs";
+import { NORCAL_SPOTS } from "../../packages/forecast-core/src/spot-registry.ts";
 
 const workerVersion = "11111111-2222-4333-8444-555555555555";
 const otherVersion = "66666666-7777-4888-8999-000000000000";
@@ -18,14 +19,7 @@ const generatedAt = "2026-08-04T07:27:00.000Z";
 const materializedAt = "2026-08-04T07:27:30.000Z";
 const generationId = `sha256:${"a".repeat(64)}:ingest:cron-20260804T0717Z`;
 const otherGenerationId = `sha256:${"b".repeat(64)}:ingest:cron-20260804T0617Z`;
-const spotIds = [
-  "obsf-north",
-  "obsf-central",
-  "obsf-south",
-  "linda-mar",
-  "stinson",
-  "bolinas"
-];
+const spotIds = NORCAL_SPOTS.map((spot) => spot.id);
 const config = {
   name: "surf",
   vars: { SURF_REGION: "norcal" },
@@ -192,9 +186,15 @@ test("ops status performs exactly four locked read-only probes and prints compac
   assert.equal(result.deployment.workerVersion, workerVersion);
   assert.equal(result.queue.batchSize, 1);
   assert.equal(result.queue.maxConcurrency, 1);
-  assert.equal(result.readModels.ready, 12);
+  assert.equal(result.readModels.ready, spotIds.length * 2);
   const rendered = formatOpsStatus(result);
-  assert.match(rendered, /4\/4 read-only probes; 12\/12 read models ready/);
+  const expectedReadModelCount = spotIds.length * 2;
+  assert.match(
+    rendered,
+    new RegExp(
+      `4/4 read-only probes; ${expectedReadModelCount}/${expectedReadModelCount} read models ready`
+    )
+  );
   assert.match(rendered, new RegExp(workerVersion));
   assert.match(rendered, /surf-ingest-dlq/);
   assert.doesNotMatch(rendered, /ingest-secret-must-not-render|cloudflare-secret-must-not-render/);
@@ -457,9 +457,10 @@ test("D1 status rejects malformed output, failed statements, missing rows, dupli
     () => parseReadModelStatus(d1Status([], { success: false })),
     /did not complete successfully/
   );
+  assert.throws(() => parseReadModelStatus(d1Status([])), /no active spot rows/);
   assert.throws(
-    () => parseReadModelStatus(d1Status(readModelRows().slice(0, 10))),
-    /exactly 12 read-model rows/
+    () => parseReadModelStatus(d1Status(readModelRows().slice(0, -1))),
+    /complete 1h\/3h pairs for every active spot/
   );
 
   const duplicate = readModelRows();
@@ -494,7 +495,7 @@ test("D1 status rejects malformed output, failed statements, missing rows, dupli
   incompletePairs[0] = { ...incompletePairs[0], spot_id: "seventh-spot" };
   assert.throws(
     () => parseReadModelStatus(d1Status(incompletePairs)),
-    /six complete 1h\/3h spot pairs/
+    /complete 1h\/3h pairs for every active spot/
   );
 
   const splitGeneration = readModelRows();
@@ -532,7 +533,7 @@ test("D1 status permits whole spot generations and materialization times to diff
     materialized_at: "2026-08-04T07:27:29.000Z"
   };
   const result = parseReadModelStatus(d1Status(rows));
-  assert.equal(result.ready, 12);
+  assert.equal(result.ready, spotIds.length * 2);
   assert.equal(result.oldestGeneratedAt, "2026-08-04T06:17:00.000Z");
   assert.equal(result.newestGeneratedAt, generatedAt);
 });

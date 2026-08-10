@@ -18,6 +18,7 @@ function renameInstance(config, name) {
   config.name = name;
   config.d1_databases[0].database_name = name;
   config.queues.producers[0].queue = `${name}-ingest`;
+  config.queues.producers[1].queue = `${name}-narrative`;
   config.queues.consumers[0].queue = `${name}-ingest`;
   config.queues.consumers[0].dead_letter_queue = `${name}-ingest-dlq`;
 }
@@ -101,7 +102,7 @@ test("instance validation rejects namespace, region, and contact drift", () => {
   ]);
 });
 
-test("instance validation protects the Agent lifecycle and secret boundary", () => {
+test("instance validation keeps the legacy Agent dormant and protects its secret boundary", () => {
   const config = structuredClone(canonical);
   config.durable_objects.bindings[0].class_name = "WrongAgent";
   config.exports.ForecastBriefAgent.storage = "kv";
@@ -111,8 +112,24 @@ test("instance validation protects the Agent lifecycle and secret boundary", () 
   assert.deepEqual(wranglerStructureFailures(config, configPath), [
     "FORECAST_BRIEF_AGENT must bind exactly once to ForecastBriefAgent.",
     "ForecastBriefAgent must be declared as a live SQLite durable-object export.",
-    "The tracked config must keep FORECAST_BRIEF_ENABLED=false for the first Durable Object lifecycle deploy.",
+    "FORECAST_BRIEF_ENABLED must remain false; ForecastBriefAgent is dormant rollback compatibility, not the active Analysis path.",
     "GEMINI_API_KEY must be a Wrangler secret, never a tracked Worker var."
+  ]);
+});
+
+test("instance validation protects the outbound narrative pull boundary", () => {
+  const config = structuredClone(canonical);
+  config.queues.producers[1].queue = "wrong-narrative";
+  config.queues.consumers.push({ queue: "surf-narrative" });
+  config.vars.NARRATIVE_ENABLED = "true";
+  config.vars.NARRATIVE_RESULT_TOKEN = "must-not-be-tracked";
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "NARRATIVE_QUEUE must produce to surf-narrative.",
+    "Queue consumer must read surf-ingest and dead-letter to surf-ingest-dlq.",
+    "The narrative queue must use an out-of-band HTTP pull consumer, not a Worker consumer.",
+    "The tracked config must keep NARRATIVE_ENABLED=false until pull infrastructure exists.",
+    "NARRATIVE_RESULT_TOKEN must be a Wrangler secret, never a tracked Worker var."
   ]);
 });
 
@@ -203,9 +220,19 @@ test("instance validation requires the exact Worker version metadata binding", (
   }
 });
 
-test("an ignored instance config may enable the brief after the lifecycle deploy", () => {
+test("an ignored instance config cannot reactivate the dormant brief Agent", () => {
   const config = structuredClone(canonical);
   config.vars.FORECAST_BRIEF_ENABLED = "true";
+  const instanceConfigPath = resolve(root, "apps/web/wrangler.instance.jsonc");
+
+  assert.deepEqual(wranglerStructureFailures(config, instanceConfigPath), [
+    "FORECAST_BRIEF_ENABLED must remain false; ForecastBriefAgent is dormant rollback compatibility, not the active Analysis path."
+  ]);
+});
+
+test("an ignored instance config may enable narrative production after operator setup", () => {
+  const config = structuredClone(canonical);
+  config.vars.NARRATIVE_ENABLED = "true";
   const instanceConfigPath = resolve(root, "apps/web/wrangler.instance.jsonc");
 
   assert.deepEqual(wranglerStructureFailures(config, instanceConfigPath), []);

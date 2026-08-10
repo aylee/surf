@@ -268,6 +268,13 @@ describe("forecast-as-issued snapshots", () => {
         type: "high" as const,
         heightFtMllw: 4.2,
         sourceRunId: "first-run"
+      }],
+      hazards: [{
+        headline: "Beach Hazards Statement",
+        startsAt: "2026-07-10T12:30:00.000Z",
+        endsAt: "2026-07-10T15:30:00.000Z",
+        sourceId: "nws:point-forecast-alerts",
+        sourceRunId: "first-run"
       }]
     };
     const retried = {
@@ -284,6 +291,10 @@ describe("forecast-as-issued snapshots", () => {
       tideEvents: first.tideEvents?.map((event) => ({
         ...event,
         sourceRunId: "retry-run"
+      })),
+      hazards: first.hazards?.map((hazard) => ({
+        ...hazard,
+        sourceRunId: "retry-run"
       }))
     };
     const changed = {
@@ -293,11 +304,21 @@ describe("forecast-as-issued snapshots", () => {
         windGustKt: (window.windGustKt ?? 0) + 1
       }))
     };
+    const changedHazard = {
+      ...retried,
+      hazards: retried.hazards?.map((hazard) => ({
+        ...hazard,
+        headline: `${hazard.headline} updated`
+      }))
+    };
 
     await expect(forecastSourceIssueFingerprint(retried)).resolves.toBe(
       await forecastSourceIssueFingerprint(first)
     );
     await expect(forecastSourceIssueFingerprint(changed)).resolves.not.toBe(
+      await forecastSourceIssueFingerprint(first)
+    );
+    await expect(forecastSourceIssueFingerprint(changedHazard)).resolves.not.toBe(
       await forecastSourceIssueFingerprint(first)
     );
   });

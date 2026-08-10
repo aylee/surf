@@ -16,7 +16,7 @@ export type SourceSeedRow = {
 
 type NorcalSeedConfig = {
   schemaVersion: 1;
-  referenceConfigVersion: 1;
+  referenceConfigVersion: 2;
   sources: SourceSeedRow[];
 };
 
@@ -32,7 +32,7 @@ const nwsLicense = "Public NWS API data; provide User-Agent and retain attributi
  */
 export const NORCAL_SEED_CONFIG: NorcalSeedConfig = {
   schemaVersion: 1,
-  referenceConfigVersion: 1,
+  referenceConfigVersion: 2,
   sources: [
     {
       id: "cdip:mop-forecast",
@@ -149,6 +149,43 @@ export const NORCAL_SEED_CONFIG: NorcalSeedConfig = {
       }
     },
     {
+      id: "ndbc-46236",
+      name: "NDBC 46236 Monterey Canyon Outer buoy",
+      type: "observed_wave",
+      provider: "NOAA/NDBC",
+      externalId: "46236",
+      url: "https://www.ndbc.noaa.gov/station_page.php?station=46236",
+      format: "ndbc_text",
+      parserRuntime: "worker",
+      attribution: "NOAA/NDBC Station 46236 / CDIP 156",
+      licenseNote: ndbcStationLicense,
+      refreshMinutes: 60,
+      active: true,
+      metadata: {
+        station: "46236",
+        cdipStation: "156",
+        notes: "Active regional Monterey Bay wave context; not a Santa Cruz break measurement."
+      }
+    },
+    {
+      id: "ndbc-46042",
+      name: "NDBC 46042 Monterey buoy",
+      type: "observed_wave",
+      provider: "NOAA/NDBC",
+      externalId: "46042",
+      url: "https://www.ndbc.noaa.gov/station_page.php?station=46042",
+      format: "ndbc_text",
+      parserRuntime: "worker",
+      attribution: "NOAA/NDBC Station 46042",
+      licenseNote: ndbcStationLicense,
+      refreshMinutes: 60,
+      active: true,
+      metadata: {
+        station: "46042",
+        notes: "Active deep-water offshore context shared by the Santa Cruz reference spots."
+      }
+    },
+    {
       id: "coops-9414290",
       name: "NOAA CO-OPS San Francisco tide station",
       type: "tide",
@@ -206,6 +243,48 @@ export const NORCAL_SEED_CONFIG: NorcalSeedConfig = {
         datum: "MLLW",
         units: "english",
         notes: "Stinson and Bolinas reference tide station."
+      }
+    },
+    {
+      id: "coops-9413450",
+      name: "NOAA CO-OPS Monterey tide station",
+      type: "tide",
+      provider: "NOAA CO-OPS",
+      externalId: "9413450",
+      url: "https://api.tidesandcurrents.noaa.gov/api/prod/",
+      format: "json",
+      parserRuntime: "worker",
+      attribution: "NOAA CO-OPS Station 9413450",
+      licenseNote: coopsLicense,
+      refreshMinutes: 360,
+      active: true,
+      metadata: {
+        station: "9413450",
+        datum: "MLLW",
+        units: "english",
+        notes: "Runtime hourly/high-low reference tide station shared by Santa Cruz spots; reference for subordinate 9413745."
+      }
+    },
+    {
+      id: "coops-9413745",
+      name: "NOAA CO-OPS Santa Cruz, Monterey Bay subordinate tide station",
+      type: "tide",
+      provider: "NOAA CO-OPS",
+      externalId: "9413745",
+      url: "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/9413745.json",
+      format: "json",
+      parserRuntime: "worker",
+      attribution: "NOAA CO-OPS Station 9413745",
+      licenseNote: coopsLicense,
+      refreshMinutes: 360,
+      active: true,
+      metadata: {
+        station: "9413745",
+        referenceStation: "9413450",
+        supportedPredictionInterval: "hilo_only",
+        datum: "MLLW",
+        units: "english",
+        notes: "Documented local subordinate relationship only; the current hourly curve adapter does not ingest this station because hourly predictions are unavailable."
       }
     },
     {

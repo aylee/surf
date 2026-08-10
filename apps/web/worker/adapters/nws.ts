@@ -38,6 +38,7 @@ export type NwsContextRow = {
   forecastZone: string | null;
   windForecasts: NwsWindForecastRow[];
   hazards: NwsHazard[];
+  alertsFetchSucceeded: boolean;
 };
 
 type NwsPointResponse = {
@@ -77,6 +78,7 @@ type NwsAlertFeature = {
     certainty?: unknown;
     headline?: unknown;
     effective?: unknown;
+    ends?: unknown;
     expires?: unknown;
   };
 };
@@ -89,6 +91,7 @@ export type NwsMetadata = {
   spotCount: number;
   windRowCount: number;
   hazardCount: number;
+  alertsFetchSucceededSpotIds: SpotId[];
   requestUrls: string[];
 };
 
@@ -252,33 +255,47 @@ async function fetchSpotContext(fetcher: SourceFetch, spot: SpotProfile): Promis
     }
 
     let hazards: NwsHazard[] = [];
+    let alertsFetchSucceeded = false;
     try {
       const alerts = await readJson<NwsAlertsResponse>(fetcher, alertsUrl);
-      hazards = Array.isArray(alerts.features)
-        ? alerts.features.flatMap((feature) => {
-            const event = stringOrNull(feature.properties?.event);
-            if (!event) {
-              caveats.push({
-                code: "nws_invalid_alert",
-                message: `Skipped a malformed NWS alert for ${spot.id}.`
-              });
-              return [];
-            }
-            return [
-              {
-                spotId: spot.id,
-                event,
-                severity: stringOrNull(feature.properties?.severity),
-                urgency: stringOrNull(feature.properties?.urgency),
-                certainty: stringOrNull(feature.properties?.certainty),
-                headline: stringOrNull(feature.properties?.headline),
-                effectiveAt: isoOrNull(feature.properties?.effective),
-                expiresAt: isoOrNull(feature.properties?.expires),
-                sourceUrl: alertsUrl
-              }
-            ];
-          })
-        : [];
+      if (!Array.isArray(alerts.features)) {
+        throw new Error("NWS alerts response omitted the features array");
+      }
+      let malformedAlert = false;
+      const parsedHazards = alerts.features.flatMap((feature) => {
+        const event = stringOrNull(feature.properties?.event);
+        if (!event) {
+          malformedAlert = true;
+          caveats.push({
+            code: "nws_invalid_alert",
+            message: `NWS returned a malformed active alert for ${spot.id}.`
+          });
+          return [];
+        }
+        return [
+          {
+            spotId: spot.id,
+            event,
+            severity: stringOrNull(feature.properties?.severity),
+            urgency: stringOrNull(feature.properties?.urgency),
+            certainty: stringOrNull(feature.properties?.certainty),
+            headline: stringOrNull(feature.properties?.headline),
+            effectiveAt: isoOrNull(feature.properties?.effective),
+            // CAP `expires` is the message/product expiration and can precede
+            // the actual hazard end by days. Prefer the event's `ends` field,
+            // retaining `expires` only for providers that omit `ends`.
+            expiresAt:
+              isoOrNull(feature.properties?.ends) ??
+              isoOrNull(feature.properties?.expires),
+            sourceUrl: alertsUrl
+          }
+        ];
+      });
+      if (malformedAlert) {
+        throw new Error("NWS alerts response contained a malformed active alert");
+      }
+      hazards = parsedHazards;
+      alertsFetchSucceeded = true;
     } catch (error) {
       caveats.push({
         code: "nws_alerts_unavailable",
@@ -296,7 +313,8 @@ async function fetchSpotContext(fetcher: SourceFetch, spot: SpotProfile): Promis
       gridY: numberOrNull(point.properties?.gridY),
       forecastZone: stringOrNull(point.properties?.forecastZone),
       windForecasts,
-      hazards
+      hazards,
+      alertsFetchSucceeded
     };
 
     if (windForecasts.length === 0) {
@@ -349,6 +367,9 @@ export async function fetchNwsContextForSpots(
       spotCount: spots.length,
       windRowCount,
       hazardCount,
+      alertsFetchSucceededSpotIds: rows
+        .filter(({ alertsFetchSucceeded }) => alertsFetchSucceeded)
+        .map(({ spotId }) => spotId),
       requestUrls
     }
   };

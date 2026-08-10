@@ -54,6 +54,16 @@ export type CoopsTideSourceMapping = {
   lat: number;
   lon: number;
   predictionVerified: boolean;
+  localSubordinateStation?: {
+    stationId: string;
+    name: string;
+    lat: number;
+    lon: number;
+    referenceStationId: string;
+    supportedPredictionInterval: "hilo_only";
+    evidence: SourceEvidence[];
+    notes: string;
+  };
   evidence: SourceEvidence[];
   notes: string;
 };
@@ -69,7 +79,7 @@ export type NwsWaveGridSourceMapping = {
     lat: number;
     lon: number;
   };
-  forecastZone: "PZZ545";
+  forecastZone: "PZZ535" | "PZZ545";
   forecastGridData: string;
   breakingHeightScale: number;
   evidence: SourceEvidence[];
@@ -88,6 +98,7 @@ export type NorcalSpotProfile = SpotProfile & {
 };
 
 const checkedAt = "2026-07-08";
+const expansionCheckedAt = "2026-08-09";
 
 const evidence = {
   ndbc46026: {
@@ -110,6 +121,27 @@ const evidence = {
     url: "https://www.ndbc.noaa.gov/station_page.php?station=46012",
     checkedAt,
     notes: "Half Moon Bay buoy, 24 NM south-southwest of San Francisco, useful Pacifica/HMB reference."
+  },
+  ndbc46042: {
+    id: "ndbc-46042",
+    label: "NDBC 46042 Monterey",
+    url: "https://www.ndbc.noaa.gov/station_page.php?station=46042",
+    checkedAt: expansionCheckedAt,
+    notes: "Active deep-water Monterey buoy, 27 NM west-northwest of Monterey, used as regional offshore context for Santa Cruz."
+  },
+  ndbc46236: {
+    id: "ndbc-46236",
+    label: "NDBC 46236 Monterey Canyon Outer",
+    url: "https://www.ndbc.noaa.gov/station_page.php?station=46236",
+    checkedAt: expansionCheckedAt,
+    notes: "Active CDIP 156 / NDBC 46236 wave buoy in outer Monterey Canyon, used as regional Monterey Bay context."
+  },
+  ndbc46269: {
+    id: "ndbc-46269",
+    label: "NDBC 46269 Point Santa Cruz",
+    url: "https://www.ndbc.noaa.gov/station_page.php?station=46269",
+    checkedAt: expansionCheckedAt,
+    notes: "CDIP 254 / NDBC 46269 is the closest named Point Santa Cruz buoy, but NDBC reports no current observations; it is validation evidence only."
   },
   cdip142: {
     id: "cdip-142",
@@ -146,6 +178,20 @@ const evidence = {
     checkedAt: "2026-07-09",
     notes: "Public THREDDS exposes per-point forecast NetCDF files and constrained OPeNDAP ASCII responses. Exact point metadata and five bulk forecast variables were verified live."
   },
+  cdipMopMarin: {
+    id: "cdip-mop-marin",
+    label: "CDIP MOP Marin County transects",
+    url: "https://cdip.ucsd.edu/mops/?xitem=countymap&moplist=Marin_County",
+    checkedAt: expansionCheckedAt,
+    notes: "Official transect map places MA048's shoreline endpoint at Rodeo Beach; the public forecast file reports a 15 m modeled point and 223.72 degree shore normal."
+  },
+  cdipMopSantaCruz: {
+    id: "cdip-mop-santa-cruz",
+    label: "CDIP MOP Santa Cruz County locations",
+    url: "https://cdip.ucsd.edu/mops/?xitem=mlmap&moplist=Santa_Cruz_County",
+    checkedAt: expansionCheckedAt,
+    notes: "Official location map names SC117 as Pleasure Point and SC149 as Steamer Lane; no distinct Cowell's or Jack's/38th named output point is published."
+  },
   coops9414290: {
     id: "coops-9414290",
     label: "CO-OPS 9414290 San Francisco",
@@ -167,11 +213,39 @@ const evidence = {
     checkedAt,
     notes: "Bolinas Lagoon tide station; public prediction endpoint returned hilo tide predictions."
   },
+  coops9413450: {
+    id: "coops-9413450",
+    label: "CO-OPS 9413450 Monterey",
+    url: "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/9413450.json",
+    checkedAt: expansionCheckedAt,
+    notes: "Monterey is the CO-OPS reference station for Santa Cruz subordinate station 9413745 and returns both hourly and high/low MLLW predictions."
+  },
+  coops9413745: {
+    id: "coops-9413745",
+    label: "CO-OPS 9413745 Santa Cruz, Monterey Bay",
+    url: "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations/9413745.json",
+    checkedAt: expansionCheckedAt,
+    notes: "Official metadata identifies 9413745 as a subordinate station referenced to 9413450; the Data API returned high/low but not hourly MLLW predictions."
+  },
+  npsRodeoBeach: {
+    id: "nps-rodeo-beach",
+    label: "NPS Rodeo Beach",
+    url: "https://www.nps.gov/places/000/rodeo-beach.htm",
+    checkedAt: expansionCheckedAt,
+    notes: "Golden Gate National Recreation Area identifies Rodeo Beach beside Fort Cronkhite and describes it as popular with surfers."
+  },
+  nwsMtrMarineZones: {
+    id: "nws-mtr-marine-zones",
+    label: "NWS MTR coastal marine zones",
+    url: "https://www.weather.gov/marine/mtrmz",
+    checkedAt: expansionCheckedAt,
+    notes: "MTR defines PZZ545 from Point Reyes to Pigeon Point and PZZ535 for Monterey Bay."
+  },
   nwsPoints: {
     id: "nws-points-api",
     label: "NWS points API",
     url: "https://api.weather.gov/points/{lat},{lon}",
-    checkedAt,
+    checkedAt: expansionCheckedAt,
     notes: "NWS point metadata was queried for each spot with a surf-v1 user agent."
   }
 } satisfies Record<string, SourceEvidence>;
@@ -236,6 +310,42 @@ const observedSources = {
     role: "validation",
     evidence: [evidence.cdip029],
     notes: "Deep offshore Point Reyes reference for Marin and north swell validation."
+  },
+  ndbc46042: {
+    sourceId: "ndbc-46042",
+    provider: "NDBC",
+    capability: "observed_wave",
+    stationId: "46042",
+    name: "Monterey",
+    lat: 36.787,
+    lon: -122.408,
+    role: "secondary",
+    evidence: [evidence.ndbc46042],
+    notes: "Active deep-water regional buoy west-northwest of Monterey; not a Santa Cruz break measurement."
+  },
+  ndbc46236: {
+    sourceId: "ndbc-46236",
+    provider: "NDBC",
+    capability: "observed_wave",
+    stationId: "46236",
+    name: "Monterey Canyon Outer",
+    lat: 36.759,
+    lon: -121.95,
+    role: "primary",
+    evidence: [evidence.ndbc46236],
+    notes: "Active Monterey Bay regional wave context; it does not observe conditions at any Santa Cruz break."
+  },
+  ndbc46269: {
+    sourceId: "ndbc-46269",
+    provider: "NDBC",
+    capability: "observed_wave",
+    stationId: "46269",
+    name: "Point Santa Cruz",
+    lat: 36.934,
+    lon: -122.034,
+    role: "validation",
+    evidence: [evidence.ndbc46269],
+    notes: "Closest named Point Santa Cruz buoy, retained only as historical/validation context because no current reports are available."
   }
 } satisfies Record<string, ObservedWaveSourceMapping>;
 
@@ -248,7 +358,8 @@ function cdipMop(
     NonNullable<CdipMopSourceMapping["modelPoint"]>,
     "forecastAsciiUrl" | "forecastDasUrl" | "forecastFileUrl"
   > | null,
-  notes: string
+  notes: string,
+  pointEvidence: SourceEvidence[] = []
 ): CdipMopSourceMapping {
   const pointWithUrls = modelPoint
     ? {
@@ -267,7 +378,12 @@ function cdipMop(
     modelRegion,
     modelPoint: pointWithUrls,
     observedStationIds,
-    evidence: [evidence.cdipSfModel, evidence.cdipMopIntro, evidence.cdipMopForecast],
+    evidence: [
+      ...(modelRegion === "sf" ? [evidence.cdipSfModel] : []),
+      evidence.cdipMopIntro,
+      evidence.cdipMopForecast,
+      ...pointEvidence
+    ],
     notes
   };
 }
@@ -302,6 +418,26 @@ const coopsTideStations = {
     predictionVerified: true,
     evidence: [evidence.coops9414958],
     notes: "Closest verified public tide-prediction station for Stinson and Bolinas."
+  },
+  monterey: {
+    capability: "tide",
+    stationId: "9413450",
+    name: "Monterey",
+    lat: 36.60889,
+    lon: -121.89139,
+    predictionVerified: true,
+    localSubordinateStation: {
+      stationId: "9413745",
+      name: "Santa Cruz, Monterey Bay",
+      lat: 36.9583,
+      lon: -122.017,
+      referenceStationId: "9413450",
+      supportedPredictionInterval: "hilo_only",
+      evidence: [evidence.coops9413745],
+      notes: "The closer Santa Cruz subordinate station publishes official extrema but not the hourly MLLW series required by the current curve adapter."
+    },
+    evidence: [evidence.coops9413450, evidence.coops9413745],
+    notes: "Shared Santa Cruz runtime tide reference. Uses official hourly and high/low MLLW predictions from the Monterey reference station; the local subordinate relationship remains explicit."
   }
 } satisfies Record<string, CoopsTideSourceMapping>;
 
@@ -309,17 +445,18 @@ function nwsWaveGrid(
   input: Omit<
     NwsWaveGridSourceMapping,
     "sourceId" | "provider" | "capability" | "office" | "forecastZone" | "forecastGridData" | "evidence"
-  >
+  > & { forecastZone?: NwsWaveGridSourceMapping["forecastZone"]; evidence?: SourceEvidence[] }
 ): NwsWaveGridSourceMapping {
+  const { evidence: pointEvidence = [], forecastZone = "PZZ545", ...mapping } = input;
   return {
     sourceId: "nws:mtr-grid-wave",
     provider: "NOAA/NWS MTR",
     capability: "forecast_wave_nearshore",
     office: "MTR",
-    forecastZone: "PZZ545",
-    forecastGridData: `https://api.weather.gov/gridpoints/MTR/${input.gridX},${input.gridY}`,
-    evidence: [evidence.nwsPoints],
-    ...input
+    forecastZone,
+    forecastGridData: `https://api.weather.gov/gridpoints/MTR/${mapping.gridX},${mapping.gridY}`,
+    evidence: [evidence.nwsPoints, evidence.nwsMtrMarineZones, ...pointEvidence],
+    ...mapping
   };
 }
 
@@ -327,6 +464,7 @@ const norcalSpots: NorcalSpotProfile[] = [
   {
     id: "obsf-north",
     name: "Ocean Beach North",
+    aliases: ["OBSF North", "OB North"],
     region: "norcal",
     lat: 37.782,
     lon: -122.514,
@@ -374,6 +512,7 @@ const norcalSpots: NorcalSpotProfile[] = [
   {
     id: "obsf-central",
     name: "Ocean Beach Central",
+    aliases: ["OBSF Central", "OB Central"],
     region: "norcal",
     lat: 37.759,
     lon: -122.51,
@@ -421,6 +560,7 @@ const norcalSpots: NorcalSpotProfile[] = [
   {
     id: "obsf-south",
     name: "Ocean Beach South",
+    aliases: ["OBSF South", "OB South"],
     region: "norcal",
     lat: 37.735,
     lon: -122.506,
@@ -468,6 +608,7 @@ const norcalSpots: NorcalSpotProfile[] = [
   {
     id: "linda-mar",
     name: "Linda Mar / Pacifica",
+    aliases: ["Linda Mar", "Pacifica State Beach"],
     region: "norcal",
     lat: 37.594,
     lon: -122.506,
@@ -514,6 +655,7 @@ const norcalSpots: NorcalSpotProfile[] = [
   {
     id: "stinson",
     name: "Stinson",
+    aliases: ["Stinson Beach"],
     region: "norcal",
     lat: 37.899,
     lon: -122.644,
@@ -561,6 +703,7 @@ const norcalSpots: NorcalSpotProfile[] = [
   {
     id: "bolinas",
     name: "Bolinas — Wharf/Brighton",
+    aliases: ["Bolinas Wharf", "Brighton Beach"],
     region: "norcal",
     lat: 37.909,
     lon: -122.687,
@@ -596,10 +739,256 @@ const norcalSpots: NorcalSpotProfile[] = [
         notes: "First verified PZZ545 marine cell west of Bolinas; land cells 77,113 and 76,113 returned all-zero wave layers. Cold-start scale is 0.65."
       })
     }
+  },
+  {
+    id: "rodeo-beach",
+    name: "Rodeo Beach",
+    aliases: ["Fort Cronkhite", "Fort Cronkite", "Rodeo Beach — Fort Cronkhite"],
+    region: "norcal",
+    lat: 37.8305,
+    lon: -122.5376,
+    timezone: "America/Los_Angeles",
+    shoreNormalDeg: 224,
+    bestSwellDeg: { minDeg: 220, maxDeg: 300 },
+    workableSwellDeg: { minDeg: 190, maxDeg: 330 },
+    bestPeriodSec: { min: 9, max: 17 },
+    bestTideFt: { min: 1, max: 5 },
+    offshoreWindFromDeg: { minDeg: 20, maxDeg: 120 },
+    maxGoodWindKt: 8,
+    maxOkWindKt: 14,
+    notes: "Exposed Marin Headlands beach at Fort Cronkhite. Geometry and tide preferences are uncalibrated cold-start priors; regional buoys are context, not break measurements.",
+    sourceMap: {
+      observedWave: [
+        observedSources.ndbc46237,
+        { ...observedSources.ndbc46026, role: "secondary" },
+        observedSources.ndbc46013,
+        observedSources.cdip029
+      ],
+      cdipMop: cdipMop(
+        "nocal",
+        ["142", "029"],
+        {
+          id: "MA048",
+          lat: 37.82574,
+          lon: -122.54282,
+          waterDepthM: 15,
+          shoreNormalDeg: 223.72,
+          nearshoreHeightScale: 1,
+          relationship: "direct_nearshore_point"
+        },
+        "MA048 is the verified public 15 m MOP transect whose shoreline endpoint lands at Rodeo Beach. Its Hs is modeled nearshore significant wave height, not an observation or breaking-wave face height.",
+        [evidence.cdipMopMarin, evidence.npsRodeoBeach]
+      ),
+      coopsTide: coopsTideStations.sanFrancisco,
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 81,
+        gridY: 108,
+        lookupPoint: { lat: 37.826, lon: -122.543 },
+        forecastZone: "PZZ545",
+        breakingHeightScale: 1,
+        notes: "Verified nonzero MTR marine wave cell in PZZ545 at the MA048 approach point; raw significant height is retained without a spot reduction."
+      })
+    }
+  },
+  {
+    id: "steamer-lane",
+    name: "Steamer Lane",
+    aliases: ["The Lane"],
+    region: "norcal",
+    lat: 36.9511,
+    lon: -122.0264,
+    timezone: "America/Los_Angeles",
+    shoreNormalDeg: 128,
+    bestSwellDeg: { minDeg: 190, maxDeg: 300 },
+    workableSwellDeg: { minDeg: 170, maxDeg: 320 },
+    bestPeriodSec: { min: 10, max: 18 },
+    bestTideFt: { min: 0.5, max: 5.5 },
+    offshoreWindFromDeg: { minDeg: 285, maxDeg: 60 },
+    maxGoodWindKt: 8,
+    maxOkWindKt: 14,
+    notes: "Santa Cruz point/reef report. Break geometry and preferences are uncalibrated cold-start priors; CDIP and buoys remain modeled/regional inputs.",
+    sourceMap: {
+      observedWave: [
+        observedSources.ndbc46236,
+        observedSources.ndbc46042,
+        observedSources.ndbc46269
+      ],
+      cdipMop: cdipMop(
+        "nocal",
+        ["254", "156"],
+        {
+          id: "SC149",
+          lat: 36.94873,
+          lon: -122.02122,
+          waterDepthM: 15,
+          shoreNormalDeg: 127.5,
+          nearshoreHeightScale: 1,
+          relationship: "direct_nearshore_point"
+        },
+        "SC149 is CDIP's named public 15 m Steamer Lane MOP point. Its Hs is modeled nearshore significant wave height, not a reef-wave or breaking-face measurement.",
+        [evidence.cdipMopSantaCruz]
+      ),
+      coopsTide: coopsTideStations.monterey,
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 91,
+        gridY: 66,
+        lookupPoint: { lat: 36.949, lon: -122.021 },
+        forecastZone: "PZZ535",
+        breakingHeightScale: 1,
+        notes: "Verified nonzero MTR Monterey Bay marine wave cell at SC149; raw significant height is retained without a spot reduction."
+      })
+    }
+  },
+  {
+    id: "pleasure-point",
+    name: "Pleasure Point",
+    aliases: ["The Point"],
+    region: "norcal",
+    lat: 36.9545,
+    lon: -121.9725,
+    timezone: "America/Los_Angeles",
+    shoreNormalDeg: 158,
+    bestSwellDeg: { minDeg: 180, maxDeg: 280 },
+    workableSwellDeg: { minDeg: 160, maxDeg: 310 },
+    bestPeriodSec: { min: 9, max: 18 },
+    bestTideFt: { min: 0.5, max: 5 },
+    offshoreWindFromDeg: { minDeg: 300, maxDeg: 70 },
+    maxGoodWindKt: 8,
+    maxOkWindKt: 14,
+    notes: "Santa Cruz east-side point report. Break geometry and preferences are uncalibrated cold-start priors; regional sources do not resolve individual peaks.",
+    sourceMap: {
+      observedWave: [
+        observedSources.ndbc46236,
+        observedSources.ndbc46042,
+        observedSources.ndbc46269
+      ],
+      cdipMop: cdipMop(
+        "nocal",
+        ["254", "156"],
+        {
+          id: "SC117",
+          lat: 36.94633,
+          lon: -121.96892,
+          waterDepthM: 15,
+          shoreNormalDeg: 158,
+          nearshoreHeightScale: 1,
+          relationship: "direct_nearshore_point"
+        },
+        "SC117 is CDIP's named public 15 m Pleasure Point MOP point. Its Hs is modeled nearshore significant wave height, not a peak-specific or breaking-face measurement.",
+        [evidence.cdipMopSantaCruz]
+      ),
+      coopsTide: coopsTideStations.monterey,
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 93,
+        gridY: 66,
+        lookupPoint: { lat: 36.946, lon: -121.969 },
+        forecastZone: "PZZ535",
+        breakingHeightScale: 1,
+        notes: "Verified nonzero MTR Monterey Bay marine wave cell at SC117; raw significant height is retained without a spot reduction."
+      })
+    }
+  },
+  {
+    id: "cowells",
+    name: "Cowell's",
+    aliases: ["Cowell Beach", "Cowell's Beach"],
+    region: "norcal",
+    lat: 36.9624,
+    lon: -122.0238,
+    timezone: "America/Los_Angeles",
+    shoreNormalDeg: 140,
+    bestSwellDeg: { minDeg: 190, maxDeg: 280 },
+    workableSwellDeg: { minDeg: 170, maxDeg: 310 },
+    bestPeriodSec: { min: 10, max: 18 },
+    bestTideFt: { min: 0.5, max: 4.5 },
+    offshoreWindFromDeg: { minDeg: 290, maxDeg: 70 },
+    maxGoodWindKt: 8,
+    maxOkWindKt: 14,
+    notes: "Protected Santa Cruz cove report. SC149 and the 0.50 cove scale are an explicit uncalibrated approach proxy, never a Cowell's measurement.",
+    sourceMap: {
+      observedWave: [
+        observedSources.ndbc46236,
+        observedSources.ndbc46042,
+        observedSources.ndbc46269
+      ],
+      cdipMop: cdipMop(
+        "nocal",
+        ["254", "156"],
+        {
+          id: "SC149",
+          lat: 36.94873,
+          lon: -122.02122,
+          waterDepthM: 15,
+          shoreNormalDeg: 127.5,
+          nearshoreHeightScale: 0.5,
+          relationship: "outside_cove_approach_proxy"
+        },
+        "CDIP publishes no distinct Cowell's MOP output. Cowell's transparently shares the named SC149 Steamer Lane 15 m approach Hs with a visible, uncalibrated 0.50 cove scale.",
+        [evidence.cdipMopSantaCruz]
+      ),
+      coopsTide: coopsTideStations.monterey,
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 91,
+        gridY: 66,
+        lookupPoint: { lat: 36.949, lon: -122.021 },
+        forecastZone: "PZZ535",
+        breakingHeightScale: 0.5,
+        notes: "Shared verified SC149-area MTR Monterey Bay cell; the visible 0.50 scale is a cold-start cove proxy, not calibrated Cowell's surf."
+      })
+    }
+  },
+  {
+    id: "jacks",
+    name: "Jack's",
+    aliases: ["38th Ave", "38th Avenue", "Jack's / 38th Ave", "Jacks"],
+    region: "norcal",
+    lat: 36.9616,
+    lon: -121.9662,
+    timezone: "America/Los_Angeles",
+    shoreNormalDeg: 165,
+    bestSwellDeg: { minDeg: 180, maxDeg: 280 },
+    workableSwellDeg: { minDeg: 160, maxDeg: 310 },
+    bestPeriodSec: { min: 9, max: 17 },
+    bestTideFt: { min: 0.5, max: 5 },
+    offshoreWindFromDeg: { minDeg: 300, maxDeg: 70 },
+    maxGoodWindKt: 8,
+    maxOkWindKt: 14,
+    notes: "38th Avenue area report within the broader Pleasure Point coastline. SC117 is a shared uncalibrated approach proxy and does not resolve Jack's from neighboring peaks.",
+    sourceMap: {
+      observedWave: [
+        observedSources.ndbc46236,
+        observedSources.ndbc46042,
+        observedSources.ndbc46269
+      ],
+      cdipMop: cdipMop(
+        "nocal",
+        ["254", "156"],
+        {
+          id: "SC117",
+          lat: 36.94633,
+          lon: -121.96892,
+          waterDepthM: 15,
+          shoreNormalDeg: 158,
+          nearshoreHeightScale: 1,
+          relationship: "outside_cove_approach_proxy"
+        },
+        "CDIP publishes no distinct Jack's/38th MOP output. Jack's transparently shares the named SC117 Pleasure Point 15 m approach Hs without an unsupported attenuation factor.",
+        [evidence.cdipMopSantaCruz]
+      ),
+      coopsTide: coopsTideStations.monterey,
+      nwsWaveGrid: nwsWaveGrid({
+        gridX: 93,
+        gridY: 66,
+        lookupPoint: { lat: 36.946, lon: -121.969 },
+        forecastZone: "PZZ535",
+        breakingHeightScale: 1,
+        notes: "Shared verified SC117-area MTR Monterey Bay cell; no distinct NWS grid or break-scale precision is claimed for Jack's."
+      })
+    }
   }
 ];
 
-export const NORCAL_REFERENCE_CONFIG_VERSION = 1 as const;
+export const NORCAL_REFERENCE_CONFIG_VERSION = 2 as const;
 
 function validateNorcalReferenceConfig(spots: NorcalSpotProfile[]): void {
   const seenIds = new Set<string>();
@@ -614,6 +1003,9 @@ function validateNorcalReferenceConfig(spots: NorcalSpotProfile[]): void {
 
     if (spot.region !== "norcal") {
       throw new Error(`NorCal reference spot ${spot.id} has unexpected region ${spot.region}`);
+    }
+    if (new Set(spot.aliases).size !== spot.aliases.length) {
+      throw new Error(`Aliases for ${spot.id} must be unique`);
     }
     const observedStationIds = spot.sourceMap.observedWave.map((source) => source.stationId);
     if (observedStationIds.length === 0 || new Set(observedStationIds).size !== observedStationIds.length) {
@@ -630,7 +1022,7 @@ validateNorcalReferenceConfig(norcalSpots);
  */
 export const NORCAL_REFERENCE_CONFIG = Object.freeze({
   schemaVersion: NORCAL_REFERENCE_CONFIG_VERSION,
-  id: "norcal-reference-v1",
+  id: "norcal-reference-v2",
   region: "norcal" as const,
   spots: norcalSpots
 });

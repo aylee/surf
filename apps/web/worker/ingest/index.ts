@@ -5,6 +5,7 @@ export {
 } from "./coordinator";
 export {
   FORECAST_HISTORY_RETENTION_DAYS,
+  NARRATIVE_RETENTION_DAYS,
   OPERATIONAL_FORECAST_RETENTION_DAYS,
   pruneRetainedData
 } from "./retention";
@@ -14,5 +15,8 @@ export type {
   IngestKind,
   IngestQueueMessage,
   IngestSummary,
-  SourceIngestQueueMessage
+  SourceBatchQueueMessage,
+  SourceIngestQueueMessage,
+  SurfAnalysisSignalQueueMessage
 } from "./types";
+export { SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION } from "./types";

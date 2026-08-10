@@ -6,12 +6,22 @@ import {
 } from "../forecast-read-model";
 import type { Env } from "../index";
 import { boundedErrorName } from "../logging";
+import { narrativeEnabled } from "../narrative/config";
 import { normalizeIngestMessage, runNorcalIngest } from "./coordinator";
 import {
   ingestRequiresRetry,
   type ForecastMaterializationQueueMessage,
-  type IngestSummary
+  type IngestSummary,
+  type SourceBatchQueueMessage,
+  type SourceIngestQueueMessage,
+  SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION,
+  type SurfAnalysisSignalQueueMessage
 } from "./types";
+import {
+  NORCAL_SOURCE_BATCHES,
+  SOURCE_BATCH_SCHEMA_VERSION,
+  sourceBatchRunSuffix
+} from "./source-batches";
 
 export type ForecastBriefSignalContext = {
   ingestId: string;
@@ -32,6 +42,87 @@ export type ForecastBriefSignalRequest = {
   context: ForecastBriefSignalContext;
 };
 
+function forecastGenerationIsActiveForSignal(
+  outcomes: readonly ForecastMaterializationOutcome[]
+): boolean {
+  const generationIds = new Set(
+    outcomes.flatMap(({ generationId }) => (generationId ? [generationId] : []))
+  );
+  return (
+    outcomes.length === FORECAST_INTERVALS.length &&
+    outcomes.every(
+      ({ outcome, reasonCode }) =>
+        outcome === "publish" ||
+        (outcome === "skip" && reasonCode === "forecast_generation_already_active")
+    ) &&
+    generationIds.size === 1
+  );
+}
+
+export function buildSurfAnalysisSignalMessage(
+  spotId: ForecastMaterializationQueueMessage["spotId"],
+  context: ForecastBriefSignalContext,
+  region: string
+): SurfAnalysisSignalQueueMessage {
+  return {
+    job: "analysis-signal",
+    schemaVersion: SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION,
+    domain: "surf",
+    ingestId: context.ingestId,
+    spotId,
+    generationId: context.generationId,
+    generatedAt: context.generatedAt,
+    materializedAt: context.materializedAt,
+    region
+  };
+}
+
+export async function dispatchSurfAnalysisSignal(
+  env: Env,
+  spotId: ForecastMaterializationQueueMessage["spotId"],
+  _generatedAt: Date,
+  context: ForecastBriefSignalContext
+): Promise<void> {
+  if (!narrativeEnabled(env)) return;
+  try {
+    await env.INGEST_QUEUE.send(
+      buildSurfAnalysisSignalMessage(spotId, context, env.SURF_REGION),
+      { contentType: "json" }
+    );
+    console.info(
+      JSON.stringify({
+        event: "surf_analysis_signal_dispatched",
+        message: "Analysis signal dispatched after forecast publication",
+        phase: "analysis_signal_dispatch",
+        ingestId: context.ingestId,
+        spotId,
+        generationId: context.generationId,
+        schemaVersion: SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION,
+        dispatchOutcome: "enqueued",
+        reasonCode: "analysis_signal_queued"
+      })
+    );
+  } catch (error) {
+    // Analysis is advisory to deterministic forecast publication. Retrying the
+    // materialization after it has committed would only duplicate this signal;
+    // the next hourly generation is the bounded recovery path.
+    console.error(
+      JSON.stringify({
+        event: "surf_analysis_signal_dispatch_failed",
+        message: "Analysis signal dispatch failed after forecast publication",
+        phase: "analysis_signal_dispatch",
+        ingestId: context.ingestId,
+        spotId,
+        generationId: context.generationId,
+        schemaVersion: SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION,
+        dispatchOutcome: "failed",
+        reasonCode: "analysis_signal_dispatch_failed",
+        errorName: boundedPipelineErrorName(error)
+      })
+    );
+  }
+}
+
 export type IngestQueueDependencies = {
   runIngest: typeof runNorcalIngest;
   materializeSpot: typeof materializeForecastReadModelForSpot;
@@ -51,9 +142,11 @@ export type SourceIngestReasonCode =
   | "lineage_check_failed"
   | "newer_source_generation_active"
   | "source_ingest_threw"
+  | "source_batch_enqueue_failed"
+  | "source_batches_dispatched"
   | "source_persistence_incomplete"
   | "materialization_enqueue_failed"
-  | "source_ingest_requires_retry"
+  | "materialization_jobs_published_from_degraded_source"
   | "materialization_jobs_published_with_caveats"
   | "materialization_jobs_published"
   | "inline_ingest_requires_retry"
@@ -72,6 +165,9 @@ export type SourceIngestTerminalOutcome = {
   caveatCount?: number;
   errorCount?: number;
   materializationJobCount?: number;
+  sourceBatchJobCount?: number;
+  batchKey?: string;
+  spotCount?: number;
   errorName?: string;
 };
 
@@ -114,7 +210,9 @@ export function boundedPipelineErrorName(error: unknown): string {
 }
 
 export function logSourceIngestTerminalOutcome(outcome: SourceIngestTerminalOutcome): void {
-  const descriptor = sourceEventByOutcome[outcome.outcome];
+  const descriptor = outcome.reasonCode === "source_batches_dispatched"
+    ? { event: "source_ingest_dispatched", message: "source ingest batches dispatched" }
+    : sourceEventByOutcome[outcome.outcome];
   const entry = JSON.stringify({
     ...descriptor,
     ...outcome
@@ -184,7 +282,10 @@ function validForecastOutcomeSet(
         (outcome.generationId !== null && typeof outcome.generationId !== "string") ||
         typeof outcome.retryable !== "boolean" ||
         !outcome.reasonCode ||
-        ((outcome.outcome === "publish" || outcome.outcome === "supersede") &&
+        ((outcome.outcome === "publish" ||
+          outcome.outcome === "supersede" ||
+          (outcome.outcome === "skip" &&
+            outcome.reasonCode === "forecast_generation_already_active")) &&
           (!outcome.generationId || outcome.retryable)) ||
         (outcome.outcome === "supersede" && outcome.retryable) ||
         (outcome.outcome === "failure" && !outcome.retryable)
@@ -195,7 +296,12 @@ function validForecastOutcomeSet(
   const outcomeClasses = new Set(outcomes.map(({ outcome }) => outcome));
   if (
     outcomeClasses.size > 1 &&
-    !outcomes.every(({ outcome }) => outcome === "publish" || outcome === "supersede")
+    !outcomes.every(
+      ({ outcome, reasonCode }) =>
+        outcome === "publish" ||
+        outcome === "supersede" ||
+        (outcome === "skip" && reasonCode === "forecast_generation_already_active")
+    )
   ) {
     return false;
   }
@@ -261,10 +367,7 @@ function normalizeInlineForecastOutcomes(summary: IngestSummary): {
   const publishedSignals = valid
     ? NORCAL_SPOTS.flatMap((spot): ForecastBriefSignalRequest[] => {
         const spotOutcomes = normalized.filter(({ spotId }) => spotId === spot.id);
-        if (
-          spotOutcomes.length !== FORECAST_INTERVALS.length ||
-          !spotOutcomes.every(({ outcome }) => outcome === "publish")
-        ) {
+        if (!forecastGenerationIsActiveForSignal(spotOutcomes)) {
           return [];
         }
         const generationId = spotOutcomes[0]!.generationId;
@@ -350,17 +453,36 @@ export async function sourceGenerationIsCurrent(
 }
 
 export function buildForecastMaterializationMessages(
-  summary: Pick<IngestSummary, "requestedAt" | "region" | "publication">
+  summary: Pick<IngestSummary, "requestedAt" | "region" | "publication">,
+  spotIds: readonly ForecastMaterializationQueueMessage["spotId"][] = NORCAL_SPOTS.map(
+    ({ id }) => id
+  )
 ): ForecastMaterializationQueueMessage[] {
-  return NORCAL_SPOTS.map((spot) => ({
+  return spotIds.map((spotId) => ({
     job: "forecast-materialization",
     ingestId: summary.publication.ingestId,
-    spotId: spot.id,
+    spotId,
     requestedAt: summary.requestedAt,
     region: summary.region,
     generatedAt: summary.publication.generatedAt,
     sourceCompletedAt: summary.publication.sourceCompletedAt,
     captureHistory: summary.publication.captureHistory
+  }));
+}
+
+export function buildSourceBatchMessages(
+  source: SourceIngestQueueMessage
+): SourceBatchQueueMessage[] {
+  return NORCAL_SOURCE_BATCHES.map(({ batchKey, spotIds }) => ({
+    job: "source-batch",
+    schemaVersion: SOURCE_BATCH_SCHEMA_VERSION,
+    kind: source.kind,
+    ingestId: source.ingestId,
+    batchKey,
+    spotIds: [...spotIds],
+    requestedAt: source.requestedAt,
+    forecastGeneratedAt: source.forecastGeneratedAt,
+    region: source.region
   }));
 }
 
@@ -371,6 +493,15 @@ export async function processIngestQueueMessage(
   dependencies: IngestQueueDependencies = defaultDependencies
 ): Promise<void> {
   const body = normalizeIngestMessage(rawBody, env.SURF_REGION);
+  if (body.job === "analysis-signal") {
+    await signalBrief(env, body.spotId, new Date(body.generatedAt), {
+      ingestId: body.ingestId,
+      generationId: body.generationId,
+      generatedAt: body.generatedAt,
+      materializedAt: body.materializedAt
+    });
+    return;
+  }
   if (body.job === "forecast-materialization") {
     console.info(
       JSON.stringify({
@@ -432,12 +563,16 @@ export async function processIngestQueueMessage(
       );
       throw new Error(`forecast materialization outcome contract failed for ${body.spotId}`);
     }
-    const allPublished = result.forecastOutcomes.every(({ outcome }) => outcome === "publish");
-    if (allPublished) {
+    const generationIsActive = forecastGenerationIsActiveForSignal(result.forecastOutcomes);
+    if (generationIsActive) {
+      const duplicateRows = result.forecastOutcomes.filter(
+        ({ outcome, reasonCode }) =>
+          outcome === "skip" && reasonCode === "forecast_generation_already_active"
+      ).length;
       const publicationComplete =
         result.errors.length === 0 &&
-        result.forecastRowsWritten === FORECAST_INTERVALS.length &&
-        result.factBundleRowsWritten > 0;
+        result.forecastRowsWritten === FORECAST_INTERVALS.length - duplicateRows &&
+        (result.factBundleRowsWritten > 0 || duplicateRows > 0);
       if (!publicationComplete) {
         logForecastMaterializationOutcomes(
           terminalForecastOutcomes(
@@ -480,12 +615,14 @@ export async function processIngestQueueMessage(
         })
       );
     }
-    await signalBrief(env, body.spotId, new Date(body.generatedAt), {
-      ingestId: body.ingestId,
-      generationId: result.forecastOutcomes[0]!.generationId!,
-      generatedAt: body.generatedAt,
-      materializedAt
-    });
+    if (result.forecastOutcomes.some(({ outcome }) => outcome === "publish")) {
+      await dispatchSurfAnalysisSignal(env, body.spotId, new Date(body.generatedAt), {
+        ingestId: body.ingestId,
+        generationId: result.forecastOutcomes[0]!.generationId!,
+        generatedAt: body.generatedAt,
+        materializedAt
+      });
+    }
     return;
   }
 
@@ -515,6 +652,33 @@ export async function processIngestQueueMessage(
     return;
   }
 
+  if (body.job === "source-ingest") {
+    const sourceBatches = buildSourceBatchMessages(body);
+    try {
+      await env.INGEST_QUEUE.sendBatch(
+        sourceBatches.map((sourceBatch) => ({ body: sourceBatch }))
+      );
+    } catch (error) {
+      logSourceIngestTerminalOutcome({
+        ingestId: body.ingestId,
+        generatedAt: body.forecastGeneratedAt,
+        outcome: "failure",
+        reasonCode: "source_batch_enqueue_failed",
+        sourceBatchJobCount: 0,
+        errorName: boundedPipelineErrorName(error)
+      });
+      throw error;
+    }
+    logSourceIngestTerminalOutcome({
+      ingestId: body.ingestId,
+      generatedAt: body.forecastGeneratedAt,
+      outcome: "publish",
+      reasonCode: "source_batches_dispatched",
+      sourceBatchJobCount: sourceBatches.length
+    });
+    return;
+  }
+
   let summary: IngestSummary;
   try {
     summary = await dependencies.runIngest(env, {
@@ -523,8 +687,9 @@ export async function processIngestQueueMessage(
       region: body.region,
       now: new Date(body.forecastGeneratedAt),
       ingestId: body.ingestId,
-      idSuffix: body.ingestId,
-      deferForecastMaterialization: true
+      idSuffix: sourceBatchRunSuffix(body.ingestId, body.batchKey),
+      deferForecastMaterialization: true,
+      spotIds: body.spotIds
     });
   } catch (error) {
     logSourceIngestTerminalOutcome({
@@ -543,7 +708,9 @@ export async function processIngestQueueMessage(
     sourceCount: summary.sourceRuns.length,
     partialSourceCount: summary.sourceRuns.filter(({ status }) => status === "partial").length,
     caveatCount: summary.caveats.length,
-    errorCount: summary.errors.length
+    errorCount: summary.errors.length,
+    batchKey: body.batchKey,
+    spotCount: body.spotIds.length
   };
   if (!summary.publication.sourcePersistenceReady) {
     logSourceIngestTerminalOutcome({
@@ -554,10 +721,12 @@ export async function processIngestQueueMessage(
     });
     throw new Error("source ingest persistence is incomplete");
   }
-  // Dispatch usable per-spot work before retrying a degraded source ingest.
+  // Dispatch usable per-spot work before recording a degraded source ingest.
   // Each materialization independently validates whether the normalized rows
-  // are sufficient, so one provider error cannot freeze every spot.
-  const materializationMessages = buildForecastMaterializationMessages(summary);
+  // are sufficient, so one provider error cannot freeze every spot. Once the
+  // complete child set is accepted, this message must ACK: retrying it would
+  // amplify identical child messages. The next hourly root retries providers.
+  const materializationMessages = buildForecastMaterializationMessages(summary, body.spotIds);
   try {
     await env.INGEST_QUEUE.sendBatch(
       materializationMessages.map((materialization) => ({ body: materialization }))
@@ -575,11 +744,11 @@ export async function processIngestQueueMessage(
   if (ingestRequiresRetry(summary)) {
     logSourceIngestTerminalOutcome({
       ...sourceContext,
-      outcome: "failure",
-      reasonCode: "source_ingest_requires_retry",
+      outcome: "publish",
+      reasonCode: "materialization_jobs_published_from_degraded_source",
       materializationJobCount: materializationMessages.length
     });
-    throw new Error(`source ingest requires retry: ${summary.status}`);
+    return;
   }
   logSourceIngestTerminalOutcome({
     ...sourceContext,

@@ -112,7 +112,10 @@ export async function persistRawArtifacts(
     };
   }
 
-  const date = createdAt.slice(0, 10).replaceAll("-", "/");
+  // The source generation is stable across Queue redelivery; completion time
+  // is not. Partition with the generation date so a retry across UTC midnight
+  // cannot remap the same artifact IDs to new R2 keys and orphan the old keys.
+  const date = run.startedAt.slice(0, 10).replaceAll("-", "/");
   const prefix = `raw/${safeKeyPart(run.sourceId)}/${date}/${safeKeyPart(idSuffix)}`;
   const artifacts: Array<{
     id: string;
@@ -124,9 +127,21 @@ export async function persistRawArtifacts(
     capturedAt: string;
   }> = [];
 
-  for (const [index, capture] of captures.items.entries()) {
+  const orderedCaptures = (
+    await Promise.all(
+      captures.items.map(async (capture) => ({
+        capture,
+        checksumSha256: hex(await crypto.subtle.digest("SHA-256", capture.body))
+      }))
+    )
+  ).sort((left, right) =>
+    left.capture.requestUrl.localeCompare(right.capture.requestUrl) ||
+    left.capture.contentType.localeCompare(right.capture.contentType) ||
+    left.checksumSha256.localeCompare(right.checksumSha256)
+  );
+
+  for (const [index, { capture, checksumSha256 }] of orderedCaptures.entries()) {
     try {
-      const checksumSha256 = hex(await crypto.subtle.digest("SHA-256", capture.body));
       const r2Key = `${prefix}/${String(index + 1).padStart(2, "0")}-${checksumSha256.slice(0, 12)}.${artifactExtension(capture.contentType)}`;
       const id = `${run.id}-artifact-${index + 1}`;
       await bucket.put(r2Key, capture.body, {
@@ -138,32 +153,6 @@ export async function persistRawArtifacts(
           checksumSha256
         }
       });
-      await db
-        .prepare(
-          `insert into source_artifacts (
-            id, source_run_id, source_id, r2_key, artifact_type, content_type,
-            byte_size, checksum_sha256, created_at, metadata_json
-          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          on conflict(id) do update set
-            r2_key = excluded.r2_key,
-            content_type = excluded.content_type,
-            byte_size = excluded.byte_size,
-            checksum_sha256 = excluded.checksum_sha256,
-            metadata_json = excluded.metadata_json`
-        )
-        .bind(
-          id,
-          run.id,
-          run.sourceId,
-          r2Key,
-          "upstream_response",
-          capture.contentType,
-          capture.body.byteLength,
-          checksumSha256,
-          createdAt,
-          JSON.stringify({ requestUrl: capture.requestUrl, capturedAt: capture.capturedAt })
-        )
-        .run();
       artifacts.push({
         id,
         r2Key,
@@ -175,6 +164,47 @@ export async function persistRawArtifacts(
       });
     } catch (error) {
       errors.push(`${run.sourceId} raw artifact ${index + 1}: ${errorMessage(error)}`);
+    }
+  }
+
+  if (artifacts.length > 0) {
+    try {
+      await db.prepare(
+        `insert into source_artifacts (
+          id, source_run_id, source_id, r2_key, artifact_type, content_type,
+          byte_size, checksum_sha256, created_at, metadata_json
+        )
+        select
+          json_extract(item.value, '$.id'),
+          ?,
+          ?,
+          json_extract(item.value, '$.r2Key'),
+          'upstream_response',
+          json_extract(item.value, '$.contentType'),
+          json_extract(item.value, '$.byteSize'),
+          json_extract(item.value, '$.checksumSha256'),
+          ?,
+          json_object(
+            'requestUrl', json_extract(item.value, '$.requestUrl'),
+            'capturedAt', json_extract(item.value, '$.capturedAt')
+          )
+        from json_each(?) as item
+        where 1
+        on conflict(id) do update set
+          r2_key = excluded.r2_key,
+          content_type = excluded.content_type,
+          byte_size = excluded.byte_size,
+          checksum_sha256 = excluded.checksum_sha256,
+          metadata_json = excluded.metadata_json`
+      ).bind(
+        run.id,
+        run.sourceId,
+        createdAt,
+        JSON.stringify(artifacts)
+      ).run();
+    } catch (error) {
+      errors.push(`${run.sourceId} raw artifact metadata: ${errorMessage(error)}`);
+      return { rowsWritten: 0, errors, manifestKey: null, manifestJson: null };
     }
   }
 

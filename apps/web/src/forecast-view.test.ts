@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import { getSpotProfile, scoreSpotWindow } from "@surf/forecast-core";
 import type { ScoredForecastWindow } from "@surf/contracts";
 import {
+  availableDisplayLocalDateKeys,
   availableLocalDateKeys,
-  calmestWindow,
+  bestWindow,
+  bestWindowSelection,
   cardinalDirection,
   earliestAvailableLocalDateKey,
   formatWindowSpan,
@@ -76,7 +78,7 @@ describe("forecast presentation", () => {
       score: 100
     });
     const ready = windowAt("2026-07-10T19:00:00Z", { score: 61 });
-    expect(calmestWindow(spot, [past, unknown, ready], now)?.forecastAt).toBe(ready.forecastAt);
+    expect(bestWindow(spot, [past, unknown, ready], now)?.forecastAt).toBe(ready.forecastAt);
   });
 
   it("moves the report to the next daylight day after the 6pm planning window", () => {
@@ -87,7 +89,11 @@ describe("forecast presentation", () => {
     expect(availableLocalDateKeys(spot, [tonight, tomorrowMorning], now)).toEqual([
       "2026-07-11"
     ]);
-    expect(calmestWindow(spot, [tonight, tomorrowMorning], now, "2026-07-11")?.forecastAt).toBe(
+    expect(availableDisplayLocalDateKeys(spot, [tonight, tomorrowMorning])).toEqual([
+      "2026-07-10",
+      "2026-07-11"
+    ]);
+    expect(bestWindow(spot, [tonight, tomorrowMorning], now, "2026-07-11")?.forecastAt).toBe(
       tomorrowMorning.forecastAt
     );
   });
@@ -133,5 +139,75 @@ describe("forecast presentation", () => {
     expect(surfHeightRange(3)).toBe("2–3 ft");
     expect(cardinalDirection(292)).toBe("WNW");
     expect(formatWindowSpan("2026-07-10T13:00:00Z", spot.timezone)).toBe("6 AM–9 AM");
+    expect(
+      formatWindowSpan(
+        "2026-07-10T13:22:00Z",
+        spot.timezone,
+        "2026-07-10T15:30:00Z"
+      )
+    ).toBe("6:22 AM–8:30 AM");
+  });
+
+  it("uses published hourly recommendation boundaries with a coarser display payload", () => {
+    const now = new Date("2026-07-10T12:00:00Z");
+    const displayed = windowAt("2026-07-10T12:00:00Z");
+    const representative = windowAt("2026-07-10T14:00:00Z", { score: 84 });
+    const selection = bestWindowSelection(
+      spot,
+      [displayed],
+      now,
+      "2026-07-10",
+      undefined,
+      [{
+        localDate: "2026-07-10",
+        representative,
+        constituentWindowIds: [representative.forecastAt],
+        startAt: "2026-07-10T13:22:00Z",
+        endAt: "2026-07-10T15:30:00Z"
+      }]
+    );
+
+    expect(selection?.window.forecastAt).toBe(representative.forecastAt);
+    expect(selection?.startAt).toBe("2026-07-10T13:22:00Z");
+    expect(selection?.endAt).toBe("2026-07-10T15:30:00Z");
+  });
+
+  it("treats a published empty recommendation set as authoritative", () => {
+    const now = new Date("2026-07-10T12:00:00Z");
+    const displayed = windowAt("2026-07-10T15:00:00Z", { score: 90 });
+
+    expect(
+      bestWindowSelection(
+        spot,
+        [displayed],
+        now,
+        "2026-07-10",
+        undefined,
+        []
+      )
+    ).toBeUndefined();
+  });
+
+  it("keeps each legacy three-hour span on its own DST-safe local boundary", () => {
+    const now = new Date("2026-03-08T12:00:00Z");
+    const rows = [
+      windowAt("2026-03-08T08:00:00Z", { score: 20 }), // 12 AM PST
+      windowAt("2026-03-08T10:00:00Z", { score: 20 }), // 3 AM PDT
+      windowAt("2026-03-08T13:00:00Z", { score: 90 }), // 6 AM PDT
+      windowAt("2026-03-08T16:00:00Z", { score: 20 })  // 9 AM PDT
+    ];
+
+    const selection = bestWindowSelection(
+      spot,
+      rows,
+      now,
+      "2026-03-08"
+    );
+
+    expect(selection?.startAt).toBe("2026-03-08T13:00:00.000Z");
+    expect(selection?.endAt).toBe("2026-03-08T16:00:00.000Z");
+    expect(formatWindowSpan(selection!.startAt, spot.timezone, selection!.endAt)).toBe(
+      "6 AM–9 AM"
+    );
   });
 });

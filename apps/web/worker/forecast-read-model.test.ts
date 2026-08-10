@@ -33,7 +33,14 @@ function fixtureResponses() {
   };
 }
 
-function writeDb(changesByWrite: number[] = []) {
+function writeDb(
+  changesByWrite: number[] = [],
+  activeForecastRows: Array<{
+    interval: "1h" | "3h";
+    generation_id: string;
+    generated_at: string;
+  }> = []
+) {
   const preparedSql: string[] = [];
   const writes: Array<{ sql: string; values: unknown[] }> = [];
   const db = {
@@ -48,6 +55,9 @@ function writeDb(changesByWrite: number[] = []) {
                 success: true,
                 meta: { changes: changesByWrite[writes.length - 1] ?? 1 }
               };
+            },
+            async all() {
+              return { success: true, meta: {}, results: activeForecastRows };
             }
           };
         }
@@ -165,13 +175,13 @@ describe("forecast read model repository", () => {
     expect(new Set(result.forecastOutcomes.map(({ generationId }) => generationId)).size).toBe(1);
     expect(writes.filter((write) => /insert into forecast_read_models/i.test(write.sql))).toHaveLength(2);
     expect(writes.find((write) => /insert into forecast_read_models/i.test(write.sql))?.sql).toContain(
-      "excluded.generated_at >= forecast_read_models.generated_at"
+      "excluded.generated_at > forecast_read_models.generated_at"
     );
     expect(writes.filter((write) => /insert into forecast_fact_bundles/i.test(write.sql))).toHaveLength(
       localDates.length
     );
     expect(writes.find((write) => /insert into forecast_fact_bundles/i.test(write.sql))?.sql).toContain(
-      "excluded.generated_at >= forecast_fact_bundles.generated_at"
+      "excluded.generated_at > forecast_fact_bundles.generated_at"
     );
     const forecastIntervals = writes
       .filter((write) => /insert into forecast_read_models/i.test(write.sql))
@@ -415,7 +425,14 @@ describe("forecast read model repository", () => {
       threeHour.spot.timezone
     );
     const factBundles = [await buildForecastFactBundle(threeHour, { localDate })];
-    const { db } = writeDb([0, 0, 0]);
+    const { db } = writeDb(
+      [0, 0, 0],
+      (["3h", "1h"] as const).map((interval) => ({
+        interval,
+        generation_id: `active-newer-${interval}`,
+        generated_at: "2026-08-02T14:00:00.000Z"
+      }))
+    );
 
     const result = await persistForecastMaterialization({
       db,
@@ -453,6 +470,56 @@ describe("forecast read model repository", () => {
     ]);
   });
 
+  it("reports an equal generatedAt redelivery as an already-active no-op", async () => {
+    const { threeHour, hourly } = fixtureResponses();
+    const localDate = localDateForTime(
+      threeHour.windows[0]!.forecastAt,
+      threeHour.spot.timezone
+    );
+    const factBundles = [await buildForecastFactBundle(threeHour, { localDate })];
+    const { db } = writeDb(
+      [0, 0, 0],
+      (["3h", "1h"] as const).map((interval) => ({
+        interval,
+        generation_id: "sha256:already-active:ingest:duplicate-ingest",
+        generated_at: threeHour.generatedAt
+      }))
+    );
+
+    const result = await persistForecastMaterialization({
+      db,
+      threeHour,
+      hourly,
+      factBundles,
+      sourceIssueFingerprint: "duplicate-source-fingerprint",
+      materializedAt: "2026-08-02T13:06:00.000Z",
+      ingestId: "duplicate-ingest"
+    });
+
+    expect(result).toMatchObject({
+      rowsWritten: 0,
+      forecastRowsWritten: 0,
+      factBundleRowsWritten: 0,
+      errors: []
+    });
+    expect(result.forecastOutcomes).toEqual([
+      expect.objectContaining({
+        interval: "3h",
+        generationId: "sha256:already-active:ingest:duplicate-ingest",
+        outcome: "skip",
+        reasonCode: "forecast_generation_already_active",
+        retryable: false
+      }),
+      expect.objectContaining({
+        interval: "1h",
+        generationId: "sha256:already-active:ingest:duplicate-ingest",
+        outcome: "skip",
+        reasonCode: "forecast_generation_already_active",
+        retryable: false
+      })
+    ]);
+  });
+
   it("preserves mixed per-interval D1 publication truth for an already-mixed table", async () => {
     const { threeHour, hourly } = fixtureResponses();
     const localDate = localDateForTime(
@@ -460,7 +527,13 @@ describe("forecast read model repository", () => {
       threeHour.spot.timezone
     );
     const factBundles = [await buildForecastFactBundle(threeHour, { localDate })];
-    const { db } = writeDb([1, 0, 0]);
+    const { db } = writeDb([1, 0, 0], [
+      {
+        interval: "1h",
+        generation_id: "active-newer-1h",
+        generated_at: "2026-08-02T14:00:00.000Z"
+      }
+    ]);
 
     const result = await persistForecastMaterialization({
       db,
@@ -600,6 +673,60 @@ describe("forecast read model repository", () => {
     );
   });
 
+  it("persists complete hourly facts when the hourly and three-hour leaders differ", async () => {
+    const generatedAt = new Date("2026-08-02T13:00:00.000Z");
+    const spotId = "obsf-north";
+    const fixture = buildFixtureForecast(spotId, generatedAt);
+    const dayStartMs = Date.parse("2026-08-02T07:00:00.000Z");
+    const makeWindows = (count: number, stepHours: number) =>
+      Array.from({ length: count }, (_, index) => {
+        const forecastAt = new Date(dayStartMs + index * stepHours * 60 * 60 * 1000).toISOString();
+        const isHourlyLeader = forecastAt === "2026-08-02T14:00:00.000Z";
+        const isThreeHourLeader = forecastAt === "2026-08-02T16:00:00.000Z";
+        return {
+          ...fixture.windows[index % fixture.windows.length]!,
+          forecastAt,
+          surfaceCondition: "clean" as const,
+          score: stepHours === 1
+            ? isHourlyLeader ? 100 : 5
+            : isThreeHourLeader ? 95 : 5,
+          confidence: stepHours === 1 && isHourlyLeader ? 100 : 60
+        };
+      });
+    const threeHour = {
+      ...fixture,
+      interval: "3h" as const,
+      windows: makeWindows(40, 3)
+    };
+    const hourly = {
+      ...fixture,
+      interval: "1h" as const,
+      windows: makeWindows(120, 1)
+    };
+    vi.mocked(buildSynchronizedForecastResponses).mockClear();
+    vi.mocked(buildSynchronizedForecastResponses).mockResolvedValue({ threeHour, hourly });
+    const { db, writes } = writeDb();
+
+    const result = await materializeForecastReadModelForSpot(
+      { DB: db } as never,
+      spotId,
+      generatedAt,
+      { materializedAt: "2026-08-02T13:05:00.000Z" }
+    );
+
+    expect(result.errors).toEqual([]);
+    const firstDateWrite = writes.find(
+      (write) =>
+        /insert into forecast_fact_bundles/i.test(write.sql) &&
+        write.values[1] === "2026-08-02"
+    );
+    expect(firstDateWrite).toBeDefined();
+    const bundle = ForecastFactBundleSchema.parse(JSON.parse(String(firstDateWrite!.values[7])));
+    expect(bundle.input.windows).toHaveLength(24);
+    expect(bundle.input.recommendationWindowIds[0]).toBe("2026-08-02T14:00:00.000Z");
+    expect(bundle.input.recommendationWindowIds[0]).not.toBe("2026-08-02T16:00:00.000Z");
+  });
+
   it("does not capture history for a mixed publish and supersession", async () => {
     const generatedAt = new Date("2026-08-02T13:00:00.000Z");
     const spotId = "obsf-north";
@@ -611,7 +738,14 @@ describe("forecast read model repository", () => {
         hourly: { ...fixture, interval: "1h" }
       };
     });
-    const { db, preparedSql } = writeDb([1, 0, ...Array<number>(20).fill(0)]);
+    const { db, preparedSql } = writeDb(
+      [1, 0, ...Array<number>(20).fill(0)],
+      [{
+        interval: "1h",
+        generation_id: "active-newer-1h",
+        generated_at: "2026-08-02T14:00:00.000Z"
+      }]
+    );
 
     const result = await materializeForecastReadModelForSpot(
       { DB: db } as never,

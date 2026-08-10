@@ -5,9 +5,20 @@ import type {
   ForecastMaterializationReasonCode
 } from "../forecast-read-model";
 import type { Env } from "../index";
-import type { IngestSummary } from "./types";
+import type {
+  IngestSummary,
+  SourceBatchQueueMessage,
+  SourceIngestQueueMessage
+} from "./types";
+import {
+  NORCAL_SOURCE_BATCHES,
+  SOURCE_BATCH_SCHEMA_VERSION,
+  sourceBatchRunSuffix
+} from "./source-batches";
 import {
   buildForecastMaterializationMessages,
+  buildSurfAnalysisSignalMessage,
+  buildSourceBatchMessages,
   logInlineIngestTerminalOutcomes,
   processIngestQueueMessage,
   signalInlineForecastBriefs,
@@ -15,6 +26,38 @@ import {
   type ForecastBriefSignal,
   type IngestQueueDependencies
 } from "./queue";
+
+function sourceMessage(
+  overrides: Partial<SourceIngestQueueMessage> = {}
+): SourceIngestQueueMessage {
+  return {
+    job: "source-ingest",
+    kind: "manual-ingest",
+    ingestId: "ingest-123",
+    requestedAt: "2026-08-03T01:02:03.456Z",
+    forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
+    region: "norcal",
+    ...overrides
+  };
+}
+
+function sourceBatchMessage(
+  overrides: Partial<SourceBatchQueueMessage> = {}
+): SourceBatchQueueMessage {
+  const configured = NORCAL_SOURCE_BATCHES[0]!;
+  return {
+    job: "source-batch",
+    schemaVersion: SOURCE_BATCH_SCHEMA_VERSION,
+    kind: "manual-ingest",
+    ingestId: "ingest-123",
+    batchKey: configured.batchKey,
+    spotIds: [...configured.spotIds],
+    requestedAt: "2026-08-03T01:02:03.456Z",
+    forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
+    region: "norcal",
+    ...overrides
+  };
+}
 
 function summary(options: {
   status?: IngestSummary["status"];
@@ -78,7 +121,9 @@ function forecastOutcomes(options: {
     spotId: options.spotId ?? NORCAL_SPOTS[0]!.id,
     interval,
     generationId:
-      outcome === "publish" || outcome === "supersede"
+      outcome === "publish" ||
+      outcome === "supersede" ||
+      (outcome === "skip" && options.reasonCode === "forecast_generation_already_active")
         ? `sha256:${"a".repeat(64)}:ingest:${options.ingestId ?? "ingest-123"}`
         : null,
     generatedAt: options.generatedAt ?? "2026-08-03T01:02:03.456Z",
@@ -105,7 +150,20 @@ function testEnv(sendBatch: unknown = vi.fn(async () => undefined)): Env {
     DB: {} as D1Database,
     ASSETS: {} as Fetcher,
     RAW_ARTIFACTS: {} as R2Bucket,
-    INGEST_QUEUE: { sendBatch } as unknown as Queue
+    INGEST_QUEUE: { sendBatch, send: vi.fn(async () => undefined) } as unknown as Queue
+  };
+}
+
+function narrativeTestEnv(
+  sendBatch: unknown = vi.fn(async () => undefined),
+  send: unknown = vi.fn(async () => undefined)
+): Env {
+  return {
+    ...testEnv(sendBatch),
+    INGEST_QUEUE: { sendBatch, send } as unknown as Queue,
+    NARRATIVE_ENABLED: "true",
+    NARRATIVE_QUEUE: {} as Queue,
+    NARRATIVE_RESULT_TOKEN: "test-result-token"
   };
 }
 
@@ -354,13 +412,13 @@ describe("forecast materialization queue orchestration", () => {
     error.mockRestore();
   });
 
-  it("fans one immutable child job per spot out of the source invocation", async () => {
+  it("dispatches stable source batches, then fans only one batch's spot jobs", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const sentBatches: Array<Array<{ body: unknown }>> = [];
     const sendBatch = vi.fn(async (messages: Iterable<{ body: unknown }>) => {
       sentBatches.push([...messages]);
     });
-    const runOptions: Array<{ idSuffix?: string }> = [];
+    const runOptions: Array<{ idSuffix?: string; spotIds?: readonly string[] }> = [];
     const runIngest: IngestQueueDependencies["runIngest"] = vi.fn(async (_env, options) => {
       runOptions.push(options);
       return summary();
@@ -368,56 +426,160 @@ describe("forecast materialization queue orchestration", () => {
     const deps = dependencies(runIngest);
     const signalBrief = vi.fn(async () => undefined);
 
-    await processIngestQueueMessage(
-      testEnv(sendBatch),
-      {
-        job: "source-ingest",
-        kind: "manual-ingest",
-        ingestId: "ingest-123",
-        requestedAt: "2026-08-03T01:02:03.456Z",
-        forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
-        region: "norcal"
-      },
-      signalBrief,
-      deps
-    );
+    const source = sourceMessage();
+    await processIngestQueueMessage(testEnv(sendBatch), source, signalBrief, deps);
 
+    expect(runIngest).not.toHaveBeenCalled();
+    expect(sendBatch).toHaveBeenCalledOnce();
+    const batchMessages = sentBatches[0]!.map((entry) => entry.body);
+    expect(batchMessages).toEqual(buildSourceBatchMessages(source));
+    expect(batchMessages).toHaveLength(NORCAL_SOURCE_BATCHES.length);
+
+    const sourceBatch = batchMessages[0] as SourceBatchQueueMessage;
+    await processIngestQueueMessage(testEnv(sendBatch), sourceBatch, signalBrief, deps);
+
+    expect(runIngest).toHaveBeenCalledOnce();
     expect(runIngest).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         deferForecastMaterialization: true,
         ingestId: "ingest-123",
-        idSuffix: "ingest-123",
-        now: new Date("2026-08-03T01:02:03.456Z")
+        idSuffix: sourceBatchRunSuffix("ingest-123", sourceBatch.batchKey),
+        now: new Date("2026-08-03T01:02:03.456Z"),
+        spotIds: sourceBatch.spotIds
       })
     );
     expect(deps.materializeSpot).not.toHaveBeenCalled();
     expect(signalBrief).not.toHaveBeenCalled();
-    expect(sendBatch).toHaveBeenCalledOnce();
-    const messages = sentBatches[0]!.map((entry) => entry.body);
-    expect(messages).toHaveLength(NORCAL_SPOTS.length);
+    expect(sendBatch).toHaveBeenCalledTimes(2);
+    const messages = sentBatches[1]!.map((entry) => entry.body);
+    expect(messages).toHaveLength(sourceBatch.spotIds.length);
     expect(messages.map((message) => (message as { spotId: string }).spotId)).toEqual(
-      NORCAL_SPOTS.map((spot) => spot.id)
+      sourceBatch.spotIds
     );
     expect(messages).toEqual(
-      buildForecastMaterializationMessages(summary()).map((body) => body)
+      buildForecastMaterializationMessages(summary(), sourceBatch.spotIds)
     );
     const terminal = info.mock.calls
       .map(([entry]) => JSON.parse(String(entry)))
       .filter(({ outcome }) => outcome !== undefined);
     expect(terminal).toEqual([
       expect.objectContaining({
+        event: "source_ingest_dispatched",
+        ingestId: "ingest-123",
+        outcome: "publish",
+        reasonCode: "source_batches_dispatched",
+        sourceBatchJobCount: NORCAL_SOURCE_BATCHES.length
+      }),
+      expect.objectContaining({
         event: "source_ingest_published",
         ingestId: "ingest-123",
         outcome: "publish",
         reasonCode: "materialization_jobs_published",
-        materializationJobCount: NORCAL_SPOTS.length
+        materializationJobCount: sourceBatch.spotIds.length,
+        batchKey: sourceBatch.batchKey,
+        spotCount: sourceBatch.spotIds.length
       })
     ]);
     info.mockRestore();
   });
 
-  it("dispatches independently-valid spot jobs before retrying a degraded source run", async () => {
+  it("preserves all eleven spot jobs and twenty-two interval outcomes across the batch barrier", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const sentBatches: Array<Array<{ body: unknown }>> = [];
+    const sendBatch = vi.fn(async (messages: Iterable<{ body: unknown }>) => {
+      sentBatches.push([...messages]);
+    });
+    const runIngest: IngestQueueDependencies["runIngest"] = vi.fn(async (_env, options) =>
+      summary({
+        ingestId: options.ingestId,
+        requestedAt: options.requestedAt,
+        generatedAt: options.now!.toISOString()
+      })
+    );
+    const materializeSpot = vi.fn(async (_env, spotId, now, options) => ({
+      rowsWritten: 7,
+      forecastRowsWritten: 2,
+      factBundleRowsWritten: 5,
+      errors: [],
+      forecastOutcomes: forecastOutcomes({
+        ingestId: options?.ingestId,
+        spotId,
+        generatedAt: now.toISOString(),
+        materializedAt: options?.materializedAt
+      })
+    }));
+    const deps: IngestQueueDependencies = {
+      runIngest,
+      materializeSpot: materializeSpot as IngestQueueDependencies["materializeSpot"],
+      sourceGenerationIsCurrent: vi.fn(async () => true)
+    };
+    const analysisSignals = vi.fn(async (_body: unknown, _options?: unknown) => undefined);
+    const workerEnv = narrativeTestEnv(sendBatch, analysisSignals);
+    const source = sourceMessage();
+    const signalBrief = vi.fn(async () => undefined);
+
+    await processIngestQueueMessage(workerEnv, source, signalBrief, deps);
+    const sourceBatches = sentBatches[0]!.map(({ body }) => body);
+    for (const sourceBatch of sourceBatches) {
+      await processIngestQueueMessage(workerEnv, sourceBatch, signalBrief, deps);
+    }
+
+    const materializationMessages = sentBatches
+      .slice(1)
+      .flatMap((batch) => batch.map(({ body }) => body));
+    expect(materializationMessages).toHaveLength(NORCAL_SPOTS.length);
+    expect(
+      materializationMessages
+        .map((message) => (message as { spotId: string }).spotId)
+        .sort()
+    ).toEqual(NORCAL_SPOTS.map(({ id }) => id).sort());
+    expect(
+      materializationMessages
+        .map((message) => JSON.stringify(message))
+        .sort()
+    ).toEqual(
+      buildForecastMaterializationMessages(summary())
+        .map((message) => JSON.stringify(message))
+        .sort()
+    );
+
+    for (const materialization of materializationMessages) {
+      await processIngestQueueMessage(workerEnv, materialization, signalBrief, deps);
+    }
+
+    expect(runIngest).toHaveBeenCalledTimes(NORCAL_SOURCE_BATCHES.length);
+    expect(materializeSpot).toHaveBeenCalledTimes(NORCAL_SPOTS.length);
+    expect(signalBrief).not.toHaveBeenCalled();
+    expect(analysisSignals).toHaveBeenCalledTimes(NORCAL_SPOTS.length);
+    expect(
+      analysisSignals.mock.calls.map(([message]) => message)
+    ).toEqual(
+      expect.arrayContaining(
+        NORCAL_SPOTS.map((spot) =>
+          expect.objectContaining({
+            job: "analysis-signal",
+            schemaVersion: 1,
+            domain: "surf",
+            spotId: spot.id
+          })
+        )
+      )
+    );
+    const publishedIntervals = info.mock.calls
+      .map(([entry]) => JSON.parse(String(entry)))
+      .filter(({ event }) => event === "forecast_materialization_published");
+    expect(publishedIntervals).toHaveLength(NORCAL_SPOTS.length * 2);
+    expect(
+      publishedIntervals.map(({ spotId, interval }) => `${spotId}:${interval}`).sort()
+    ).toEqual(
+      NORCAL_SPOTS.flatMap(({ id }) => [`${id}:1h`, `${id}:3h`]).sort()
+    );
+    info.mockRestore();
+  });
+
+  it("ACKs a degraded source run after dispatching its complete usable child set", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const sentBatches: Array<Array<{ body: unknown }>> = [];
     const sendBatch = vi.fn(async (messages: Iterable<{ body: unknown }>) => {
@@ -430,33 +592,30 @@ describe("forecast materialization queue orchestration", () => {
     await expect(
       processIngestQueueMessage(
         testEnv(sendBatch),
-        {
-          job: "source-ingest",
-          kind: "manual-ingest",
-          ingestId: "ingest-123",
-          requestedAt: "2026-08-03T01:02:03.456Z",
-          forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
-          region: "norcal"
-        },
+        sourceBatchMessage(),
         vi.fn(async () => undefined),
         deps
       )
-    ).rejects.toThrow("source ingest requires retry: failure");
+    ).resolves.toBeUndefined();
     expect(sendBatch).toHaveBeenCalledOnce();
-    expect(sentBatches[0]).toHaveLength(NORCAL_SPOTS.length);
-    expect(error).toHaveBeenCalledOnce();
-    const terminal = JSON.parse(String(error.mock.calls[0]![0]));
+    expect(sentBatches[0]).toHaveLength(NORCAL_SOURCE_BATCHES[0]!.spotIds.length);
+    expect(error).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledOnce();
+    const terminal = JSON.parse(String(info.mock.calls[0]![0]));
     expect(terminal).toEqual(
       expect.objectContaining({
-        event: "source_ingest_failed",
+        event: "source_ingest_published",
         ingestId: "ingest-123",
-        outcome: "failure",
-        reasonCode: "source_ingest_requires_retry",
+        outcome: "publish",
+        sourceStatus: "failure",
+        reasonCode: "materialization_jobs_published_from_degraded_source",
         errorCount: 1,
-        materializationJobCount: NORCAL_SPOTS.length
+        materializationJobCount: NORCAL_SOURCE_BATCHES[0]!.spotIds.length,
+        batchKey: NORCAL_SOURCE_BATCHES[0]!.batchKey
       })
     );
     expect(JSON.stringify(terminal)).not.toContain("optional provider failed");
+    info.mockRestore();
     error.mockRestore();
   });
 
@@ -475,14 +634,7 @@ describe("forecast materialization queue orchestration", () => {
     await expect(
       processIngestQueueMessage(
         testEnv(sendBatch),
-        {
-          job: "source-ingest",
-          kind: "manual-ingest",
-          ingestId: "ingest-123",
-          requestedAt: "2026-08-03T01:02:03.456Z",
-          forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
-          region: "norcal"
-        },
+        sourceBatchMessage(),
         vi.fn(async () => undefined),
         deps
       )
@@ -545,43 +697,122 @@ describe("forecast materialization queue orchestration", () => {
     error.mockRestore();
   });
 
-  it("reuses source-run and child identities under at-least-once redelivery", async () => {
+  it("reuses identities and suppresses duplicate publication/signaling after root and batch redelivery", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const sentBatches: Array<Array<{ body: unknown }>> = [];
     const sendBatch = vi.fn(async (messages: Iterable<{ body: unknown }>) => {
       sentBatches.push([...messages]);
     });
-    const runOptions: Array<{ idSuffix?: string }> = [];
+    const runOptions: Array<{ idSuffix?: string; spotIds?: readonly string[] }> = [];
     const runIngest: IngestQueueDependencies["runIngest"] = vi.fn(async (_env, options) => {
       runOptions.push(options);
       return summary();
     });
-    const deps = dependencies(runIngest);
-    const sourceMessage = {
-      job: "source-ingest",
-      kind: "manual-ingest",
-      ingestId: "ingest-123",
-      requestedAt: "2026-08-03T01:02:03.456Z",
-      forecastGeneratedAt: "2026-08-03T01:02:03.456Z",
-      region: "norcal"
+    let generationActive = false;
+    const materializeSpot: IngestQueueDependencies["materializeSpot"] = vi.fn(
+      async (_env, spotId, now, options) => {
+        const duplicate = generationActive;
+        generationActive = true;
+        return {
+          rowsWritten: duplicate ? 0 : 3,
+          forecastRowsWritten: duplicate ? 0 : 2,
+          factBundleRowsWritten: duplicate ? 0 : 1,
+          errors: [],
+          forecastOutcomes: forecastOutcomes({
+            ingestId: options?.ingestId,
+            spotId,
+            generatedAt: now.toISOString(),
+            materializedAt: options?.materializedAt,
+            outcome: duplicate ? "skip" : "publish",
+            reasonCode: duplicate
+              ? "forecast_generation_already_active"
+              : "forecast_generation_published",
+            retryable: false
+          })
+        };
+      }
+    );
+    const deps: IngestQueueDependencies = {
+      runIngest,
+      materializeSpot,
+      sourceGenerationIsCurrent: vi.fn(async () => true)
     };
+    const signalBrief = vi.fn(async () => undefined);
+    const analysisSignals = vi.fn(async (_body: unknown, _options?: unknown) => undefined);
+    const workerEnv = narrativeTestEnv(sendBatch, analysisSignals);
+    const source = sourceMessage();
 
     await processIngestQueueMessage(
-      testEnv(sendBatch),
-      sourceMessage,
-      vi.fn(async () => undefined),
+      workerEnv,
+      source,
+      signalBrief,
       deps
     );
     await processIngestQueueMessage(
-      testEnv(sendBatch),
-      sourceMessage,
-      vi.fn(async () => undefined),
+      workerEnv,
+      source,
+      signalBrief,
+      deps
+    );
+
+    expect(sentBatches).toHaveLength(2);
+    expect(sentBatches[1]).toEqual(sentBatches[0]);
+
+    const configuredBatch = sentBatches[0]![0]!.body as SourceBatchQueueMessage;
+    const reorderedBatch = {
+      ...configuredBatch,
+      spotIds: [...configuredBatch.spotIds].reverse()
+    };
+    await processIngestQueueMessage(
+      workerEnv,
+      reorderedBatch,
+      signalBrief,
+      deps
+    );
+    await processIngestQueueMessage(
+      workerEnv,
+      configuredBatch,
+      signalBrief,
       deps
     );
 
     expect(runIngest).toHaveBeenCalledTimes(2);
-    expect(runOptions.map((options) => options.idSuffix)).toEqual(["ingest-123", "ingest-123"]);
-    expect(sentBatches).toHaveLength(2);
-    expect(sentBatches[1]).toEqual(sentBatches[0]);
+    const expectedSuffix = sourceBatchRunSuffix("ingest-123", configuredBatch.batchKey);
+    expect(runOptions.map((options) => options.idSuffix)).toEqual([
+      expectedSuffix,
+      expectedSuffix
+    ]);
+    expect(runOptions.map((options) => options.spotIds)).toEqual([
+      configuredBatch.spotIds,
+      configuredBatch.spotIds
+    ]);
+    expect(sentBatches).toHaveLength(4);
+    expect(sentBatches[3]).toEqual(sentBatches[2]);
+
+    const firstChild = sentBatches[2]![0]!.body;
+    const duplicateChild = sentBatches[3]![0]!.body;
+    await processIngestQueueMessage(workerEnv, firstChild, signalBrief, deps);
+    await processIngestQueueMessage(workerEnv, duplicateChild, signalBrief, deps);
+
+    expect(signalBrief).not.toHaveBeenCalled();
+    expect(analysisSignals).toHaveBeenCalledOnce();
+    const forecastTerminals = info.mock.calls
+      .map(([entry]) => JSON.parse(String(entry)))
+      .filter(({ outcome, interval }) => outcome !== undefined && interval !== undefined);
+    expect(forecastTerminals.filter(({ outcome }) => outcome === "publish")).toHaveLength(2);
+    expect(forecastTerminals.filter(({ outcome }) => outcome === "skip")).toEqual([
+      expect.objectContaining({
+        interval: "3h",
+        reasonCode: "forecast_generation_already_active",
+        retryable: false
+      }),
+      expect.objectContaining({
+        interval: "1h",
+        reasonCode: "forecast_generation_already_active",
+        retryable: false
+      })
+    ]);
+    info.mockRestore();
   });
 
   it("skips an older source job before it can overwrite a newer generation's inputs", async () => {
@@ -620,20 +851,18 @@ describe("forecast materialization queue orchestration", () => {
         latestGeneration === null || Date.parse(latestGeneration) <= Date.parse(generatedAt)
       )
     };
-    const newer = {
-      job: "source-ingest",
+    const newer = sourceMessage({
       kind: "scheduled-ingest",
       ingestId: "newer-ingest",
       requestedAt: "2026-08-03T01:05:00.000Z",
-      forecastGeneratedAt: "2026-08-03T01:05:00.000Z",
-      region: "norcal"
-    };
-    const older = {
-      ...newer,
+      forecastGeneratedAt: "2026-08-03T01:05:00.000Z"
+    });
+    const older = sourceMessage({
+      kind: "scheduled-ingest",
       ingestId: "older-ingest",
       requestedAt: "2026-08-03T01:00:00.000Z",
       forecastGeneratedAt: "2026-08-03T01:00:00.000Z"
-    };
+    });
 
     await processIngestQueueMessage(
       testEnv(sendBatch),
@@ -643,14 +872,23 @@ describe("forecast materialization queue orchestration", () => {
     );
     await processIngestQueueMessage(
       testEnv(sendBatch),
+      sentBatches[0]![0]!.body,
+      vi.fn(async () => undefined),
+      deps
+    );
+    expect(runIngest).toHaveBeenCalledOnce();
+    expect(sentBatches).toHaveLength(2);
+
+    await processIngestQueueMessage(
+      testEnv(sendBatch),
       older,
       vi.fn(async () => undefined),
       deps
     );
 
     expect(runIngest).toHaveBeenCalledOnce();
-    expect(sentBatches).toHaveLength(1);
-    const newerChild = sentBatches[0]![0]!.body;
+    expect(sentBatches).toHaveLength(2);
+    const newerChild = sentBatches[1]![0]!.body;
     await processIngestQueueMessage(
       testEnv(sendBatch),
       newerChild,
@@ -669,9 +907,16 @@ describe("forecast materialization queue orchestration", () => {
       .filter(({ event }) => String(event).startsWith("source_ingest_"));
     expect(sourceTerminal).toEqual([
       expect.objectContaining({
+        event: "source_ingest_dispatched",
+        ingestId: "newer-ingest",
+        outcome: "publish",
+        reasonCode: "source_batches_dispatched"
+      }),
+      expect.objectContaining({
         event: "source_ingest_published",
         ingestId: "newer-ingest",
-        outcome: "publish"
+        outcome: "publish",
+        reasonCode: "materialization_jobs_published"
       }),
       expect.objectContaining({
         event: "source_ingest_superseded",
@@ -878,6 +1123,81 @@ describe("forecast materialization queue orchestration", () => {
     );
     expect(terminal.every(({ outcome }) => outcome === "supersede")).toBe(true);
     expect(terminal.every(({ retryable }) => retryable === false)).toBe(true);
+    info.mockRestore();
+    error.mockRestore();
+  });
+
+  it("signals once when a same-generation retry fills its missing interval", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const signalBrief = vi.fn(async () => undefined);
+    const materializeSpot = vi.fn(async (_env, spotId, now, options) => {
+      const outcomes = forecastOutcomes({
+        ingestId: options?.ingestId,
+        spotId,
+        generatedAt: now.toISOString(),
+        materializedAt: options?.materializedAt
+      });
+      outcomes[0] = {
+        ...outcomes[0]!,
+        outcome: "skip",
+        reasonCode: "forecast_generation_already_active",
+        retryable: false
+      };
+      return {
+        rowsWritten: 1,
+        forecastRowsWritten: 1,
+        factBundleRowsWritten: 0,
+        errors: [],
+        forecastOutcomes: outcomes
+      };
+    });
+    const deps: IngestQueueDependencies = {
+      runIngest: vi.fn() as unknown as IngestQueueDependencies["runIngest"],
+      materializeSpot: materializeSpot as IngestQueueDependencies["materializeSpot"],
+      sourceGenerationIsCurrent: vi.fn(async () => true)
+    };
+    const message = buildForecastMaterializationMessages(summary())[0]!;
+
+    const analysisSignals = vi.fn(async () => undefined);
+    await expect(
+      processIngestQueueMessage(narrativeTestEnv(undefined, analysisSignals), message, signalBrief, deps)
+    ).resolves.toBeUndefined();
+
+    expect(error).not.toHaveBeenCalled();
+    expect(signalBrief).not.toHaveBeenCalled();
+    expect(analysisSignals).toHaveBeenCalledOnce();
+    expect(analysisSignals).toHaveBeenCalledWith(
+      expect.objectContaining({
+        job: "analysis-signal",
+        schemaVersion: 1,
+        domain: "surf",
+        spotId: message.spotId,
+        ingestId: message.ingestId,
+        generationId: expect.stringMatching(/^sha256:/),
+        generatedAt: message.generatedAt
+      }),
+      { contentType: "json" }
+    );
+    const terminal = info.mock.calls
+      .map(([entry]) => JSON.parse(String(entry)))
+      .filter(({ outcome }) => outcome !== undefined);
+    expect(terminal.map(({ interval, outcome, reasonCode }) => ({
+      interval,
+      outcome,
+      reasonCode
+    }))).toEqual([
+      {
+        interval: "3h",
+        outcome: "skip",
+        reasonCode: "forecast_generation_already_active"
+      },
+      {
+        interval: "1h",
+        outcome: "publish",
+        reasonCode: "forecast_generation_published"
+      }
+    ]);
     info.mockRestore();
     error.mockRestore();
   });
@@ -1149,7 +1469,13 @@ describe("forecast materialization queue orchestration", () => {
     };
     const message = buildForecastMaterializationMessages(summary())[0]!;
 
-    await processIngestQueueMessage(testEnv(), message, signalBrief, deps);
+    const analysisSignals = vi.fn(async () => undefined);
+    await processIngestQueueMessage(
+      narrativeTestEnv(undefined, analysisSignals),
+      message,
+      signalBrief,
+      deps
+    );
 
     expect(materializeSpot).toHaveBeenCalledWith(
       expect.anything(),
@@ -1160,17 +1486,19 @@ describe("forecast materialization queue orchestration", () => {
         ingestId: message.ingestId
       })
     );
-    expect(signalBrief).toHaveBeenCalledOnce();
-    expect(signalBrief).toHaveBeenCalledWith(
-      expect.anything(),
-      message.spotId,
-      new Date(message.generatedAt),
-      {
+    expect(signalBrief).not.toHaveBeenCalled();
+    expect(analysisSignals).toHaveBeenCalledWith(
+      expect.objectContaining({
+        job: "analysis-signal",
+        schemaVersion: 1,
+        domain: "surf",
+        spotId: message.spotId,
         ingestId: message.ingestId,
         generationId: `sha256:${"a".repeat(64)}:ingest:${message.ingestId}`,
         generatedAt: message.generatedAt,
         materializedAt: expect.any(String)
-      }
+      }),
+      { contentType: "json" }
     );
     const entries = info.mock.calls.map(([entry]) => JSON.parse(String(entry)));
     expect(entries[0]).toEqual({
@@ -1211,6 +1539,69 @@ describe("forecast materialization queue orchestration", () => {
     warning.mockRestore();
   });
 
+  it("ACKs a published forecast when advisory Analysis dispatch fails and does not repeat it", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let generationActive = false;
+    const materializeSpot: IngestQueueDependencies["materializeSpot"] = vi.fn(
+      async (_env, spotId, now, options) => {
+        const duplicate = generationActive;
+        generationActive = true;
+        return {
+          rowsWritten: duplicate ? 0 : 7,
+          forecastRowsWritten: duplicate ? 0 : 2,
+          factBundleRowsWritten: duplicate ? 0 : 5,
+          errors: [],
+          forecastOutcomes: forecastOutcomes({
+            ingestId: options?.ingestId,
+            spotId,
+            generatedAt: now.toISOString(),
+            materializedAt: options?.materializedAt,
+            outcome: duplicate ? "skip" : "publish",
+            reasonCode: duplicate
+              ? "forecast_generation_already_active"
+              : "forecast_generation_published",
+            retryable: false
+          })
+        };
+      }
+    );
+    const dependenciesWithPublication: IngestQueueDependencies = {
+      runIngest: vi.fn() as unknown as IngestQueueDependencies["runIngest"],
+      materializeSpot,
+      sourceGenerationIsCurrent: vi.fn(async () => true)
+    };
+    const analysisSend = vi.fn(async () => {
+      throw new Error("secret Queue transport detail");
+    });
+    const env = narrativeTestEnv(undefined, analysisSend);
+    const message = buildForecastMaterializationMessages(summary())[0]!;
+
+    await expect(
+      processIngestQueueMessage(env, message, vi.fn(), dependenciesWithPublication)
+    ).resolves.toBeUndefined();
+    await expect(
+      processIngestQueueMessage(env, message, vi.fn(), dependenciesWithPublication)
+    ).resolves.toBeUndefined();
+
+    expect(analysisSend).toHaveBeenCalledOnce();
+    expect(error).toHaveBeenCalledOnce();
+    const failure = JSON.parse(String(error.mock.calls[0]![0]));
+    expect(failure).toEqual(
+      expect.objectContaining({
+        event: "surf_analysis_signal_dispatch_failed",
+        ingestId: message.ingestId,
+        spotId: message.spotId,
+        dispatchOutcome: "failed",
+        reasonCode: "analysis_signal_dispatch_failed",
+        errorName: "Error"
+      })
+    );
+    expect(JSON.stringify(failure)).not.toContain("secret Queue transport detail");
+    info.mockRestore();
+    error.mockRestore();
+  });
+
   it("compares child lineage with the latest indexed logical source generation", async () => {
     const dbFor = (latestGenerationAt: string | null) => ({
       prepare: () => ({
@@ -1224,6 +1615,36 @@ describe("forecast materialization queue orchestration", () => {
     await expect(
       sourceGenerationIsCurrent(dbFor("2026-08-03T01:05:00.000Z"), "2026-08-03T01:00:00.000Z")
     ).resolves.toBe(false);
+  });
+
+  it("processes only the versioned Analysis signal envelope in its own invocation", async () => {
+    const signal = vi.fn(async () => undefined);
+    const context = {
+      ingestId: "ingest-123",
+      generationId: `sha256:${"a".repeat(64)}:ingest:ingest-123`,
+      generatedAt: "2026-08-03T01:02:03.456Z",
+      materializedAt: "2026-08-03T01:03:00.000Z"
+    };
+    const message = buildSurfAnalysisSignalMessage(
+      NORCAL_SPOTS[0]!.id,
+      context,
+      "norcal"
+    );
+
+    await processIngestQueueMessage(testEnv(), message, signal);
+    expect(signal).toHaveBeenCalledWith(
+      expect.anything(),
+      NORCAL_SPOTS[0]!.id,
+      new Date(context.generatedAt),
+      context
+    );
+    await expect(
+      processIngestQueueMessage(
+        testEnv(),
+        { ...message, schemaVersion: 2 },
+        signal
+      )
+    ).rejects.toThrow("Analysis signal queue message is invalid");
   });
 
   it("rejects poison queue job types instead of turning them into scheduled ingests", async () => {
@@ -1260,11 +1681,11 @@ describe("forecast materialization queue orchestration", () => {
   );
 
   it("normalizes a legacy source message to one stable retry identity", async () => {
-    const runOptions: Array<{ ingestId?: string }> = [];
-    const runIngest: IngestQueueDependencies["runIngest"] = vi.fn(async (_env, options) => {
-      runOptions.push(options);
-      return summary();
+    const sentBatches: Array<Array<{ body: unknown }>> = [];
+    const sendBatch = vi.fn(async (messages: Iterable<{ body: unknown }>) => {
+      sentBatches.push([...messages]);
     });
+    const runIngest = vi.fn() as unknown as IngestQueueDependencies["runIngest"];
     const deps = dependencies(runIngest);
     const legacy = {
       kind: "scheduled-ingest",
@@ -1272,12 +1693,16 @@ describe("forecast materialization queue orchestration", () => {
       region: "norcal"
     };
 
-    await processIngestQueueMessage(testEnv(), legacy, vi.fn(async () => undefined), deps);
-    await processIngestQueueMessage(testEnv(), legacy, vi.fn(async () => undefined), deps);
+    await processIngestQueueMessage(testEnv(sendBatch), legacy, vi.fn(async () => undefined), deps);
+    await processIngestQueueMessage(testEnv(sendBatch), legacy, vi.fn(async () => undefined), deps);
 
-    expect(runOptions.map(({ ingestId }) => ingestId)).toEqual([
-      "legacy-20260803010203456",
-      "legacy-20260803010203456"
-    ]);
+    expect(runIngest).not.toHaveBeenCalled();
+    expect(sentBatches).toHaveLength(2);
+    expect(sentBatches[1]).toEqual(sentBatches[0]);
+    expect(
+      sentBatches.flatMap((batch) =>
+        batch.map(({ body }) => (body as SourceBatchQueueMessage).ingestId)
+      )
+    ).toEqual(Array(NORCAL_SOURCE_BATCHES.length * 2).fill("legacy-20260803010203456"));
   });
 });

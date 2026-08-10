@@ -5,18 +5,25 @@ import {
   NORCAL_SPOTS
 } from "@surf/forecast-core";
 import { ForecastIntervalSchema, SpotIdSchema, SpotsResponseSchema } from "@surf/contracts";
+import {
+  NARRATIVE_RESULT_MAX_BYTES,
+  NarrativeResultResponseSchema,
+  NarrativeResultSubmissionSchema,
+  assertNarrativeResultSize
+} from "@surf/narrative-contracts";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import type { ForecastBriefAgent } from "./agents";
+import {
+  acceptSurfAnalysisResult,
+  buildSurfAnalysisSnapshot,
+  buildSurfAnalysisResponse,
+  unavailableSurfAnalysisResponse
+} from "./analysis";
 import { bearerTokenMatches } from "./auth";
 import {
-  buildDisabledForecastBriefResponse,
-  buildForecastBriefResponse,
-  buildUnavailableForecastBriefResponse
-} from "./brief";
-import {
-  getActiveMaterializedForecastFactBundle,
+  getActiveMaterializedForecastFactBundlesForGeneration,
   getMaterializedForecastFactBundle,
   getMaterializedForecastJson
 } from "./forecast-read-model";
@@ -27,12 +34,22 @@ import {
 } from "./ingest";
 import {
   boundedPipelineErrorName,
+  dispatchSurfAnalysisSignal,
   logInlineIngestTerminalOutcomes,
   logSourceIngestTerminalOutcome,
   processIngestQueueMessage,
   signalInlineForecastBriefs,
   type ForecastBriefSignalContext
 } from "./ingest/queue";
+import {
+  acceptNarrativeTerminalResult,
+  enqueueSurfAnalysisBundles,
+  getNarrativeJob,
+  narrativeEnabled,
+  reconcileNarrativeEnqueues,
+  selectSurfAnalysisBundlesForSignal,
+  SURF_ANALYSIS_FUTURE_CADENCE_HOURS
+} from "./narrative";
 import { localDateForTime } from "./time";
 
 export type Env = Omit<
@@ -42,6 +59,9 @@ export type Env = Omit<
   | "SURF_USER_AGENT"
   | "FORECAST_BRIEF_AGENT"
   | "FORECAST_BRIEF_ENABLED"
+  | "NARRATIVE_ENABLED"
+  | "NARRATIVE_QUEUE"
+  | "NARRATIVE_RESULT_TOKEN"
   | "CF_VERSION_METADATA"
   | "GEMINI_API_KEY"
 > & {
@@ -53,11 +73,24 @@ export type Env = Omit<
   FORECAST_BRIEF_AGENT?: DurableObjectNamespace<ForecastBriefAgent>;
   FORECAST_BRIEF_ENABLED?: string;
   GEMINI_API_KEY?: string;
+  NARRATIVE_ENABLED?: string;
+  NARRATIVE_QUEUE?: Queue;
+  NARRATIVE_RESULT_TOKEN?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
 type AppContext = Context<{ Bindings: Env }>;
 const INGEST_RETRY_DELAYS_SECONDS = [15, 30, 60, 300] as const;
+
+function declaresSurfAnalysisSignal(value: unknown): boolean {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      (value as Record<string, unknown>).job === "analysis-signal"
+  );
+}
+
 const EXPECTED_WORKER_VERSION_HEADER = "X-Surf-Expected-Worker-Version";
 const WORKER_VERSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -82,14 +115,12 @@ app.use("/api/*", async (c, next) => {
 app.use("/api/*", cors());
 app.use("/api/*", async (c, next) => {
   await next();
+  if (/^\/api\/forecast\/[^/]+\/brief$/.test(new URL(c.req.url).pathname)) {
+    c.res.headers.set("Cache-Control", "no-store");
+    return;
+  }
   if (c.res.headers.has("Cache-Control")) return;
-  const isBrief = /^\/api\/forecast\/[^/]+\/brief$/.test(new URL(c.req.url).pathname);
-  c.res.headers.set(
-    "Cache-Control",
-    isBrief && c.res.status === 200
-      ? "public, max-age=60, stale-while-revalidate=300"
-      : "no-store"
-  );
+  c.res.headers.set("Cache-Control", "no-store");
 });
 
 app.get("/api/health", (c) =>
@@ -132,35 +163,28 @@ app.get("/api/forecast-readiness", async (c) => {
   }
 });
 
-function forecastBriefEnabled(env: Env): boolean {
-  return (
-    env.FORECAST_BRIEF_ENABLED?.trim().toLowerCase() === "true" &&
-    Boolean(env.GEMINI_API_KEY?.trim())
-  );
-}
-
-async function signalForecastBriefAgent(
+async function signalSurfAnalysis(
   env: Env,
   spotId: ForecastMaterializationQueueMessage["spotId"],
   _generatedAt: Date,
   context: ForecastBriefSignalContext
 ): Promise<void> {
-  const namespace = env.FORECAST_BRIEF_AGENT;
-  if (!namespace || !forecastBriefEnabled(env)) return;
+  const queue = env.NARRATIVE_QUEUE;
+  if (!queue || !narrativeEnabled(env)) return;
   const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
   if (!spot) return;
   try {
-    const localDate = localDateForTime(context.generatedAt, spot.timezone);
-    const active = await getActiveMaterializedForecastFactBundle(env.DB, spot.id, localDate);
-    if (!active) {
-      throw new Error(`Materialized forecast facts are unavailable for ${spot.id} on ${localDate}`);
-    }
-    if (active.generationId !== context.generationId) {
+    const active = await getActiveMaterializedForecastFactBundlesForGeneration(
+      env.DB,
+      spot.id,
+      context.generationId
+    );
+    if (active.length === 0) {
       console.info(
         JSON.stringify({
-          event: "forecast_brief_signal_superseded",
-          message: "forecast brief signal superseded before Agent RPC",
-          phase: "brief_signal",
+          event: "surf_analysis_signal_superseded",
+          message: "Analysis signal superseded before Queue publication",
+          phase: "analysis_signal",
           ingestId: context.ingestId,
           spotId,
           generationId: context.generationId,
@@ -173,22 +197,114 @@ async function signalForecastBriefAgent(
       );
       return;
     }
-    await namespace.getByName(spot.id).signal(active.bundle);
+    const selected = selectSurfAnalysisBundlesForSignal({
+      bundles: active.map((candidate) => candidate.bundle),
+      generatedAt: context.generatedAt,
+      timeZone: spot.timezone
+    });
+    if (selected.deferredLocalDates.length > 0) {
+      console.info(
+        JSON.stringify({
+          event: "surf_analysis_future_dates_deferred",
+          message: "Future Analysis refreshes follow the spot-local cadence",
+          phase: "analysis_signal",
+          ingestId: context.ingestId,
+          spotId,
+          generationId: context.generationId,
+          localDates: selected.deferredLocalDates,
+          cadenceHours: SURF_ANALYSIS_FUTURE_CADENCE_HOURS,
+          reasonCode: "analysis_future_cadence_deferred"
+        })
+      );
+    }
+    const outcomes = await enqueueSurfAnalysisBundles({
+      db: env.DB,
+      queue,
+      bundles: selected.bundles
+    });
+    let failed = 0;
+    for (const result of outcomes) {
+      if (result.status === "unavailable") {
+        console.info(
+          JSON.stringify({
+            event: "surf_analysis_enqueue_unavailable",
+            message: "Analysis is unavailable because no planning window was recommended",
+            phase: "analysis_signal",
+            ingestId: context.ingestId,
+            spotId,
+            localDate: result.localDate,
+            generationId: context.generationId,
+            outcome: "unavailable",
+            reasonCode: result.reasonCode
+          })
+        );
+      } else if (result.status !== "failed") {
+        console.info(
+          JSON.stringify({
+            event: "surf_analysis_enqueue_completed",
+            message: "Analysis enqueue completed after forecast publication",
+            phase: "analysis_signal",
+            ingestId: context.ingestId,
+            spotId,
+            localDate: result.localDate,
+            generationId: context.generationId,
+            jobId: result.jobId,
+            outcome: result.status,
+            reasonCode:
+              result.status === "enqueued"
+                ? "analysis_job_enqueued"
+                : "analysis_job_duplicate"
+          })
+        );
+      } else {
+        failed += 1;
+        console.error(
+          JSON.stringify({
+            event: "surf_analysis_signal_failed",
+            message: "One Analysis date failed after materialization publication",
+            phase: "analysis_signal",
+            ingestId: context.ingestId,
+            spotId,
+            localDate: result.localDate,
+            generationId: context.generationId,
+            reasonCode: "analysis_date_signal_failed",
+            errorName: boundedPipelineErrorName(result.error)
+          })
+        );
+      }
+    }
+    if (failed > 0) {
+      console.warn(
+        JSON.stringify({
+          event: "surf_analysis_signal_deferred",
+          message: "Analysis signaling deferred to ledger reconciliation or the next forecast generation",
+          phase: "analysis_signal",
+          ingestId: context.ingestId,
+          spotId,
+          generationId: context.generationId,
+          failedDates: failed,
+          reasonCode: "analysis_signal_advisory_failure"
+        })
+      );
+    }
   } catch (error) {
     console.error(
       JSON.stringify({
-        event: "forecast_brief_signal_failed",
-        message: "forecast brief signaling failed after materialization publication",
-        phase: "brief_signal",
+        event: "surf_analysis_signal_failed",
+        message: "Analysis signaling failed after materialization publication",
+        phase: "analysis_signal",
         ingestId: context.ingestId,
         spotId,
         generationId: context.generationId,
         generatedAt: context.generatedAt,
         materializedAt: context.materializedAt,
-        reasonCode: "brief_signal_failed",
+        reasonCode: "analysis_signal_failed",
         errorName: boundedPipelineErrorName(error)
       })
     );
+    // This advisory signal is ACK-only. Forecast/source jobs retain the
+    // ingest Queue's configured retry policy; Analysis recovery comes from
+    // the hourly ledger reconciler or the next exact generation signal.
   }
 }
 
@@ -210,40 +326,40 @@ app.get(
     const { spotId } = c.req.valid("param");
     const { date } = c.req.valid("query");
     const now = new Date();
-    let spotName = "This spot";
     let localDate = date ?? now.toISOString().slice(0, 10);
     try {
-      // This GET is intentionally read-only. Agent signaling and model calls
+      // This GET is intentionally read-only. Queue signaling and model calls
       // happen only after ingest; a page request may read a published revision
       // but must never trigger generation.
       const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
       if (!spot) throw new Error("Validated spot metadata is unavailable");
-      spotName = spot.name;
       localDate = date ?? localDateForTime(now.toISOString(), spot.timezone);
       const bundle = await getMaterializedForecastFactBundle(c.env.DB, spotId, localDate);
       if (!bundle) {
         console.warn(
           JSON.stringify({
-            event: "forecast_brief_fallback_used",
-            message: "forecast brief response used the safe summary",
+            event: "surf_analysis_unavailable",
+            message: "Analysis is unavailable for the requested date",
             spotId,
             localDate,
             reasonCode: "requested_date_unavailable"
           })
         );
         return c.json(
-          buildUnavailableForecastBriefResponse({
-            spotId,
-            spotName,
-            localDate,
-            generatedAt: now.toISOString()
-          })
+          unavailableSurfAnalysisResponse(),
+          200,
+          { "Cache-Control": "no-store" }
         );
       }
-      if (!forecastBriefEnabled(c.env)) {
-        return c.json(buildDisabledForecastBriefResponse(bundle));
-      }
-      return c.json(await buildForecastBriefResponse(c.env.DB, bundle, now));
+      const response = await buildSurfAnalysisResponse(
+        c.env.DB,
+        bundle,
+        now,
+        narrativeEnabled(c.env)
+      );
+      return c.json(response, 200, {
+        "Cache-Control": "no-store"
+      });
     } catch (error) {
       const reason =
         error instanceof Error && error.message.startsWith("Forecast has no windows for")
@@ -251,8 +367,8 @@ app.get(
           : "brief_assembly_failed";
       console.warn(
         JSON.stringify({
-          event: "forecast_brief_fallback_used",
-          message: "forecast brief response used the safe summary",
+          event: "surf_analysis_unavailable",
+          message: "Analysis assembly failed closed",
           spotId,
           localDate,
           reasonCode: reason,
@@ -262,16 +378,142 @@ app.get(
         })
       );
       return c.json(
-        buildUnavailableForecastBriefResponse({
-          spotId,
-          spotName,
-          localDate,
-          generatedAt: now.toISOString()
-        })
+        unavailableSurfAnalysisResponse(),
+        200,
+        { "Cache-Control": "no-store" }
       );
     }
   }
 );
+
+async function requireNarrativeResultAuthorization(c: AppContext) {
+  if (
+    await bearerTokenMatches(
+      c.req.header("Authorization"),
+      c.env.NARRATIVE_RESULT_TOKEN
+    )
+  ) {
+    return null;
+  }
+  return c.json({ error: "Unauthorized" }, 401, {
+    "WWW-Authenticate": "Bearer",
+    "Cache-Control": "no-store"
+  });
+}
+
+class NarrativeResultTooLargeError extends Error {}
+
+async function readBoundedNarrativeResult(request: Request): Promise<unknown> {
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength !== null) {
+    const declaredBytes = Number(contentLength);
+    if (Number.isFinite(declaredBytes) && declaredBytes > NARRATIVE_RESULT_MAX_BYTES) {
+      throw new NarrativeResultTooLargeError("Narrative result exceeds the request limit");
+    }
+  }
+  if (!request.body) throw new SyntaxError("Narrative result body is missing");
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > NARRATIVE_RESULT_MAX_BYTES) {
+      await reader.cancel();
+      throw new NarrativeResultTooLargeError("Narrative result exceeds the request limit");
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(body));
+}
+
+app.post("/api/internal/narratives/results", async (c) => {
+  const authorizationFailure = await requireNarrativeResultAuthorization(c);
+  if (authorizationFailure) return authorizationFailure;
+
+  let payload: unknown;
+  try {
+    payload = await readBoundedNarrativeResult(c.req.raw);
+  } catch (error) {
+    if (error instanceof NarrativeResultTooLargeError) {
+      return c.json({ error: "narrative_result_too_large" }, 413);
+    }
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  const parsed = NarrativeResultSubmissionSchema.safeParse(payload);
+  if (!parsed.success) return c.json({ error: "invalid_narrative_result" }, 400);
+  const submission = assertNarrativeResultSize(parsed.data);
+
+  try {
+    if ("terminal" in submission) {
+      const result = NarrativeResultResponseSchema.parse(
+        await acceptNarrativeTerminalResult({ db: c.env.DB, submission })
+      );
+      console.info(
+        JSON.stringify({
+          event: "narrative_result_completed",
+          message: "Narrative runner terminal outcome was recorded",
+          jobId: result.jobId,
+          disposition: result.disposition,
+          reasonCode: `narrative_result_${result.disposition}`
+        })
+      );
+      return c.json(result, 200, { "Cache-Control": "no-store" });
+    }
+    const stored = await getNarrativeJob(c.env.DB, submission.jobId);
+    let factFingerprint: string | null = null;
+    if (stored?.job.domain === "surf") {
+      const current = await getMaterializedForecastFactBundle(
+        c.env.DB,
+        stored.job.entity.id,
+        stored.job.entity.localDate
+      );
+      factFingerprint =
+        current && current.input.recommendationWindowIds.length > 0
+          ? (await buildSurfAnalysisSnapshot(current)).factFingerprint
+          : null;
+    }
+    const result = NarrativeResultResponseSchema.parse(
+      await acceptSurfAnalysisResult({
+        db: c.env.DB,
+        submission,
+        currentFactFingerprint: factFingerprint
+      })
+    );
+    console.info(
+      JSON.stringify({
+        event: "narrative_result_completed",
+        message: "Narrative result reached a terminal cloud disposition",
+        jobId: result.jobId,
+        disposition: result.disposition,
+        reasonCode: `narrative_result_${result.disposition}`
+      })
+    );
+    return c.json(result, 200, { "Cache-Control": "no-store" });
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "narrative_result_failed",
+        message: "Narrative result processing failed",
+        jobId: submission.jobId,
+        reasonCode: "narrative_result_storage_failed",
+        errorName: boundedPipelineErrorName(error)
+      })
+    );
+    return c.json(
+      { error: "narrative_result_temporarily_unavailable", retryable: true },
+      503,
+      { "Retry-After": "30", "Cache-Control": "no-store" }
+    );
+  }
+});
 
 app.get(
   "/api/forecast/:spotId",
@@ -471,7 +713,7 @@ app.post("/api/ingest/once", async (c) => {
     throw error;
   }
   const briefSignals = logInlineIngestTerminalOutcomes(summary);
-  await signalInlineForecastBriefs(c.env, briefSignals, signalForecastBriefAgent);
+  await signalInlineForecastBriefs(c.env, briefSignals, dispatchSurfAnalysisSignal);
 
   return c.json(summary);
 });
@@ -482,6 +724,24 @@ export default {
   },
   async scheduled(_controller, env) {
     const requestedAt = new Date().toISOString();
+    if (narrativeEnabled(env) && env.NARRATIVE_QUEUE) {
+      try {
+        await reconcileNarrativeEnqueues({
+          db: env.DB,
+          queue: env.NARRATIVE_QUEUE,
+          now: new Date(requestedAt)
+        });
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            event: "narrative_reconciliation_failed",
+            message: "Narrative outbox reconciliation failed without blocking ingest scheduling",
+            reasonCode: "narrative_reconciliation_failed",
+            errorName: boundedPipelineErrorName(error)
+          })
+        );
+      }
+    }
     await env.INGEST_QUEUE.send({
       job: "source-ingest",
       kind: "scheduled-ingest",
@@ -494,9 +754,26 @@ export default {
   async queue(batch, env) {
     for (const message of batch.messages) {
       try {
-        await processIngestQueueMessage(env, message.body, signalForecastBriefAgent);
+        await processIngestQueueMessage(env, message.body, signalSurfAnalysis);
         message.ack();
       } catch (error) {
+        if (declaresSurfAnalysisSignal(message.body)) {
+          // Analysis signals are advisory and explicitly excluded from the
+          // source Queue retry/DLQ budget. This also ACKs version-skewed or
+          // malformed signal envelopes at the raw boundary.
+          console.error(
+            JSON.stringify({
+              event: "surf_analysis_signal_discarded",
+              message: "Analysis signal failed and was acknowledged without redelivery",
+              messageId: message.id,
+              attempts: message.attempts,
+              reasonCode: "analysis_signal_invalid_or_failed",
+              errorName: boundedPipelineErrorName(error)
+            })
+          );
+          message.ack();
+          continue;
+        }
         console.error(
           JSON.stringify({
             event: "ingest_queue_retry_scheduled",

@@ -64,7 +64,7 @@ function successfulFetcher(text = asciiFixture()): SourceFetch {
 }
 
 describe("CDIP MOP forecast adapter", () => {
-  it("locks the five verified public point mappings and leaves Bolinas unmapped", () => {
+  it("locks direct public point mappings, explicit shared proxies, and unmapped Bolinas", () => {
     expect(
       Object.fromEntries(
         NORCAL_SPOTS.map((spot) => [
@@ -85,7 +85,12 @@ describe("CDIP MOP forecast adapter", () => {
       "obsf-south": { point: "SF015", depth: 10.01, scale: 1, relationship: "direct_nearshore_point" },
       "linda-mar": { point: "SM371", depth: 15.01, scale: 0.6, relationship: "outside_cove_approach_proxy" },
       stinson: { point: "MA122", depth: 15, scale: 1, relationship: "direct_nearshore_point" },
-      bolinas: null
+      bolinas: null,
+      "rodeo-beach": { point: "MA048", depth: 15, scale: 1, relationship: "direct_nearshore_point" },
+      "steamer-lane": { point: "SC149", depth: 15, scale: 1, relationship: "direct_nearshore_point" },
+      "pleasure-point": { point: "SC117", depth: 15, scale: 1, relationship: "direct_nearshore_point" },
+      cowells: { point: "SC149", depth: 15, scale: 0.5, relationship: "outside_cove_approach_proxy" },
+      jacks: { point: "SC117", depth: 15, scale: 1, relationship: "outside_cove_approach_proxy" }
     });
     expect(getSpotProfile("bolinas").sourceMap.cdipMop.coverageStatus).toBe("absent");
   });
@@ -172,7 +177,7 @@ describe("CDIP MOP forecast adapter", () => {
       pointRelationship: "outside_cove_approach_proxy"
     });
     expect(outcome.metadata.unavailableSpotIds).toEqual(["bolinas"]);
-    expect(outcome.caveats).toContainEqual(expect.objectContaining({ code: "cdip_mop_linda_mar_cove_scale" }));
+    expect(outcome.caveats).toContainEqual(expect.objectContaining({ code: "cdip_mop_approach_proxy_scale" }));
     expect(outcome.caveats).toContainEqual(expect.objectContaining({ code: "cdip_mop_bolinas_unmapped" }));
   });
 
@@ -192,6 +197,44 @@ describe("CDIP MOP forecast adapter", () => {
       stinson: "2026-07-10T00:00:00.000Z"
     });
     expect(outcome.rows.map((row) => row.leadHour)).toEqual([3, 6]);
+  });
+
+  it.each([
+    ["normal", "2026-07-01T07:17:00.000Z", "2026-07-06T07:00:00.000Z"],
+    ["spring-forward", "2026-03-08T08:17:00.000Z", "2026-03-13T07:00:00.000Z"],
+    ["fall-back", "2026-11-01T07:17:00.000Z", "2026-11-06T08:00:00.000Z"]
+  ])("keeps the CDIP %s source window through the exact fifth local midnight", async (
+    _label,
+    nowAt,
+    horizonEndAt
+  ) => {
+    const endMs = Date.parse(horizonEndAt);
+    const times = [endMs - 3 * 60 * 60 * 1000, endMs]
+      .map((value) => String(Math.floor(value / 1000)))
+      .join(", ");
+    const cycle = nowAt.replace(/[-:TZ.]/g, "").slice(0, 12);
+    const fetcher: SourceFetch = async (input, init) => {
+      if (init?.method === "HEAD") {
+        return new Response(null, {
+          headers: { "Last-Modified": new Date(nowAt).toUTCString() }
+        });
+      }
+      if (String(input).endsWith(".das")) return new Response(dasFixture(cycle));
+      return new Response(asciiFixture({ waveTime: times }));
+    };
+    const outcome = await fetchCdipMopForecastsForSpots([getSpotProfile("obsf-north")], {
+      fetcher,
+      now: new Date(nowAt),
+      horizonHours: Math.ceil((endMs - Date.parse(nowAt)) / (60 * 60 * 1000)),
+      horizonEndAt
+    });
+
+    expect(outcome.status).toBe("success");
+    expect(outcome.metadata.windowEnd).toBe(horizonEndAt);
+    expect(outcome.rows.map(({ forecastAt }) => forecastAt)).toEqual([
+      new Date(endMs - 3 * 60 * 60 * 1000).toISOString(),
+      horizonEndAt
+    ]);
   });
 
   it("fails closed when DAS history omits or ambiguously repeats the runtime cycle", async () => {

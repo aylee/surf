@@ -7,6 +7,8 @@ Use the shortest document that answers the question.
 - [Self-hosting](self-hosting.md) — clone, configure, deploy, and verify.
 - [Runtime operations](runtime-operations.md) — ingest, health checks, backup,
   update, retention, and rollback.
+- [Local narrative runner](narrative-runner.md) — oMLX pull-consumer setup,
+  status, launchd template, recovery, and MacBook-to-Studio migration.
 
 ## Understand or change the system
 

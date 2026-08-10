@@ -15,7 +15,7 @@ export const SourceCapabilitySchema = z.enum([
 export type SourceCapability = z.infer<typeof SourceCapabilitySchema>;
 
 // Spot identifiers are part of the public data contract, not a closed list of
-// the reference deployment's six spots. Deployments validate membership
+// the reference deployment's curated spots. Deployments validate membership
 // against their configured registry at the API boundary.
 export const SpotIdSchema = z
   .string()
@@ -38,6 +38,7 @@ export const RangeSchema = z.object({
 export const SpotProfileSchema = z.object({
   id: SpotIdSchema,
   name: z.string(),
+  aliases: z.array(z.string().min(1).max(80)).max(20).default([]),
   region: z.literal("norcal"),
   lat: z.number(),
   lon: z.number(),
@@ -251,6 +252,32 @@ export const TideEventSchema = z.object({
 
 export type TideEvent = z.infer<typeof TideEventSchema>;
 
+const ForecastHazardTimestampSchema = z.string().datetime({ offset: true });
+
+export const ForecastHazardSchema = z
+  .object({
+    headline: z.string().min(1).max(500),
+    startsAt: ForecastHazardTimestampSchema.nullable(),
+    endsAt: ForecastHazardTimestampSchema.nullable(),
+    sourceId: z.string().min(1).max(160),
+    sourceRunId: z.string().nullable()
+  })
+  .superRefine((hazard, context) => {
+    if (
+      hazard.startsAt !== null &&
+      hazard.endsAt !== null &&
+      Date.parse(hazard.endsAt) <= Date.parse(hazard.startsAt)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["endsAt"],
+        message: "Forecast hazard end must follow its start"
+      });
+    }
+  });
+
+export type ForecastHazard = z.infer<typeof ForecastHazardSchema>;
+
 export const SunPhasesSchema = z.object({
   localDate: z.string(),
   firstLight: z.string(),
@@ -385,18 +412,103 @@ export const ScoredForecastWindowSchema = SurfScoreSchema.extend({
 
 export type ScoredForecastWindow = z.infer<typeof ScoredForecastWindowSchema>;
 
-export const ForecastResponseSchema = z.object({
-  spot: SpotProfileSchema,
-  windows: z.array(ScoredForecastWindowSchema),
-  interval: ForecastIntervalSchema.optional(),
-  generatedAt: z.string(),
-  sourceNote: z.string(),
-  observation: WaveObservationSummarySchema.nullable().optional(),
-  observations: z.array(WaveObservationSummarySchema).optional(),
-  tideEvents: z.array(TideEventSchema).optional(),
-  sunPhases: z.array(SunPhasesSchema).optional(),
-  issueDelta: ForecastIssueDeltaSchema.nullable().optional()
-});
+const ForecastRecommendationTimestampSchema = z.string().datetime({ offset: true });
+
+export const ForecastRecommendationWindowSchema = z
+  .object({
+    localDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    representative: ScoredForecastWindowSchema.extend({
+      forecastAt: ForecastRecommendationTimestampSchema
+    }),
+    constituentWindowIds: z.array(ForecastRecommendationTimestampSchema).min(1).max(24),
+    startAt: ForecastRecommendationTimestampSchema,
+    endAt: ForecastRecommendationTimestampSchema
+  })
+  .superRefine((recommendation, context) => {
+    const uniqueIds = new Set(recommendation.constituentWindowIds);
+    if (uniqueIds.size !== recommendation.constituentWindowIds.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["constituentWindowIds"],
+        message: "Recommendation constituent window IDs must be unique"
+      });
+    }
+    if (!uniqueIds.has(recommendation.representative.forecastAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["constituentWindowIds"],
+        message: "Recommendation constituents must include the representative window"
+      });
+    }
+    if (Date.parse(recommendation.endAt) <= Date.parse(recommendation.startAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["endAt"],
+        message: "Recommendation end must follow its start"
+      });
+    }
+  });
+
+export type ForecastRecommendationWindow = z.infer<
+  typeof ForecastRecommendationWindowSchema
+>;
+
+function localDateInTimeZone(value: string, timeZone: string): string | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(new Date(value));
+    const part = (type: Intl.DateTimeFormatPartTypes) =>
+      parts.find((candidate) => candidate.type === type)?.value;
+    const year = part("year");
+    const month = part("month");
+    const day = part("day");
+    return year && month && day ? `${year}-${month}-${day}` : null;
+  } catch {
+    return null;
+  }
+}
+
+export const ForecastResponseSchema = z
+  .object({
+    spot: SpotProfileSchema,
+    windows: z.array(ScoredForecastWindowSchema),
+    interval: ForecastIntervalSchema.optional(),
+    generatedAt: z.string(),
+    sourceNote: z.string(),
+    observation: WaveObservationSummarySchema.nullable().optional(),
+    observations: z.array(WaveObservationSummarySchema).optional(),
+    tideEvents: z.array(TideEventSchema).optional(),
+    hazards: z.array(ForecastHazardSchema).max(50).optional(),
+    sunPhases: z.array(SunPhasesSchema).optional(),
+    recommendations: z.array(ForecastRecommendationWindowSchema).max(10).optional(),
+    issueDelta: ForecastIssueDeltaSchema.nullable().optional()
+  })
+  .superRefine((response, context) => {
+    response.recommendations?.forEach((recommendation, recommendationIndex) => {
+      const timestamps = [
+        recommendation.representative.forecastAt,
+        recommendation.startAt,
+        recommendation.endAt,
+        ...recommendation.constituentWindowIds
+      ];
+      if (
+        timestamps.some(
+          (timestamp) =>
+            localDateInTimeZone(timestamp, response.spot.timezone) !== recommendation.localDate
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["recommendations", recommendationIndex, "localDate"],
+          message: "Recommendation timestamps must match its local date in the spot timezone"
+        });
+      }
+    });
+  });
 
 export type ForecastResponse = z.infer<typeof ForecastResponseSchema>;
 
@@ -452,3 +564,55 @@ export const ForecastBriefResponseSchema = z.object({
 });
 
 export type ForecastBriefResponse = z.infer<typeof ForecastBriefResponseSchema>;
+
+export const SurfAnalysisReportV3Schema = z
+  .object({
+    schemaVersion: z.literal(3),
+    spotId: SpotIdSchema,
+    localDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    revisionId: z.string().min(1).max(160),
+    headline: z.string().min(1).max(180),
+    paragraphs: z.array(z.string().min(1).max(1_200)).min(2).max(3),
+    updatedAt: z.string().datetime({ offset: true })
+  })
+  .strict();
+
+export type SurfAnalysisReportV3 = z.infer<typeof SurfAnalysisReportV3Schema>;
+
+export const SurfAnalysisPublishedResponseSchema = z
+  .object({
+    schemaVersion: z.literal(3),
+    status: z.literal("published"),
+    report: SurfAnalysisReportV3Schema,
+    availableRevisions: z.number().int().nonnegative()
+  })
+  .strict();
+
+export const SurfAnalysisPendingResponseSchema = z
+  .object({
+    schemaVersion: z.literal(3),
+    status: z.literal("pending"),
+    report: z.null(),
+    message: z.literal("Analysis is being prepared."),
+    availableRevisions: z.number().int().nonnegative()
+  })
+  .strict();
+
+export const SurfAnalysisUnavailableResponseSchema = z
+  .object({
+    schemaVersion: z.literal(3),
+    status: z.literal("unavailable"),
+    report: z.null(),
+    message: z.literal("Analysis unavailable"),
+    detail: z.literal("No validated report is available for this forecast."),
+    availableRevisions: z.number().int().nonnegative()
+  })
+  .strict();
+
+export const SurfAnalysisResponseV3Schema = z.discriminatedUnion("status", [
+  SurfAnalysisPublishedResponseSchema,
+  SurfAnalysisPendingResponseSchema,
+  SurfAnalysisUnavailableResponseSchema
+]);
+
+export type SurfAnalysisResponseV3 = z.infer<typeof SurfAnalysisResponseV3Schema>;

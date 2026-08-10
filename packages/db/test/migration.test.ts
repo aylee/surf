@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import {
+  getOperationalObservedWaveSources,
+  NORCAL_SPOTS
+} from "@surf/forecast-core";
+import { NORCAL_SEED_CONFIG } from "../src/norcal-seed-config";
 import { generateNorcalSeedSql, validateNorcalSeedConfig } from "../src/norcal-seed";
 
 const migrationSql = readFileSync(new URL("../migrations/0000_initial.sql", import.meta.url), "utf8");
@@ -16,7 +21,11 @@ const readModelMigrationSql = readFileSync(
   new URL("../migrations/0003_forecast_read_models.sql", import.meta.url),
   "utf8"
 );
-const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}\n${readModelMigrationSql}`;
+const narrativeMigrationSql = readFileSync(
+  new URL("../migrations/0004_narrative_jobs.sql", import.meta.url),
+  "utf8"
+);
+const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}\n${readModelMigrationSql}\n${narrativeMigrationSql}`;
 const seedSql = readFileSync(new URL("../seeds/0000_v1_norcal.sql", import.meta.url), "utf8");
 
 const appliedMigrationHashes = {
@@ -111,6 +120,23 @@ describe("D1 migration", () => {
       "material_fingerprint text not null",
       "schema_version integer not null",
       "fact_bundle_json text not null"
+    ],
+    narrative_jobs: [
+      "job_id text primary key",
+      "domain text not null",
+      "entity_id text not null",
+      "generation_fingerprint text not null unique",
+      "deadline_at text not null",
+      "job_json text not null",
+      "validation_snapshot_json text not null"
+    ],
+    narrative_revisions: [
+      "revision_id text primary key",
+      "job_id text not null unique",
+      "revision_fingerprint text not null unique",
+      "model_id text not null",
+      "report_json text not null",
+      "validation_json text not null"
     ]
   };
 
@@ -195,37 +221,45 @@ describe("D1 migration", () => {
     expect(normalizedReadModel).toContain("primary key (spot_id, local_date)");
     expect(normalizedReadModel).toContain("check (interval in ('1h', '3h'))");
   });
+
+  it("adds the narrative ledger and revision history without altering v2 storage", () => {
+    const normalizedNarrative = narrativeMigrationSql.replace(/\s+/g, " ").toLowerCase();
+
+    expect(normalizedNarrative).not.toContain("alter table");
+    expect(normalizedNarrative).not.toContain("drop table");
+    expect(normalizedNarrative).not.toContain("forecast_brief_revisions");
+    expect(normalizedNarrative).toContain("generation_fingerprint text not null unique");
+    expect(normalizedNarrative).toContain("job_id text not null unique");
+    expect(normalizedNarrative).toContain("foreign key (job_id) references narrative_jobs(job_id)");
+    expect(normalizedNarrative).toContain(
+      "narrative_jobs_retention_idx on narrative_jobs (updated_at, local_date, status, deadline_at)"
+    );
+    expect(normalizedNarrative).toContain(
+      "narrative_revisions_retention_idx on narrative_revisions (published_at, local_date)"
+    );
+  });
 });
 
-describe("v1 seed SQL", () => {
+describe("NorCal reference seed SQL", () => {
   it("is generated deterministically from the validated reference config", () => {
     expect(() => validateNorcalSeedConfig()).not.toThrow();
     expect(seedSql).toBe(generateNorcalSeedSql());
   });
 
-  it("seeds all v1 spots and public source records", () => {
-    const spotIds = ["obsf-north", "obsf-central", "obsf-south", "linda-mar", "stinson", "bolinas"];
-    const sourceIds = [
-      "cdip:mop-forecast",
-      "ndbc:realtime2-standard-meteorological",
-      "ndbc-46237",
-      "ndbc-46026",
-      "ndbc-46013",
-      "ndbc-46012",
-      "coops-9414290",
-      "coops-9414131",
-      "coops-9414958",
-      "coops:tide-predictions",
-      "nws:mtr-grid-wave",
-      "nws:point-forecast-alerts"
-    ];
-
-    for (const spotId of spotIds) {
+  it("seeds every configured spot and public source record", () => {
+    for (const spotId of NORCAL_SPOTS.map((spot) => spot.id)) {
       expect(seedSql).toContain(`'${spotId}'`);
     }
 
-    for (const sourceId of sourceIds) {
+    for (const sourceId of NORCAL_SEED_CONFIG.sources.map((source) => source.id)) {
       expect(seedSql).toContain(`'${sourceId}'`);
+    }
+  });
+
+  it("keeps generated spot aliases synchronized with the shared catalog", () => {
+    for (const spot of NORCAL_SPOTS) {
+      const escapedAliasJson = `"aliases":${JSON.stringify(spot.aliases)}`.replaceAll("'", "''");
+      expect(seedSql).toContain(escapedAliasJson);
     }
   });
 
@@ -236,10 +270,18 @@ describe("v1 seed SQL", () => {
   });
 
   it("derives adapter station metadata and retires superseded generated sources", () => {
-    expect(seedSql).toContain(
-      '"stations":["46237","46026","46013","46012"]'
-    );
-    expect(seedSql).toContain('"stations":["9414290","9414131","9414958"]');
+    const operationalNdbcStationIds = [
+      ...new Set(
+        NORCAL_SPOTS.flatMap((spot) =>
+          getOperationalObservedWaveSources(spot).map((source) => source.stationId)
+        )
+      )
+    ];
+    const runtimeTideStationIds = [
+      ...new Set(NORCAL_SPOTS.map((spot) => spot.sourceMap.coopsTide.stationId))
+    ];
+    expect(seedSql).toContain(`"stations":${JSON.stringify(operationalNdbcStationIds)}`);
+    expect(seedSql).toContain(`"stations":${JSON.stringify(runtimeTideStationIds)}`);
     expect(seedSql).toContain(
       "update sources set active = 0\nwhere id in ('noaa-gfswave-norcal', 'cdip-mop-norcal-unmapped', 'nws-grid-norcal', 'nws-alerts-norcal');"
     );

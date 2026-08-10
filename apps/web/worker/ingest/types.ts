@@ -13,6 +13,18 @@ export type SourceIngestQueueMessage = {
   region: string;
 };
 
+export type SourceBatchQueueMessage = {
+  job: "source-batch";
+  schemaVersion: 1;
+  kind: "manual-ingest" | "scheduled-ingest";
+  ingestId: string;
+  batchKey: string;
+  spotIds: SpotId[];
+  requestedAt: string;
+  forecastGeneratedAt: string;
+  region: string;
+};
+
 export type ForecastMaterializationQueueMessage = {
   job: "forecast-materialization";
   ingestId: string;
@@ -24,13 +36,34 @@ export type ForecastMaterializationQueueMessage = {
   captureHistory: boolean;
 };
 
+export const SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION = 1 as const;
+// Analysis is advisory to deterministic forecast publication. This signal is
+// deliberately ACK-only: ledger reconciliation and the next exact generation
+// recover delivery without spending the source-ingest retry/DLQ budget.
+export const SURF_ANALYSIS_SIGNAL_MAX_QUEUE_RETRIES = 0 as const;
+
+export type SurfAnalysisSignalQueueMessage = {
+  job: "analysis-signal";
+  schemaVersion: typeof SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION;
+  domain: "surf";
+  ingestId: string;
+  spotId: SpotId;
+  generationId: string;
+  generatedAt: string;
+  materializedAt: string;
+  region: string;
+};
+
 export type IngestQueueMessage =
   | SourceIngestQueueMessage
-  | ForecastMaterializationQueueMessage;
+  | SourceBatchQueueMessage
+  | ForecastMaterializationQueueMessage
+  | SurfAnalysisSignalQueueMessage;
 
 export type SourceRunRecord = {
   id: string;
   sourceId: string;
+  startedAt: string;
   status: AdapterStatus;
   recorded: boolean;
   rowCount: number;

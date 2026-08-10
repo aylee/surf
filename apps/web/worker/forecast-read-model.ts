@@ -40,6 +40,12 @@ type ForecastFactBundleRow = {
   fact_bundle_json: string;
 };
 
+type ActiveForecastGenerationRow = {
+  interval: ForecastInterval;
+  generation_id: string;
+  generated_at: string;
+};
+
 export type MaterializedForecastJson = {
   generationId: string;
   ingestId: string | null;
@@ -73,6 +79,7 @@ export type ForecastReadModelPersistenceResult = {
 // inline orchestration own the single canonical log line for each interval.
 export type ForecastMaterializationReasonCode =
   | "forecast_generation_published"
+  | "forecast_generation_already_active"
   | "newer_generation_active"
   | "unsynchronized_inputs"
   | "no_scored_windows"
@@ -99,6 +106,24 @@ export type ForecastMaterializationOutcome = {
   reasonCode: ForecastMaterializationReasonCode;
   retryable: boolean;
 };
+
+export function forecastGenerationBecameActive(
+  outcomes: readonly ForecastMaterializationOutcome[]
+): boolean {
+  const generationIds = new Set(
+    outcomes.flatMap(({ generationId }) => (generationId ? [generationId] : []))
+  );
+  return (
+    outcomes.length === FORECAST_INTERVALS.length &&
+    outcomes.some(({ outcome }) => outcome === "publish") &&
+    outcomes.every(
+      ({ outcome, reasonCode }) =>
+        outcome === "publish" ||
+        (outcome === "skip" && reasonCode === "forecast_generation_already_active")
+    ) &&
+    generationIds.size === 1
+  );
+}
 
 function validIso(value: string): boolean {
   return Number.isFinite(new Date(value).getTime());
@@ -213,6 +238,36 @@ export async function getMaterializedForecastFactBundle(
   return (await getActiveMaterializedForecastFactBundle(db, spotId, localDate))?.bundle ?? null;
 }
 
+export async function getActiveMaterializedForecastFactBundlesForGeneration(
+  db: D1Database,
+  spotId: SpotId,
+  generationId: string
+): Promise<ActiveMaterializedForecastFactBundle[]> {
+  const result = await db
+    .prepare(
+      `select bundle.generation_id, bundle.schema_version, bundle.fact_bundle_json
+       from forecast_fact_bundles as bundle
+       join forecast_read_models as model
+         on model.spot_id = bundle.spot_id
+        and model.interval = '3h'
+        and model.generation_id = bundle.generation_id
+       where bundle.spot_id = ? and bundle.generation_id = ?
+       order by bundle.local_date asc`
+    )
+    .bind(spotId, generationId)
+    .all<ForecastFactBundleRow>();
+  return (result.results ?? []).map((row) => {
+    if (row.schema_version !== FORECAST_READ_MODEL_SCHEMA_VERSION || !row.generation_id) {
+      throw new Error("Stored forecast fact bundle metadata is invalid");
+    }
+    const bundle = ForecastFactBundleSchema.parse(JSON.parse(row.fact_bundle_json));
+    if (bundle.input.spotId !== spotId || row.generation_id !== generationId) {
+      throw new Error("Stored forecast fact bundle identity does not match its generation");
+    }
+    return { generationId: row.generation_id, bundle };
+  });
+}
+
 async function executeMaterialization(
   db: D1Database,
   statements: D1PreparedStatement[]
@@ -226,6 +281,26 @@ async function executeMaterialization(
 }
 
 const FORECAST_INTERVALS = ["3h", "1h"] as const satisfies readonly ForecastInterval[];
+
+async function activeForecastGenerations(
+  db: D1Database,
+  spotId: SpotId
+): Promise<Map<ForecastInterval, ActiveForecastGenerationRow>> {
+  const result = await db
+    .prepare(
+      `select interval, generation_id, generated_at
+       from forecast_read_models
+       where spot_id = ? and interval in ('3h', '1h')`
+    )
+    .bind(spotId)
+    .all<ActiveForecastGenerationRow>();
+  const active = new Map<ForecastInterval, ActiveForecastGenerationRow>();
+  for (const row of result.results ?? []) {
+    if (row.interval !== "3h" && row.interval !== "1h") continue;
+    active.set(row.interval, row);
+  }
+  return active;
+}
 
 function forecastOutcomes(options: {
   spotId: SpotId;
@@ -427,7 +502,7 @@ export async function persistForecastMaterialization(options: {
        schema_version = excluded.schema_version,
        forecast_json = excluded.forecast_json,
        materialized_at = excluded.materialized_at
-     where excluded.generated_at >= forecast_read_models.generated_at`
+     where excluded.generated_at > forecast_read_models.generated_at`
   );
   const factStatement = options.db.prepare(
     `insert into forecast_fact_bundles (
@@ -442,7 +517,7 @@ export async function persistForecastMaterialization(options: {
        schema_version = excluded.schema_version,
        fact_bundle_json = excluded.fact_bundle_json,
        materialized_at = excluded.materialized_at
-     where excluded.generated_at >= forecast_fact_bundles.generated_at`
+     where excluded.generated_at > forecast_fact_bundles.generated_at`
   );
   const forecastStatements = serializedForecasts.map(({ forecast, json }) =>
     forecastStatement.bind(
@@ -488,22 +563,34 @@ export async function persistForecastMaterialization(options: {
     const changes = results.map((result) => result.meta.changes);
     const forecastChanges = changes.slice(0, forecastStatements.length);
     const factBundleChanges = changes.slice(forecastStatements.length);
-    // Conditional upserts can be real no-ops when a newer generation wins
-    // after the lineage precheck. D1 changes, not prepared-statement count,
-    // are the publication authority for each interval's terminal outcome.
+    const activeGenerations = forecastChanges.some((count) => count === 0)
+      ? await activeForecastGenerations(options.db, threeHour.spot.id)
+      : new Map<ForecastInterval, ActiveForecastGenerationRow>();
+    // Strictly-newer conditional upserts make an equal-generation delivery a
+    // real no-op. D1 changes remain publication authority; the active indexed
+    // rows distinguish that idempotent duplicate from a genuinely newer winner.
     const outcomes = FORECAST_INTERVALS.map(
       (interval, index): ForecastMaterializationOutcome => {
         const published = (forecastChanges[index] ?? 0) > 0;
+        const active = published ? null : activeGenerations.get(interval) ?? null;
+        if (!published && !active) {
+          throw new Error(`D1 omitted active ${interval} generation after a conditional no-op`);
+        }
+        const alreadyActive = active?.generated_at === threeHour.generatedAt;
         return {
           ingestId: options.ingestId ?? null,
           spotId: threeHour.spot.id,
           interval,
-          generationId,
+          generationId: alreadyActive ? active!.generation_id : generationId,
           generatedAt: threeHour.generatedAt,
           materializedAt: options.materializedAt,
-          outcome: published ? "publish" : "supersede",
+          outcome: published ? "publish" : alreadyActive ? "skip" : "supersede",
           retryable: false,
-          reasonCode: published ? "forecast_generation_published" : "newer_generation_active"
+          reasonCode: published
+            ? "forecast_generation_published"
+            : alreadyActive
+              ? "forecast_generation_already_active"
+              : "newer_generation_active"
         };
       }
     );
@@ -539,7 +626,8 @@ export async function materializeForecastReadModels(
   now: Date,
   _sourceIssueFingerprint: string,
   materializedAt = new Date().toISOString(),
-  ingestId?: string
+  ingestId?: string,
+  spotIds: readonly SpotId[] = NORCAL_SPOTS.map(({ id }) => id)
 ): Promise<ForecastReadModelPersistenceResult> {
   let rowsWritten = 0;
   let forecastRowsWritten = 0;
@@ -547,10 +635,10 @@ export async function materializeForecastReadModels(
   const errors: string[] = [];
   const outcomes: ForecastMaterializationOutcome[] = [];
 
-  for (const spot of NORCAL_SPOTS) {
+  for (const spotId of spotIds) {
     const result = await materializeForecastReadModelForSpot(
       env,
-      spot.id,
+      spotId,
       now,
       {
         materializedAt,
@@ -593,7 +681,7 @@ export async function materializeForecastReadModelForSpot(
       )
     ];
     const factBundles = await Promise.all(
-      localDates.map((localDate) => buildForecastFactBundle(threeHour, { localDate }))
+      localDates.map((localDate) => buildForecastFactBundle(hourly, { localDate }))
     );
     const materialization = await persistForecastMaterialization({
       db: env.DB,
@@ -604,11 +692,15 @@ export async function materializeForecastReadModelForSpot(
       materializedAt,
       ingestId: options.ingestId
     });
+    const duplicateRows = materialization.forecastOutcomes.filter(
+      ({ outcome, reasonCode }) =>
+        outcome === "skip" && reasonCode === "forecast_generation_already_active"
+    ).length;
     const publicationComplete =
       materialization.errors.length === 0 &&
-      materialization.forecastRowsWritten === FORECAST_INTERVALS.length &&
-      materialization.factBundleRowsWritten > 0 &&
-      materialization.forecastOutcomes.every(({ outcome }) => outcome === "publish");
+      forecastGenerationBecameActive(materialization.forecastOutcomes) &&
+      materialization.forecastRowsWritten === FORECAST_INTERVALS.length - duplicateRows &&
+      (materialization.factBundleRowsWritten > 0 || duplicateRows > 0);
     if (!options.captureHistory || !publicationComplete) return materialization;
     const history = await persistForecastSnapshots(env.DB, threeHour, {
       capturedAt: materializedAt,

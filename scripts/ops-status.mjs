@@ -230,8 +230,8 @@ export function parseReadModelStatus(output) {
   }
 
   const rows = statement.results;
-  if (rows.length !== 12) {
-    throw new Error(`Expected exactly 12 read-model rows; found ${rows.length}.`);
+  if (rows.length === 0) {
+    throw new Error("D1 read-model SELECT returned no active spot rows.");
   }
   const keys = new Set();
   const intervalsBySpot = new Map();
@@ -284,20 +284,21 @@ export function parseReadModelStatus(output) {
     generatedTimes.push(row.generated_at);
   }
   if (
-    intervalsBySpot.size !== 6 ||
+    intervalsBySpot.size === 0 ||
     [...intervalsBySpot.values()].some(
       ({ intervals }) =>
         intervals.size !== 2 || !intervals.has("1h") || !intervals.has("3h")
     )
   ) {
-    throw new Error("D1 read-model SELECT did not return six complete 1h/3h spot pairs.");
+    throw new Error("D1 read-model SELECT did not return complete 1h/3h pairs for every active spot.");
   }
 
+  const expected = intervalsBySpot.size * 2;
   generatedTimes.sort((left, right) => Date.parse(left) - Date.parse(right));
   return {
     status: "PASS",
     ready: rows.length,
-    expected: 12,
+    expected,
     spots: intervalsBySpot.size,
     oldestGeneratedAt: generatedTimes[0],
     newestGeneratedAt: generatedTimes.at(-1)
@@ -362,7 +363,7 @@ export function formatOpsStatus(result) {
     line(widths.map((width) => "-".repeat(width))),
     ...rows.map(line),
     "",
-    "ops:status PASS — 4/4 read-only probes; 12/12 read models ready."
+    `ops:status PASS — 4/4 read-only probes; ${result.readModels.ready}/${result.readModels.expected} read models ready.`
   ].join("\n");
 }
 

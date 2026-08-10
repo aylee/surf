@@ -1,5 +1,7 @@
-import type { ApiSpot } from "@surf/contracts";
+import type { ApiSpot, SunPhases } from "@surf/contracts";
+import { intervalOverlapsCivilLight, surfSizeRange } from "@surf/forecast-core";
 import { CloudOff, LineChart as LineChartIcon, ShieldCheck, Waves, Wind } from "lucide-react";
+import type { KeyboardEvent } from "react";
 import {
   CartesianGrid,
   Line,
@@ -23,6 +25,8 @@ export type ForecastChartDatum = {
   forecastAt: string | null;
   isGap: boolean;
   isDaylight: boolean;
+  surfHeightFt: number | null;
+  surfSizeLabel: string;
   modeledHeightFt: number | null;
   windSpeedKt: number | null;
   windGustKt: number | null;
@@ -38,6 +42,23 @@ type TooltipEntry = {
   payload?: ForecastChartDatum;
   value?: number | string;
 };
+
+type ChartNavigationKey =
+  | "ArrowLeft"
+  | "ArrowRight"
+  | "ArrowUp"
+  | "ArrowDown"
+  | "Home"
+  | "End";
+
+const CHART_NAVIGATION_KEYS = new Set<ChartNavigationKey>([
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "Home",
+  "End"
+]);
 
 function formatClock(value: number | string, timezone: string): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -57,10 +78,75 @@ function formatTimestamp(value: number | string, timezone: string): string {
   }).format(new Date(value));
 }
 
+export function forecastAtForChartKey(
+  data: ForecastChartDatum[],
+  selectedAt: string | null,
+  key: string
+): string | null {
+  if (!CHART_NAVIGATION_KEYS.has(key as ChartNavigationKey)) return null;
+  const available = data.filter(
+    (datum): datum is ForecastChartDatum & { forecastAt: string } => datum.forecastAt !== null
+  );
+  if (available.length === 0) return null;
+  if (key === "Home") return available[0]!.forecastAt;
+  if (key === "End") return available.at(-1)!.forecastAt;
+  const currentIndex = available.findIndex((datum) => datum.forecastAt === selectedAt);
+  if (currentIndex < 0) {
+    return key === "ArrowLeft" || key === "ArrowUp"
+      ? available.at(-1)!.forecastAt
+      : available[0]!.forecastAt;
+  }
+  const delta = key === "ArrowLeft" || key === "ArrowUp" ? -1 : 1;
+  const nextIndex = Math.min(available.length - 1, Math.max(0, currentIndex + delta));
+  return available[nextIndex]!.forecastAt;
+}
+
+export function forecastGraphSelectionSummary(
+  data: ForecastChartDatum[],
+  selectedAt: string | null,
+  timezone: string
+): string {
+  const selected = selectedAt === null
+    ? undefined
+    : data.find((datum) => datum.forecastAt === selectedAt);
+  if (!selected) {
+    return "No chart time is selected. Use Left and Right Arrow, Home, or End to inspect available forecast times.";
+  }
+  const value = (number: number | null, unit: string, digits = 0) =>
+    number === null ? "unavailable" : `${number.toFixed(digits)}${unit}`;
+  return [
+    `${formatTimestamp(selected.timestamp, timezone)} selected.`,
+    `Surf ${selected.surfSizeLabel}.`,
+    `Wind ${value(selected.windSpeedKt, " kt")}${selected.windRelation ? `, ${selected.windRelation}` : ""}.`,
+    `Tide ${value(selected.tideFt, " ft", 1)}.`,
+    `Confidence ${value(selected.confidence, "%")}.`
+  ].join(" ");
+}
+
+export function chartCivilLightBounds(
+  civilLight: Pick<SunPhases, "firstLight" | "lastLight"> | null | undefined,
+  domainStart: number,
+  domainEnd: number
+): { start: number; end: number } | null {
+  const start = civilLight ? Date.parse(civilLight.firstLight) : Number.NaN;
+  const end = civilLight ? Date.parse(civilLight.lastLight) : Number.NaN;
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    start >= end ||
+    end <= domainStart ||
+    start >= domainEnd
+  ) {
+    return null;
+  }
+  return { start: Math.max(domainStart, start), end: Math.min(domainEnd, end) };
+}
+
 export function buildForecastChartData(
   windows: WorkbenchWindow[],
   interval: ForecastInterval,
-  timezone: string
+  timezone: string,
+  civilLight?: Pick<SunPhases, "firstLight" | "lastLight"> | null
 ): ForecastChartDatum[] {
   const first = windows[0];
   if (!first) return [];
@@ -96,18 +182,30 @@ export function buildForecastChartData(
   const firstDaylightTimestamp = daylightTimestamps[0] ?? null;
   const lastDaylightTimestamp = daylightTimestamps.at(-1) ?? null;
 
-  return slots.map((timestamp) => {
+  const domainEnd = localDayDomain(first.localDateKey, timezone).end;
+  return slots.map((timestamp, index) => {
     const window = rowsByTimestamp.get(timestamp)?.window;
     const localHour = localHourForTimestamp(timestamp, timezone);
+    const slotEnd = slots[index + 1] ?? domainEnd;
+    const surfHeightFt = window?.raw.waveHeightFt ?? null;
     return {
       timestamp,
       forecastAt: window?.forecastAt ?? null,
       isGap: !window,
       isDaylight: window?.isDaylight ?? (
-        firstDaylightTimestamp !== null && lastDaylightTimestamp !== null
-          ? timestamp >= firstDaylightTimestamp && timestamp <= lastDaylightTimestamp
-          : localHour >= 6 && localHour < 18
+        civilLight
+          ? intervalOverlapsCivilLight(
+              new Date(timestamp).toISOString(),
+              new Date(slotEnd).toISOString(),
+              civilLight.firstLight,
+              civilLight.lastLight
+            )
+          : firstDaylightTimestamp !== null && lastDaylightTimestamp !== null
+            ? timestamp >= firstDaylightTimestamp && timestamp <= lastDaylightTimestamp
+            : localHour >= 6 && localHour < 18
       ),
+      surfHeightFt,
+      surfSizeLabel: surfSizeRange(surfHeightFt),
       modeledHeightFt: window?.modeledHeightFt ?? null,
       windSpeedKt: window?.windSpeedKt ?? null,
       windGustKt: window?.windGustKt ?? null,
@@ -148,7 +246,9 @@ function WorkbenchTooltip({
             ? [
                 <span className="graphTooltipValue" key={String(entry.dataKey)}>
                   <i style={{ background: entry.color }} aria-hidden="true" />
-                  {entry.name}: {entry.value.toFixed(kind === "confidence" ? 0 : 1)}{units}
+                  {entry.name}: {kind === "wave"
+                    ? datum?.surfSizeLabel ?? surfSizeRange(entry.value)
+                    : `${entry.value.toFixed(kind === "confidence" ? 0 : 1)}${units}`}
                 </span>
               ]
             : [])}
@@ -164,6 +264,7 @@ export function ForecastGraph({
   interval,
   tideEvents,
   selectedAt,
+  civilLight,
   spot,
   onSelect
 }: {
@@ -171,27 +272,35 @@ export function ForecastGraph({
   interval: ForecastInterval;
   tideEvents: TideEvent[];
   selectedAt: string | null;
+  civilLight?: Pick<SunPhases, "firstLight" | "lastLight"> | null;
   spot: ApiSpot;
   onSelect: (value: string) => void;
 }) {
-  const data = buildForecastChartData(windows, interval, spot.timezone);
+  const data = buildForecastChartData(windows, interval, spot.timezone, civilLight);
   const localDateKey = windows[0]?.localDateKey;
   const domain = localDateKey ? localDayDomain(localDateKey, spot.timezone) : { start: 0, end: 0 };
   const domainStart = domain.start;
   const domainEnd = domain.end;
   const selectedTimestamp = data.find((datum) => datum.forecastAt === selectedAt)?.timestamp ?? null;
+  const exactCivilBounds = chartCivilLightBounds(civilLight, domainStart, domainEnd);
   const daylight = data.filter((datum) => datum.isDaylight);
-  const daylightStart = daylight[0]?.timestamp ?? null;
+  const daylightStart = exactCivilBounds
+    ? exactCivilBounds.start
+    : daylight[0]?.timestamp ?? null;
   const lastDaylightIndex = daylight.length > 0
     ? data.findIndex((datum) => datum.timestamp === daylight.at(-1)!.timestamp)
     : -1;
-  const daylightEnd = daylight.length > 0
-    ? data[lastDaylightIndex + 1]?.timestamp ?? domainEnd
-    : null;
+  const daylightEnd = exactCivilBounds
+    ? exactCivilBounds.end
+    : daylight.length > 0
+      ? data[lastDaylightIndex + 1]?.timestamp ?? domainEnd
+      : null;
   const visibleTideEvents = tideEvents
     .map((event) => ({ ...event, timestamp: new Date(event.at).getTime() }))
     .filter((event) => event.timestamp >= domainStart && event.timestamp < domainEnd);
   const gapCount = data.filter((datum) => datum.isGap).length;
+  const selectedSurfSize = data.find((datum) => datum.forecastAt === selectedAt)?.surfSizeLabel;
+  const selectedSummary = forecastGraphSelectionSummary(data, selectedAt, spot.timezone);
   const slotEnd = (index: number) => data[index + 1]?.timestamp ?? domainEnd;
 
   const selectChartPoint = (state: unknown) => {
@@ -201,6 +310,20 @@ export function ForecastGraph({
     const forecastAt = data.find((datum) => datum.timestamp === timestamp)?.forecastAt;
     if (forecastAt) onSelect(forecastAt);
   };
+  const inspectChartByKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
+    const forecastAt = forecastAtForChartKey(data, selectedAt, event.key);
+    if (!forecastAt) return;
+    event.preventDefault();
+    onSelect(forecastAt);
+  };
+  const chartInteractionProps = (label: string) => ({
+    role: "img" as const,
+    tabIndex: 0,
+    "aria-label": label,
+    "aria-describedby": "forecast-graph-summary forecast-graph-selection",
+    "aria-keyshortcuts": "ArrowLeft ArrowRight ArrowUp ArrowDown Home End",
+    onKeyDown: inspectChartByKeyboard
+  });
   const xTicks = data
     .filter((datum) => interval === "3h" || localHourForTimestamp(datum.timestamp, spot.timezone) % 3 === 0)
     .map((datum) => datum.timestamp);
@@ -251,12 +374,16 @@ export function ForecastGraph({
   return (
     <div className="forecastGraphs">
       <p className="srOnly" id="forecast-graph-summary">
-        Four synchronized charts show modeled wave state, wind and gusts, tide, and confidence across the selected local day. {gapCount} time slot{gapCount === 1 ? " is" : "s are"} missing. Night periods are shaded. Use the time buttons or Table view for exact values.
+        Four synchronized charts show surf size, wind and gusts, tide, and confidence across the selected local day. {gapCount} time slot{gapCount === 1 ? " is" : "s are"} missing. Night periods are shaded. Move the pointer across a chart or use Table view for exact values.
+        {selectedSurfSize ? ` The selected surf-size estimate is ${selectedSurfSize}.` : ""}
+      </p>
+      <p className="srOnly" id="forecast-graph-selection" role="status" aria-live="polite">
+        {selectedSummary}
       </p>
 
       <section className="chartCard" aria-labelledby="wave-chart-title">
-        <div className="chartTitle"><div><Waves size={17} aria-hidden="true" /><h3 id="wave-chart-title">Modeled wave state</h3></div><span>Stepped across source validity</span></div>
-        <div className="chartCanvas" role="img" aria-label="Stepped modeled nearshore wave-height chart" aria-describedby="forecast-graph-summary">
+        <div className="chartTitle"><div><Waves size={17} aria-hidden="true" /><h3 id="wave-chart-title">Surf size estimate</h3></div><span>Planning estimate; Hs detail in Table</span></div>
+        <div className="chartCanvas" {...chartInteractionProps("Stepped surf-size estimate chart")}>
           <ResponsiveContainer width="100%" height={190}>
             <LineChart data={data} syncId="forecast-workbench" syncMethod="value" onClick={selectChartPoint} margin={{ top: 12, right: 16, left: 0, bottom: 0 }}>
               {contextBands("wave")}
@@ -264,7 +391,7 @@ export function ForecastGraph({
               {xAxis()}
               <YAxis unit=" ft" width={44} tickLine={false} axisLine={false} fontSize={11} />
               <ChartTooltip content={<WorkbenchTooltip spot={spot} kind="wave" />} />
-              <Line type="stepAfter" dataKey="modeledHeightFt" name="Modeled Hs" unit=" ft" stroke="#2b8695" strokeWidth={2.5} dot={false} connectNulls={false} />
+              <Line type="stepAfter" dataKey="surfHeightFt" name="Surf estimate" unit=" ft" stroke="#2b8695" strokeWidth={2.5} dot={false} connectNulls={false} />
               {selectedLine}
             </LineChart>
           </ResponsiveContainer>
@@ -273,7 +400,7 @@ export function ForecastGraph({
 
       <section className="chartCard" aria-labelledby="wind-chart-title">
         <div className="chartTitle"><div><Wind size={17} aria-hidden="true" /><h3 id="wind-chart-title">Wind and gusts</h3></div><span>Beach relationship in tooltip</span></div>
-        <div className="chartCanvas" role="img" aria-label="Wind speed and gust chart" aria-describedby="forecast-graph-summary">
+        <div className="chartCanvas" {...chartInteractionProps("Wind speed and gust chart")}>
           <ResponsiveContainer width="100%" height={190}>
             <LineChart data={data} syncId="forecast-workbench" syncMethod="value" onClick={selectChartPoint} margin={{ top: 12, right: 16, left: 0, bottom: 0 }}>
               {contextBands("wind")}
@@ -291,7 +418,7 @@ export function ForecastGraph({
 
       <section className="chartCard" aria-labelledby="tide-chart-title">
         <div className="chartTitle"><div><LineChartIcon size={17} aria-hidden="true" /><h3 id="tide-chart-title">Tide</h3></div><span>MLLW with official extrema</span></div>
-        <div className="chartCanvas" role="img" aria-label="Tide-height chart with high and low tide markers" aria-describedby="forecast-graph-summary">
+        <div className="chartCanvas" {...chartInteractionProps("Tide-height chart with high and low tide markers")}>
           <ResponsiveContainer width="100%" height={190}>
             <LineChart data={data} syncId="forecast-workbench" syncMethod="value" onClick={selectChartPoint} margin={{ top: 12, right: 16, left: 0, bottom: 0 }}>
               {contextBands("tide")}
@@ -317,7 +444,7 @@ export function ForecastGraph({
 
       <section className="chartCard" aria-labelledby="confidence-chart-title">
         <div className="chartTitle"><div><ShieldCheck size={17} aria-hidden="true" /><h3 id="confidence-chart-title">Confidence</h3></div><span>Input and calibration trust</span></div>
-        <div className="chartCanvas" role="img" aria-label="Forecast confidence chart from zero to one hundred percent" aria-describedby="forecast-graph-summary">
+        <div className="chartCanvas" {...chartInteractionProps("Forecast confidence chart from zero to one hundred percent")}>
           <ResponsiveContainer width="100%" height={190}>
             <LineChart data={data} syncId="forecast-workbench" syncMethod="value" onClick={selectChartPoint} margin={{ top: 12, right: 16, left: 0, bottom: 0 }}>
               {contextBands("confidence")}
@@ -332,18 +459,6 @@ export function ForecastGraph({
         </div>
       </section>
 
-      <div className="graphTimeRail" aria-label="Select chart time">
-        {windows.map((window) => (
-          <button
-            key={window.forecastAt}
-            type="button"
-            aria-pressed={selectedAt === window.forecastAt}
-            onClick={() => onSelect(window.forecastAt)}
-          >
-            {formatClock(window.forecastAt, spot.timezone)}
-          </button>
-        ))}
-      </div>
     </div>
   );
 }

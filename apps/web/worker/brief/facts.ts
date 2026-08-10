@@ -1,6 +1,8 @@
 import type { ForecastResponse, ScoredForecastWindow } from "@surf/contracts";
 import {
+  intervalOverlapsCivilLight,
   selectCanonicalRecommendationIds,
+  surfSizeRange,
   surfaceConditionForWind
 } from "@surf/forecast-core";
 import {
@@ -54,32 +56,27 @@ function dateParts(value: string, timeZone: string): { date: string; minutes: nu
   };
 }
 
-function phaseMinutes(value: string, timeZone: string): number | null {
-  const parsed = new Date(value);
-  if (Number.isFinite(parsed.getTime())) return dateParts(parsed.toISOString(), timeZone).minutes;
-  const match = value.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/i);
-  if (!match) return null;
-  let hour = Number(match[1]);
-  const minute = Number(match[2]);
-  const meridiem = match[3]?.toLowerCase();
-  if (meridiem === "pm" && hour < 12) hour += 12;
-  if (meridiem === "am" && hour === 12) hour = 0;
-  return hour * 60 + minute;
-}
-
 function isDaylight(
   forecast: ForecastResponse,
-  forecastAt: string,
+  validFrom: string,
+  validTo: string,
   localDate: string
 ): boolean {
-  const local = dateParts(forecastAt, forecast.spot.timezone);
-  if (local.date !== localDate) return false;
   const phases = forecast.sunPhases?.find((candidate) => candidate.localDate === localDate);
-  if (!phases) return local.minutes >= 6 * 60 && local.minutes <= 18 * 60;
-  const firstLight = phaseMinutes(phases.firstLight, forecast.spot.timezone);
-  const lastLight = phaseMinutes(phases.lastLight, forecast.spot.timezone);
-  if (firstLight === null || lastLight === null) return false;
-  return local.minutes >= firstLight && local.minutes <= lastLight;
+  if (!phases) {
+    const from = dateParts(validFrom, forecast.spot.timezone);
+    const to = dateParts(validTo, forecast.spot.timezone);
+    if (from.date !== localDate && to.date !== localDate) return false;
+    const fromMinutes = from.date < localDate ? 0 : from.minutes;
+    const toMinutes = to.date > localDate ? 24 * 60 : to.minutes;
+    return fromMinutes < 18 * 60 && toMinutes > 6 * 60;
+  }
+  return intervalOverlapsCivilLight(
+    validFrom,
+    validTo,
+    phases.firstLight,
+    phases.lastLight
+  );
 }
 
 function confidenceBand(confidence: number): "low" | "medium" | "high" {
@@ -177,14 +174,18 @@ function toWindowInput(
   localDate: string
 ): ForecastBriefWindowInput {
   const waveHeight = window.waveState?.modeledNearshoreHeightFt ?? window.waveHeightFt;
+  const surfSizeFt = window.waveHeightFt;
   const interval = forecast.interval ?? "3h";
   const valid = validity(window, interval);
+  const displayValidTo = new Date(
+    Date.parse(window.forecastAt) + (interval === "1h" ? 1 : 3) * 60 * 60 * 1000
+  ).toISOString();
   return {
     windowId: window.forecastAt,
     forecastAt: window.forecastAt,
     validFrom: valid.from,
     validTo: valid.to,
-    isDaylight: isDaylight(forecast, window.forecastAt, localDate),
+    isDaylight: isDaylight(forecast, window.forecastAt, displayValidTo, localDate),
     ratingStatus: window.ratingStatus,
     surfaceCondition:
       window.surfaceCondition ??
@@ -196,6 +197,8 @@ function toWindowInput(
     score: window.score,
     confidence: window.confidence,
     confidenceBand: confidenceBand(window.confidence),
+    surfSizeFt,
+    surfSizeLabel: surfSizeRange(surfSizeFt),
     modeledHeightFt: waveHeight,
     modeledHeightLabel: modeledHeightLabel(waveHeight),
     waveSemantics: waveSemantics(window),
@@ -505,9 +508,12 @@ function materialSnapshot(input: ForecastBriefInput) {
     timezone: input.timezone,
     localDate: input.localDate,
     recommendationWindowIds: input.recommendationWindowIds,
+    recommendations: input.recommendations,
+    tideEvents: input.tideEvents,
     windows: input.windows.map((window) => ({
       windowId: window.windowId,
       surfaceCondition: window.surfaceCondition,
+      surfSizeLabel: window.surfSizeLabel,
       modeledHeightLabel: window.modeledHeightLabel,
       qualityLabel: window.qualityLabel,
       confidenceBand: window.confidenceBand,
@@ -554,7 +560,23 @@ export async function buildForecastFactBundle(
   }
   const recommendationWindowIds =
     options.recommendationWindowIds ??
+    forecast.recommendations
+      ?.filter((recommendation) => recommendation.localDate === localDate)
+      .map((recommendation) => recommendation.representative.forecastAt) ??
     selectCanonicalRecommendationIds(windows, new Date(forecast.generatedAt));
+  const recommendations =
+    forecast.recommendations
+      ?.filter(
+        (recommendation) =>
+          recommendation.localDate === localDate &&
+          recommendationWindowIds.includes(recommendation.representative.forecastAt)
+      )
+      .map((recommendation) => ({
+        representativeWindowId: recommendation.representative.forecastAt,
+        constituentWindowIds: recommendation.constituentWindowIds,
+        startAt: recommendation.startAt,
+        endAt: recommendation.endAt
+      })) ?? [];
   const health = sourceHealth(forecast, windows);
   const input = ForecastBriefInputSchema.parse({
     spotId: forecast.spot.id,
@@ -564,6 +586,17 @@ export async function buildForecastFactBundle(
     generatedAt: new Date(forecast.generatedAt).toISOString(),
     expiresAt: options.expiresAt ?? null,
     recommendationWindowIds,
+    recommendations,
+    tideEvents:
+      forecast.tideEvents
+        ?.filter(
+          (event) => dateParts(event.eventAt, forecast.spot.timezone).date === localDate
+        )
+        .map((event) => ({
+          eventAt: event.eventAt,
+          type: event.type,
+          heightFtMllw: event.heightFtMllw
+        })) ?? [],
     windows,
     activeHazards: activeHazards(windows),
     sourceHealth: health,
@@ -609,6 +642,16 @@ export async function buildForecastFactBundle(
       kind: "hazard",
       role: "locked",
       statement: hazard,
+      windowId: null,
+      material: true
+    });
+  });
+  input.tideEvents.forEach((event, index) => {
+    facts.push({
+      id: `tide:event:e${index}`,
+      kind: "tide",
+      role: "context",
+      statement: `An official ${event.type}-tide event is available for this forecast date.`,
       windowId: null,
       material: true
     });

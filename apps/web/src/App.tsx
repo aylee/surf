@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   sourceFreshnessVerdict,
   type ApiSpot,
+  type ForecastHazard,
   type ForecastResponse,
   type ScoredForecastWindow,
   type SourceCapability,
@@ -9,6 +10,7 @@ import {
   type SpotId,
   type SpotsResponse
 } from "@surf/contracts";
+import { intervalOverlapsRange } from "@surf/forecast-core";
 import {
   ArrowLeft,
   AlertTriangle,
@@ -20,19 +22,22 @@ import {
   Waves
 } from "lucide-react";
 import {
+  availableDisplayLocalDateKeys,
   availableLocalDateKeys,
-  calmestWindow,
+  bestWindowSelection,
   cardinalDirection,
   earliestAvailableLocalDateKey,
   formatDay,
   formatWindowSpan,
+  localDateParts,
   selectedSpotIdFromSearch,
   surfaceCondition,
   surfHeightRange,
-  windRelation,
-  type SurfaceCondition
+  windRelation
 } from "./forecast-view";
+import type { BestWindowSelection } from "./forecast-view";
 import { ForecastWorkbench } from "./features/workbench/ForecastWorkbench";
+import { localDayDomain } from "./features/workbench/workbench-time";
 import {
   isUsableForecastResponse,
   parseUsableForecastResponse
@@ -59,6 +64,7 @@ type SpotSummary = {
 };
 
 type DailySpotRow = SpotSummary & {
+  selection: BestWindowSelection | undefined;
   window: ScoredForecastWindow | undefined;
 };
 
@@ -77,13 +83,6 @@ const DELAYED_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const CATALOG_REFRESH_DELAY_NOTICE =
   "The latest update is delayed. Showing the last forecast we loaded.";
 
-const surfaceRank: Record<SurfaceCondition, number> = {
-  clean: 3,
-  fair: 2,
-  choppy: 1,
-  unknown: 0
-};
-
 async function fetchJson<T>(path: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(path, { headers: { Accept: "application/json" }, signal });
   if (!response.ok) throw new Error(`${path} returned ${response.status}`);
@@ -98,10 +97,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function unique<T>(values: T[]): T[] {
-  return values.filter((value, index, all) => all.indexOf(value) === index);
-}
-
 function formatNumber(value: number | null, suffix: string, digits = 0): string {
   if (value === null || !Number.isFinite(value)) return "—";
   return `${value.toFixed(digits)}${suffix}`;
@@ -109,18 +104,111 @@ function formatNumber(value: number | null, suffix: string, digits = 0): string 
 
 function formatSourceAgeRange(values: number[]): string {
   if (values.length === 0) return "Source ages unavailable";
-  const formatAge = (minutes: number) => {
-    if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
-    if (minutes < 24 * 60) return `${Math.round(minutes / 60)}h`;
-    return `${Math.round(minutes / (24 * 60))}d`;
-  };
-  const minimumLabel = formatAge(Math.min(...values));
-  const maximumLabel = formatAge(Math.max(...values));
+  const minimumLabel = formatSourceAge(Math.min(...values));
+  const maximumLabel = formatSourceAge(Math.max(...values));
   // Compare the formatted labels, not the raw minutes: distinct ages that
   // round to the same label collapse to one value instead of "3h–3h".
   return minimumLabel === maximumLabel
     ? `Source data ${maximumLabel} old`
     : `Sources ${minimumLabel}–${maximumLabel} old`;
+}
+
+function formatSourceAge(minutes: number): string {
+  if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
+  if (minutes < 24 * 60) return `${Math.round(minutes / 60)}h`;
+  return `${Math.round(minutes / (24 * 60))}d`;
+}
+
+function formatSourceCadence(minutes: number | null | undefined): string {
+  if (minutes === null || minutes === undefined) return "its expected cadence";
+  if (minutes <= 90) return "hourly";
+  if (minutes >= 24 * 60) return "daily";
+  return `every ${Math.round(minutes / 60)} hours`;
+}
+
+const REQUIRED_SOURCE_CAPABILITIES = new Set<SourceCapability>([
+  "forecast_wave_offshore",
+  "forecast_wave_nearshore",
+  "wind",
+  "tide"
+]);
+
+const headerSourceLabels: Partial<Record<SourceCapability, string>> = {
+  forecast_wave_offshore: "Wave model",
+  forecast_wave_nearshore: "Wave model",
+  wind: "Wind forecast",
+  tide: "Tide data"
+};
+
+type HeaderSourceIssue = {
+  entry: SourceFreshness;
+  kind: "late" | "missing";
+  spotName: string;
+};
+
+function headerReferenceWindow(
+  forecast: ForecastResponse,
+  now: Date
+): ScoredForecastWindow | undefined {
+  const nowMs = now.getTime();
+  const recommendation = forecast.recommendations
+    ?.filter((candidate) => {
+      const endMs = Date.parse(candidate.endAt);
+      return Number.isFinite(endMs) && endMs >= nowMs;
+    })
+    .sort((left, right) => left.startAt.localeCompare(right.startAt))[0];
+  if (recommendation) return recommendation.representative;
+
+  const ordered = forecast.windows
+    .map((window) => ({ window, timestamp: Date.parse(window.forecastAt) }))
+    .filter((candidate) => Number.isFinite(candidate.timestamp))
+    .sort((left, right) => left.timestamp - right.timestamp);
+  return ordered.find((candidate) => candidate.timestamp >= nowMs)?.window
+    ?? ordered.at(-1)?.window;
+}
+
+function headerSourceIssue(state: DashboardState, now: Date): HeaderSourceIssue | null {
+  const issues: HeaderSourceIssue[] = [];
+  for (const spot of state.spots) {
+    const result = state.forecasts[spot.id];
+    if (result?.status !== "ready") continue;
+    // Full-day responses begin at local midnight, which can be historical by
+    // the time the report is read. Judge the recommendation/live horizon, not
+    // a retained elapsed row; if the entire payload is elapsed, use its tail.
+    const reference = headerReferenceWindow(result.data, now);
+    for (const entry of reference?.sourceFreshness ?? []) {
+      if (!REQUIRED_SOURCE_CAPABILITIES.has(entry.capability)) continue;
+      if (entry.status === "missing") {
+        issues.push({ entry, kind: "missing", spotName: spot.name });
+        continue;
+      }
+      const verdict = sourceFreshnessVerdict(entry);
+      if (verdict === "late" || (verdict === null && entry.status === "stale")) {
+        issues.push({ entry, kind: "late", spotName: spot.name });
+      }
+    }
+  }
+  return issues.sort((left, right) => {
+    if (left.kind !== right.kind) return left.kind === "missing" ? -1 : 1;
+    return (right.entry.freshnessMinutes ?? 0) - (left.entry.freshnessMinutes ?? 0);
+  })[0] ?? null;
+}
+
+function headerSourceIssueCopy(issue: HeaderSourceIssue): { label: string; detail: string } {
+  const source = headerSourceLabels[issue.entry.capability] ?? "Required source";
+  if (issue.kind === "missing") {
+    return {
+      label: `${source} unavailable`,
+      detail: `${source} at ${issue.spotName} is unavailable.`
+    };
+  }
+  const age = issue.entry.freshnessMinutes === null
+    ? "older than expected"
+    : `${formatSourceAge(issue.entry.freshnessMinutes)} old`;
+  return {
+    label: `${source} delayed`,
+    detail: `${source} at ${issue.spotName} is ${age}; expected ${formatSourceCadence(issue.entry.expectedCadenceMinutes)}.`
+  };
 }
 
 function formatFetchedAt(value: string | null): string {
@@ -148,73 +236,6 @@ function formatLastGoodTime(value: string): string {
     : formatFetchedAt(value);
 }
 
-function formatBannerAge(minutes: number): string {
-  if (minutes < 60) return `${Math.max(1, Math.round(minutes))}m`;
-  // Day tier mirrors the header chip so both surfaces describe a multi-day
-  // outage with the same unit.
-  if (minutes >= 24 * 60) return `${Math.round(minutes / (24 * 60))}d`;
-  const hours = minutes / 60;
-  return `${hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10}h`;
-}
-
-function formatCadence(expectedCadenceMinutes: number): string {
-  if (expectedCadenceMinutes <= 90) return "hourly";
-  if (expectedCadenceMinutes >= 1440) return "daily";
-  return `every ${Math.round(expectedCadenceMinutes / 60)} hours`;
-}
-
-const lateSourceLabels: Partial<Record<SourceCapability, string>> = {
-  observed_wave: "Buoy observations",
-  wind: "Wind forecast",
-  tide: "Tide predictions",
-  forecast_wave_nearshore: "Wave model data",
-  forecast_wave_offshore: "Wave model data"
-};
-
-// The banner names actionable causes only. A source is actionable when the
-// contracts verdict over its own shipped cadence says "late"; fresh and aging
-// sources stay quiet. Whole-source absence (null age) belongs to per-window
-// caveats and the data-health panel, not the dashboard banner.
-function lateSourceNotice(
-  forecasts: Partial<Record<SpotId, ForecastResult>>,
-  spots: ApiSpot[]
-): string | null {
-  let worst: { entry: SourceFreshness; ratio: number; spotId: string } | null = null;
-  let readySpotCount = 0;
-  const lateSpotsBySource = new Map<string, Set<string>>();
-  for (const [spotId, result] of Object.entries(forecasts)) {
-    if (result?.status !== "ready") continue;
-    readySpotCount += 1;
-    const window = result.data.windows[0];
-    for (const entry of window?.sourceFreshness ?? []) {
-      // Placeholder entries (a source that never produced data) carry a null
-      // age; their absence is caveat/panel territory, and bannering them
-      // would render a nonsense "1m old". Pre-cadence entries return a null
-      // verdict and stay with their shipped status.
-      if (entry.freshnessMinutes === null) continue;
-      if (entry.expectedCadenceMinutes === null || entry.expectedCadenceMinutes === undefined) continue;
-      if (sourceFreshnessVerdict(entry) !== "late") continue;
-      const lateSpots = lateSpotsBySource.get(entry.sourceId) ?? new Set<string>();
-      lateSpots.add(spotId);
-      lateSpotsBySource.set(entry.sourceId, lateSpots);
-      const ratio = entry.freshnessMinutes / (entry.expectedCadenceMinutes + (entry.graceMinutes ?? 0));
-      if (!worst || ratio > worst.ratio) worst = { entry, ratio, spotId };
-    }
-  }
-  if (!worst) return null;
-  const label = lateSourceLabels[worst.entry.capability] ?? "Source data";
-  // A source that is late for only some spots names the worst one so the
-  // banner cannot contradict another spot's fresh source panel; a source
-  // late everywhere states the regional truth without singling a spot out.
-  const affectedSpots = lateSpotsBySource.get(worst.entry.sourceId)?.size ?? 0;
-  const scope = affectedSpots < readySpotCount
-    ? ` at ${spots.find((spot) => spot.id === worst.spotId)?.name ?? worst.spotId}`
-    : "";
-  return `${label}${scope} ${formatBannerAge(worst.entry.freshnessMinutes ?? 0)} old; expected ${formatCadence(
-    worst.entry.expectedCadenceMinutes ?? 0
-  )}.`;
-}
-
 function delayedSpotsNotice(names: string[], lastGoodAt: string | null): string {
   const first = names[0] ?? "Some spots";
   const others = names.length - 1;
@@ -233,10 +254,6 @@ function sortDailyRows(left: DailySpotRow, right: DailySpotRow): number {
   if (!left.window && !right.window) return 0;
   if (!left.window) return 1;
   if (!right.window) return -1;
-  const surfaceDelta =
-    surfaceRank[surfaceCondition(right.spot, right.window)] -
-    surfaceRank[surfaceCondition(left.spot, left.window)];
-  if (surfaceDelta !== 0) return surfaceDelta;
   if (right.window.score !== left.window.score) return right.window.score - left.window.score;
   if (right.window.confidence !== left.window.confidence) {
     return right.window.confidence - left.window.confidence;
@@ -266,6 +283,12 @@ function windowConditionText(spot: ApiSpot, window: ScoredForecastWindow): strin
   return surface[0]!.toUpperCase() + surface.slice(1);
 }
 
+function windSnapshot(spot: ApiSpot, window: ScoredForecastWindow): string {
+  const relation = windRelation(spot, window);
+  if (window.windSpeedKt === null || window.windDirectionDeg === null) return relation;
+  return `${relation} · ${cardinalDirection(window.windDirectionDeg)} ${formatNumber(window.windSpeedKt, " kt")}`;
+}
+
 function regionalReport(rows: DailySpotRow[], dateKey: string | null): { title: string; body: string } {
   const ready = rows.filter((row): row is DailySpotRow & { window: ScoredForecastWindow } => Boolean(row.window));
   if (ready.length === 0 || !dateKey) {
@@ -291,7 +314,11 @@ function regionalReport(rows: DailySpotRow[], dateKey: string | null): { title: 
       : "Modeled size is not available.";
   return {
     title,
-    body: `The calmest surface forecast is ${top.spot.name} around ${formatWindowSpan(top.window.forecastAt, top.spot.timezone)}. ${sizeStory}`
+    body: `${top.spot.name} has the best overall window around ${formatWindowSpan(
+      top.selection?.startAt ?? top.window.forecastAt,
+      top.spot.timezone,
+      top.selection?.endAt
+    )}. ${sizeStory}`
   };
 }
 
@@ -300,36 +327,145 @@ function ConditionPill({ spot, window }: { spot: ApiSpot; window: ScoredForecast
   return <span className={`conditionPill ${surface}`}>{windowConditionText(spot, window)}</span>;
 }
 
-function activeHazardMessages(windows: Array<ScoredForecastWindow | undefined>): string[] {
-  return unique(
-    windows.flatMap((window) =>
-      window?.activeCapabilities.includes("hazard")
-        ? window.caveats.filter((caveat) => caveat.startsWith("Active NWS hazard:"))
-        : []
-    )
+export type HazardNoticeItem = {
+  headline: string;
+  status: "active" | "upcoming";
+};
+
+function dedupeHazardNotices(notices: HazardNoticeItem[]): HazardNoticeItem[] {
+  const seen = new Set<string>();
+  return notices.filter((notice) => {
+    const key = `${notice.status}\u0000${notice.headline}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export function hazardNoticesForDate(
+  hazards: ForecastHazard[],
+  now: Date,
+  dateKey: string | null,
+  timezone: string
+): HazardNoticeItem[] {
+  const nowMs = now.getTime();
+  if (!Number.isFinite(nowMs)) return [];
+  const day = dateKey ? localDayDomain(dateKey, timezone) : null;
+  const notices = hazards.flatMap((hazard): HazardNoticeItem[] => {
+    const startsAtMs = hazard.startsAt === null
+      ? Number.NEGATIVE_INFINITY
+      : Date.parse(hazard.startsAt);
+    const endsAtMs = hazard.endsAt === null
+      ? Number.POSITIVE_INFINITY
+      : Date.parse(hazard.endsAt);
+    if (
+      (hazard.startsAt !== null && !Number.isFinite(startsAtMs)) ||
+      (hazard.endsAt !== null && !Number.isFinite(endsAtMs)) ||
+      endsAtMs <= startsAtMs ||
+      endsAtMs <= nowMs
+    ) {
+      return [];
+    }
+    if (
+      !day ||
+      !intervalOverlapsRange(
+        new Date(day.start).toISOString(),
+        new Date(day.end).toISOString(),
+        hazard.startsAt,
+        hazard.endsAt
+      )
+    ) {
+      return [];
+    }
+    if (startsAtMs <= nowMs && nowMs < endsAtMs) {
+      return [{ headline: hazard.headline, status: "active" }];
+    }
+    return [{ headline: hazard.headline, status: "upcoming" }];
+  });
+  return dedupeHazardNotices(notices).sort((left, right) =>
+    left.status === right.status ? left.headline.localeCompare(right.headline) : left.status === "active" ? -1 : 1
   );
 }
 
-function HazardNotice({ messages }: { messages: string[] }) {
-  if (messages.length === 0) return null;
+function legacyHazardNoticesForDate(
+  windows: ScoredForecastWindow[],
+  interval: ForecastResponse["interval"],
+  now: Date,
+  dateKey: string | null,
+  timezone: string
+): HazardNoticeItem[] {
+  const nowMs = now.getTime();
+  const durationMs = interval === "1h" ? 60 * 60_000 : 3 * 60 * 60_000;
+  const byHeadline = new Map<string, HazardNoticeItem>();
+  for (const window of windows) {
+    if (!window.activeCapabilities.includes("hazard")) continue;
+    const startMs = Date.parse(window.forecastAt);
+    if (!Number.isFinite(startMs)) continue;
+    const localDate = localDateParts(window.forecastAt, timezone).key;
+    if (!dateKey || localDate !== dateKey) continue;
+    const status = startMs <= nowMs && nowMs < startMs + durationMs
+      ? "active"
+      : startMs > nowMs
+        ? "upcoming"
+        : null;
+    if (!status) continue;
+    for (const caveat of window.caveats) {
+      const match = /^Active NWS hazard:\s*(.+)$/i.exec(caveat);
+      const headline = match?.[1]?.trim();
+      if (!headline) continue;
+      const current = byHeadline.get(headline);
+      if (!current || status === "active") byHeadline.set(headline, { headline, status });
+    }
+  }
+  return dedupeHazardNotices([...byHeadline.values()]);
+}
+
+function forecastHazardNotices(
+  forecast: ForecastResponse,
+  now: Date,
+  dateKey: string | null,
+  timezone: string
+): HazardNoticeItem[] {
+  return forecast.hazards === undefined
+    ? legacyHazardNoticesForDate(forecast.windows, forecast.interval, now, dateKey, timezone)
+    : hazardNoticesForDate(forecast.hazards, now, dateKey, timezone);
+}
+
+function HazardNotice({ notices }: { notices: HazardNoticeItem[] }) {
+  if (notices.length === 0) return null;
+  const active = notices.filter((notice) => notice.status === "active");
+  const upcoming = notices.filter((notice) => notice.status === "upcoming");
   return (
-    <aside className="hazardNotice" aria-label="Active National Weather Service hazard">
+    <aside className="hazardNotice" aria-label="National Weather Service hazards">
       <AlertTriangle size={19} aria-hidden="true" />
       <div>
-        <strong>Active NWS hazard</strong>
-        {messages.map((message) => (
-          <span key={message}>{message.replace(/^Active NWS hazard:\s*/, "")}</span>
-        ))}
+        {active.length > 0 && <strong>Active NWS hazard</strong>}
+        {active.map((notice) => <span key={`active:${notice.headline}`}>{notice.headline}</span>)}
+        {upcoming.length > 0 && <strong>Upcoming NWS hazard</strong>}
+        {upcoming.map((notice) => <span key={`upcoming:${notice.headline}`}>{notice.headline}</span>)}
       </div>
     </aside>
   );
 }
 
-function Header({ state, onRefresh }: { state: DashboardState; onRefresh: () => void }) {
+function Header({
+  state,
+  now,
+  onRefresh
+}: {
+  state: DashboardState;
+  now: Date;
+  onRefresh: () => void;
+}) {
   const sourceAges = Object.values(state.forecasts).flatMap((forecast) =>
-    forecast?.status === "ready" ? forecast.data.windows.map((window) => window.sourceFreshnessMinutes) : []
+    forecast?.status === "ready"
+      ? [headerReferenceWindow(forecast.data, now)?.sourceFreshnessMinutes]
+          .filter((age): age is number => age !== undefined && Number.isFinite(age))
+      : []
   );
   const sourceAgeRange = formatSourceAgeRange(sourceAges);
+  const sourceIssue = headerSourceIssue(state, now);
+  const sourceStatus = sourceIssue ? headerSourceIssueCopy(sourceIssue) : null;
 
   return (
     <header className="appHeader">
@@ -338,9 +474,16 @@ function Header({ state, onRefresh }: { state: DashboardState; onRefresh: () => 
         <span>surf</span>
       </a>
       <div className="headerActions">
-        <span className="updateLabel" title={state.fetchedAt ? `Browser fetched ${formatFetchedAt(state.fetchedAt)}. ${sourceAgeRange}.` : sourceAgeRange}>
-          <Clock3 size={15} aria-hidden="true" />
-          {sourceAgeRange}
+        <span
+          className={`updateLabel${sourceStatus ? " degraded" : ""}`}
+          data-testid="source-status"
+          title={sourceStatus?.detail ?? (state.fetchedAt ? `Browser fetched ${formatFetchedAt(state.fetchedAt)}. ${sourceAgeRange}.` : sourceAgeRange)}
+          aria-label={sourceStatus?.detail}
+        >
+          {sourceStatus
+            ? <AlertTriangle size={15} aria-hidden="true" />
+            : <Clock3 size={15} aria-hidden="true" />}
+          {sourceStatus?.label ?? sourceAgeRange}
         </span>
         <button className="refreshButton" type="button" onClick={onRefresh} disabled={state.loading}>
           <RefreshCw className={state.loading ? "spin" : undefined} size={17} aria-hidden="true" />
@@ -361,21 +504,35 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
     now
   );
   const rows = summaries
-    .map((summary) => ({
-      ...summary,
-      window: reportDateKey
-        ? calmestWindow(
+    .map((summary) => {
+      const selection = reportDateKey
+        ? bestWindowSelection(
             summary.spot,
             summary.windows,
             now,
             reportDateKey,
-            summary.forecast?.status === "ready" ? summary.forecast.data.sunPhases : undefined
+            summary.forecast?.status === "ready" ? summary.forecast.data.sunPhases : undefined,
+            summary.forecast?.status === "ready"
+              ? summary.forecast.data.recommendations
+              : undefined
           )
-        : undefined
-    }))
+        : undefined;
+      return { ...summary, selection, window: selection?.window };
+    })
     .sort(sortDailyRows);
   const report = regionalReport(rows, reportDateKey);
-  const hazards = activeHazardMessages(rows.map((row) => row.window));
+  const hazards = dedupeHazardNotices(
+    summaries.flatMap((summary) =>
+      summary.forecast?.status === "ready"
+        ? forecastHazardNotices(
+            summary.forecast.data,
+            now,
+            reportDateKey,
+            summary.spot.timezone
+          )
+        : []
+    )
+  );
 
   return (
     <>
@@ -385,20 +542,15 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
         <p className="reportLead">{report.body}</p>
       </section>
 
-      <HazardNotice messages={hazards} />
-
       <section className="compareSection" aria-labelledby="compare-heading">
-        <div className="sectionTitle">
-          <div>
-            <p className="kicker">6am–6pm</p>
-            <h2 id="compare-heading">Compare spots</h2>
-          </div>
-          {rows[0]?.window && <span>{formatDay(rows[0].window.forecastAt, rows[0].spot.timezone)}</span>}
+        <div className="sectionTitle compareSectionTitle">
+          <h2 id="compare-heading">Compare spots</h2>
+          <HazardNotice notices={hazards} />
         </div>
         <div className="compareList">
           <div className="compareHeader" aria-hidden="true">
             <span>Spot</span>
-            <span>Calmest window</span>
+            <span>Best window</span>
             <span>Size estimate</span>
             <span>Wind / surface</span>
             <span>Tide</span>
@@ -412,11 +564,13 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
               </span>
               {row.window ? (
                 <>
-                  <span data-label="Calmest window">{formatWindowSpan(row.window.forecastAt, row.spot.timezone)}</span>
+                  <span data-label="Best window">{formatWindowSpan(
+                    row.selection?.startAt ?? row.window.forecastAt,
+                    row.spot.timezone,
+                    row.selection?.endAt
+                  )}</span>
                   <strong data-label="Size estimate">{surfHeightRange(row.window.waveHeightFt)}</strong>
-                  <span data-label="Wind / surface">
-                    {windRelation(row.spot, row.window)} · {cardinalDirection(row.window.windDirectionDeg)} {formatNumber(row.window.windSpeedKt, " kt")}
-                  </span>
+                  <span data-label="Wind / surface">{windSnapshot(row.spot, row.window)}</span>
                   <span data-label="Tide">{formatNumber(row.window.tideFt, " ft", 1)} · {tideTrend(row.windows, row.window).toLowerCase()}</span>
                 </>
               ) : (
@@ -460,15 +614,40 @@ function SpotDetail({
 }) {
   const { spot, windows, forecast } = summary;
   const forecastData = forecast?.status === "ready" ? forecast.data : null;
-  const reportDateKey = availableLocalDateKeys(
-    spot,
-    windows,
-    now,
-    forecastData?.sunPhases
-  )[0];
-  const dayBest = reportDateKey
-    ? calmestWindow(spot, windows, now, reportDateKey, forecastData?.sunPhases)
+  const displayReportDateKeys = useMemo(
+    () => availableDisplayLocalDateKeys(spot, windows),
+    [spot, windows]
+  );
+  const planningReportDateKeys = useMemo(
+    () => availableLocalDateKeys(spot, windows, now, forecastData?.sunPhases),
+    [forecastData?.sunPhases, now, spot, windows]
+  );
+  const defaultReportDateKey = planningReportDateKeys[0] ?? displayReportDateKeys[0] ?? null;
+  const [selectedReportDateKey, setSelectedReportDateKey] = useState<string | null>(
+    defaultReportDateKey
+  );
+  useEffect(() => {
+    setSelectedReportDateKey((current) =>
+      current && displayReportDateKeys.includes(current) ? current : defaultReportDateKey
+    );
+  }, [defaultReportDateKey, displayReportDateKeys, spot.id]);
+  const selectReportDate = useCallback((date: string | null) => {
+    setSelectedReportDateKey(
+      date && displayReportDateKeys.includes(date) ? date : defaultReportDateKey
+    );
+  }, [defaultReportDateKey, displayReportDateKeys]);
+  const reportDateKey = selectedReportDateKey ?? defaultReportDateKey;
+  const daySelection = reportDateKey
+    ? bestWindowSelection(
+        spot,
+        windows,
+        now,
+        reportDateKey,
+        forecastData?.sunPhases,
+        forecastData?.recommendations
+      )
     : undefined;
+  const dayBest = daySelection?.window;
   const current = windows
     .filter((window) => window.ratingStatus === "scored")
     .sort(
@@ -476,39 +655,28 @@ function SpotDetail({
         Math.abs(new Date(left.forecastAt).getTime() - now.getTime()) -
         Math.abs(new Date(right.forecastAt).getTime() - now.getTime())
     )[0];
-  const featured = dayBest ?? current;
-  const hazards = activeHazardMessages(windows);
-  // The slim header's freshness badge is PR-B's verdict over the featured
-  // window's own shipped cadence, worst source wins, using exactly the
-  // dashboard banner's rule: judge every entry that has a real age and a
-  // declared cadence.
-  //
-  // Deliberately NOT filtered by `activeCapabilities`. A stale buoy leaves
-  // that set at precisely the age its verdict turns late — the worker's
-  // freshness cutoff and the declared cadence + grace are the same constant —
-  // so filtering by it would convert every late buoy into an unqualified
-  // "Data fresh" while the banner names that same source as late and the
-  // provenance panel labels it Stale. A null age stays excluded: absence is
-  // "Missing" in the panel, and the banner skips it too.
-  const featuredVerdicts = (featured?.sourceFreshness ?? [])
-    .filter((entry) => entry.freshnessMinutes !== null)
-    .map((entry) => sourceFreshnessVerdict(entry))
-    .filter((verdict): verdict is Exclude<ReturnType<typeof sourceFreshnessVerdict>, null> => verdict !== null);
-  const spotFreshness = featuredVerdicts.length === 0
-    ? null
-    : featuredVerdicts.includes("late")
-      ? "late"
-      : featuredVerdicts.includes("aging")
-        ? "aging"
-        : "fresh";
+  const featured = reportDateKey ? dayBest : current;
+  const hazards = forecastData
+    ? forecastHazardNotices(forecastData, now, reportDateKey, spot.timezone)
+    : [];
+  const activeSpotLinkRef = useRef<HTMLAnchorElement | null>(null);
 
+  useEffect(() => {
+    activeSpotLinkRef.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [spot.id]);
   return (
     <>
       <nav className="spotNav" aria-label="Surf spots">
         <a className="backLink" href="/"><ArrowLeft size={17} aria-hidden="true" /> Daily report</a>
         <div className="spotLinks">
           {summaries.map((item) => (
-            <a className={item.spot.id === spot.id ? "active" : undefined} href={forecastHref(item.spot.id)} key={item.spot.id}>
+            <a
+              className={item.spot.id === spot.id ? "active" : undefined}
+              href={forecastHref(item.spot.id)}
+              key={item.spot.id}
+              aria-current={item.spot.id === spot.id ? "page" : undefined}
+              ref={item.spot.id === spot.id ? activeSpotLinkRef : undefined}
+            >
               {item.spot.name.replace("Ocean Beach ", "OB ")}
             </a>
           ))}
@@ -520,28 +688,30 @@ function SpotDetail({
           <h1>{spot.name}</h1>
           {featured ? (
             <p className="spotCall">
-              <strong>{formatDay(featured.forecastAt, spot.timezone, false)}:</strong> {formatNumber(featured.waveState?.modeledNearshoreHeightFt ?? featured.waveHeightFt, " ft", 1)} modeled nearshore Hs and {surfaceCondition(spot, featured)} surface.
-              {dayBest && <> Calmest window: <strong>{formatWindowSpan(dayBest.forecastAt, spot.timezone)}</strong>.</>}
+              <strong>{formatDay(featured.forecastAt, spot.timezone, false)}:</strong> {surfHeightRange(featured.waveHeightFt)} surf with {surfaceCondition(spot, featured)} surface.
+              {dayBest && <> Best window: <strong>{formatWindowSpan(
+                daySelection?.startAt ?? dayBest.forecastAt,
+                spot.timezone,
+                daySelection?.endAt
+              )}</strong>.</>}
             </p>
           ) : (
             <p className="spotCall">No reliable wave call yet. Wind and tide may still be available below.</p>
           )}
         </div>
-        {spotFreshness && (
-          <span className={`freshnessBadge ${spotFreshness}`}>
-            Data {spotFreshness}
-          </span>
-        )}
       </section>
 
-      <HazardNotice messages={hazards} />
-      <ForecastWorkbench
-        spot={spot}
-        initialForecast={forecastData}
-        initialError={forecast?.status === "error" ? forecast.error : null}
-        now={now}
-        onForecastRecovered={onForecastRecovered}
-      />
+      <HazardNotice notices={hazards} />
+      <div className="spotWorkbench">
+        <ForecastWorkbench
+          spot={spot}
+          initialForecast={forecastData}
+          initialError={forecast?.status === "error" ? forecast.error : null}
+          now={now}
+          onForecastRecovered={onForecastRecovered}
+          onSelectedDateChange={selectReportDate}
+        />
+      </div>
     </>
   );
 }
@@ -614,7 +784,7 @@ export function App() {
           ? retainedFetchTimes.reduce((oldest, candidate) => (candidate < oldest ? candidate : oldest))
           : null;
         const notice = failedForecastCount === 0
-          ? lateSourceNotice(forecasts, spotsPayload.spots)
+          ? null
           : retainedForecastCount > 0
             ? delayedSpotsNotice(delayedSpotNames, oldestRetainedAt)
             : "Some forecasts are temporarily unavailable. We'll try again automatically.";
@@ -729,7 +899,7 @@ export function App() {
 
   return (
     <main className="appShell">
-      <Header state={state} onRefresh={() => void loadDashboard()} />
+      <Header state={state} now={now} onRefresh={() => void loadDashboard()} />
       {state.error && <div className="errorBanner" role="alert"><Info size={18} aria-hidden="true" /> {state.error}</div>}
       {state.notice && <div className="noticeBanner" role="status"><Info size={18} aria-hidden="true" /> {state.notice}</div>}
       {state.loading && state.spots.length === 0 ? (

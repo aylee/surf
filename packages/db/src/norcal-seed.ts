@@ -135,6 +135,7 @@ function buildSpotRows(): SpotSeedRow[] {
     timezone: spot.timezone,
     shoreNormalDeg: spot.shoreNormalDeg,
     configJson: JSON.stringify({
+      aliases: spot.aliases,
       bestSwellDeg: spot.bestSwellDeg,
       workableSwellDeg: spot.workableSwellDeg,
       bestPeriodSec: spot.bestPeriodSec,

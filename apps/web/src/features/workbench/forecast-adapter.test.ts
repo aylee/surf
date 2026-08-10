@@ -29,6 +29,40 @@ function fixture(overrides: Partial<ForecastResponse> = {}): ForecastResponse {
 }
 
 describe("forecast workbench adapter", () => {
+  it("uses interval overlap at exact civil-light boundaries", () => {
+    const base = buildFixtureForecast("bolinas");
+    const localDate = "2026-12-10";
+    const dayStart = Date.parse("2026-12-10T08:00:00.000Z");
+    const windows = Array.from({ length: 24 }, (_, hour) => ({
+      ...base.windows[0]!,
+      forecastAt: new Date(dayStart + hour * 60 * 60 * 1000).toISOString()
+    }));
+    const forecast = fixture({
+      interval: "1h",
+      windows,
+      sunPhases: [{
+        localDate,
+        firstLight: "2026-12-10T15:22:00.000Z",
+        sunrise: "2026-12-10T15:50:00.000Z",
+        sunset: "2026-12-11T00:50:00.000Z",
+        lastLight: "2026-12-11T01:19:00.000Z"
+      }]
+    });
+
+    const adapted = adaptForecastResponse(forecast, spot, "1h");
+    const atHour = (hour: number) => adapted.windows.find((window) => window.localHour === hour);
+
+    expect(atHour(6)?.isDaylight).toBe(false);
+    expect(atHour(7)?.isDaylight).toBe(true);
+    expect(atHour(17)?.isDaylight).toBe(true);
+    expect(atHour(18)?.isDaylight).toBe(false);
+  });
+
+  it("preserves legacy recommendation omission separately from an authoritative empty list", () => {
+    expect(adaptForecastResponse(fixture(), spot, "3h").recommendations).toBeNull();
+    expect(adaptForecastResponse(fixture({ recommendations: [] }), spot, "3h").recommendations).toEqual([]);
+  });
+
   it("keeps a direct CDIP bulk wave state separate from swell components", () => {
     const base = buildFixtureForecast("bolinas");
     const forecast = fixture({
@@ -166,55 +200,53 @@ describe("forecast workbench adapter", () => {
     }]);
   });
 
-  it("parses the validated brief envelope and object bust factors", () => {
-    const brief = parseBriefResponse({
-      status: "model",
-      brief: {
-        provider: "google",
-        headline: "Early wind window",
-        setup: "Public facts only.",
-        revision: 2,
-        generatedAt: "2026-08-02T12:00:00Z",
-        picks: [{ windowId: "window:1", label: "Sun 7:00 AM", why: "Wind is lighter.", tradeoff: "Lower tide." }],
-        bustFactors: [{ text: "Wind arrives early.", factRefs: ["wind:1"] }],
-        lesson: { topic: "Period", text: "Period changes wave energy.", factRefs: ["wave:1"] }
-      }
+  it("parses the validated v3 published Analysis envelope", () => {
+    const analysis = parseBriefResponse({
+      schemaVersion: 3,
+      status: "published",
+      report: {
+        schemaVersion: 3,
+        spotId: "bolinas",
+        localDate: "2026-08-02",
+        revisionId: "revision.fixture",
+        headline: "Bolinas: Sun 7:00–10:00 AM leads",
+        paragraphs: [
+          "Surf holds through daylight; swell holds from the west.",
+          "The top deterministic session is Sun 7:00–10:00 AM.",
+          "The call carries medium confidence."
+        ],
+        updatedAt: "2026-08-02T12:00:00.000Z"
+      },
+      availableRevisions: 2
     });
 
-    expect(brief).toMatchObject({
-      status: "model",
-      provider: "google",
-      headline: "Early wind window",
-      revision: 2,
-      picks: [{ label: "Sun 7:00 AM" }],
-      bustFactors: ["Wind arrives early."]
+    expect(analysis).toMatchObject({
+      status: "published",
+      availableRevisions: 2,
+      report: {
+        revisionId: "revision.fixture",
+        paragraphs: expect.any(Array)
+      }
     });
   });
 
-  it("preserves a stale deterministic brief and its fallback reason", () => {
-    const brief = parseBriefResponse({
-      status: "stale",
-      fallbackReason: "Forecast inputs changed materially.",
-      availableRevisions: 3,
-      brief: {
-        provider: "deterministic",
-        headline: "Use the deterministic read",
-        setup: "The prior model brief no longer matches the inputs.",
-        revision: 3,
-        generatedAt: "2026-08-02T12:00:00Z",
-        picks: [{ windowId: "window:1", label: "Sun 7:00 AM", why: "The score leads.", tradeoff: "Check freshness." }],
-        bustFactors: [],
-        lesson: { topic: "Freshness", text: "Check source age." }
-      }
-    });
+  it("rejects legacy deterministic pseudo-reports and preserves honest pending", () => {
+    expect(
+      parseBriefResponse({
+        status: "stale",
+        brief: { provider: "deterministic", headline: "Legacy fallback" }
+      })
+    ).toBeNull();
 
-    expect(brief).toMatchObject({
-      status: "stale",
-      provider: "deterministic",
-      fallbackReason: "Forecast inputs changed materially.",
-      availableRevisions: 3,
-      picks: [{ label: "Sun 7:00 AM" }]
-    });
+    expect(
+      parseBriefResponse({
+        schemaVersion: 3,
+        status: "pending",
+        report: null,
+        message: "Analysis is being prepared.",
+        availableRevisions: 0
+      })
+    ).toMatchObject({ status: "pending", report: null });
   });
 
   it("defaults URL state to a three-hour table on the Forecast tab", () => {

@@ -1,157 +1,121 @@
-# Forecast Brief Evaluation
+# Analysis Narrative Evaluation
 
-Surf's daily outlook is useful only when it adds a clear explanation without
-weakening the deterministic forecast underneath it. The model may synthesize
-public facts into natural language, but it cannot calculate wave physics,
-change the ranked windows, or turn modeled wave state into observed breaking
-surf.
+This page defines the quality gate for the current Analysis v3 narrative. The
+historical filename is retained for links; the active path is the generic
+Cloudflare Queue to local oMLX runner described in
+[`narrative-runner.md`](./narrative-runner.md), not Gemini or the dormant
+`ForecastBriefAgent`.
 
-The publication path therefore has two independent gates:
+The narrative is useful only when it makes the deterministic forecast easier
+to read without changing it. TypeScript owns every time, measurement, surf-size
+range, swell evolution, wind/surface description, tide event, confidence band,
+bust factor, and recommendation. The model may connect those code-owned slots
+into three compact paragraphs. It may not calculate wave physics, author a
+measurement, change the ranked sessions, or turn modeled wave state into an
+observation.
 
-1. **Policy validation** checks schemas, recommendation identity and order,
-   sentence-level fact references, measurements, qualitative claims, modeled
-   versus observed semantics, and prohibited safety or markup content.
-2. **Quality evaluation** checks that a policy-valid answer is still worth
-   showing: it explains the recommendation, names a real tradeoff, cites
-   relevant and varied evidence, avoids repeated boilerplate, and reads like a
-   surf outlook rather than an implementation trace.
+## Publication gate
 
-Failure at either gate is fail-closed. The model draft is not written to D1,
-and the read-only brief endpoint continues to return the fact-based local
-summary. Forecast publication, ranking, Table, and Graph remain independent of
-the Agent and model.
+Cloud validation is fail-closed. A generated result is published only when all
+of these checks pass:
 
-## What CI proves
+1. The result authenticates to the internal endpoint and matches the active
+   job, per-attempt submission ID, schema, prompt, model capability, and exact
+   Analysis fact fingerprint.
+2. The response matches the advertised bounded JSON schema. The model returns
+   only paragraph templates; the headline is code-owned and fact references
+   are derived from the slots actually used.
+3. Every required slot appears exactly once in its assigned paragraph, all
+   braces resolve, and the rendered report remains within the public contract.
+4. The setup preserves surf-before-swell grammar, the plan names the leading
+   call before a distinct alternate, and the confidence paragraph places the
+   code-owned bust factor last after uncertainty framing.
+5. Model-authored measurements, time claims, condition ratings, reversed or
+   negated recommendations, unsupported causation, directives, markup, and
+   implementation vocabulary are rejected.
 
-Ordinary CI is secretless and deterministic. It never calls Gemini and never
-needs `GEMINI_API_KEY`. Fixed direct-model and NWS-fallback cases exercise the
-same quality evaluator used at publication time, alongside negative cases for:
+Validation or rendering failure marks that attempt rejected. It never writes a
+published revision and never blocks deterministic forecast publication. The
+public `/brief` response honestly remains `pending` or `unavailable`; there is
+no deterministic pseudo-report under an Analysis heading.
 
-- recommendation prose supported only by a rank or unrelated fact;
-- missing support or tradeoff roles;
-- citations from another forecast window;
-- repeated reasons or tradeoffs across adjacent picks;
-- implementation language such as raw enum values, fingerprints, fact IDs, or
-  source-status plumbing;
-- raw fact dumps that pass factual checks but do not synthesize the setup; and
-- weak evidence diversity when better facts are available.
+## What ordinary verification proves
 
-These tests establish a deterministic quality floor. They do not prove that a
-particular hosted model will always write well.
+`pnpm verify` is secretless and deterministic. It does not contact oMLX,
+Gemini, or another model provider. Its fixtures cover:
 
-### Claim licenses, not word matching
+- exact-fact generation identity, repeat-ingest deduplication, and
+  supersession when output-visible facts change;
+- recommendation order and anti-reversal semantics;
+- accepted natural variations and rejected unsupported adjectives,
+  conditions, causes, measurements, time words, directives, and malformed
+  placeholders;
+- schema limits, slot placement, renderability, and derived provenance;
+- delayed or duplicated results across rearmed attempts;
+- authenticated, byte-bounded result ingestion before JSON parsing;
+- all complete selectable dates, Queue send reconciliation, expiration, and
+  fail-isolated forecast publication;
+- published/pending/unavailable API and UI behavior, no-store caching, bounded
+  polling, and cancellation; and
+- fresh D1 migration/seed, seven-day FK-safe retention, production build, and a
+  secretless Wrangler dry-run.
 
-Each cited fact acts as a narrow claim license. The validator derives its
-forecast domain, evidence role, polarity, explicit state, and recommendation
-window before accepting model prose. A clause that says one factor supports or
-limits another must be licensed by a single cited fact carrying that
-relationship and polarity for the same window. Citing separate true wind and
-wave facts therefore cannot license a new claim that wind strengthens the
-modeled wave state, and support evidence cannot be rewritten as a limiter.
-Compound predicates are split and checked independently, so a licensed first
-relationship cannot conceal an inverted relationship later in the sentence.
+These checks establish the authority and reliability floor. They cannot prove
+that a particular local model will always produce useful prose.
 
-The vocabulary allowlist is an additional guard, not the grounding model. It
-prevents uncited topics from entering otherwise natural prose. Adversarial
-tests cover cross-domain recombination, inverted support/tradeoff claims,
-field/value swaps, invented tide effects, and evidence borrowed from another
-recommendation window. The validator remains deliberately conservative: when
-it cannot prove the relationship, it rejects the draft and serves the local
-fact-based outlook.
+## Live local-model acceptance
 
-## What the optional live evaluation proves
+Run live acceptance only as an explicit prompt/model evaluation against the
+same response schema and cloud validator used in production. Keep the model ID
+configurable; do not add model-specific branches to the runner. The current
+local baseline is `Qwen3.5-27B-8bit` on oMLX.
 
-The opt-in Gemini evaluation uses the ignored `apps/web/.dev.vars` key for one
-bounded call on a representative direct-nearshore scenario. It runs the result
-through the production policy validator and deterministic quality evaluator,
-then assembles the same public brief shape used by the product. Its safe log
-contains the scenario name, quality-policy version, pass/fail checks, issue
-count, metrics, and user-visible brief copy. It omits prompts, API keys, provider
-requests, fact references, recommendation window IDs, and private context.
-If generation or validation rejects the draft, the harness emits only the
-scenario, phase, and an allowlisted failure category before failing the test;
-raw provider or policy messages are not printed.
+Before enabling Queue production, require at least three consecutive generated
+drafts to:
 
-Direct-model and NWS-fallback quality cases remain deterministic, secretless
-fixtures in ordinary tests; the opt-in evaluator does not make a separate
-provider call for each case.
+- pass the real cloud validator and renderer, not merely JSON parsing;
+- retain the deterministic best and alternate calls;
+- render the code-owned headline and all required slots exactly once;
+- read as three short forecaster paragraphs rather than a field inventory; and
+- end confidence with the supplied bust factor without duplication.
 
-The live evaluation is intentionally outside CI: model output is stochastic,
-quota-limited, and tied to a versioned external provider. It is a release and
-prompt-development tool, not a substitute for deterministic tests.
+Record only the model/config version, bounded timings, pass/fail category, and
+sanitized rendered copy. Never log the result token, Queue credentials, raw
+provider artifacts, private target maps, or full rejected payloads. A failed
+probe is a prompt/evaluation result, not permission to weaken fact authority.
 
-## Quality checks
+Live acceptance is intentionally outside CI because output is stochastic and
+depends on the operator's local hardware. It is a rollout gate, not a
+substitute for deterministic tests.
 
-### Relevance and role coverage
+## Versioning and identity
 
-Facts are assigned a product role before they reach the model:
+Prompt version, output schema version, target capability, and exact code-owned
+Analysis facts participate in generation identity. Model identity participates
+in revision identity. Volatile generation timestamps, source ages, deadlines,
+and facts the report cannot render do not create new work.
 
-- `support` explains why a ranked window is attractive;
-- `tradeoff` explains what limits confidence or quality;
-- `context` helps teach the user how to read the setup; and
-- `locked` is a code-owned caveat that the model cannot rewrite or select.
+The inference deadline bounds one attempt; it is not report freshness. A
+published revision remains eligible while its exact fact fingerprint still
+matches the current forecast bundle. Changed facts make the stable `/brief`
+URL return pending or unavailable until a matching revision exists, and every
+response uses `Cache-Control: no-store`.
 
-Every recommended window needs window-specific support in its `why` text and a
-window-specific tradeoff when one is available. When every forecast dimension
-is limiting, the deterministic recommendation may support a "least
-compromised" explanation only when it is paired with substantive
-window-specific context. A context fact may fill a tradeoff only when the input
-has no applicable tradeoff fact. Recommendation rank and spot identity cannot
-be the sole evidence for a forecast claim.
+## Rollout and rollback
 
-Locked measurement, proxy, fallback, calibration, and hazard caveats are
-inserted by code after model validation. Nearby buoy observations remain
-separate regional context and are not promoted into a mandatory forecast bust
-factor. This keeps precise trust language stable while allowing the model to
-write the explanatory connective prose.
+The tracked Worker configuration keeps `NARRATIVE_ENABLED=false`. Follow the
+operator sequence in [`self-hosting.md`](./self-hosting.md): provision the Queue
+and DLQ through the normal authorized setup/deploy path, add the out-of-band
+HTTP pull consumer, configure separate Queue and result credentials, prove the
+runner health path, complete live acceptance, and only then enable production
+in a versioned deploy. No evaluation command itself mutates Cloudflare state.
 
-Validation metadata retains the claim-level fact references for the summary,
-each reason and tradeoff, every bust factor, the lesson, and code-owned locked
-caveats. The public response remains compact, while persisted revisions keep
-enough provenance to audit which evidence supported each sentence. Older v1
-rows without the additive claim map remain readable.
+Rollback is non-destructive: disable new narrative production, stop the local
+pull runner, quiesce or reconcile outstanding jobs, and revoke its scoped
+credentials as appropriate. Deterministic Forecast remains available
+throughout.
 
-### Evidence diversity
-
-The evaluator expects a pick to use more than one forecast dimension when the
-input makes that possible. Across the full outlook it checks the breadth of
-fact kinds and rejects a single generic fact reused as the reason, tradeoff,
-bust factor, and lesson. The learning note must add a distinct concept rather
-than restate the call.
-
-### Naturalness and non-repetition
-
-The quality floor rejects exact fact-statement copies, repeated sentence
-skeletons, labeled data dumps, and internal vocabulary such as `window ID`,
-`input fingerprint`, `quality band`, `required-source status`, or raw enum
-names. It also bounds extremely short fragments and unusually long fields.
-
-These are deliberately conservative heuristics. They catch the failure mode
-where structurally valid output still looks machine-assembled; they do not
-attempt to compute a universal prose-quality score.
-
-## Versioning and rollout
-
-Model identity, thinking level, prompt, schema, and quality-policy versions are
-forecast-generation inputs. They participate in the generation fingerprints
-so a generation-policy upgrade can publish a new revision even when the
-physical forecast facts have not changed. Freshness-age drift remains
-non-material.
-
-Published v1 rows stay in additive history. A v2 deployment reads only a
-revision compatible with the current material and generation policy; while a
-new revision is pending or rejected, the endpoint serves the local fact-based
-summary. Rollout does not require a new Agent namespace, public Agent route, or
-model key.
-
-For production, preserve the existing two-version sequence:
-
-1. deploy the post-Agent Worker with forecast briefs disabled;
-2. smoke-test forecast and fallback behavior;
-3. enable Gemini in a second Worker version and trigger ingest;
-4. inspect outcomes for all configured spots; and
-5. disable brief generation if provider or quality behavior regresses.
-
-Do not remove the `ForecastBriefAgent` export as a rollback technique. D1
-brief revisions and Durable Object coordination state are additive and can
-remain in place while model generation is disabled.
+`ForecastBriefAgent`, its `FORECAST_BRIEF_AGENT` binding/export, migration
+`0002`, and old brief rows remain dormant rollback compatibility for existing
+installations. They are not an active generation path, should not be enabled as
+part of Analysis v3, and do not require Gemini credentials.
