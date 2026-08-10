@@ -6,8 +6,13 @@
   "compatibility_date": "2026-07-08",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  // Standard-plan runtime guard. Two seconds covers the observed Queue CPU
+  // envelope while keeping runaway work bounded and reviewable.
+  "limits": {
+    "cpu_ms": 2000
+  },
   // Workers Cache checks cacheable forecast/brief responses before invoking
-  // the 10 ms HTTP Worker. Version-scoped keys prevent stale cross-deploy data.
+  // the HTTP Worker. Version-scoped keys prevent stale cross-deploy data.
   "cache": {
     "enabled": true,
     "cross_version_cache": false

@@ -3,6 +3,7 @@ import { basename, dirname, resolve } from "node:path";
 import { SCHEDULED_INGEST_CRON } from "./ingest-schedule.mjs";
 
 const OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
+export const SUPPORTED_WORKER_CPU_LIMIT_MS = 2_000;
 
 function exactlyOne(collection, binding, kind, failures) {
   const matches = (collection ?? []).filter((entry) => entry.binding === binding);
@@ -27,6 +28,11 @@ export function wranglerStructureFailures(config, configPath) {
   }
   if (typeof config?.$schema !== "string" || !existsSync(resolve(configDirectory, config.$schema))) {
     failures.push("Wrangler schema must resolve to an existing file.");
+  }
+  if (config?.limits?.cpu_ms !== SUPPORTED_WORKER_CPU_LIMIT_MS) {
+    failures.push(
+      `Worker CPU limit must be exactly ${SUPPORTED_WORKER_CPU_LIMIT_MS} ms; the supported deployment requires the Standard usage model.`
+    );
   }
 
   const db = exactlyOne(config?.d1_databases, "DB", "D1", failures);

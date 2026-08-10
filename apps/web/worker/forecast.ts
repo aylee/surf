@@ -111,6 +111,7 @@ type WaveRow = {
   swell_direction_deg: number | null;
   payload_json: string | null;
   source_run_id: string | null;
+  created_at: string;
 };
 
 type HazardRow = {
@@ -268,6 +269,36 @@ function waveSourcePriority(sourceId: string): number {
   if (sourceId === CDIP_MOP_SOURCE_ID) return 0;
   if (sourceId === NWS_GRID_WAVE_SOURCE_ID) return 1;
   return 2;
+}
+
+function preferredWaveRowsBySourceTime(rows: WaveRow[]): WaveRow[] {
+  const preferred = new Map<string, { row: WaveRow; order: number }>();
+  rows.forEach((row, order) => {
+    const key = `${row.source_id}\u0000${row.forecast_at}`;
+    const current = preferred.get(key);
+    if (!current) {
+      preferred.set(key, { row, order });
+      return;
+    }
+    const rowHasNearshore = row.nearshore_height_m !== null;
+    const currentHasNearshore = current.row.nearshore_height_m !== null;
+    const preferredOverCurrent =
+      rowHasNearshore !== currentHasNearshore
+        ? rowHasNearshore
+        : row.model_cycle_at !== current.row.model_cycle_at
+          ? row.model_cycle_at > current.row.model_cycle_at
+          : row.created_at !== current.row.created_at
+            ? row.created_at > current.row.created_at
+            : order < current.order;
+    if (preferredOverCurrent) preferred.set(key, { row, order });
+  });
+  return [...preferred.values()]
+    .sort(
+      (left, right) =>
+        left.row.forecast_at.localeCompare(right.row.forecast_at) ||
+        left.order - right.order
+    )
+    .map(({ row }) => row);
 }
 
 type WaveSelection = {
@@ -850,6 +881,130 @@ function preparedQuery(
   return bindings.length > 0 ? statement.bind(...bindings) : statement;
 }
 
+const WAVE_ROW_COLUMNS = `source_id, forecast_at, model_cycle_at, nearshore_height_m,
+  offshore_height_m, significant_height_m, peak_period_s, primary_direction_deg,
+  swell_height_m, swell_period_s, swell_direction_deg, payload_json, source_run_id,
+  created_at`;
+
+function waveCycleFloorSql(): string {
+  return `coalesce(
+    (select model_cycle_at
+     from wave_forecasts
+     where spot_id = ? and source_id = ? and model_cycle_at <= ?
+     order by model_cycle_at desc
+     limit 1),
+    (select model_cycle_at
+     from wave_forecasts
+     where spot_id = ? and source_id = ?
+     order by model_cycle_at asc
+     limit 1)
+  )`;
+}
+
+function recentWaveArmSql(): string {
+  return `select ${WAVE_ROW_COLUMNS}
+    from wave_forecasts
+    where rowid in (
+      select rowid
+      from wave_forecasts
+      where spot_id = ? and source_id = ?
+        and model_cycle_at >= ${waveCycleFloorSql()}
+    )
+      and forecast_at >= ? and forecast_at <= ?`;
+}
+
+function recentWaveArmBindings(
+  spotId: SpotId,
+  sourceId: string,
+  cycleFloorAt: string,
+  forecastStartAt: string,
+  forecastEndAt: string
+): unknown[] {
+  return [
+    spotId,
+    sourceId,
+    spotId,
+    sourceId,
+    cycleFloorAt,
+    spotId,
+    sourceId,
+    forecastStartAt,
+    forecastEndAt
+  ];
+}
+
+type WaveFallbackRange = {
+  sourceId: string;
+  forecastStartAt: string;
+  forecastEndAt: string;
+};
+
+function olderWaveArmSql(): string {
+  return `select ${WAVE_ROW_COLUMNS}
+    from wave_forecasts
+    where spot_id = ? and source_id = ?
+      and model_cycle_at < ${waveCycleFloorSql()}
+      and forecast_at >= ? and forecast_at <= ?`;
+}
+
+function waveFallbackRanges(options: {
+  rows: WaveRow[];
+  forecastTimes: string[];
+  sourceIds: string[];
+  timeZone: string;
+  waveHorizonStart: string;
+  waveHorizonEnd: string;
+}): WaveFallbackRange[] {
+  const targets = options.forecastTimes.map((forecastAt) => ({
+    forecastAt,
+    timeMs: Date.parse(forecastAt)
+  }));
+  const waveHorizonStartMs = Date.parse(options.waveHorizonStart);
+  const waveHorizonEndMs = Date.parse(options.waveHorizonEnd);
+  return options.sourceIds.flatMap((sourceId): WaveFallbackRange[] => {
+    const sourceRows = options.rows.filter((row) => row.source_id === sourceId);
+    const selected = preferredWaveSelectionsAt(sourceRows, targets, options.timeZone);
+    const missingTimes = targets.flatMap(({ timeMs }) => {
+      const row = selected.get(timeMs)?.row;
+      return !row || row.nearshore_height_m === null ? [timeMs] : [];
+    });
+    if (missingTimes.length === 0) return [];
+    // Wave rows are valid for about three hours. The extra hour keeps the
+    // fallback correct across a local DST boundary while still restricting the
+    // historical scan to the uncovered portion of the display horizon.
+    const forecastStartMs = Math.max(
+      waveHorizonStartMs,
+      Math.min(...missingTimes) - 4 * HOUR_MS
+    );
+    const forecastEndMs = Math.min(waveHorizonEndMs, Math.max(...missingTimes));
+    return [{
+      sourceId,
+      forecastStartAt: new Date(forecastStartMs).toISOString(),
+      forecastEndAt: new Date(forecastEndMs).toISOString()
+    }];
+  });
+}
+
+async function loadOlderWaveFallbackRows(
+  db: D1Database,
+  spotId: SpotId,
+  cycleFloorAt: string,
+  ranges: WaveFallbackRange[]
+): Promise<WaveRow[]> {
+  if (ranges.length === 0) return [];
+  const sql = ranges.map(() => olderWaveArmSql()).join(" union all ");
+  const bindings = ranges.flatMap((range) =>
+    recentWaveArmBindings(
+      spotId,
+      range.sourceId,
+      cycleFloorAt,
+      range.forecastStartAt,
+      range.forecastEndAt
+    )
+  );
+  return queryRows<WaveRow>(db, sql, ...bindings);
+}
+
 async function loadForecastSourceRows(
   db: D1Database,
   spotId: SpotId,
@@ -865,6 +1020,11 @@ async function loadForecastSourceRows(
     new Date(horizonStart).getTime() - 3 * 60 * 60 * 1000
   ).toISOString();
   const waveHorizonEnd = new Date(new Date(horizonEnd).getTime() + 90 * 60 * 1000).toISOString();
+  const spot = getSpotProfile(spotId);
+  const expectedWaveSourceIds = [
+    ...(spot.sourceMap.cdipMop.modelPoint ? [CDIP_MOP_SOURCE_ID] : []),
+    NWS_GRID_WAVE_SOURCE_ID
+  ];
   const statements = [
     preparedQuery(
       db,
@@ -898,26 +1058,16 @@ async function loadForecastSourceRows(
     ),
     preparedQuery(
       db,
-      `select source_id, forecast_at, model_cycle_at, nearshore_height_m, offshore_height_m,
-              significant_height_m, peak_period_s, primary_direction_deg, swell_height_m,
-              swell_period_s, swell_direction_deg, payload_json, source_run_id
-       from (
-         select source_id, forecast_at, model_cycle_at, nearshore_height_m, offshore_height_m,
-                significant_height_m, peak_period_s, primary_direction_deg, swell_height_m,
-                swell_period_s, swell_direction_deg, payload_json, source_run_id, created_at,
-                row_number() over (
-                  partition by source_id, forecast_at
-                  order by case when nearshore_height_m is not null then 0 else 1 end,
-                           model_cycle_at desc, created_at desc
-                ) as source_rank
-         from wave_forecasts
-         where spot_id = ? and forecast_at >= ? and forecast_at <= ?
+      expectedWaveSourceIds.map(() => recentWaveArmSql()).join(" union all "),
+      ...expectedWaveSourceIds.flatMap((sourceId) =>
+        recentWaveArmBindings(
+          spotId,
+          sourceId,
+          waveHorizonStart,
+          waveHorizonStart,
+          waveHorizonEnd
+        )
       )
-       where source_rank = 1
-       order by forecast_at asc`,
-      spotId,
-      waveHorizonStart,
-      waveHorizonEnd
     ),
     preparedQuery(
       db,
@@ -963,7 +1113,26 @@ async function loadForecastSourceRows(
   const tideRows = asRows(results[0] as D1Result<TideRow>);
   const tideEventRows = asRows(results[1] as D1Result<TideEventRow>);
   const windRows = asRows(results[2] as D1Result<WindRow>);
-  const waveRows = asRows(results[3] as D1Result<WaveRow>);
+  const recentWaveRows = preferredWaveRowsBySourceTime(
+    asRows(results[3] as D1Result<WaveRow>)
+  );
+  const fallbackWaveRows = await loadOlderWaveFallbackRows(
+    db,
+    spotId,
+    waveHorizonStart,
+    waveFallbackRanges({
+      rows: recentWaveRows,
+      forecastTimes,
+      sourceIds: expectedWaveSourceIds,
+      timeZone: spot.timezone,
+      waveHorizonStart,
+      waveHorizonEnd
+    })
+  );
+  const waveRows = preferredWaveRowsBySourceTime([
+    ...recentWaveRows,
+    ...fallbackWaveRows
+  ]);
   const observationRows = asRows(results[4] as D1Result<ObservationRow>);
   const hazardRows = asRows(results[5] as D1Result<HazardRow>);
   const forecastIssues = asRows(results[6] as D1Result<ForecastIssueRow>);

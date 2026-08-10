@@ -86,7 +86,11 @@ function batchingQueryDb(rows: QueryRows) {
   } as unknown as D1PreparedStatement);
   const db = {
     prepare(sql: string) {
-      return statement(queryKey(sql), sql, sql.includes("from json_each(?)"));
+      return statement(
+        queryKey(sql),
+        sql,
+        sql.includes("from json_each(?)") || sql.includes("and model_cycle_at < coalesce(")
+      );
     },
     async batch(statements: D1PreparedStatement[]) {
       batchCalls += 1;
@@ -270,8 +274,12 @@ describe("forecast assembly", () => {
 
     expect(batched.batchCalls()).toBe(1);
     expect(batched.batchedStatements()).toBe(7);
-    expect(batched.individualAllCalls()).toBe(1);
+    expect(batched.individualAllCalls()).toBe(2);
     expect(batched.individualQueries()).toEqual([
+      expect.objectContaining({
+        key: "wave",
+        sql: expect.stringContaining("and model_cycle_at < coalesce(")
+      }),
       expect.objectContaining({
         key: "source",
         sql: expect.stringContaining("from json_each(?)"),

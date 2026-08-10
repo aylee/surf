@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync, readdirSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import {
+  OPS_STATUS_GENERATION_CADENCE_MS,
+  OPS_STATUS_GENERATION_SETTLE_MS,
+  OPS_STATUS_MAX_GENERATION_AGE_MS,
   OPS_STATUS_WRANGLER_TIMEOUT_MS,
   READ_MODEL_STATUS_SQL,
   formatOpsStatus,
@@ -17,6 +22,7 @@ const otherVersion = "66666666-7777-4888-8999-000000000000";
 const deploymentId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 const generatedAt = "2026-08-04T07:27:00.000Z";
 const materializedAt = "2026-08-04T07:27:30.000Z";
+const statusObservedAt = "2026-08-04T07:32:00.000Z";
 const generationId = `sha256:${"a".repeat(64)}:ingest:cron-20260804T0717Z`;
 const otherGenerationId = `sha256:${"b".repeat(64)}:ingest:cron-20260804T0617Z`;
 const spotIds = NORCAL_SPOTS.map((spot) => spot.id);
@@ -82,8 +88,8 @@ function queueConsumer(overrides = {}) {
   };
 }
 
-function readModelRows() {
-  return spotIds.flatMap((spotId) =>
+function readModelRows(ids = spotIds) {
+  return ids.flatMap((spotId) =>
     ["1h", "3h"].map((interval) => ({
       spot_id: spotId,
       interval,
@@ -91,7 +97,13 @@ function readModelRows() {
       generation_id: generationId,
       generated_at: generatedAt,
       materialized_at: materializedAt,
-      json_chars: interval === "1h" ? 300_000 : 120_000
+      json_chars: interval === "1h" ? 300_000 : 120_000,
+      latest_completed_generation_at: generatedAt,
+      status_observed_at: statusObservedAt,
+      source_run_count: 15,
+      completed_source_run_count: 15,
+      failed_source_run_count: 0,
+      partial_source_run_count: 1
     }))
   );
 }
@@ -176,11 +188,19 @@ test("ops status performs exactly four locked read-only probes and prints compac
     OPS_STATUS_WRANGLER_TIMEOUT_MS
   ]);
   assert.match(READ_MODEL_STATUS_SQL, /^with intervals\(interval\) as /);
+  assert.match(
+    READ_MODEL_STATUS_SQL,
+    /latest_completed_generation_at.*status_observed_at.*source_run_count/
+  );
   assert.doesNotMatch(
     READ_MODEL_STATUS_SQL,
     /\b(insert|update|delete|replace|drop|alter|create|pragma|vacuum)\b/i
   );
   assert.doesNotMatch(READ_MODEL_STATUS_SQL, /select\s+r\.forecast_json/i);
+  assert.doesNotMatch(
+    READ_MODEL_STATUS_SQL,
+    /\b(error|metadata_json|artifact_manifest_json|raw_r2_key)\b/i
+  );
 
   assert.equal(result.health.workerVersion, workerVersion);
   assert.equal(result.deployment.workerVersion, workerVersion);
@@ -197,6 +217,8 @@ test("ops status performs exactly four locked read-only probes and prints compac
   );
   assert.match(rendered, new RegExp(workerVersion));
   assert.match(rendered, /surf-ingest-dlq/);
+  assert.match(rendered, /watermark 2026-08-04T07:27:00.000Z · max lag 0m \(settling\)/);
+  assert.match(rendered, /source runs 15\/15 complete, 0 failed, 1 partial/);
   assert.doesNotMatch(rendered, /ingest-secret-must-not-render|cloudflare-secret-must-not-render/);
 });
 
@@ -517,25 +539,212 @@ test("D1 status rejects malformed output, failed statements, missing rows, dupli
     () => parseReadModelStatus(d1Status(splitGeneratedAt)),
     /split generated_at/
   );
+
+  for (const change of [
+    { latest_completed_generation_at: null },
+    { latest_completed_generation_at: "2026-08-04T07:33:00.000Z" },
+    { status_observed_at: "2026-08-04T07:32:00Z" },
+    { source_run_count: 0 },
+    { completed_source_run_count: 16 },
+    { failed_source_run_count: -1 },
+    { failed_source_run_count: 10, partial_source_run_count: 10 }
+  ]) {
+    const rows = readModelRows();
+    rows[0] = { ...rows[0], ...change };
+    assert.throws(
+      () => parseReadModelStatus(d1Status(rows)),
+      /invalid source-generation evidence|disagree on source-generation evidence/
+    );
+  }
+
+  const disagreeingEvidence = readModelRows();
+  disagreeingEvidence[1] = {
+    ...disagreeingEvidence[1],
+    partial_source_run_count: 0
+  };
+  assert.throws(
+    () => parseReadModelStatus(d1Status(disagreeingEvidence)),
+    /disagree on source-generation evidence/
+  );
 });
 
-test("D1 status permits whole spot generations and materialization times to differ", () => {
+test("D1 status permits a normal serialized one-generation drain inside the settle window", () => {
   const rows = readModelRows();
   for (const index of [0, 1]) {
     rows[index] = {
       ...rows[index],
       generation_id: otherGenerationId,
-      generated_at: "2026-08-04T06:17:00.000Z"
+      generated_at: "2026-08-04T06:27:00.000Z"
     };
   }
   rows[0] = {
     ...rows[0],
-    materialized_at: "2026-08-04T07:27:29.000Z"
+    materialized_at: "2026-08-04T06:27:29.000Z"
   };
   const result = parseReadModelStatus(d1Status(rows));
   assert.equal(result.ready, spotIds.length * 2);
-  assert.equal(result.oldestGeneratedAt, "2026-08-04T06:17:00.000Z");
+  assert.equal(result.oldestGeneratedAt, "2026-08-04T06:27:00.000Z");
   assert.equal(result.newestGeneratedAt, generatedAt);
+  assert.equal(result.maxGenerationLagMinutes, 60);
+  assert.equal(result.settling, true);
+});
+
+test("D1 status rejects the production pattern of five current spots and one two cycles behind", () => {
+  const rows = readModelRows();
+  for (const spotId of spotIds.slice(6)) {
+    for (const interval of ["1h", "3h"]) {
+      const index = rows.findIndex(
+        (row) => row.spot_id === spotId && row.interval === interval
+      );
+      rows[index] = {
+        ...rows[index],
+        generation_id: otherGenerationId,
+        generated_at: "2026-08-04T06:27:00.000Z",
+        materialized_at: "2026-08-04T06:27:30.000Z"
+      };
+    }
+  }
+  for (const interval of ["1h", "3h"]) {
+    const index = rows.findIndex(
+      (row) => row.spot_id === spotIds[5] && row.interval === interval
+    );
+    rows[index] = {
+      ...rows[index],
+      generation_id: `sha256:${"c".repeat(64)}:ingest:cron-20260804T0527Z`,
+      generated_at: "2026-08-04T05:27:00.000Z",
+      materialized_at: "2026-08-04T05:27:30.000Z"
+    };
+  }
+  assert.throws(
+    () => parseReadModelStatus(d1Status(rows)),
+    /lag the latest completed source generation by 120 minutes; policy allows 60 during the settle window/
+  );
+});
+
+test("D1 status fails closed on missing, extra, and substituted active spots", () => {
+  const missingSpotId = spotIds.at(-1);
+  assert.throws(
+    () => parseReadModelStatus(d1Status(readModelRows(spotIds.slice(0, -1)))),
+    new RegExp(`missing: ${missingSpotId}; unexpected: none`)
+  );
+
+  assert.throws(
+    () => parseReadModelStatus(d1Status(readModelRows([...spotIds, "unexpected-break"]))),
+    /missing: none; unexpected: unexpected-break/
+  );
+
+  assert.throws(
+    () =>
+      parseReadModelStatus(
+        d1Status(readModelRows([...spotIds.slice(0, -1), "unexpected-break"]))
+      ),
+    new RegExp(`missing: ${missingSpotId}; unexpected: unexpected-break`)
+  );
+});
+
+test("full watermark SELECT executes against a freshly migrated and seeded D1 schema", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const migrationsUrl = new URL("../../packages/db/migrations/", import.meta.url);
+    for (const migration of readdirSync(migrationsUrl)
+      .filter((name) => name.endsWith(".sql"))
+      .sort()) {
+      database.exec(readFileSync(new URL(migration, migrationsUrl), "utf8"));
+    }
+    database.exec(
+      readFileSync(
+        new URL("../../packages/db/seeds/0000_v1_norcal.sql", import.meta.url),
+        "utf8"
+      )
+    );
+
+    const nowMs = Date.now();
+    const sourceGeneratedAt = new Date(nowMs - 60_000).toISOString();
+    const sourceCompletedAt = new Date(nowMs - 45_000).toISOString();
+    const modelMaterializedAt = new Date(nowMs - 30_000).toISOString();
+    database
+      .prepare(
+        `insert into source_runs (
+          id, run_key, source_id, run_kind, started_at, completed_at, status
+        ) values (?, ?, ?, 'ingest', ?, ?, 'success')`
+      )
+      .run(
+        "ops-status-source-run",
+        "ops-status-source-run-key",
+        "nws:mtr-grid-wave",
+        sourceGeneratedAt,
+        sourceCompletedAt
+      );
+    const insertReadModel = database.prepare(
+      `insert into forecast_read_models (
+        spot_id, interval, generation_id, generated_at,
+        source_issue_fingerprint, schema_version, forecast_json, materialized_at
+      ) values (?, ?, ?, ?, ?, 1, '{}', ?)`
+    );
+    for (const spotId of spotIds) {
+      for (const interval of ["1h", "3h"]) {
+        insertReadModel.run(
+          spotId,
+          interval,
+          generationId,
+          sourceGeneratedAt,
+          "ops-status-source-fingerprint",
+          modelMaterializedAt
+        );
+      }
+    }
+
+    const rows = database.prepare(READ_MODEL_STATUS_SQL).all();
+    const result = parseReadModelStatus(
+      JSON.stringify([{ results: rows, success: true }])
+    );
+    assert.equal(result.ready, spotIds.length * 2);
+    assert.equal(result.expected, spotIds.length * 2);
+    assert.equal(result.spots, spotIds.length);
+    assert.equal(result.latestCompletedGenerationAt, sourceGeneratedAt);
+    assert.equal(result.maxGenerationLagMinutes, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("D1 status requires exact convergence after the settle window", () => {
+  const rows = readModelRows();
+  for (const row of rows) {
+    row.status_observed_at = "2026-08-04T07:37:00.001Z";
+  }
+  for (const index of [0, 1]) {
+    rows[index] = {
+      ...rows[index],
+      generation_id: otherGenerationId,
+      generated_at: "2026-08-04T06:27:00.000Z",
+      materialized_at: "2026-08-04T06:27:30.000Z"
+    };
+  }
+  assert.throws(
+    () => parseReadModelStatus(d1Status(rows)),
+    /policy allows 0 after the settle window/
+  );
+});
+
+test("D1 status rejects a globally stale completed generation", () => {
+  const rows = readModelRows();
+  for (const row of rows) {
+    row.status_observed_at = "2026-08-04T08:37:00.001Z";
+  }
+  assert.throws(
+    () => parseReadModelStatus(d1Status(rows)),
+    /Latest completed source generation is 71 minutes old; policy allows 70/
+  );
+});
+
+test("D1 generation policy stays aligned with the hourly cadence and documented settle budget", () => {
+  assert.equal(OPS_STATUS_GENERATION_CADENCE_MS, 60 * 60_000);
+  assert.equal(OPS_STATUS_GENERATION_SETTLE_MS, 10 * 60_000);
+  assert.equal(
+    OPS_STATUS_MAX_GENERATION_AGE_MS,
+    OPS_STATUS_GENERATION_CADENCE_MS + OPS_STATUS_GENERATION_SETTLE_MS
+  );
 });
 
 test("ops status rejects subprocess failures without leaking stderr or running later probes", async () => {
