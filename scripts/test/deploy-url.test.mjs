@@ -3,7 +3,8 @@ import test from "node:test";
 import {
   resolveActiveDeploymentId,
   resolveDeployedUrl,
-  resolveDeployedVersionId
+  resolveDeployedVersionId,
+  resolveUploadedVersionId
 } from "../lib/deploy-url.mjs";
 
 const versionId = "11111111-2222-4333-8444-555555555555";
@@ -64,6 +65,37 @@ test("deploy version parser rejects missing, ambiguous, and malformed IDs", () =
   assert.throws(
     () => resolveDeployedVersionId(`prefix Current Version ID: ${versionId}`),
     /exactly one Current Version ID line; found 0/
+  );
+});
+
+test("staged upload parser extracts Wrangler's one exact Worker Version ID", () => {
+  assert.equal(
+    resolveUploadedVersionId(
+      `Uploaded surf\n\u001b[32mWorker Version ID: ${versionId}\u001b[0m\nVersion Preview URL: https://11111111-surf.example.workers.dev`
+    ),
+    versionId
+  );
+});
+
+test("staged upload parser rejects missing, ambiguous, and malformed IDs", () => {
+  assert.throws(
+    () => resolveUploadedVersionId("Uploaded surf without version evidence"),
+    /exactly one Worker Version ID line; found 0/
+  );
+  assert.throws(
+    () =>
+      resolveUploadedVersionId(
+        `Worker Version ID: ${versionId}\nWorker Version ID: aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`
+      ),
+    /exactly one Worker Version ID line; found 2/
+  );
+  assert.throws(
+    () => resolveUploadedVersionId("Worker Version ID: latest"),
+    /invalid Worker Version ID UUID/
+  );
+  assert.throws(
+    () => resolveUploadedVersionId(`prefix Worker Version ID: ${versionId}`),
+    /exactly one Worker Version ID line; found 0/
   );
 });
 

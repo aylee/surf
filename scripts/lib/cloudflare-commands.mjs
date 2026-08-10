@@ -31,6 +31,29 @@ function displayCommand(args) {
   return ["pnpm", ...args].join(" ");
 }
 
+export function cloudflareApiErrorCodes(output) {
+  if (typeof output !== "string") return [];
+  const codes = new Set();
+  for (const match of output.matchAll(/\[code:\s*(\d+)\]/gi)) {
+    codes.add(Number(match[1]));
+  }
+  return [...codes];
+}
+
+export function hasCloudflareApiErrorCode(error, expectedCode) {
+  if (!Number.isInteger(expectedCode) || expectedCode <= 0) {
+    throw new Error("Cloudflare API error code must be a positive integer.");
+  }
+  let current = error;
+  const visited = new Set();
+  while (current && typeof current === "object" && !visited.has(current)) {
+    visited.add(current);
+    if (current.cloudflareApiErrorCodes?.includes?.(expectedCode)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
 export function resolveCloudflareCommandTimeout(options = {}) {
   const timeoutPolicy = options.timeoutPolicy ?? "finite";
   if (timeoutPolicy === "unbounded") {
@@ -94,7 +117,14 @@ export function runPnpm(args, options = {}) {
     if (options.capture && options.echo === false && output) {
       process.stderr.write(output);
     }
-    throw new Error(`${displayCommand(args)} exited with status ${result.status ?? "unknown"}`);
+    const error = new Error(
+      `${displayCommand(args)} exited with status ${result.status ?? "unknown"}`
+    );
+    Object.defineProperty(error, "cloudflareApiErrorCodes", {
+      value: cloudflareApiErrorCodes(output),
+      enumerable: false
+    });
+    throw error;
   }
 
   return output;

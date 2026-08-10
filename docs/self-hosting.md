@@ -8,9 +8,9 @@ or resource identifiers.
 
 - Node.js 24 (see `.node-version`)
 - pnpm 11 through Corepack
-- For deployment: a Cloudflare account whose Workers settings report the
-  Standard usage model, with D1, R2, and Queues, plus a registered `workers.dev`
-  subdomain
+- For deployment: a Cloudflare Workers Paid account (the project requires the
+  Standard usage model), with D1, R2, and Queues, plus a registered
+  `workers.dev` subdomain
 
 The forecast feeds used by the reference configuration do not require paid API
 keys. Optional Analysis can run on a self-hosted oMLX server; it has no hosted
@@ -27,9 +27,11 @@ Workers Paid. Workers Free is not a supported deployment target: its 10 ms CPU
 budget is below this application's measured forecast-materialization workload.
 The config validator rejects removing or changing the limit so a fork cannot
 silently fall back to an account- or dashboard-specific CPU cap. Project setup
-does not change account usage models, subscriptions, or billing; if the account
-does not already report Standard, stop before deployment and let the operator
-choose whether to change plans.
+does not change account usage models, subscriptions, or billing. Verify Workers
+Paid in the billing dashboard before first setup and let the operator choose
+whether to change plans. Do not use an existing version's `usage_model` field
+as billing evidence: a version can report `standard` on a Free account even
+though Cloudflare rejects a new custom CPU limit.
 
 ## Local setup
 
@@ -133,10 +135,13 @@ are idempotent.
 The setup command runs automatic provisioning in non-interactive mode so
 instance IDs stay in Cloudflare rather than being written into the tracked
 configuration. The config-hygiene check rejects owner-specific IDs. A first
-setup deploys once before D1 can be migrated, so a migration failure can leave
-a temporarily uninitialized Worker and partially created resources. Read the
-reported error, fix it, and rerun the same command; do not delete resources to
-retry. If automatic provisioning is unavailable for an account, use
+setup cannot use the update deploy's inactive-version capability gate because
+neither the Worker nor all bindings exist yet. Confirm Workers Paid first. It
+then deploys once before D1 can be migrated, so a plan/config rejection or
+migration failure can leave partially created resources or a temporarily
+uninitialized Worker. Read the reported error, fix it, and rerun the same
+command; do not delete resources to retry. If automatic provisioning is
+unavailable for an account, use
 [Cloudflare's manual resource setup](https://developers.cloudflare.com/workers/wrangler/configuration/#bindings)
 and an ignored instance configuration rather than guessing IDs or committing
 account-specific values:
@@ -177,12 +182,20 @@ your shell, provide the same value through the ignored environment variable
 `SURF_INGEST_TOKEN`; never paste it into a script or GitHub issue.
 
 Keep that variable available for later `pnpm deploy` runs. An update deploy
-first proves the exact Wrangler-emitted Worker version is callable and that
-unpinned production routing has converged, verifies the control plane reports
-that one version at 100%, then performs one unpinned authenticated PATCH with a
-Worker-enforced version precondition. Any newly migrated forecast read-model
-tables are populated before unpinned, exact-version strict smoke testing and a
-final 100% control-plane check.
+requires `SURF_BASE_URL` and first reconciles configured Queues, because
+Wrangler prechecks them before it will upload a version. It then stages the
+exact target as an inactive Worker version. Cloudflare must accept the
+configured 2,000 ms CPU guard and the version-detail readback must match before
+the command mutates D1. A Free-plan rejection can therefore leave newly created
+Queues, but never a D1 migration/seed from that deploy attempt. The command then
+prepares storage, rechecks that the original predecessor remains solely active,
+activates only the target at 100%, synchronizes triggers, proves the exact
+version is callable and ordinary routing has converged, then performs one
+unpinned authenticated PATCH with a Worker-enforced version precondition. Any
+newly migrated forecast read-model tables are populated before unpinned,
+exact-version strict smoke testing and a final 100% control-plane check.
+`versions upload` can emit a public preview URL; deployment never substitutes
+it for the configured production origin.
 
 ### 5. Optional local-oMLX Analysis rollout
 
@@ -324,10 +337,15 @@ pnpm deploy
 
 Instances that use the tracked canonical configuration can omit the export.
 
-The deploy command applies migrations, deploys, refreshes the materialized
-forecast generation, and then runs the strict remote smoke. Once Wrangler
-activates the version, any readiness, publication, or smoke failure
-deliberately leaves it active for a Queue-safe fix-forward: cron, manual
+The deploy command reconciles Queues, stages and validates the target, applies
+migrations, activates the target, synchronizes triggers, refreshes the
+materialized forecast generation, and then runs the strict remote smoke.
+Wrangler requires Queues before staging, but a rejected CPU guard stops before
+D1; there is no Workers Free fallback. Because Wrangler can activate before a
+later observability patch fails, a nonzero activation command is reconciled
+against exact control-plane state before the workflow proceeds. Once Wrangler
+activates the version, any settings, trigger, readiness, publication, or smoke
+failure deliberately leaves it active for a Queue-safe fix-forward: cron, manual
 traffic, or backlog processing may already have crossed the Queue schema
 boundary. Rolling back requires first proving the Queue quiescent, no consumer
 in flight, and every payload predecessor-compatible. Additive D1 schema changes

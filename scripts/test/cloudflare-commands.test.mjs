@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CLOUDFLARE_COMMAND_TIMEOUT_MS,
+  cloudflareApiErrorCodes,
+  hasCloudflareApiErrorCode,
   resolveCloudflareCommandTimeout,
   runPnpm
 } from "../lib/cloudflare-commands.mjs";
@@ -88,4 +90,24 @@ test("unbounded timeout policy rejects an ambiguous millisecond limit", () => {
     () => resolveCloudflareCommandTimeout({ timeoutPolicy: "forever" }),
     /must be finite or unbounded/
   );
+});
+
+test("failed commands expose only structured Cloudflare API codes for classification", () => {
+  assert.deepEqual(
+    cloudflareApiErrorCodes(
+      "custom CPU limits require another plan [code: 100328]\nrepeat [code: 100328]"
+    ),
+    [100328]
+  );
+  assert.deepEqual(cloudflareApiErrorCodes("ordinary failure 100328"), []);
+
+  const classified = new Error("bounded command failure");
+  Object.defineProperty(classified, "cloudflareApiErrorCodes", {
+    value: [100328],
+    enumerable: false
+  });
+  const wrapped = new Error("staging failed", { cause: classified });
+  assert.equal(hasCloudflareApiErrorCode(wrapped, 100328), true);
+  assert.equal(hasCloudflareApiErrorCode(wrapped, 1102), false);
+  assert.deepEqual(Object.keys(classified), []);
 });

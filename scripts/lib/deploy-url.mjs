@@ -25,6 +25,28 @@ export function resolveDeployedVersionId(output) {
   return match[1];
 }
 
+export function resolveUploadedVersionId(output) {
+  const lines = stripAnsi(output).split(/\r?\n/);
+  const versionLines = lines.filter((line) =>
+    /^\s*Worker Version ID:/.test(line)
+  );
+  if (versionLines.length !== 1) {
+    throw new Error(
+      `Wrangler versions upload output must contain exactly one Worker Version ID line; found ${versionLines.length}.`
+    );
+  }
+
+  const match = versionLines[0].match(
+    /^\s*Worker Version ID:\s*([^\s]+)\s*$/
+  );
+  if (!match || !VERSION_ID_PATTERN.test(match[1])) {
+    throw new Error(
+      "Wrangler versions upload output contained an invalid Worker Version ID UUID."
+    );
+  }
+  return match[1];
+}
+
 export function resolveActiveDeploymentId(output, expectedVersionId) {
   if (!VERSION_ID_PATTERN.test(expectedVersionId)) {
     throw new Error("Expected Worker version must be a UUID.");
