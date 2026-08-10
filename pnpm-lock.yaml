@@ -12,6 +12,28 @@ importers:
         specifier: 3.3.1
         version: 3.3.1
 
+  apps/narrative-runner:
+    dependencies:
+      '@surf/narrative-contracts':
+        specifier: workspace:*
+        version: link:../../packages/narrative-contracts
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+    devDependencies:
+      '@types/node':
+        specifier: 26.1.2
+        version: 26.1.2
+      tsx:
+        specifier: 4.23.5
+        version: 4.23.5
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: 4.1.10
+        version: 4.1.10(@opentelemetry/api@1.9.1)(@types/node@26.1.2)(jsdom@30.0.1)(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.5)(yaml@2.9.0))
+
   apps/web:
     dependencies:
       '@ai-sdk/google':
@@ -44,6 +66,9 @@ importers:
       '@surf/forecast-core':
         specifier: workspace:*
         version: link:../../packages/forecast-core
+      '@surf/narrative-contracts':
+        specifier: workspace:*
+        version: link:../../packages/narrative-contracts
       agents:
         specifier: 0.20.1
         version: 0.20.1(@babel/core@8.0.1)(@babel/runtime@7.29.7)(@cloudflare/workers-types@5.20260804.1)(@modelcontextprotocol/client@2.0.0)(@modelcontextprotocol/sdk@1.30.0(@cfworker/json-schema@4.1.1)(zod@4.4.3))(@modelcontextprotocol/server@2.0.0)(ai@7.0.51(zod@4.4.3))(react@19.2.8)(rolldown@1.2.3)(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.5)(yaml@2.9.0))(zod@4.4.3)
@@ -158,6 +183,19 @@ importers:
       '@surf/contracts':
         specifier: workspace:*
         version: link:../contracts
+    devDependencies:
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: 4.1.10
+        version: 4.1.10(@opentelemetry/api@1.9.1)(@types/node@26.1.2)(jsdom@30.0.1)(vite@8.2.0(@types/node@26.1.2)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.5)(yaml@2.9.0))
+
+  packages/narrative-contracts:
+    dependencies:
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
     devDependencies:
       typescript:
         specifier: 7.0.2

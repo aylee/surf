@@ -77,6 +77,10 @@ assert(
   !/GEMINI_API_KEY=AIza[0-9A-Za-z_-]+/.test(devVarsExample),
   "apps/web/.dev.vars.example must never contain a real Gemini key."
 );
+assert(
+  devVarsExample.includes("NARRATIVE_RESULT_TOKEN=replace_with_a_dedicated_result_token"),
+  "apps/web/.dev.vars.example must document only a placeholder narrative result token."
+);
 
 for (const file of worktreeFiles.filter(
   (candidate) =>

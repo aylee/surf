@@ -83,6 +83,7 @@ export type CdipMopMetadata = {
   modelPointBySpot: Record<string, string>;
   documentationUrl: string;
   sourceTimestampSemantics: "http_last_modified_source_update_not_model_cycle";
+  windowEnd: string;
 };
 
 type SpotFetchResult = {
@@ -274,7 +275,8 @@ async function fetchSpotForecast(
   fetcher: SourceFetch,
   spot: NorcalSpotProfile,
   now: Date,
-  horizonHours: number
+  horizonHours: number,
+  horizonEndMs: number
 ): Promise<SpotFetchResult> {
   const point = spot.sourceMap.cdipMop.modelPoint;
   if (!point) throw new Error(`CDIP MOP fetch called for unmapped spot ${spot.id}.`);
@@ -357,7 +359,7 @@ async function fetchSpotForecast(
 
     const parsed = parseCdipMopAscii(asciiText);
     const startMs = now.getTime() - THREE_HOURS_MS;
-    const endMs = now.getTime() + horizonHours * 60 * 60 * 1000 + THREE_HOURS_MS;
+    const endMs = horizonEndMs;
     const modelCycleMs = new Date(modelCycleAt).getTime();
     if (parsed.samples.some((sample) => sample.epochSeconds * 1000 < modelCycleMs)) {
       throw new Error(`CDIP MOP ${point.id} contained a forecast time before its runtime cycle.`);
@@ -445,8 +447,8 @@ async function fetchSpotForecast(
     ];
     if (point.relationship === "outside_cove_approach_proxy") {
       caveats.push({
-        code: "cdip_mop_linda_mar_cove_scale",
-        message: `Linda Mar uses outside-cove point ${point.id} Hs × ${point.nearshoreHeightScale.toFixed(2)} as the explicit final cove exposure scale.`
+        code: "cdip_mop_approach_proxy_scale",
+        message: `${spot.name} uses shared or outside-cove approach point ${point.id} Hs × ${point.nearshoreHeightScale.toFixed(2)} as an explicit uncalibrated exposure proxy, not a spot observation.`
       });
     }
     if (transformFailureCount > 0) {
@@ -490,16 +492,23 @@ export async function fetchCdipMopForecastsForSpots(
     fetcher?: SourceFetch;
     now?: Date;
     horizonHours?: number;
+    horizonEndAt?: string;
   } = {}
 ): Promise<AdapterOutcome<CdipMopForecastRow, CdipMopMetadata>> {
   const fetchedAt = new Date().toISOString();
   const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
   const now = options.now ?? new Date();
   const horizonHours = options.horizonHours ?? 120;
+  const horizonEndMs = options.horizonEndAt === undefined
+    ? now.getTime() + horizonHours * 60 * 60 * 1000
+    : Date.parse(options.horizonEndAt);
+  if (!Number.isFinite(horizonEndMs) || horizonEndMs <= now.getTime()) {
+    throw new Error("CDIP MOP horizonEndAt must be a valid instant after now");
+  }
   const configured = spots.filter((spot) => spot.sourceMap.cdipMop.modelPoint !== null);
   const unavailable = spots.filter((spot) => spot.sourceMap.cdipMop.modelPoint === null);
   const results = await Promise.all(
-    configured.map((spot) => fetchSpotForecast(fetcher, spot, now, horizonHours))
+    configured.map((spot) => fetchSpotForecast(fetcher, spot, now, horizonHours, horizonEndMs))
   );
   const caveats: SourceCaveat[] = results.flatMap((result) => result.caveats);
   if (unavailable.some((spot) => spot.id === "bolinas")) {
@@ -538,7 +547,8 @@ export async function fetchCdipMopForecastsForSpots(
         })
       ),
       documentationUrl: CDIP_MOP_DOCUMENTATION_URL,
-      sourceTimestampSemantics: "http_last_modified_source_update_not_model_cycle"
+      sourceTimestampSemantics: "http_last_modified_source_update_not_model_cycle",
+      windowEnd: new Date(horizonEndMs).toISOString()
     }
   };
 }

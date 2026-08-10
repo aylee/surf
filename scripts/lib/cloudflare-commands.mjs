@@ -140,6 +140,9 @@ export function configuredQueueNames(config = readWranglerConfig()) {
     if (consumer.queue) names.add(consumer.queue);
     if (consumer.dead_letter_queue) names.add(consumer.dead_letter_queue);
   }
+  if ((config.queues?.producers ?? []).some((producer) => producer.binding === "NARRATIVE_QUEUE")) {
+    names.add(`${config.name}-narrative-dlq`);
+  }
   return [...names];
 }
 

@@ -9,8 +9,18 @@ export {
 } from "./spot-registry";
 export type { NorcalSpotProfile, NwsWaveGridSourceMapping } from "./spot-registry";
 export { scoreSpotWindow } from "./scoring";
-export { selectCanonicalRecommendationIds } from "./recommendations";
-export type { CanonicalRecommendationCandidate } from "./recommendations";
+export {
+  CANONICAL_RECOMMENDATION_SCORE_BAND,
+  intervalOverlapsCivilLight,
+  intervalOverlapsRange,
+  selectCanonicalRecommendationIds,
+  selectCanonicalRecommendationWindows
+} from "./recommendations";
+export type {
+  CanonicalRecommendationCandidate,
+  CanonicalRecommendationWindow
+} from "./recommendations";
+export { surfSizeRange } from "./surf-size";
 export { DEFAULT_BREAKER_INDEX, estimateBreakingWaveHeight } from "./wave-transform";
 export type { BreakingWaveEstimate, BreakingWaveInput } from "./wave-transform";
 export {

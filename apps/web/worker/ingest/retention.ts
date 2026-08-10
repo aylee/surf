@@ -3,6 +3,7 @@ import type { PersistenceResult } from "./types";
 
 export const FORECAST_HISTORY_RETENTION_DAYS = 400;
 export const OPERATIONAL_FORECAST_RETENTION_DAYS = 2;
+export const NARRATIVE_RETENTION_DAYS = 7;
 
 export async function pruneRetainedData(
   db: D1Database,
@@ -17,7 +18,39 @@ export async function pruneRetainedData(
   const operationalCutoff = new Date(
     now.getTime() - OPERATIONAL_FORECAST_RETENTION_DAYS * 24 * 60 * 60 * 1000
   ).toISOString();
+  const narrativeCutoff = new Date(
+    now.getTime() - NARRATIVE_RETENTION_DAYS * 24 * 60 * 60 * 1000
+  ).toISOString();
+  const currentDate = now.toISOString().slice(0, 10);
   return runPendingStatements(db, [
+    {
+      // Revisions own a foreign key to jobs, so this must remain before the
+      // narrative_jobs deletion below.
+      label: "prune narrative_revisions",
+      statement: db
+        .prepare(
+          `delete from narrative_revisions
+           where published_at < ? and local_date < ?`
+        )
+        .bind(narrativeCutoff, currentDate)
+    },
+    {
+      label: "prune narrative_jobs",
+      statement: db
+        .prepare(
+          `delete from narrative_jobs
+           where updated_at < ? and local_date < ?
+             and (
+               status in ('published', 'rejected', 'expired', 'superseded')
+               or (status in ('enqueueing', 'pending', 'enqueue_failed') and deadline_at < ?)
+             )
+             and not exists (
+               select 1 from narrative_revisions
+               where narrative_revisions.job_id = narrative_jobs.job_id
+             )`
+        )
+        .bind(narrativeCutoff, currentDate, narrativeCutoff)
+    },
     {
       label: "prune forecast_snapshots",
       statement: db

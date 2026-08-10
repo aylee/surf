@@ -64,6 +64,7 @@ export type NwsGridWaveMetadata = {
   requestUrls: string[];
   rowCountBySpot: Record<string, number>;
   modelCycleBySpot: Record<string, string>;
+  windowEnd: string | null;
 };
 
 export type ParsedNwsValidTime = {
@@ -171,7 +172,8 @@ async function fetchSpotGridWave(
   fetcher: SourceFetch,
   spot: NorcalSpotProfile,
   now: Date,
-  horizonHours: number
+  horizonHours: number,
+  horizonEndMs: number | null
 ): Promise<{
   rows: NwsGridWaveForecastRow[];
   modelCycleAt: string | null;
@@ -221,6 +223,7 @@ async function fetchSpotGridWave(
     };
   }
   const rows = stableThreeHourForecastTimes(now, horizonHours, spot.timezone).flatMap((forecastAt) => {
+    if (horizonEndMs !== null && Date.parse(forecastAt) >= horizonEndMs) return [];
     const significantHeightM = nwsGridLayerValueAt(properties.waveHeight, forecastAt);
     if (significantHeightM === null || significantHeightM < 0) return [];
 
@@ -283,15 +286,25 @@ export async function fetchNwsGridWaveForSpots(
     fetcher?: SourceFetch;
     now?: Date;
     horizonHours?: number;
+    horizonEndAt?: string;
   } = {}
 ): Promise<AdapterOutcome<NwsGridWaveForecastRow, NwsGridWaveMetadata>> {
   const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
   const now = options.now ?? new Date();
   const horizonHours = options.horizonHours ?? 120;
+  const horizonEndMs = options.horizonEndAt === undefined
+    ? null
+    : Date.parse(options.horizonEndAt);
+  if (
+    horizonEndMs !== null &&
+    (!Number.isFinite(horizonEndMs) || horizonEndMs <= now.getTime())
+  ) {
+    throw new Error("NWS grid-wave horizonEndAt must be a valid instant after now");
+  }
   const outcomes = await Promise.all(
     spots.map(async (spot) => {
       try {
-        return await fetchSpotGridWave(fetcher, spot, now, horizonHours);
+        return await fetchSpotGridWave(fetcher, spot, now, horizonHours, horizonEndMs);
       } catch (error) {
         return {
           rows: [],
@@ -332,7 +345,8 @@ export async function fetchNwsGridWaveForSpots(
       rowCount: rows.length,
       requestUrls: outcomes.map((outcome) => outcome.requestUrl),
       rowCountBySpot,
-      modelCycleBySpot
+      modelCycleBySpot,
+      windowEnd: horizonEndMs === null ? null : new Date(horizonEndMs).toISOString()
     }
   };
 }

@@ -3,7 +3,12 @@ import { ForecastResponseSchema, type ApiSpot } from "@surf/contracts";
 import { getSpotProfile } from "@surf/forecast-core";
 import { buildFixtureForecast } from "@surf/forecast-core/test-support";
 import { adaptForecastResponse, type WorkbenchWindow } from "./forecast-adapter";
-import { buildForecastChartData } from "./ForecastGraph";
+import {
+  buildForecastChartData,
+  chartCivilLightBounds,
+  forecastAtForChartKey,
+  forecastGraphSelectionSummary
+} from "./ForecastGraph";
 import { expectedForecastSlotCount } from "./workbench-time";
 
 const profile = getSpotProfile("bolinas");
@@ -66,6 +71,38 @@ function rowsForUtcRange(start: string, end: string, localDateKey: string): Work
 }
 
 describe("forecast graph normalization", () => {
+  it("uses exact civil-light bounds for gap context and chart shading", () => {
+    const civilLight = {
+      firstLight: "2026-08-02T14:22:00.000Z",
+      lastLight: "2026-08-03T00:19:00.000Z"
+    };
+    const data = buildForecastChartData([localRow(0)], "1h", spot.timezone, civilLight);
+    const domainStart = Date.parse("2026-08-02T07:00:00.000Z");
+    const domainEnd = Date.parse("2026-08-03T07:00:00.000Z");
+
+    expect(data[6]?.isDaylight).toBe(false);
+    expect(data[7]).toMatchObject({ isGap: true, isDaylight: true });
+    expect(data[17]).toMatchObject({ isGap: true, isDaylight: true });
+    expect(data[18]?.isDaylight).toBe(false);
+    expect(chartCivilLightBounds(civilLight, domainStart, domainEnd)).toEqual({
+      start: Date.parse(civilLight.firstLight),
+      end: Date.parse(civilLight.lastLight)
+    });
+  });
+
+  it.each([
+    [0.6, "0–1 ft"],
+    [3, "2–3 ft"],
+    [3.4, "3–4 ft"],
+    [10.4, "10 ft+"],
+    [null, "Size unavailable"]
+  ])("uses the shared surf-size range for graph data at %s", (height, expected) => {
+    const row = localRow(7);
+    row.raw = { ...row.raw, waveHeightFt: height };
+    const datum = buildForecastChartData([row], "1h", spot.timezone)[7];
+    expect(datum?.surfSizeLabel).toBe(expected);
+  });
+
   it("creates an explicit 24-hour domain and leaves an omitted hour null", () => {
     const rows = [0, 1, 3, 6, 12, 18, 23].map(localRow);
     const data = buildForecastChartData(rows, "1h", spot.timezone);
@@ -81,6 +118,35 @@ describe("forecast graph normalization", () => {
     expect(data[3]!.timestamp - data[2]!.timestamp).toBe(60 * 60 * 1000);
     expect(data[6]?.isDaylight).toBe(true);
     expect(data[23]?.isDaylight).toBe(false);
+  });
+
+  it("moves keyboard inspection across available points, skipping gaps", () => {
+    const data = buildForecastChartData([0, 1, 3, 6].map(localRow), "1h", spot.timezone);
+    const midnight = data[0]!.forecastAt;
+    const oneAm = data[1]!.forecastAt;
+    const threeAm = data[3]!.forecastAt;
+    const sixAm = data[6]!.forecastAt;
+
+    expect(forecastAtForChartKey(data, midnight, "ArrowRight")).toBe(oneAm);
+    expect(forecastAtForChartKey(data, oneAm, "ArrowRight")).toBe(threeAm);
+    expect(forecastAtForChartKey(data, threeAm, "ArrowLeft")).toBe(oneAm);
+    expect(forecastAtForChartKey(data, threeAm, "Home")).toBe(midnight);
+    expect(forecastAtForChartKey(data, threeAm, "End")).toBe(sixAm);
+    expect(forecastAtForChartKey(data, null, "ArrowLeft")).toBe(sixAm);
+    expect(forecastAtForChartKey(data, midnight, "PageDown")).toBeNull();
+  });
+
+  it("builds a persistent accessible readout for the selected chart time", () => {
+    const data = buildForecastChartData([localRow(7)], "1h", spot.timezone);
+    const selectedAt = data[7]!.forecastAt;
+    const summary = forecastGraphSelectionSummary(data, selectedAt, spot.timezone);
+
+    expect(summary).toContain("selected");
+    expect(summary).toContain(data[7]!.surfSizeLabel);
+    expect(summary).toContain("Wind");
+    expect(summary).toContain("Tide");
+    expect(summary).toContain("Confidence");
+    expect(forecastGraphSelectionSummary(data, null, spot.timezone)).toContain("Use Left and Right Arrow");
   });
 
   it("creates eight three-hour slots instead of compressing a missing window", () => {

@@ -32,6 +32,7 @@
     "@radix-ui/react-tooltip": "1.2.16",
     "@surf/contracts": "workspace:*",
     "@surf/forecast-core": "workspace:*",
+    "@surf/narrative-contracts": "workspace:*",
     "agents": "0.20.1",
     "ai": "7.0.51",
     "class-variance-authority": "0.7.1",

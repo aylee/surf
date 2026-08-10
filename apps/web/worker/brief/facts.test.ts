@@ -8,6 +8,59 @@ import {
 import { briefForecastFixture } from "./test-helpers";
 
 describe("forecast brief fact bundle", () => {
+  it("keeps first- and last-light overlap eligible independently of wave-source validity", async () => {
+    const forecast = briefForecastFixture();
+    const morning = {
+      ...forecast.windows[0]!,
+      forecastAt: "2026-08-02T14:00:00.000Z",
+      waveHeightFt: 3,
+      waveState: {
+        ...forecast.windows[0]!.waveState!,
+        validFrom: "2026-08-02T13:00:00.000Z",
+        validTo: "2026-08-02T14:00:00.000Z"
+      }
+    };
+    const evening = {
+      ...forecast.windows[0]!,
+      forecastAt: "2026-08-03T00:00:00.000Z",
+      waveState: {
+        ...forecast.windows[0]!.waveState!,
+        validFrom: "2026-08-02T23:00:00.000Z",
+        validTo: "2026-08-03T00:00:00.000Z"
+      }
+    };
+    forecast.interval = "1h";
+    forecast.windows = [morning, evening];
+    forecast.sunPhases = [{
+      localDate: "2026-08-02",
+      firstLight: "2026-08-02T14:22:00.000Z",
+      sunrise: "2026-08-02T14:50:00.000Z",
+      sunset: "2026-08-02T23:50:00.000Z",
+      lastLight: "2026-08-03T00:19:00.000Z"
+    }];
+    forecast.recommendations = [
+      {
+        localDate: "2026-08-02",
+        representative: morning,
+        constituentWindowIds: [morning.forecastAt],
+        startAt: "2026-08-02T14:22:00.000Z",
+        endAt: "2026-08-02T15:00:00.000Z"
+      },
+      {
+        localDate: "2026-08-02",
+        representative: evening,
+        constituentWindowIds: [evening.forecastAt],
+        startAt: evening.forecastAt,
+        endAt: "2026-08-03T00:19:00.000Z"
+      }
+    ];
+
+    const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-08-02" });
+
+    expect(bundle.input.windows.map(({ isDaylight }) => isDaylight)).toEqual([true, true]);
+    expect(bundle.input.windows[0]?.surfSizeLabel).toBe("2–3 ft");
+  });
+
   it("builds stable public facts and daylight-only deterministic recommendations", async () => {
     const bundle = await buildForecastFactBundle(briefForecastFixture());
 

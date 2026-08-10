@@ -108,12 +108,62 @@ export function localDateForTime(forecastAt: string, timeZone: string): string {
   return localDateAt(new Date(forecastAt), timeZone);
 }
 
-export function stableHourlyForecastTimes(now: Date, horizonHours = 120): string[] {
-  const count = Math.floor(horizonHours) + 1;
-  const firstHourMs = Math.ceil(now.getTime() / ONE_HOUR_MS) * ONE_HOUR_MS;
-  return Array.from({ length: count }, (_, index) =>
-    new Date(firstHourMs + index * ONE_HOUR_MS).toISOString()
+function localDatePlusDays(localDate: string, days: number): string {
+  const [year, month, day] = localDate.split("-").map(Number);
+  if (!year || !month || !day) throw new Error(`Invalid local date: ${localDate}`);
+  return new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+}
+
+function completeLocalDateHours(
+  now: Date,
+  horizonHours: number,
+  timeZone: string
+): Array<{ instant: string; localHour: number }> {
+  if (!Number.isFinite(now.getTime())) return [];
+
+  // The public product promises five complete local forecast dates for the
+  // default 120-hour horizon. Round a custom horizon up to complete dates so a
+  // selectable edge date can never contain only a partial set of rows.
+  const completeDateCount = Math.max(1, Math.ceil(Math.max(0, Math.floor(horizonHours)) / 24));
+  const firstLocalDate = localDateAt(now, timeZone);
+  const localDates = new Set(
+    Array.from({ length: completeDateCount }, (_, index) =>
+      localDatePlusDays(firstLocalDate, index)
+    )
   );
+
+  const [year, month, day] = firstLocalDate.split("-").map(Number);
+  if (!year || !month || !day) return [];
+  // Every IANA offset is within 14 hours of UTC. Scan a bounded UTC-hour
+  // envelope around the requested local dates and retain the instants that
+  // actually format into them. Iterating absolute hours naturally keeps both
+  // sides of a fall-back fold and omits the spring-forward gap.
+  const scanStartMs = Date.UTC(year, month - 1, day) - 15 * ONE_HOUR_MS;
+  const scanHourCount = completeDateCount * 24 + 30;
+  const hourFormatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour: "2-digit",
+    hourCycle: "h23"
+  });
+  const hours: Array<{ instant: string; localHour: number }> = [];
+  for (let index = 0; index <= scanHourCount; index += 1) {
+    const candidate = new Date(scanStartMs + index * ONE_HOUR_MS);
+    if (!localDates.has(localDateAt(candidate, timeZone))) continue;
+    const localHour = Number(
+      hourFormatter.formatToParts(candidate).find((part) => part.type === "hour")?.value
+    );
+    if (!Number.isInteger(localHour)) continue;
+    hours.push({ instant: candidate.toISOString(), localHour });
+  }
+  return hours;
+}
+
+export function stableHourlyForecastTimes(
+  now: Date,
+  horizonHours = 120,
+  timeZone = "America/Los_Angeles"
+): string[] {
+  return completeLocalDateHours(now, horizonHours, timeZone).map(({ instant }) => instant);
 }
 
 export function stableThreeHourForecastTimes(
@@ -121,24 +171,23 @@ export function stableThreeHourForecastTimes(
   horizonHours = 120,
   timeZone = "America/Los_Angeles"
 ): string[] {
-  const count = Math.floor(horizonHours / 3) + 1;
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hour: "2-digit",
-    hourCycle: "h23"
-  });
-  let candidateMs = Math.ceil(now.getTime() / ONE_HOUR_MS) * ONE_HOUR_MS;
-  const times: string[] = [];
+  return completeLocalDateHours(now, horizonHours, timeZone).flatMap(
+    ({ instant, localHour }) => (localHour % 3 === 0 ? [instant] : [])
+  );
+}
 
-  // Iterating UTC hours keeps this correct through local daylight-saving gaps and folds.
-  while (times.length < count) {
-    const candidate = new Date(candidateMs);
-    const hour = Number(formatter.formatToParts(candidate).find((part) => part.type === "hour")?.value);
-    if (Number.isInteger(hour) && hour % 3 === 0) times.push(candidate.toISOString());
-    candidateMs += ONE_HOUR_MS;
-  }
-
-  return times;
+/**
+ * Exclusive end of the last materialized display interval. Because forecast
+ * slots cover complete local dates, this instant is the next local midnight,
+ * including across 23- and 25-hour daylight-saving dates.
+ */
+export function forecastDisplayHorizonEnd(
+  forecastTimes: readonly string[],
+  interval: "1h" | "3h"
+): string | null {
+  const lastMs = Date.parse(forecastTimes.at(-1) ?? "");
+  if (!Number.isFinite(lastMs)) return null;
+  return new Date(lastMs + (interval === "1h" ? 1 : 3) * ONE_HOUR_MS).toISOString();
 }
 
 export function threeHourValidityFor(

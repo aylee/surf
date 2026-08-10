@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  ForecastBriefResponseSchema,
   ForecastResponseSchema,
+  SurfAnalysisResponseV3Schema,
   type ForecastInterval,
   type ForecastResponse
 } from "@surf/contracts";
-import { NORCAL_SPOTS } from "@surf/forecast-core";
+import { getOperationalObservedWaveSources, NORCAL_SPOTS } from "@surf/forecast-core";
 import { buildFixtureForecast } from "@surf/forecast-core/test-support";
 import { buildForecastFactBundle, type ForecastFactBundle } from "./brief";
 import { FORECAST_READ_MODEL_SCHEMA_VERSION } from "./forecast-read-model";
@@ -13,12 +13,15 @@ import type { Env } from "./index";
 import worker from "./index";
 import {
   FORECAST_HISTORY_RETENTION_DAYS,
+  NARRATIVE_RETENTION_DAYS,
   OPERATIONAL_FORECAST_RETENTION_DAYS,
   pruneRetainedData,
   runNorcalIngest,
   shouldCaptureForecastHistory
 } from "./ingest";
 import { localDateForTime, stableThreeHourForecastTimes } from "./time";
+
+const forecastIntervals = ["3h", "1h"] as const;
 
 function dbMock(options: {
   forecastAssemblyRows?: boolean;
@@ -240,7 +243,26 @@ describe("worker api", () => {
     const result = await pruneRetainedData(db, now);
 
     expect(result.errors).toEqual([]);
-    expect(sqls).toHaveLength(13);
+    expect(sqls).toHaveLength(15);
+    const narrativeRevisionIndex = sqls.findIndex((sql) =>
+      sql.includes("delete from narrative_revisions")
+    );
+    const narrativeJobIndex = sqls.findIndex((sql) =>
+      sql.includes("delete from narrative_jobs")
+    );
+    expect(narrativeRevisionIndex).toBeGreaterThanOrEqual(0);
+    expect(narrativeJobIndex).toBeGreaterThan(narrativeRevisionIndex);
+    expect(runs[narrativeRevisionIndex]).toEqual([
+      new Date(now.getTime() - NARRATIVE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString(),
+      "2026-07-10"
+    ]);
+    expect(runs[narrativeJobIndex]).toEqual([
+      new Date(now.getTime() - NARRATIVE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString(),
+      "2026-07-10",
+      new Date(now.getTime() - NARRATIVE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()
+    ]);
+    expect(sqls[narrativeJobIndex]).toContain("status in ('enqueueing', 'pending', 'enqueue_failed') and deadline_at < ?");
+    expect(sqls[narrativeJobIndex]).toContain("not exists");
     for (const table of ["wave_forecasts", "tide_forecasts", "tide_events", "wind_forecasts"]) {
       const index = sqls.findIndex((sql) => sql.includes(`delete from ${table}`));
       expect(index).toBeGreaterThanOrEqual(0);
@@ -309,7 +331,7 @@ describe("worker api", () => {
     expect(await response.json()).toMatchObject({ status: "ok", service: "surf" });
   });
 
-  it("returns v1 spots", async () => {
+  it("returns every configured reference spot", async () => {
     const request = new Request("http://surf.test/api/spots") as unknown as Parameters<typeof worker.fetch>[0];
     const response = await worker.fetch(request, env(), {} as ExecutionContext);
     expect(response.headers.get("Cache-Control")).toBe(
@@ -321,7 +343,7 @@ describe("worker api", () => {
         sourceMap: { observedWave: Array<{ provider: string; stationId: string }> };
       }>;
     };
-    expect(body.spots).toHaveLength(6);
+    expect(body.spots).toHaveLength(NORCAL_SPOTS.length);
     expect(body.spots.find((spot) => spot.id === "stinson")?.sourceMap.observedWave).toEqual([
       expect.objectContaining({ provider: "NDBC", stationId: "46237" }),
       expect.objectContaining({ provider: "NDBC", stationId: "46013" }),
@@ -469,9 +491,10 @@ describe("worker api", () => {
     );
 
     expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
-  it("returns a typed deterministic brief when no model revision exists", async () => {
+  it("returns an honest unavailable Analysis response when no validated revision exists", async () => {
     const { db, preparedSql } = dbMock();
     const forecast = fixtureForecast("3h");
     const bundle = await buildForecastFactBundle(forecast, { localDate: "2026-08-02" });
@@ -482,20 +505,15 @@ describe("worker api", () => {
       env(withMaterializedRows(db, [forecast], [bundle])),
       {} as ExecutionContext
     );
-    const body = (await response.json()) as {
-      status: string;
-      brief: { provider: string; spotId: string };
-      fallbackReason: string;
-    };
+    const body = SurfAnalysisResponseV3Schema.parse(await response.json());
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("Cache-Control")).toBe(
-      "public, max-age=60, stale-while-revalidate=300"
-    );
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(body).toMatchObject({
-      status: "deterministic_fallback",
-      brief: { provider: "deterministic", spotId: "obsf-central" },
-      fallbackReason: "AI forecast briefs are disabled for this Worker version."
+      schemaVersion: 3,
+      status: "unavailable",
+      report: null,
+      message: "Analysis unavailable"
     });
     expect(preparedSql.some((sql) => /forecast_brief_revisions/i.test(sql))).toBe(false);
   });
@@ -510,9 +528,57 @@ describe("worker api", () => {
     );
 
     expect(response.status).toBe(400);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
-  it("serves deterministic briefs for future dates from materialized fact bundles", async () => {
+  it("authenticates narrative results before attempting to parse the body", async () => {
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/internal/narratives/results", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{not-json"
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      { ...env(), NARRATIVE_RESULT_TOKEN: "result-secret" },
+      {} as ExecutionContext
+    );
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("WWW-Authenticate")).toBe("Bearer");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("rejects an authenticated narrative result above the byte limit", async () => {
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    vi.stubGlobal("crypto", {
+      subtle: {
+        digest,
+        timingSafeEqual(left: ArrayBuffer, right: ArrayBuffer) {
+          const leftBytes = new Uint8Array(left);
+          const rightBytes = new Uint8Array(right);
+          if (leftBytes.length !== rightBytes.length) return false;
+          return leftBytes.every((byte, index) => byte === rightBytes[index]);
+        }
+      }
+    });
+    const response = await worker.fetch(
+      new Request("http://surf.test/api/internal/narratives/results", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer result-secret",
+          "Content-Type": "application/json"
+        },
+        body: "x".repeat(65_537)
+      }) as unknown as Parameters<typeof worker.fetch>[0],
+      { ...env(), NARRATIVE_RESULT_TOKEN: "result-secret" },
+      {} as ExecutionContext
+    );
+
+    expect(response.status).toBe(413);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(await response.json()).toEqual({ error: "narrative_result_too_large" });
+  });
+
+  it("returns typed unavailable Analysis for future materialized dates without a revision", async () => {
     const forecast = fixtureForecast("3h");
     const futureDate = localDateForTime(
       forecast.windows.at(-1)!.forecastAt,
@@ -528,15 +594,14 @@ describe("worker api", () => {
       env(db),
       {} as ExecutionContext
     );
-    const body = ForecastBriefResponseSchema.parse(await response.json());
+    const body = SurfAnalysisResponseV3Schema.parse(await response.json());
 
     expect(response.status).toBe(200);
-    expect(body.brief.localDate).toBe(futureDate);
-    expect(body.brief.picks.length).toBeGreaterThan(0);
-    expect(body.fallbackReason).toBe("AI forecast briefs are disabled for this Worker version.");
+    expect(body.status).toBe("unavailable");
+    expect(body.report).toBeNull();
   });
 
-  it("returns a typed safe summary for a valid date outside the forecast horizon", async () => {
+  it("returns typed unavailable Analysis for a valid date outside the forecast horizon", async () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const response = await worker.fetch(
       new Request("http://surf.test/api/forecast/obsf-central/brief?date=2099-01-01") as unknown as Parameters<
@@ -545,18 +610,13 @@ describe("worker api", () => {
       env(),
       {} as ExecutionContext
     );
-    const body = ForecastBriefResponseSchema.parse(await response.json());
+    const body = SurfAnalysisResponseV3Schema.parse(await response.json());
 
     expect(response.status).toBe(200);
     expect(body).toMatchObject({
-      status: "deterministic_fallback",
-      fallbackReason: null,
-      brief: {
-        spotId: "obsf-central",
-        localDate: "2099-01-01",
-        provider: "deterministic",
-        picks: []
-      }
+      status: "unavailable",
+      report: null,
+      message: "Analysis unavailable"
     });
     expect(warning).toHaveBeenCalledOnce();
     const logged = warning.mock.calls[0]?.[0];
@@ -599,13 +659,13 @@ describe("worker api", () => {
     );
 
     expect(briefResponse.status).toBe(200);
-    ForecastBriefResponseSchema.parse(await briefResponse.json());
+    SurfAnalysisResponseV3Schema.parse(await briefResponse.json());
     expect(forecastResponse.status).toBe(200);
     ForecastResponseSchema.parse(await forecastResponse.json());
     expect(agentLookups).toBe(0);
   });
 
-  it("returns a nontechnical typed brief when D1 reads fail", async () => {
+  it("returns a nontechnical typed unavailable response when D1 reads fail", async () => {
     const failureLog = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const failingDb = {
       prepare() {
@@ -623,21 +683,21 @@ describe("worker api", () => {
       },
       {} as ExecutionContext
     );
-    const body = ForecastBriefResponseSchema.parse(await response.json());
+    const body = SurfAnalysisResponseV3Schema.parse(await response.json());
 
     expect(response.status).toBe(200);
     expect(body).toMatchObject({
-      status: "deterministic_fallback",
-      fallbackReason: null,
-      brief: { provider: "deterministic", spotId: "obsf-central" }
+      status: "unavailable",
+      report: null,
+      message: "Analysis unavailable"
     });
     expect(JSON.stringify(body)).not.toContain("internal D1 failure details");
     expect(JSON.stringify(body)).not.toMatch(/database|storage|exception/i);
     expect(failureLog).toHaveBeenCalledOnce();
     expect(JSON.parse(String(failureLog.mock.calls[0]![0]))).toEqual(
       expect.objectContaining({
-        event: "forecast_brief_fallback_used",
-        message: "forecast brief response used the safe summary",
+        event: "surf_analysis_unavailable",
+        message: "Analysis assembly failed closed",
         spotId: "obsf-central",
         reasonCode: "brief_assembly_failed",
         errorName: "Error"
@@ -651,6 +711,7 @@ describe("worker api", () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const now = new Date("2026-07-08T15:00:00.000Z");
+    const nwsGridValidFrom = "2026-07-08T12:00:00.000Z";
     vi.useFakeTimers();
     vi.setSystemTime(now);
 
@@ -746,7 +807,7 @@ describe("worker api", () => {
         });
       }
       if (/api\.weather\.gov\/gridpoints\/MTR\/\d+,\d+$/.test(url)) {
-        const validTime = "2026-07-08T12:00:00Z/P10D";
+        const validTime = `${nwsGridValidFrom}/P10D`;
         const layer = (uom: string, value: number) => ({ uom, values: [{ validTime, value }] });
         return Response.json({
           properties: {
@@ -810,12 +871,31 @@ describe("worker api", () => {
 
     expect(response.status).toBe(200);
     expect(body.status).toBe("success");
-    expect(body.counts.tidePredictionRows).toBe(12);
-    expect(body.counts.nwsWindForecastRows).toBe(6);
-    expect(body.counts.nwsWaveForecastRows).toBe(246);
-    expect(body.counts.cdipMopWaveForecastRows).toBe(10);
-    expect(body.counts.ndbcObservationRows).toBe(4);
-    expect(body.counts.forecastReadModelRows).toBe(NORCAL_SPOTS.length * 2);
+    const fixtureRowsPerSpot = 2;
+    const expectedNwsWaveRows = NORCAL_SPOTS.reduce(
+      (total, spot) =>
+        total +
+        stableThreeHourForecastTimes(now, 120, spot.timezone).filter(
+          (forecastAt) => Date.parse(forecastAt) >= Date.parse(nwsGridValidFrom)
+        ).length,
+      0
+    );
+    const expectedCdipMopRows =
+      NORCAL_SPOTS.filter((spot) => spot.sourceMap.cdipMop.modelPoint !== null).length *
+      fixtureRowsPerSpot;
+    const operationalNdbcStationIds = new Set(
+      NORCAL_SPOTS.flatMap((spot) =>
+        getOperationalObservedWaveSources(spot).map((source) => source.stationId)
+      )
+    );
+    expect(body.counts.tidePredictionRows).toBe(NORCAL_SPOTS.length * fixtureRowsPerSpot);
+    expect(body.counts.nwsWindForecastRows).toBe(NORCAL_SPOTS.length);
+    expect(body.counts.nwsWaveForecastRows).toBe(expectedNwsWaveRows);
+    expect(body.counts.cdipMopWaveForecastRows).toBe(expectedCdipMopRows);
+    expect(body.counts.ndbcObservationRows).toBe(operationalNdbcStationIds.size);
+    expect(body.counts.forecastReadModelRows).toBe(
+      NORCAL_SPOTS.length * forecastIntervals.length
+    );
     expect(body.counts.forecastFactBundleRows).toBeGreaterThanOrEqual(NORCAL_SPOTS.length * 5);
     const expectedSnapshotRows = NORCAL_SPOTS.reduce(
       (total, spot) =>
@@ -858,26 +938,47 @@ describe("worker api", () => {
         reasonCode: "inline_source_persistence_completed"
       })
     );
-    expect(forecastEntries).toHaveLength(NORCAL_SPOTS.length * 2);
+    expect(forecastEntries).toHaveLength(NORCAL_SPOTS.length * forecastIntervals.length);
     expect(new Set(forecastEntries.map(({ ingestId }) => ingestId))).toEqual(
       new Set([sourceEntries[0]!.ingestId])
     );
     expect(new Set(forecastEntries.map(({ spotId, interval }) => `${spotId}:${interval}`))).toEqual(
       new Set(
-        NORCAL_SPOTS.flatMap((spot) => ["3h", "1h"].map((interval) => `${spot.id}:${interval}`))
+        NORCAL_SPOTS.flatMap((spot) =>
+          forecastIntervals.map((interval) => `${spot.id}:${interval}`)
+        )
       )
     );
     expect(forecastEntries.every(({ generationId }) => typeof generationId === "string")).toBe(
       true
     );
     expect(errorLog).not.toHaveBeenCalled();
-    expect(runs.length).toBeGreaterThan(286);
-    expect(runs[0]).toHaveLength(14);
-    expect(runs.some((values) => values[1] === "nws:mtr-grid-wave")).toBe(true);
-    expect(runs.some((values) => values.some((value) => typeof value === "string" && value.startsWith("raw/")))).toBe(true);
-    expect(sqls.filter((sql) => sql.includes("insert into wind_forecast_issues"))).toHaveLength(6);
-    expect(sqls.filter((sql) => sql.includes("insert into forecast_configs"))).toHaveLength(6);
-    expect(sqls.filter((sql) => sql.includes("insert into forecast_issues"))).toHaveLength(6);
+    const bulkRows = (sqlFragment: string): Array<Record<string, unknown>> => {
+      const index = sqls.findIndex((sql) => sql.includes(sqlFragment));
+      expect(index).toBeGreaterThanOrEqual(0);
+      return JSON.parse(String(runs[index]?.at(-1)));
+    };
+    const sourceRunRows = bulkRows("insert into source_runs");
+    expect(sourceRunRows).toHaveLength(5);
+    expect(sourceRunRows.some(({ sourceId }) => sourceId === "nws:mtr-grid-wave")).toBe(true);
+    const artifactSqlIndexes = sqls.flatMap((sql, index) =>
+      sql.includes("insert into source_artifacts") ? [index] : []
+    );
+    expect(artifactSqlIndexes).toHaveLength(5);
+    expect(artifactSqlIndexes.some((index) =>
+      JSON.parse(String(runs[index]?.[3])).some(
+        ({ r2Key }: { r2Key: string }) => r2Key.startsWith("raw/")
+      )
+    )).toBe(true);
+    expect(sqls.filter((sql) => sql.includes("insert into wind_forecast_issues"))).toHaveLength(
+      1
+    );
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_configs"))).toHaveLength(
+      NORCAL_SPOTS.length
+    );
+    expect(sqls.filter((sql) => sql.includes("insert into forecast_issues"))).toHaveLength(
+      NORCAL_SPOTS.length
+    );
     expect(sqls.filter((sql) => sql.includes("insert into forecast_snapshots"))).toHaveLength(
       expectedSnapshotRows
     );
@@ -889,25 +990,22 @@ describe("worker api", () => {
     );
     expect(sqls.filter((sql) => sql.includes("delete from forecast_snapshots"))).toHaveLength(1);
     expect(sqls.filter((sql) => sql.includes("delete from wave_forecasts"))).toHaveLength(1);
-    const bolinasWindWrite = runs.find(
-      (values, index) =>
-        sqls[index]?.includes("insert into wind_forecasts") &&
-        values[0] === "bolinas" &&
-        values[1] === "nws:point-forecast-alerts"
+    const bolinasWindWrite = bulkRows("insert into wind_forecasts").find(
+      ({ spotId }) => spotId === "bolinas"
     );
     expect(bolinasWindWrite).toMatchObject({
-      3: "2026-07-08T18:30:00.000Z",
-      5: 1
+      modelCycleAt: "2026-07-08T18:30:00.000Z",
+      leadHour: 1
     });
-    const bolinasWaveWrite = runs.find(
-      (values) => values[0] === "bolinas" && values[1] === "nws:mtr-grid-wave" && values.length === 20
+    const bolinasWaveWrite = bulkRows("insert into wave_forecasts").find(
+      ({ spotId }) => spotId === "bolinas"
     );
     expect(bolinasWaveWrite).toMatchObject({
-      3: "2026-07-08T12:00:00.000Z",
-      7: 0.78,
-      8: 1.2,
-      9: 9,
-      11: 290
+      modelCycleAt: "2026-07-08T12:00:00.000Z",
+      nearshoreHeightM: 0.78,
+      significantHeightM: 1.2,
+      peakPeriodS: 9,
+      primaryDirectionDeg: 290
     });
 
     const failedPersistence = dbMock({
@@ -1251,7 +1349,7 @@ describe("worker api", () => {
     errorLog.mockRestore();
   });
 
-  it("signals a published fact bundle only when its active generation matches", async () => {
+  it("keeps the dormant ForecastBriefAgent unsignaled after active publication", async () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { db, runs, sqls } = dbMock({ forecastAssemblyRows: true });
@@ -1302,15 +1400,14 @@ describe("worker api", () => {
         agentEnv
       );
 
-      expect(getByName).toHaveBeenCalledWith("obsf-north");
-      expect(signal).toHaveBeenCalledOnce();
-      expect(signal).toHaveBeenCalledWith(bundle);
+      expect(getByName).not.toHaveBeenCalled();
+      expect(signal).not.toHaveBeenCalled();
       expect(ack).toHaveBeenCalledOnce();
       expect(retry).not.toHaveBeenCalled();
       expect(
         infoLog.mock.calls
           .map(([entry]) => JSON.parse(String(entry)))
-          .some(({ event }) => event === "forecast_brief_signal_superseded")
+          .some(({ event }) => event === "surf_analysis_signal_superseded")
       ).toBe(false);
       expect(errorLog).not.toHaveBeenCalled();
     } finally {
@@ -1319,7 +1416,7 @@ describe("worker api", () => {
     }
   });
 
-  it("acks but does not signal when a newer fact-bundle generation is active", async () => {
+  it("acks a newer active generation without invoking the dormant Agent", async () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { db } = dbMock({ forecastAssemblyRows: true });
@@ -1370,21 +1467,11 @@ describe("worker api", () => {
       expect(signal).not.toHaveBeenCalled();
       expect(ack).toHaveBeenCalledOnce();
       expect(retry).not.toHaveBeenCalled();
-      expect(infoLog.mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual({
-        event: "forecast_brief_signal_superseded",
-        message: "forecast brief signal superseded before Agent RPC",
-        phase: "brief_signal",
-        ingestId: "ingest-test-id",
-        spotId: "obsf-north",
-        generationId: expect.stringMatching(
-          /^sha256:[a-f0-9]{64}:ingest:ingest-test-id$/
-        ),
-        generatedAt,
-        materializedAt: expect.any(String),
-        outcome: "supersede",
-        reasonCode: "forecast_generation_no_longer_active",
-        retryable: false
-      });
+      expect(
+        infoLog.mock.calls
+          .map(([entry]) => JSON.parse(String(entry)))
+          .some(({ event }) => event.startsWith("surf_analysis_"))
+      ).toBe(false);
       expect(errorLog).not.toHaveBeenCalled();
     } finally {
       infoLog.mockRestore();
@@ -1392,7 +1479,7 @@ describe("worker api", () => {
     }
   });
 
-  it("acks a published materialization when the production brief signal fails", async () => {
+  it("acks a published materialization without consulting dormant Agent failure stubs", async () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { db, runs, sqls } = dbMock({ forecastAssemblyRows: true });
@@ -1445,8 +1532,8 @@ describe("worker api", () => {
         agentEnv
       );
 
-      expect(getByName).toHaveBeenCalledWith("obsf-north");
-      expect(signal).toHaveBeenCalledOnce();
+      expect(getByName).not.toHaveBeenCalled();
+      expect(signal).not.toHaveBeenCalled();
       expect(ack).toHaveBeenCalledOnce();
       expect(retry).not.toHaveBeenCalled();
       expect(infoLog.mock.calls.map(([entry]) => JSON.parse(String(entry)))).toContainEqual(
@@ -1457,25 +1544,7 @@ describe("worker api", () => {
           generatedAt
         })
       );
-      expect(errorLog).toHaveBeenCalledOnce();
-      expect(JSON.parse(String(errorLog.mock.calls[0]![0]))).toEqual({
-        event: "forecast_brief_signal_failed",
-        message: "forecast brief signaling failed after materialization publication",
-        phase: "brief_signal",
-        ingestId: "ingest-test-id",
-        spotId: "obsf-north",
-        generationId: expect.stringMatching(
-          /^sha256:[a-f0-9]{64}:ingest:ingest-test-id$/
-        ),
-        generatedAt,
-        materializedAt: expect.any(String),
-        reasonCode: "brief_signal_failed",
-        errorName: "Error",
-      });
-      expect(String(errorLog.mock.calls[0]![0])).not.toContain("brief agent unavailable");
-      expect(errorLog).not.toHaveBeenCalledWith(
-        expect.stringContaining("ingest queue message failed")
-      );
+      expect(errorLog).not.toHaveBeenCalled();
     } finally {
       infoLog.mockRestore();
       errorLog.mockRestore();

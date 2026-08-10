@@ -82,6 +82,8 @@ export const ForecastBriefWindowInputSchema = z
     score: z.number().int().min(0).max(100),
     confidence: z.number().int().min(0).max(100),
     confidenceBand: z.enum(["low", "medium", "high"]),
+    surfSizeFt: z.number().nonnegative().nullable().default(null),
+    surfSizeLabel: z.string().min(1).max(40).nullable().default(null),
     modeledHeightFt: z.number().nonnegative().nullable(),
     modeledHeightLabel: z.string().min(1).max(40).nullable(),
     waveSemantics: z.enum(["direct_nearshore", "cove_proxy", "nws_fallback", "unavailable"]),
@@ -116,6 +118,31 @@ export const ForecastBriefInputSchema = z
     generatedAt: IsoTimestampSchema,
     expiresAt: IsoTimestampSchema.nullable(),
     recommendationWindowIds: z.array(z.string().min(1).max(160)).max(3),
+    recommendations: z
+      .array(
+        z
+          .object({
+            representativeWindowId: z.string().min(1).max(160),
+            constituentWindowIds: z.array(z.string().min(1).max(160)).min(1).max(24),
+            startAt: IsoTimestampSchema,
+            endAt: IsoTimestampSchema
+          })
+          .strict()
+      )
+      .max(3)
+      .default([]),
+    tideEvents: z
+      .array(
+        z
+          .object({
+            eventAt: IsoTimestampSchema,
+            type: z.enum(["high", "low"]),
+            heightFtMllw: z.number()
+          })
+          .strict()
+      )
+      .max(12)
+      .default([]),
     windows: z.array(ForecastBriefWindowInputSchema).min(1).max(48),
     activeHazards: z.array(z.string().min(1).max(500)).max(12),
     sourceHealth: z
@@ -154,6 +181,17 @@ export const ForecastBriefInputSchema = z
           code: "custom",
           message: `Recommendation window ${windowId} is not present in windows`
         });
+      }
+    }
+    for (const recommendation of input.recommendations) {
+      if (!ids.has(recommendation.representativeWindowId)) {
+        context.addIssue({
+          code: "custom",
+          message: `Recommendation representative ${recommendation.representativeWindowId} is not present in windows`
+        });
+      }
+      if (new Date(recommendation.endAt).getTime() <= new Date(recommendation.startAt).getTime()) {
+        context.addIssue({ code: "custom", message: "Recommendation end must follow its start" });
       }
     }
   });

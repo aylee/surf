@@ -1,0 +1,27 @@
+{
+  "name": "@surf/narrative-runner",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "runner": "tsx --env-file-if-exists=.env src/cli.ts",
+    "run": "tsx --env-file-if-exists=.env src/cli.ts run",
+    "once": "tsx --env-file-if-exists=.env src/cli.ts once",
+    "status": "tsx --env-file-if-exists=.env src/cli.ts status",
+    "config:check": "tsx --env-file-if-exists=.env src/cli.ts check",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@surf/narrative-contracts": "workspace:*",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.2",
+    "tsx": "4.23.5",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

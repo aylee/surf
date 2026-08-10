@@ -12,9 +12,10 @@ or resource identifiers.
   plus a registered `workers.dev` subdomain
 
 The forecast feeds used by the reference configuration do not require paid API
-keys. The optional daily explanation can use a Gemini API key; deterministic
-forecast data and fallback copy continue to work without it. Cloudflare usage
-is the expected hosting cost. Python 3.12 and
+keys. Optional Analysis can run on a self-hosted oMLX server; it has no hosted
+model API key or per-inference charge. Forecast data continues to work when
+Analysis is disabled, pending, or unavailable. Cloudflare usage is the expected
+hosting cost. Python 3.12 and
 [uv](https://docs.astral.sh/uv/) are needed only for the contributor gate and
 optional scientific extractor.
 
@@ -41,50 +42,22 @@ pnpm smoke:local
 The ingest uses live public endpoints. Temporary provider failures should be
 reported as missing/stale data; rerunning the command is safe.
 
-### Optional local Gemini brief
+### Optional local Analysis
 
-Create a key in [Google AI Studio](https://aistudio.google.com/app/apikey) in a
-project with billing disabled. Under the [Gemini API pricing
-terms](https://ai.google.dev/gemini-api/docs/pricing), free-tier submitted
-content may be used to improve Google products; review the [Gemini API
-terms](https://ai.google.dev/gemini-api/terms) before enabling it. Surf
-therefore sends only public NOAA/CDIP/CO-OPS facts and no user prompt,
-identity, session history, IP-derived context, or private data. Keeping billing
-disabled makes quota exhaustion fail closed instead of creating spend.
+The tracked Worker configuration keeps `NARRATIVE_ENABLED=false`, so ordinary
+local development makes no model call and the Analysis tab reports its honest
+unavailable state. The active model path is an always-on, domain-neutral runner
+that pulls a dedicated Cloudflare Queue over HTTPS and calls an
+OpenAI-compatible oMLX server on loopback. It is not a Worker Queue consumer
+and it does not use Gemini or another hosted model provider.
 
-The repository includes a secret-free example. The local file is ignored:
-
-```bash
-cp apps/web/.dev.vars.example apps/web/.dev.vars
-chmod 600 apps/web/.dev.vars
-```
-
-Edit `apps/web/.dev.vars` and replace only the value after
-`GEMINI_API_KEY=`. Never paste the key into a command, issue, screenshot, test
-fixture, or tracked file. `FORECAST_BRIEF_ENABLED=true` enables local model
-generation; an invalid/missing key fails closed to deterministic copy.
-
-An opt-in evaluation makes exactly one provider call, validates the structured
-result against the same fact policy used by the Worker, and prints a safe
-record containing either validated public prose plus quality metadata or a
-sanitized rejection category (never the request, key, fact IDs, or provider
-payload):
-
-Gemini synthesizes natural explanatory prose from role-tagged public facts; it
-does not calculate forecast values, choose new windows, or write unrestricted
-marine claims. Every model-authored field carries sentence-scoped fact
-references and must pass independent policy and quality validation. Code adds
-the authoritative time labels, measurements, recommendation order, and hard
-measurement or hazard caveats after validation.
-
-```bash
-cd apps/web
-SURF_LIVE_GEMINI=1 node --env-file=.dev.vars \
-  ./node_modules/vitest/vitest.mjs run --config vitest.config.ts \
-  worker/brief/gemini.live.test.ts
-```
-
-Ordinary unit and CI runs skip this test and never require a Gemini key.
+Set up the Queue/result boundary only after the forecast deployment is healthy.
+The [local narrative runner guide](narrative-runner.md) covers model selection,
+ignored `0600` environment files, target-map/result credentials, bounded
+timeouts, one-shot acceptance, LaunchAgent health, and MacBook-to-Mac-Studio
+migration. The current measured baseline is configurable
+`Qwen3.5-27B-8bit`; keep model selection in configuration and use the checked
+quality fixture before changing the default.
 
 ## Deploy to Cloudflare
 
@@ -108,14 +81,14 @@ command-line value.
 ### 2. Choose an instance name
 
 Review `apps/web/wrangler.jsonc` before the first deploy. The Worker `name`, D1
-`database_name`, ingest Queue, and dead-letter Queue form one instance
-namespace. For example, an instance named `surf-dev` must use database
-`surf-dev`, Queue `surf-dev-ingest`, and dead-letter Queue
-`surf-dev-ingest-dlq`. A manually provisioned R2 bucket must be named
-`surf-dev-raw-artifacts`. The portability check enforces those relationships so
-one renamed instance cannot silently attach to another instance's storage.
-Keep binding names (`DB`, `RAW_ARTIFACTS`, and `INGEST_QUEUE`) unchanged unless
-the Worker types and code change with them.
+`database_name`, ingest Queue/DLQ, and narrative Queue/DLQ form one instance
+namespace. For example, an instance named `surf-dev` uses database `surf-dev`,
+Queues `surf-dev-ingest` and `surf-dev-narrative`, and matching `-dlq` names. A
+manually provisioned R2 bucket must be named `surf-dev-raw-artifacts`. The
+portability check enforces those relationships so one renamed instance cannot
+silently attach to another instance's storage. Keep binding names (`DB`,
+`RAW_ARTIFACTS`, `INGEST_QUEUE`, and `NARRATIVE_QUEUE`) unchanged unless the
+Worker types and code change with them.
 
 Also replace `vars.SURF_USER_AGENT` with an application name and URL or email
 that the instance operator monitors. NOAA/NWS asks API clients to identify a
@@ -192,35 +165,49 @@ Worker-enforced version precondition. Any newly migrated forecast read-model
 tables are populated before unpinned, exact-version strict smoke testing and a
 final 100% control-plane check.
 
-### 5. Optional Gemini production rollout
+### 5. Optional local-oMLX Analysis rollout
 
-The tracked configuration deliberately sets `FORECAST_BRIEF_ENABLED=false`.
-This makes the first deployment that creates `ForecastBriefAgent` a
-deterministic-only lifecycle deploy. After that deployment is healthy, set the
-key through Wrangler's hidden prompt:
+The tracked configuration deliberately sets `NARRATIVE_ENABLED=false`. The
+authorized `pnpm setup:cloudflare` and `pnpm deploy` workflows call
+`ensureQueues()`, which inspects and idempotently provisions every configured
+Queue plus the matching narrative DLQ. Do not run an unconditional second
+`queues create` after those workflows. If an operator intentionally bypasses
+project setup, use the read-before-create manual alternative in
+[the runner guide](narrative-runner.md).
 
-```bash
-pnpm wrangler -- secret put GEMINI_API_KEY
-pnpm wrangler -- secret list
-```
+After the disabled deployment is healthy:
 
-`secret list` verifies the binding name without revealing its value. To enable
-generation in a separate Worker version, copy the tracked config to the
-ignored instance config (if needed), change only
-`vars.FORECAST_BRIEF_ENABLED` to `"true"`, select that config, and deploy:
+1. Record the D1 Time Travel bookmark and export D1.
+2. Add the narrative Queue's HTTP pull consumer and DLQ with the exact command
+   in the runner guide. Do not add a Wrangler Worker consumer entry.
+3. Set `NARRATIVE_RESULT_TOKEN` through Wrangler's hidden secret prompt. Put
+   the matching value only in the runner's ignored target-specific environment
+   variable; keep it separate from the Cloudflare Queue API token.
+4. Preflight oMLX and run the runner's config/status checks. Before enablement,
+   `once` can prove only Queue authentication and an empty bounded pull; local
+   fake-server tests prove the job/result contract without production work.
+5. In the ignored instance config, change only `vars.NARRATIVE_ENABLED` to
+   `true`, then deploy through the normal version/readiness path.
+6. Trigger one fresh authorized ingest so the deployed Worker emits an
+   `analysis-signal` and a real narrative job. Run `once` (or start `run run`),
+   then require the selected `/brief` response to become `published` and
+   confirm the matching D1 ledger row/revision before calling the rollout
+   end-to-end complete.
 
-```bash
-cp apps/web/wrangler.jsonc apps/web/wrangler.instance.jsonc
-export SURF_WRANGLER_CONFIG=wrangler.instance.jsonc
-pnpm deploy
-```
+The Worker writes the D1 ledger before Queue send and scheduled reconciliation
+repairs ambiguous sends. The runner posts generated or identifiable terminal
+results to `/api/internal/narratives/results`; the Worker authenticates before
+bounded parsing and accepts only the active attempt and current exact fact
+fingerprint.
 
-Record the current D1 Time Travel bookmark and export D1 before the
-migration/deploy, then smoke the disabled version before enabling the model.
-A first Durable Object class lifecycle change cannot be
-rolled back to a pre-class Worker version; the operational rollback target is
-the disabled post-Agent version. Do not delete the Agent export/namespace as a
-rollback technique.
+Rollback is non-destructive: first set `NARRATIVE_ENABLED=false` through the
+normal deploy path to stop new production, then remove the HTTP pull consumer
+to stop local intake. Let in-flight leases settle before revoking result/Queue
+tokens.
+Never delete the Queue, DLQ, D1 rows, or dormant Agent namespace as a retry
+technique. `ForecastBriefAgent`, `FORECAST_BRIEF_AGENT`, migration 0002, and
+`FORECAST_BRIEF_ENABLED=false` remain dormant rollback compatibility only; do
+not enable them as the active Analysis path.
 
 ### 6. Verify and populate
 
@@ -253,7 +240,7 @@ deployment.
 Then verify:
 
 - `/api/health` reports `status: ok`;
-- `/api/spots` returns the six reference spots;
+- `/api/spots` returns the 11 reference spots;
 - the dashboard shows current windows after ingest;
 - source freshness and low-confidence caveats are visible; and
 - the hourly trigger and Queue consumer are present in Cloudflare.
@@ -286,9 +273,19 @@ pnpm install --frozen-lockfile
 If this instance uses ignored `apps/web/wrangler.instance.jsonc`, manually
 merge newly tracked structural keys and bindings from `apps/web/wrangler.jsonc`
 into it before verification, while preserving the instance name, resource IDs,
-operator contact, routes, secrets boundary, and intentional feature flags. Do
-not overwrite the overlay with a fresh copy. For this upgrade the overlay must
-include:
+operator contact, routes, and secrets boundary. Do not overwrite the overlay
+with a fresh copy. For this upgrade explicitly reconcile every v3 structural
+requirement:
+
+- keep the existing `FORECAST_BRIEF_AGENT` binding/export but set
+  `vars.FORECAST_BRIEF_ENABLED` to `false`; it is dormant compatibility only;
+- add `vars.NARRATIVE_ENABLED` as `false` until the authorized Queue/runner
+  rollout reaches step 5 above;
+- keep the instance-scoped `INGEST_QUEUE` producer and add exactly one
+  `NARRATIVE_QUEUE` producer targeting `<instance>-narrative`;
+- keep only the ingest Queue in `queues.consumers`; narrative HTTP pull remains
+  an out-of-band operator step; and
+- include the exact version metadata binding:
 
 ```jsonc
 "version_metadata": {
@@ -317,6 +314,17 @@ boundary. Rolling back requires first proving the Queue quiescent, no consumer
 in flight, and every payload predecessor-compatible. Additive D1 schema changes
 remain intact. The command fails if any configured spot lacks a five-day
 horizon with sourced, scored wave data.
+
+The ingest Queue now carries distinct version-1 `source-batch` and
+`analysis-signal` payloads that their predecessors do not understand. A
+rollback across either code boundary requires first deploying
+`NARRATIVE_ENABLED=false`, then pausing cron and manual ingest, pausing Queue
+delivery, waiting for all root/source-batch/materialization/Analysis-signal work
+to settle, proving the ingest Queue quiescent, and inspecting the DLQ so neither
+payload is replayed into the predecessor. These Queue changes have no D1
+migration to reverse; leave normalized rows and R2 evidence in place. While
+disabled, exact already-published Analysis revisions remain readable, but a
+non-published ledger row is reported unavailable rather than falsely pending.
 
 Back up D1 before a migration that changes or removes data. See
 [runtime operations](runtime-operations.md) for export, rollback, retention,

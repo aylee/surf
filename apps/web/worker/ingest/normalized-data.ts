@@ -1,4 +1,8 @@
-import { getOperationalObservedWaveSources, NORCAL_SPOTS } from "@surf/forecast-core";
+import {
+  getOperationalObservedWaveSources,
+  NORCAL_SPOTS,
+  type NorcalSpotProfile
+} from "@surf/forecast-core";
 import type { CdipMopForecastRow } from "../adapters/cdip-mop";
 import { CDIP_MOP_SOURCE_ID } from "../adapters/cdip-mop";
 import type { TideEventRow, TidePredictionRow } from "../adapters/coops";
@@ -10,8 +14,8 @@ import { errorMessage } from "../adapters/types";
 import { buildForecastResponse } from "../forecast";
 import { persistForecastSnapshots, sha256StableJson } from "../forecast-history";
 import type { Env } from "../index";
-import { runPendingStatements } from "./database";
-import type { PendingStatement, PersistenceResult } from "./types";
+import { runBulkStatements, type BulkStatement } from "./database";
+import type { PersistenceResult } from "./types";
 
 function isDaylightForecastAt(spotId: string, forecastAt: string): boolean {
   const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
@@ -38,7 +42,19 @@ export async function persistTideForecasts(
   if (typeof db.prepare !== "function") {
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for tide_forecasts."] };
   }
+  if (rows.length === 0) return { rowsWritten: 0, errors: [] };
 
+  const values = rows.map((row) => ({
+    spotId: row.spotId,
+    sourceRunId,
+    stationId: row.stationId,
+    forecastAt: row.forecastAt,
+    tideFtMllw: row.tideFtMllw,
+    tideMMllw: Math.round(row.tideFtMllw * 0.3048 * 1000) / 1000,
+    tideTrend: row.tideTrend,
+    payloadJson: JSON.stringify(row),
+    createdAt
+  }));
   const statement = db.prepare(
     `insert into tide_forecasts (
       spot_id,
@@ -52,7 +68,21 @@ export async function persistTideForecasts(
       high_low,
       payload_json,
       created_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )
+    select
+      json_extract(item.value, '$.spotId'),
+      'coops:tide-predictions',
+      json_extract(item.value, '$.sourceRunId'),
+      json_extract(item.value, '$.stationId'),
+      json_extract(item.value, '$.forecastAt'),
+      json_extract(item.value, '$.tideFtMllw'),
+      json_extract(item.value, '$.tideMMllw'),
+      json_extract(item.value, '$.tideTrend'),
+      null,
+      json_extract(item.value, '$.payloadJson'),
+      json_extract(item.value, '$.createdAt')
+    from json_each(?) as item
+    where 1
     on conflict(spot_id, station_id, forecast_at) do update set
       source_id = excluded.source_id,
       source_run_id = excluded.source_run_id,
@@ -61,26 +91,9 @@ export async function persistTideForecasts(
       tide_trend = excluded.tide_trend,
       payload_json = excluded.payload_json,
       created_at = excluded.created_at`
-  );
+  ).bind(JSON.stringify(values));
 
-  const pending = rows.map((row) => ({
-    label: `tide_forecasts ${row.spotId} ${row.forecastAt}`,
-    statement: statement.bind(
-      row.spotId,
-      "coops:tide-predictions",
-      sourceRunId,
-      row.stationId,
-      row.forecastAt,
-      row.tideFtMllw,
-      Math.round(row.tideFtMllw * 0.3048 * 1000) / 1000,
-      row.tideTrend,
-      null,
-      JSON.stringify(row),
-      createdAt
-    )
-  }));
-
-  return runPendingStatements(db, pending);
+  return runBulkStatements(db, [{ label: "bulk tide_forecasts", statement, rowsWritten: rows.length }]);
 }
 
 export async function persistTideEvents(
@@ -92,7 +105,18 @@ export async function persistTideEvents(
   if (typeof db.prepare !== "function") {
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for tide_events."] };
   }
+  if (rows.length === 0) return { rowsWritten: 0, errors: [] };
 
+  const values = rows.map((row) => ({
+    spotId: row.spotId,
+    sourceRunId,
+    stationId: row.stationId,
+    eventAt: row.eventAt,
+    tideFtMllw: row.tideFtMllw,
+    eventType: row.eventType,
+    payloadJson: JSON.stringify(row),
+    createdAt
+  }));
   const statement = db.prepare(
     `insert into tide_events (
       spot_id,
@@ -104,7 +128,19 @@ export async function persistTideEvents(
       event_type,
       payload_json,
       created_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )
+    select
+      json_extract(item.value, '$.spotId'),
+      'coops:tide-predictions',
+      json_extract(item.value, '$.sourceRunId'),
+      json_extract(item.value, '$.stationId'),
+      json_extract(item.value, '$.eventAt'),
+      json_extract(item.value, '$.tideFtMllw'),
+      json_extract(item.value, '$.eventType'),
+      json_extract(item.value, '$.payloadJson'),
+      json_extract(item.value, '$.createdAt')
+    from json_each(?) as item
+    where 1
     on conflict(spot_id, station_id, event_at) do update set
       source_id = excluded.source_id,
       source_run_id = excluded.source_run_id,
@@ -112,24 +148,9 @@ export async function persistTideEvents(
       event_type = excluded.event_type,
       payload_json = excluded.payload_json,
       created_at = excluded.created_at`
-  );
+  ).bind(JSON.stringify(values));
 
-  const pending = rows.map((row) => ({
-    label: `tide_events ${row.spotId} ${row.eventAt}`,
-    statement: statement.bind(
-      row.spotId,
-      "coops:tide-predictions",
-      sourceRunId,
-      row.stationId,
-      row.eventAt,
-      row.tideFtMllw,
-      row.eventType,
-      JSON.stringify(row),
-      createdAt
-    )
-  }));
-
-  return runPendingStatements(db, pending);
+  return runBulkStatements(db, [{ label: "bulk tide_events", statement, rowsWritten: rows.length }]);
 }
 
 export async function persistWaveForecasts(
@@ -141,7 +162,25 @@ export async function persistWaveForecasts(
   if (typeof db.prepare !== "function") {
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for wave_forecasts."] };
   }
+  if (rows.length === 0) return { rowsWritten: 0, errors: [] };
 
+  const values = rows.map((row) => ({
+    spotId: row.spotId,
+    sourceRunId,
+    modelCycleAt: row.modelCycleAt,
+    forecastAt: row.forecastAt,
+    leadHour: row.leadHour,
+    nearshoreHeightM: row.estimatedBreakingHeightM,
+    significantHeightM: row.significantHeightM,
+    peakPeriodS: row.primarySwellPeriodS,
+    primaryDirectionDeg: row.primarySwellDirectionDeg,
+    windWaveHeightM: row.windWaveHeightM,
+    swellHeightM: row.primarySwellHeightM,
+    swellPeriodS: row.primarySwellPeriodS,
+    swellDirectionDeg: row.primarySwellDirectionDeg,
+    payloadJson: JSON.stringify(row),
+    createdAt
+  }));
   const statement = db.prepare(
     `insert into wave_forecasts (
       spot_id,
@@ -164,7 +203,30 @@ export async function persistWaveForecasts(
       swell_direction_deg,
       payload_json,
       created_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )
+    select
+      json_extract(item.value, '$.spotId'),
+      '${NWS_GRID_WAVE_SOURCE_ID}',
+      json_extract(item.value, '$.sourceRunId'),
+      json_extract(item.value, '$.modelCycleAt'),
+      json_extract(item.value, '$.forecastAt'),
+      json_extract(item.value, '$.leadHour'),
+      null,
+      json_extract(item.value, '$.nearshoreHeightM'),
+      json_extract(item.value, '$.significantHeightM'),
+      json_extract(item.value, '$.peakPeriodS'),
+      null,
+      json_extract(item.value, '$.primaryDirectionDeg'),
+      json_extract(item.value, '$.windWaveHeightM'),
+      null,
+      null,
+      json_extract(item.value, '$.swellHeightM'),
+      json_extract(item.value, '$.swellPeriodS'),
+      json_extract(item.value, '$.swellDirectionDeg'),
+      json_extract(item.value, '$.payloadJson'),
+      json_extract(item.value, '$.createdAt')
+    from json_each(?) as item
+    where 1
     on conflict(spot_id, source_id, model_cycle_at, forecast_at) do update set
       source_run_id = excluded.source_run_id,
       nearshore_height_m = excluded.nearshore_height_m,
@@ -177,35 +239,9 @@ export async function persistWaveForecasts(
       swell_direction_deg = excluded.swell_direction_deg,
       payload_json = excluded.payload_json,
       created_at = excluded.created_at`
-  );
+  ).bind(JSON.stringify(values));
 
-  const pending = rows.map((row) => ({
-    label: `wave_forecasts ${row.spotId} ${row.forecastAt}`,
-    statement: statement.bind(
-      row.spotId,
-      NWS_GRID_WAVE_SOURCE_ID,
-      sourceRunId,
-      row.modelCycleAt,
-      row.forecastAt,
-      row.leadHour,
-      null,
-      row.estimatedBreakingHeightM,
-      row.significantHeightM,
-      row.primarySwellPeriodS,
-      null,
-      row.primarySwellDirectionDeg,
-      row.windWaveHeightM,
-      null,
-      null,
-      row.primarySwellHeightM,
-      row.primarySwellPeriodS,
-      row.primarySwellDirectionDeg,
-      JSON.stringify(row),
-      createdAt
-    )
-  }));
-
-  return runPendingStatements(db, pending);
+  return runBulkStatements(db, [{ label: "bulk NWS wave_forecasts", statement, rowsWritten: rows.length }]);
 }
 
 export async function persistCdipMopForecasts(
@@ -217,7 +253,21 @@ export async function persistCdipMopForecasts(
   if (typeof db.prepare !== "function") {
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for CDIP wave_forecasts."] };
   }
+  if (rows.length === 0) return { rowsWritten: 0, errors: [] };
 
+  const values = rows.map((row) => ({
+    spotId: row.spotId,
+    sourceRunId,
+    modelCycleAt: row.modelCycleAt,
+    forecastAt: row.forecastAt,
+    leadHour: row.leadHour,
+    nearshoreHeightM: row.nearshoreHeightM,
+    significantHeightM: row.significantHeightM,
+    peakPeriodS: row.peakPeriodS,
+    primaryDirectionDeg: row.peakDirectionDeg,
+    payloadJson: JSON.stringify(row),
+    createdAt
+  }));
   const statement = db.prepare(
     `insert into wave_forecasts (
       spot_id,
@@ -240,7 +290,30 @@ export async function persistCdipMopForecasts(
       swell_direction_deg,
       payload_json,
       created_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )
+    select
+      json_extract(item.value, '$.spotId'),
+      '${CDIP_MOP_SOURCE_ID}',
+      json_extract(item.value, '$.sourceRunId'),
+      json_extract(item.value, '$.modelCycleAt'),
+      json_extract(item.value, '$.forecastAt'),
+      json_extract(item.value, '$.leadHour'),
+      null,
+      json_extract(item.value, '$.nearshoreHeightM'),
+      json_extract(item.value, '$.significantHeightM'),
+      json_extract(item.value, '$.peakPeriodS'),
+      null,
+      json_extract(item.value, '$.primaryDirectionDeg'),
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      json_extract(item.value, '$.payloadJson'),
+      json_extract(item.value, '$.createdAt')
+    from json_each(?) as item
+    where 1
     on conflict(spot_id, source_id, model_cycle_at, forecast_at) do update set
       source_run_id = excluded.source_run_id,
       nearshore_height_m = excluded.nearshore_height_m,
@@ -249,46 +322,43 @@ export async function persistCdipMopForecasts(
       primary_direction_deg = excluded.primary_direction_deg,
       payload_json = excluded.payload_json,
       created_at = excluded.created_at`
-  );
+  ).bind(JSON.stringify(values));
 
-  const pending = rows.map((row) => ({
-    label: `wave_forecasts CDIP ${row.spotId} ${row.forecastAt}`,
-    statement: statement.bind(
-      row.spotId,
-      CDIP_MOP_SOURCE_ID,
-      sourceRunId,
-      row.modelCycleAt,
-      row.forecastAt,
-      row.leadHour,
-      null,
-      row.nearshoreHeightM,
-      row.significantHeightM,
-      row.peakPeriodS,
-      null,
-      row.peakDirectionDeg,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      JSON.stringify(row),
-      createdAt
-    )
-  }));
-
-  return runPendingStatements(db, pending);
+  return runBulkStatements(db, [{ label: "bulk CDIP wave_forecasts", statement, rowsWritten: rows.length }]);
 }
 
 export async function persistWaveObservations(
   db: D1Database,
   sourceRunId: string,
   rows: NdbcObservationRow[],
-  createdAt: string
+  createdAt: string,
+  targetSpots: readonly NorcalSpotProfile[]
 ): Promise<PersistenceResult> {
   if (typeof db.prepare !== "function") {
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for wave_observations."] };
   }
+  const values = rows.flatMap((row) =>
+    targetSpots
+      .filter((candidate) =>
+        getOperationalObservedWaveSources(candidate).some(
+          (source) => source.stationId === row.stationId
+        )
+      )
+      .map((spot) => ({
+        spotId: spot.id,
+        sourceId: `ndbc-${row.stationId}`,
+        sourceRunId,
+        observedAt: row.observedAt,
+        waveHeightM: row.waveHeightM,
+        peakPeriodS: row.dominantPeriodS,
+        meanPeriodS: row.averagePeriodS,
+        primaryDirectionDeg: row.meanWaveDirectionDeg,
+        waterTempC: row.waterTempC,
+        payloadJson: JSON.stringify(row),
+        createdAt
+      }))
+  );
+  if (values.length === 0) return { rowsWritten: 0, errors: [] };
 
   const statement = db.prepare(
     `insert into wave_observations (
@@ -305,7 +375,23 @@ export async function persistWaveObservations(
       water_temp_c,
       payload_json,
       created_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )
+    select
+      json_extract(item.value, '$.spotId'),
+      json_extract(item.value, '$.sourceId'),
+      json_extract(item.value, '$.sourceRunId'),
+      json_extract(item.value, '$.observedAt'),
+      json_extract(item.value, '$.waveHeightM'),
+      json_extract(item.value, '$.peakPeriodS'),
+      json_extract(item.value, '$.meanPeriodS'),
+      json_extract(item.value, '$.primaryDirectionDeg'),
+      null,
+      null,
+      json_extract(item.value, '$.waterTempC'),
+      json_extract(item.value, '$.payloadJson'),
+      json_extract(item.value, '$.createdAt')
+    from json_each(?) as item
+    where 1
     on conflict(spot_id, source_id, observed_at) do update set
       source_run_id = excluded.source_run_id,
       wave_height_m = excluded.wave_height_m,
@@ -315,37 +401,9 @@ export async function persistWaveObservations(
       water_temp_c = excluded.water_temp_c,
       payload_json = excluded.payload_json,
       created_at = excluded.created_at`
-  );
+  ).bind(JSON.stringify(values));
 
-  const pending: PendingStatement[] = [];
-  for (const row of rows) {
-    for (const spot of NORCAL_SPOTS.filter((candidate) =>
-      getOperationalObservedWaveSources(candidate).some(
-        (source) => source.stationId === row.stationId
-      )
-    )) {
-      pending.push({
-        label: `wave_observations ${spot.id} ${row.stationId} ${row.observedAt}`,
-        statement: statement.bind(
-          spot.id,
-          `ndbc-${row.stationId}`,
-          sourceRunId,
-          row.observedAt,
-          row.waveHeightM,
-          row.dominantPeriodS,
-          row.averagePeriodS,
-          row.meanWaveDirectionDeg,
-          null,
-          null,
-          row.waterTempC,
-          JSON.stringify(row),
-          createdAt
-        )
-      });
-    }
-  }
-
-  return runPendingStatements(db, pending);
+  return runBulkStatements(db, [{ label: "bulk wave_observations", statement, rowsWritten: values.length }]);
 }
 
 export async function persistNwsRows(
@@ -358,84 +416,12 @@ export async function persistNwsRows(
   if (typeof db.prepare !== "function") {
     return { rowsWritten: 0, errors: ["DB binding does not expose prepare() for NWS rows."] };
   }
-
-  const windStatement = db.prepare(
-    `insert into wind_forecasts (
-      spot_id,
-      source_id,
-      source_run_id,
-      model_cycle_at,
-      forecast_at,
-      lead_hour,
-      wind_speed_ms,
-      wind_direction_deg,
-      gust_ms,
-      weather_summary,
-      payload_json,
-      created_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    on conflict(spot_id, source_id, forecast_at) do update set
-      source_run_id = excluded.source_run_id,
-      model_cycle_at = excluded.model_cycle_at,
-      lead_hour = excluded.lead_hour,
-      wind_speed_ms = excluded.wind_speed_ms,
-      wind_direction_deg = excluded.wind_direction_deg,
-      gust_ms = excluded.gust_ms,
-      weather_summary = excluded.weather_summary,
-      payload_json = excluded.payload_json,
-      created_at = excluded.created_at`
-  );
-  const windIssueStatement = db.prepare(
-    `insert into wind_forecast_issues (
-      spot_id,
-      source_id,
-      source_run_id,
-      issue_key,
-      issued_at,
-      model_cycle_at,
-      forecast_at,
-      lead_hours,
-      wind_speed_ms,
-      wind_direction_deg,
-      gust_ms,
-      weather_summary,
-      payload_json,
-      captured_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    on conflict(spot_id, source_id, issue_key, forecast_at) do nothing`
-  );
-  const hazardStatement = db.prepare(
-    `insert into hazard_events (
-      spot_id,
-      source_id,
-      source_run_id,
-      event_id,
-      event_type,
-      severity,
-      certainty,
-      urgency,
-      starts_at,
-      ends_at,
-      headline,
-      description,
-      instruction,
-      payload_json,
-      updated_at
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    on conflict(spot_id, source_id, event_id) do update set
-      source_run_id = excluded.source_run_id,
-      severity = excluded.severity,
-      certainty = excluded.certainty,
-      urgency = excluded.urgency,
-      starts_at = excluded.starts_at,
-      ends_at = excluded.ends_at,
-      headline = excluded.headline,
-      payload_json = excluded.payload_json,
-      updated_at = excluded.updated_at`
-  );
-
-  const pending: PendingStatement[] = [];
+  const windValues: Array<Record<string, unknown>> = [];
+  const windIssueValues: Array<Record<string, unknown>> = [];
+  const hazardValues: Array<Record<string, unknown>> = [];
+  const successfulAlertSpotIds: string[] = [];
   for (const context of rows) {
+    if (context.alertsFetchSucceeded) successfulAlertSpotIds.push(context.spotId);
     const officialIssuedAt = context.windForecasts.find((wind) => wind.issuedAt)?.issuedAt ?? null;
     const issuedAt = officialIssuedAt ?? createdAt;
     const issueKey = `sha256:${await sha256StableJson({
@@ -448,73 +434,190 @@ export async function persistNwsRows(
       const leadHours =
         (new Date(wind.forecastAt).getTime() - new Date(issuedAt).getTime()) /
         (60 * 60 * 1000);
-      const payloadJson = JSON.stringify(wind);
-      pending.push({
-        label: `wind_forecasts ${wind.spotId} ${wind.forecastAt}`,
-        statement: windStatement.bind(
-          wind.spotId,
-          "nws:point-forecast-alerts",
-          sourceRunId,
-          officialIssuedAt,
-          wind.forecastAt,
-          Number.isFinite(leadHours) ? Math.round(leadHours) : null,
-          ktToMs(wind.windSpeedKt),
-          wind.windDirectionDeg,
-          ktToMs(wind.gustKt),
-          wind.shortForecast,
-          payloadJson,
-          createdAt
-        )
+      windValues.push({
+        spotId: wind.spotId,
+        sourceRunId,
+        modelCycleAt: officialIssuedAt,
+        forecastAt: wind.forecastAt,
+        leadHour: Number.isFinite(leadHours) ? Math.round(leadHours) : null,
+        windSpeedMs: ktToMs(wind.windSpeedKt),
+        windDirectionDeg: wind.windDirectionDeg,
+        gustMs: ktToMs(wind.gustKt),
+        weatherSummary: wind.shortForecast,
+        payloadJson: JSON.stringify(wind),
+        createdAt
       });
       if (captureHistory && isDaylightForecastAt(wind.spotId, wind.forecastAt)) {
-        pending.push({
-          label: `wind_forecast_issues ${wind.spotId} ${wind.forecastAt}`,
-          statement: windIssueStatement.bind(
-            wind.spotId,
-            "nws:point-forecast-alerts",
-            sourceRunId,
-            issueKey,
-            issuedAt,
-            officialIssuedAt,
-            wind.forecastAt,
-            Number.isFinite(leadHours) ? leadHours : null,
-            ktToMs(wind.windSpeedKt),
-            wind.windDirectionDeg,
-            ktToMs(wind.gustKt),
-            wind.shortForecast,
-            null,
-            createdAt
-          )
+        windIssueValues.push({
+          spotId: wind.spotId,
+          sourceRunId,
+          issueKey,
+          issuedAt,
+          modelCycleAt: officialIssuedAt,
+          forecastAt: wind.forecastAt,
+          leadHours: Number.isFinite(leadHours) ? leadHours : null,
+          windSpeedMs: ktToMs(wind.windSpeedKt),
+          windDirectionDeg: wind.windDirectionDeg,
+          gustMs: ktToMs(wind.gustKt),
+          weatherSummary: wind.shortForecast,
+          capturedAt: createdAt
         });
       }
     }
 
+    if (!context.alertsFetchSucceeded) continue;
     for (const hazard of context.hazards) {
       const eventId = `${hazard.spotId}:${hazard.event}:${hazard.effectiveAt ?? "unknown"}:${hazard.expiresAt ?? "unknown"}`;
-      pending.push({
-        label: `hazard_events ${hazard.spotId} ${hazard.event}`,
-        statement: hazardStatement.bind(
-          hazard.spotId,
-          "nws:point-forecast-alerts",
-          sourceRunId,
-          eventId,
-          hazard.event,
-          hazard.severity,
-          hazard.certainty,
-          hazard.urgency,
-          hazard.effectiveAt,
-          hazard.expiresAt,
-          hazard.headline ?? hazard.event,
-          null,
-          null,
-          JSON.stringify(hazard),
-          createdAt
-        )
+      hazardValues.push({
+        spotId: hazard.spotId,
+        sourceRunId,
+        eventId,
+        eventType: hazard.event,
+        severity: hazard.severity,
+        certainty: hazard.certainty,
+        urgency: hazard.urgency,
+        startsAt: hazard.effectiveAt,
+        endsAt: hazard.expiresAt,
+        headline: hazard.headline ?? hazard.event,
+        payloadJson: JSON.stringify(hazard),
+        updatedAt: createdAt
       });
     }
   }
 
-  return runPendingStatements(db, pending);
+  const pending: BulkStatement[] = [];
+  if (windValues.length > 0) {
+    pending.push({
+      label: "bulk wind_forecasts",
+      rowsWritten: windValues.length,
+      statement: db.prepare(
+        `insert into wind_forecasts (
+          spot_id, source_id, source_run_id, model_cycle_at, forecast_at,
+          lead_hour, wind_speed_ms, wind_direction_deg, gust_ms,
+          weather_summary, payload_json, created_at
+        )
+        select
+          json_extract(item.value, '$.spotId'),
+          'nws:point-forecast-alerts',
+          json_extract(item.value, '$.sourceRunId'),
+          json_extract(item.value, '$.modelCycleAt'),
+          json_extract(item.value, '$.forecastAt'),
+          json_extract(item.value, '$.leadHour'),
+          json_extract(item.value, '$.windSpeedMs'),
+          json_extract(item.value, '$.windDirectionDeg'),
+          json_extract(item.value, '$.gustMs'),
+          json_extract(item.value, '$.weatherSummary'),
+          json_extract(item.value, '$.payloadJson'),
+          json_extract(item.value, '$.createdAt')
+        from json_each(?) as item
+        where 1
+        on conflict(spot_id, source_id, forecast_at) do update set
+          source_run_id = excluded.source_run_id,
+          model_cycle_at = excluded.model_cycle_at,
+          lead_hour = excluded.lead_hour,
+          wind_speed_ms = excluded.wind_speed_ms,
+          wind_direction_deg = excluded.wind_direction_deg,
+          gust_ms = excluded.gust_ms,
+          weather_summary = excluded.weather_summary,
+          payload_json = excluded.payload_json,
+          created_at = excluded.created_at`
+      ).bind(JSON.stringify(windValues))
+    });
+  }
+  if (windIssueValues.length > 0) {
+    pending.push({
+      label: "bulk wind_forecast_issues",
+      rowsWritten: windIssueValues.length,
+      statement: db.prepare(
+        `insert into wind_forecast_issues (
+          spot_id, source_id, source_run_id, issue_key, issued_at,
+          model_cycle_at, forecast_at, lead_hours, wind_speed_ms,
+          wind_direction_deg, gust_ms, weather_summary, payload_json, captured_at
+        )
+        select
+          json_extract(item.value, '$.spotId'),
+          'nws:point-forecast-alerts',
+          json_extract(item.value, '$.sourceRunId'),
+          json_extract(item.value, '$.issueKey'),
+          json_extract(item.value, '$.issuedAt'),
+          json_extract(item.value, '$.modelCycleAt'),
+          json_extract(item.value, '$.forecastAt'),
+          json_extract(item.value, '$.leadHours'),
+          json_extract(item.value, '$.windSpeedMs'),
+          json_extract(item.value, '$.windDirectionDeg'),
+          json_extract(item.value, '$.gustMs'),
+          json_extract(item.value, '$.weatherSummary'),
+          null,
+          json_extract(item.value, '$.capturedAt')
+        from json_each(?) as item
+        where 1
+        on conflict(spot_id, source_id, issue_key, forecast_at) do nothing`
+      ).bind(JSON.stringify(windIssueValues))
+    });
+  }
+  if (hazardValues.length > 0) {
+    pending.push({
+      label: "bulk hazard_events",
+      rowsWritten: hazardValues.length,
+      statement: db.prepare(
+        `insert into hazard_events (
+          spot_id, source_id, source_run_id, event_id, event_type, severity,
+          certainty, urgency, starts_at, ends_at, headline, description,
+          instruction, payload_json, updated_at
+        )
+        select
+          json_extract(item.value, '$.spotId'),
+          'nws:point-forecast-alerts',
+          json_extract(item.value, '$.sourceRunId'),
+          json_extract(item.value, '$.eventId'),
+          json_extract(item.value, '$.eventType'),
+          json_extract(item.value, '$.severity'),
+          json_extract(item.value, '$.certainty'),
+          json_extract(item.value, '$.urgency'),
+          json_extract(item.value, '$.startsAt'),
+          json_extract(item.value, '$.endsAt'),
+          json_extract(item.value, '$.headline'),
+          null,
+          null,
+          json_extract(item.value, '$.payloadJson'),
+          json_extract(item.value, '$.updatedAt')
+        from json_each(?) as item
+        where 1
+        on conflict(spot_id, source_id, event_id) do update set
+          source_run_id = excluded.source_run_id,
+          severity = excluded.severity,
+          certainty = excluded.certainty,
+          urgency = excluded.urgency,
+          starts_at = excluded.starts_at,
+          ends_at = excluded.ends_at,
+          headline = excluded.headline,
+          payload_json = excluded.payload_json,
+          updated_at = excluded.updated_at`
+      ).bind(JSON.stringify(hazardValues))
+    });
+  }
+  if (successfulAlertSpotIds.length > 0) {
+    pending.push({
+      label: "reconcile withdrawn hazard_events",
+      rowsWritten: 0,
+      statement: db.prepare(
+        `delete from hazard_events
+         where source_id = 'nws:point-forecast-alerts'
+           and spot_id in (select value from json_each(?))
+           and not exists (
+             select 1
+             from json_each(?) as active
+             where json_extract(active.value, '$.spotId') = hazard_events.spot_id
+               and json_extract(active.value, '$.eventId') = hazard_events.event_id
+           )`
+      ).bind(
+        JSON.stringify([...new Set(successfulAlertSpotIds)]),
+        JSON.stringify(hazardValues)
+      )
+    });
+  }
+
+  return runBulkStatements(db, pending);
 }
 
 export async function persistIssuedForecasts(

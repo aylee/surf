@@ -1,8 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import { ForecastResponseSchema, sourceFreshnessVerdict } from "@surf/contracts";
+import {
+  ForecastResponseSchema,
+  sourceFreshnessVerdict,
+  type ScoredForecastWindow
+} from "@surf/contracts";
 import { estimateBreakingWaveHeight } from "@surf/forecast-core";
 import { buildForecastResponse, buildSynchronizedForecastResponses } from "./forecast";
 import type { Env } from "./index";
+import {
+  forecastDisplayHorizonEnd,
+  stableHourlyForecastTimes,
+  stableThreeHourForecastTimes
+} from "./time";
 
 type QueryRows = Record<
   "tide" | "tideEvent" | "wind" | "wave" | "observation" | "hazard" | "source" | "issue" | "snapshot",
@@ -31,13 +40,16 @@ function queryKey(sql: string): QueryKey {
                 : "source";
 }
 
-function queryDb(rows: QueryRows): D1Database {
+type CapturedQuery = { key: QueryKey; sql: string; bindings: unknown[] };
+
+function queryDb(rows: QueryRows, captured?: CapturedQuery[]): D1Database {
   return {
     prepare(sql: string) {
       const key = queryKey(sql);
       const all = async () => ({ results: rows[key], success: true, meta: {} });
       return {
-        bind() {
+        bind(...bindings: unknown[]) {
+          captured?.push({ key, sql, bindings });
           return { all };
         },
         all
@@ -50,20 +62,31 @@ function batchingQueryDb(rows: QueryRows) {
   let batchCalls = 0;
   let batchedStatements = 0;
   let individualAllCalls = 0;
+  const individualQueries: CapturedQuery[] = [];
 
-  const statement = (key: QueryKey): D1PreparedStatement => ({
+  const statement = (
+    key: QueryKey,
+    sql: string,
+    allowIndividual = false,
+    bindings: unknown[] = []
+  ): D1PreparedStatement => ({
     __queryKey: key,
-    bind() {
-      return statement(key);
+    __allowIndividual: allowIndividual,
+    bind(...nextBindings: unknown[]) {
+      return statement(key, sql, allowIndividual, nextBindings);
     },
     async all() {
       individualAllCalls += 1;
+      if (allowIndividual) {
+        individualQueries.push({ key, sql, bindings });
+        return { results: rows[key], success: true, meta: {} };
+      }
       throw new Error("Initial forecast reads must use D1 batch when it is available");
     }
   } as unknown as D1PreparedStatement);
   const db = {
     prepare(sql: string) {
-      return statement(queryKey(sql));
+      return statement(queryKey(sql), sql, sql.includes("from json_each(?)"));
     },
     async batch(statements: D1PreparedStatement[]) {
       batchCalls += 1;
@@ -79,7 +102,8 @@ function batchingQueryDb(rows: QueryRows) {
     db,
     batchCalls: () => batchCalls,
     batchedStatements: () => batchedStatements,
-    individualAllCalls: () => individualAllCalls
+    individualAllCalls: () => individualAllCalls,
+    individualQueries: () => individualQueries
   };
 }
 
@@ -107,6 +131,25 @@ function trackIndexedReads<T>(values: T[]): { values: T[]; reads: () => number }
 }
 
 const forecastAt = "2026-07-10T04:00:00.000Z";
+
+function requireWindow(
+  response: { windows: ScoredForecastWindow[] },
+  at = forecastAt
+): ScoredForecastWindow {
+  const window = response.windows.find((candidate) => candidate.forecastAt === at);
+  if (!window) throw new Error(`Expected forecast window at ${at}`);
+  return window;
+}
+
+function windowsFrom(
+  response: { windows: ScoredForecastWindow[] },
+  startAt: string,
+  count: number
+): ScoredForecastWindow[] {
+  const startIndex = response.windows.findIndex((window) => window.forecastAt === startAt);
+  if (startIndex < 0) throw new Error(`Expected forecast window at ${startAt}`);
+  return response.windows.slice(startIndex, startIndex + count);
+}
 
 function liveRows(): QueryRows {
   return {
@@ -180,6 +223,7 @@ function liveRows(): QueryRows {
     ],
     hazard: [
       {
+        source_id: "nws:point-forecast-alerts",
         starts_at: "2026-07-10T03:00:00.000Z",
         ends_at: "2026-07-10T05:00:00.000Z",
         headline: "Beach Hazards Statement",
@@ -225,10 +269,22 @@ describe("forecast assembly", () => {
     );
 
     expect(batched.batchCalls()).toBe(1);
-    expect(batched.batchedStatements()).toBe(8);
-    expect(batched.individualAllCalls()).toBe(0);
-    expect(synchronized.threeHour).toEqual(expectedThreeHour);
-    expect(synchronized.hourly).toEqual(expectedHourly);
+    expect(batched.batchedStatements()).toBe(7);
+    expect(batched.individualAllCalls()).toBe(1);
+    expect(batched.individualQueries()).toEqual([
+      expect.objectContaining({
+        key: "source",
+        sql: expect.stringContaining("from json_each(?)"),
+        bindings: [
+          JSON.stringify(["tide-run", "wind-run", "wave-run", "ndbc-run", "hazard-run"])
+        ]
+      })
+    ]);
+    const { recommendations: threeHourRecommendations, ...threeHourCore } = synchronized.threeHour;
+    const { recommendations: hourlyRecommendations, ...hourlyCore } = synchronized.hourly;
+    expect(threeHourCore).toEqual(expectedThreeHour);
+    expect(hourlyCore).toEqual(expectedHourly);
+    expect(threeHourRecommendations).toEqual(hourlyRecommendations);
   });
 
   it("emits one bounded nonterminal diagnostic when standalone assembly falls back", async () => {
@@ -298,10 +354,13 @@ describe("forecast assembly", () => {
       new Date("2026-07-10T02:53:07.000Z")
     );
 
-    expect(response.windows).toHaveLength(41);
+    expect(response.windows).toHaveLength(40);
+    expect(response.windows[0]?.forecastAt).toBe("2026-07-09T07:00:00.000Z");
+    expect(response.windows.at(-1)?.forecastAt).toBe("2026-07-14T04:00:00.000Z");
     expect(response.interval).toBe("3h");
     expect(() => ForecastResponseSchema.parse(response)).not.toThrow();
-    expect(response.windows[0]).toMatchObject({
+    const sourcedWindow = requireWindow(response);
+    expect(sourcedWindow).toMatchObject({
       forecastAt,
       ratingStatus: "scored",
       waveHeightFt: 0.78 * 3.28084,
@@ -351,7 +410,7 @@ describe("forecast assembly", () => {
         }
       }
     });
-    expect(response.windows[0]?.caveats).toContain("Active NWS hazard: Beach Hazards Statement");
+    expect(sourcedWindow.caveats).toContain("Active NWS hazard: Beach Hazards Statement");
     expect(response.sourceNote).toContain("official NOAA/NWS MTR coastal-grid data");
     expect(response.observation).toMatchObject({
       stationId: "46237",
@@ -372,6 +431,94 @@ describe("forecast assembly", () => {
         sourceRunId: "tide-run"
       }
     ]);
+    expect(response.hazards).toEqual([{
+      headline: "Beach Hazards Statement",
+      startsAt: "2026-07-10T03:00:00.000Z",
+      endsAt: "2026-07-10T05:00:00.000Z",
+      sourceId: "nws:point-forecast-alerts",
+      sourceRunId: "hazard-run"
+    }]);
+  });
+
+  it.each([
+    ["normal", "2026-07-10T18:00:00.000Z", "1h"],
+    ["normal", "2026-07-10T18:00:00.000Z", "3h"],
+    ["spring-forward", "2026-03-08T18:00:00.000Z", "1h"],
+    ["spring-forward", "2026-03-08T18:00:00.000Z", "3h"],
+    ["fall-back", "2026-11-01T18:00:00.000Z", "1h"],
+    ["fall-back", "2026-11-01T18:00:00.000Z", "3h"]
+  ] as const)(
+    "keeps final-date tide extrema through the exclusive %s %s display horizon",
+    async (_dateKind, nowAt, interval) => {
+      const now = new Date(nowAt);
+      const times = interval === "1h"
+        ? stableHourlyForecastTimes(now, 120, "America/Los_Angeles")
+        : stableThreeHourForecastTimes(now, 120, "America/Los_Angeles");
+      const displayEnd = forecastDisplayHorizonEnd(times, interval)!;
+      const rows = liveRows();
+      rows.tideEvent = [
+        {
+          station_id: "9414290",
+          event_at: new Date(Date.parse(displayEnd) - 30 * 60_000).toISOString(),
+          tide_ft_mllw: 5.1,
+          event_type: "high",
+          source_run_id: "tide-run"
+        },
+        {
+          station_id: "9414290",
+          event_at: displayEnd,
+          tide_ft_mllw: 0.2,
+          event_type: "low",
+          source_run_id: "tide-run"
+        }
+      ];
+      const captured: CapturedQuery[] = [];
+
+      const response = await buildForecastResponse(
+        env(queryDb(rows, captured)),
+        "bolinas",
+        now,
+        interval,
+        { failOnReadError: true }
+      );
+
+      expect(response.tideEvents?.map((event) => event.eventAt)).toEqual([
+        new Date(Date.parse(displayEnd) - 30 * 60_000).toISOString()
+      ]);
+      const tideEventQuery = captured.find((query) => query.key === "tideEvent");
+      expect(tideEventQuery?.sql).toContain("event_at < ?");
+      expect(tideEventQuery?.bindings).toEqual(["bolinas", times[0], displayEnd]);
+    }
+  );
+
+  it("maps a 4:30–6:30 local hazard to every overlapping hourly and three-hour slot", async () => {
+    const rows = liveRows();
+    rows.hazard = [{
+      source_id: "nws:point-forecast-alerts",
+      starts_at: "2026-07-10T11:30:00.000Z",
+      ends_at: "2026-07-10T13:30:00.000Z",
+      headline: "Between-slot advisory",
+      source_run_id: "hazard-run"
+    }];
+    const now = new Date("2026-07-10T10:00:00.000Z");
+
+    const [hourly, threeHour] = await Promise.all([
+      buildForecastResponse(env(queryDb(rows)), "bolinas", now, "1h", { failOnReadError: true }),
+      buildForecastResponse(env(queryDb(rows)), "bolinas", now, "3h", { failOnReadError: true })
+    ]);
+    const hasHazard = (window: ScoredForecastWindow) =>
+      window.caveats.includes("Active NWS hazard: Between-slot advisory");
+
+    expect(hourly.windows.filter(hasHazard).map((window) => window.forecastAt)).toEqual([
+      "2026-07-10T11:00:00.000Z",
+      "2026-07-10T12:00:00.000Z",
+      "2026-07-10T13:00:00.000Z"
+    ]);
+    expect(threeHour.windows.filter(hasHazard).map((window) => window.forecastAt)).toEqual([
+      "2026-07-10T10:00:00.000Z",
+      "2026-07-10T13:00:00.000Z"
+    ]);
+    expect(threeHour.hazards).toEqual(hourly.hazards);
   });
 
   it("explicitly prefers a usable CDIP MOP row over the NWS fallback", async () => {
@@ -434,7 +581,8 @@ describe("forecast assembly", () => {
     );
 
     expect(() => ForecastResponseSchema.parse(response)).not.toThrow();
-    expect(response.windows[0]).toMatchObject({
+    const cdipWindow = requireWindow(response);
+    expect(cdipWindow).toMatchObject({
       waveHeightFt: breaking.pointHeightM * 3.28084,
       peakPeriodSec: 15.384616,
       primaryDirectionDeg: 294.3,
@@ -475,12 +623,12 @@ describe("forecast assembly", () => {
         breakingSurfHeightFt: null
       }
     });
-    expect(response.windows[0]?.sourceRunIds).not.toContain("wave-run");
-    expect(response.windows[0]?.confidence).toBeGreaterThan(74);
-    expect(response.windows[0]?.confidence).toBeLessThanOrEqual(89);
-    expect(response.windows[0]?.caveats.join(" ")).toContain("uncalibrated-model cap of 89");
-    expect(response.windows[0]?.caveats.join(" ")).toContain("not observed breaking-wave face height");
-    expect(response.windows[0]?.caveats.join(" ")).toContain("does not affect the displayed height or score");
+    expect(cdipWindow.sourceRunIds).not.toContain("wave-run");
+    expect(cdipWindow.confidence).toBeGreaterThan(74);
+    expect(cdipWindow.confidence).toBeLessThanOrEqual(89);
+    expect(cdipWindow.caveats.join(" ")).toContain("uncalibrated-model cap of 89");
+    expect(cdipWindow.caveats.join(" ")).toContain("not observed breaking-wave face height");
+    expect(cdipWindow.caveats.join(" ")).toContain("does not affect the displayed height or score");
     expect(response.sourceNote).toContain("prefer public CDIP MOP");
     expect(response.sourceNote).toContain("not a model cycle");
   });
@@ -524,7 +672,8 @@ describe("forecast assembly", () => {
       new Date("2026-07-10T02:53:07.000Z")
     );
 
-    expect(response.windows[0]).toMatchObject({
+    const proxyWindow = requireWindow(response);
+    expect(proxyWindow).toMatchObject({
       primarySwell: null,
       secondarySwell: null,
       waveState: {
@@ -534,7 +683,7 @@ describe("forecast assembly", () => {
         breakingSurfHeightFt: null
       }
     });
-    expect(response.windows[0]?.confidence).toBeLessThanOrEqual(74);
+    expect(proxyWindow.confidence).toBeLessThanOrEqual(74);
   });
 
   it("makes an explicit unknown call when wave data is missing and never substitutes fixtures", async () => {
@@ -546,7 +695,8 @@ describe("forecast assembly", () => {
       new Date("2026-07-10T02:53:07.000Z")
     );
 
-    expect(response.windows[0]).toMatchObject({
+    const missingWaveWindow = requireWindow(response);
+    expect(missingWaveWindow).toMatchObject({
       forecastAt,
       ratingStatus: "unknown",
       qualityLabel: "unknown",
@@ -557,9 +707,9 @@ describe("forecast assembly", () => {
       primaryDirectionDeg: null,
       waveProvenance: null
     });
-    expect(response.windows[0]?.activeCapabilities).not.toContain("forecast_wave_nearshore");
-    expect(response.windows[0]?.sourceRunIds).not.toContain("fixture");
-    expect(response.windows[0]?.caveats.join(" ")).toContain("surf rating is unknown");
+    expect(missingWaveWindow.activeCapabilities).not.toContain("forecast_wave_nearshore");
+    expect(missingWaveWindow.sourceRunIds).not.toContain("fixture");
+    expect(missingWaveWindow.caveats.join(" ")).toContain("surf rating is unknown");
   });
 
   it("uses a fresh fallback buoy when the preferred station is stale", async () => {
@@ -584,7 +734,7 @@ describe("forecast assembly", () => {
     );
 
     expect(response.observation?.stationId).toBe("46013");
-    expect(response.windows[0]?.activeCapabilities).toContain("observed_wave");
+    expect(requireWindow(response).activeCapabilities).toContain("observed_wave");
   });
 
   it("uses the roughest hourly surface inside each three-hour planning window", async () => {
@@ -609,8 +759,9 @@ describe("forecast assembly", () => {
       new Date("2026-07-10T02:53:07.000Z")
     );
 
-    expect(response.windows[0]?.windDirectionDeg).toBe(145);
-    expect(response.windows[0]?.windSpeedKt).toBeCloseTo(12, 8);
+    const roughestWindow = requireWindow(response);
+    expect(roughestWindow.windDirectionDeg).toBe(145);
+    expect(roughestWindow.windSpeedKt).toBeCloseTo(12, 8);
   });
 
   it("preserves first-row tie behavior while using indexed tide, wind, wave, hazard, and source-run lookups", async () => {
@@ -655,12 +806,14 @@ describe("forecast assembly", () => {
     ];
     rows.hazard = [
       {
+        source_id: "nws:point-forecast-alerts",
         starts_at: "2026-07-10T03:30:00.000Z",
         ends_at: "2026-07-10T06:00:00.000Z",
         headline: "First input hazard",
         source_run_id: "hazard-run"
       },
       {
+        source_id: "nws:point-forecast-alerts",
         starts_at: "2026-07-10T03:00:00.000Z",
         ends_at: "2026-07-10T06:00:00.000Z",
         headline: "Earlier-starting hazard",
@@ -689,15 +842,16 @@ describe("forecast assembly", () => {
       new Date("2026-07-10T02:53:07.000Z")
     );
 
-    expect(response.windows[0]).toMatchObject({
+    const tiedWindow = requireWindow(response);
+    expect(tiedWindow).toMatchObject({
       tideFt: 5,
       tideTrend: "falling",
       windSpeedKt: 4 * 1.94384,
       weatherSummary: "first input row",
       waveHeightFt: 0.5 * 3.28084
     });
-    expect(response.windows[0]?.caveats).toContain("Active NWS hazard: First input hazard");
-    expect(response.windows[0]?.sourceFreshness?.find((entry) => entry.capability === "tide")).toMatchObject({
+    expect(tiedWindow.caveats).toContain("Active NWS hazard: First input hazard");
+    expect(tiedWindow.sourceFreshness?.find((entry) => entry.capability === "tide")).toMatchObject({
       updatedAt: "2026-07-10T02:00:00.000Z",
       freshnessMinutes: 53
     });
@@ -746,43 +900,56 @@ describe("forecast assembly", () => {
     );
 
     expect(response.interval).toBe("1h");
-    expect(response.windows).toHaveLength(121);
-    expect(response.windows.slice(0, 3).map((window) => window.forecastAt)).toEqual([
+    expect(response.windows).toHaveLength(120);
+    expect(response.windows[0]?.forecastAt).toBe("2026-07-09T07:00:00.000Z");
+    expect(response.windows.at(-1)?.forecastAt).toBe("2026-07-14T06:00:00.000Z");
+    expect(new Date(response.windows[0]!.forecastAt).getTime()).toBeLessThan(
+      new Date("2026-07-10T03:01:00.000Z").getTime()
+    );
+    const sourcedWindows = windowsFrom(response, forecastAt, 3);
+    expect(sourcedWindows.map((window) => window.forecastAt)).toEqual([
       "2026-07-10T04:00:00.000Z",
       "2026-07-10T05:00:00.000Z",
       "2026-07-10T06:00:00.000Z"
     ]);
-    expect(response.windows.slice(0, 3).map((window) => window.waveHeightFt)).toEqual([
+    expect(sourcedWindows.map((window) => window.waveHeightFt)).toEqual([
       0.78 * 3.28084,
       0.78 * 3.28084,
       0.78 * 3.28084
     ]);
-    expect(response.windows.slice(0, 3).map((window) => window.windSpeedKt)).toEqual([
+    expect(sourcedWindows.map((window) => window.windSpeedKt)).toEqual([
       3 * 1.94384,
       5,
       9
     ]);
-    expect(response.windows.slice(0, 3).map((window) => window.tideFt)).toEqual([3.2, 3.4, 3.7]);
-    expect(response.windows.slice(0, 3).every((window) =>
+    expect(sourcedWindows.map((window) => window.tideFt)).toEqual([3.2, 3.4, 3.7]);
+    expect(sourcedWindows.every((window) =>
       window.waveState?.validFrom === forecastAt &&
       window.waveState.validTo === "2026-07-10T07:00:00.000Z" &&
       window.resolution?.wave.method === "held"
     )).toBe(true);
-    expect(response.windows[1]).toMatchObject({
+    expect(sourcedWindows[1]).toMatchObject({
       weatherSummary: "Partly cloudy",
       resolution: {
         wind: { method: "exact", displayIntervalMinutes: 60 },
         tide: { method: "exact", displayIntervalMinutes: 60 }
       }
     });
-    expect(response.windows[1]?.windGustKt).toBeCloseTo(8, 8);
+    expect(sourcedWindows[1]?.windGustKt).toBeCloseTo(8, 8);
   });
 
   it("keeps dense 1-hour assembly linear in normalized input rows", async () => {
     const rows = liveRows();
-    const startMs = Date.parse(forecastAt);
-    const hourlyTimes = Array.from({ length: 121 }, (_, index) =>
-      new Date(startMs + index * 60 * 60_000).toISOString()
+    const now = new Date("2026-07-10T03:01:00.000Z");
+    const hourlyTimes = stableHourlyForecastTimes(
+      now,
+      120,
+      "America/Los_Angeles"
+    );
+    const threeHourTimes = stableThreeHourForecastTimes(
+      now,
+      120,
+      "America/Los_Angeles"
     );
     rows.tide = hourlyTimes.map((forecastAtValue, index) => ({
       forecast_at: forecastAtValue,
@@ -799,9 +966,9 @@ describe("forecast assembly", () => {
       weather_summary: "Clear",
       source_run_id: "wind-run"
     }));
-    rows.wave = Array.from({ length: 41 }, (_, index) => ({
+    rows.wave = threeHourTimes.map((forecastAtValue, index) => ({
       ...rows.wave[0] as object,
-      forecast_at: new Date(startMs + index * 3 * 60 * 60_000).toISOString(),
+      forecast_at: forecastAtValue,
       nearshore_height_m: 0.7 + index / 100
     }));
     rows.observation = [];
@@ -819,11 +986,11 @@ describe("forecast assembly", () => {
     const response = await buildForecastResponse(
       env(queryDb(rows)),
       "bolinas",
-      new Date("2026-07-10T03:01:00.000Z"),
+      now,
       "1h"
     );
 
-    expect(response.windows).toHaveLength(121);
+    expect(response.windows).toHaveLength(hourlyTimes.length);
     expect(response.windows.every((window) => window.ratingStatus === "scored")).toBe(true);
     expect(response.windows.slice(0, 3).map((window) => window.waveHeightFt)).toEqual([
       0.7 * 3.28084,
@@ -832,9 +999,9 @@ describe("forecast assembly", () => {
     ]);
     // These deterministic access counts reject a return to per-window full-array scans
     // without relying on machine-dependent wall-clock thresholds.
-    expect(tideReads.reads()).toBeLessThanOrEqual(2 * 121);
-    expect(windReads.reads()).toBeLessThanOrEqual(2 * 121);
-    expect(waveReads.reads()).toBeLessThanOrEqual(3 * 41);
+    expect(tideReads.reads()).toBeLessThanOrEqual(2 * hourlyTimes.length);
+    expect(windReads.reads()).toBeLessThanOrEqual(2 * hourlyTimes.length);
+    expect(waveReads.reads()).toBeLessThanOrEqual(3 * threeHourTimes.length);
     expect(sourceReads.reads()).toBeLessThanOrEqual(2 * rows.source.length);
   });
 
@@ -882,17 +1049,18 @@ describe("forecast assembly", () => {
       "1h"
     );
 
-    expect(response.windows.slice(0, 3).map((window) => window.waveHeightFt)).toEqual([
+    const heldWindows = windowsFrom(response, forecastAt, 3);
+    expect(heldWindows.map((window) => window.waveHeightFt)).toEqual([
       1 * 3.28084,
       1 * 3.28084,
       2 * 3.28084
     ]);
-    expect(response.windows.slice(0, 3).map((window) => window.waveState?.validFrom)).toEqual([
+    expect(heldWindows.map((window) => window.waveState?.validFrom)).toEqual([
       "2026-07-10T03:00:00.000Z",
       "2026-07-10T03:00:00.000Z",
       "2026-07-10T06:00:00.000Z"
     ]);
-    expect(response.windows.slice(0, 3).every((window) =>
+    expect(heldWindows.every((window) =>
       window.resolution?.wave.method === "held"
     )).toBe(true);
   });
@@ -924,14 +1092,15 @@ describe("forecast assembly", () => {
       new Date("2026-07-10T02:53:07.000Z")
     );
 
-    expect(response.windows[0]).toMatchObject({
+    const invalidSemanticsWindow = requireWindow(response);
+    expect(invalidSemanticsWindow).toMatchObject({
       ratingStatus: "unknown",
       waveHeightFt: null,
       waveState: null,
       waveProvenance: null
     });
-    expect(response.windows[0]?.activeCapabilities).not.toContain("forecast_wave_nearshore");
-    expect(response.windows[0]?.caveats.join(" ")).toContain("omitted recognized nearshore semantics");
+    expect(invalidSemanticsWindow.activeCapabilities).not.toContain("forecast_wave_nearshore");
+    expect(invalidSemanticsWindow.caveats.join(" ")).toContain("omitted recognized nearshore semantics");
   });
 
   it("uses the official NWS wind issue time for selected-window freshness", async () => {
@@ -946,7 +1115,8 @@ describe("forecast assembly", () => {
       "bolinas",
       new Date("2026-07-10T02:53:00.000Z")
     );
-    const windFreshness = response.windows[0]?.sourceFreshness?.find(
+    const selectedWindow = requireWindow(response);
+    const windFreshness = selectedWindow.sourceFreshness?.find(
       (entry) => entry.capability === "wind"
     );
 
@@ -955,7 +1125,7 @@ describe("forecast assembly", () => {
       freshnessMinutes: 893,
       status: "stale"
     });
-    expect(response.windows[0]?.sourceFreshnessMinutes).toBe(893);
+    expect(selectedWindow.sourceFreshnessMinutes).toBe(893);
   });
 
   it("ships adapter-declared cadence and grace on every source freshness entry", async () => {
@@ -982,20 +1152,20 @@ describe("forecast assembly", () => {
       }
     }
 
-    const first = response.windows[0]?.sourceFreshness ?? [];
-    expect(first.find((entry) => entry.capability === "wind")).toMatchObject({
+    const selectedFreshness = requireWindow(response).sourceFreshness ?? [];
+    expect(selectedFreshness.find((entry) => entry.capability === "wind")).toMatchObject({
       expectedCadenceMinutes: 360,
       graceMinutes: 180
     });
-    expect(first.find((entry) => entry.capability === "tide")).toMatchObject({
+    expect(selectedFreshness.find((entry) => entry.capability === "tide")).toMatchObject({
       expectedCadenceMinutes: 1440,
       graceMinutes: 360
     });
-    expect(first.find((entry) => entry.capability === "observed_wave")).toMatchObject({
+    expect(selectedFreshness.find((entry) => entry.capability === "observed_wave")).toMatchObject({
       expectedCadenceMinutes: 60,
       graceMinutes: 60
     });
-    expect(first.find((entry) => entry.capability.startsWith("forecast_wave"))).toMatchObject({
+    expect(selectedFreshness.find((entry) => entry.capability.startsWith("forecast_wave"))).toMatchObject({
       sourceId: "nws:mtr-grid-wave",
       expectedCadenceMinutes: 720,
       graceMinutes: 240
@@ -1013,7 +1183,7 @@ describe("forecast assembly", () => {
     );
 
     expect(
-      response.windows[0]?.sourceFreshness?.find((entry) => entry.capability.startsWith("forecast_wave"))
+      requireWindow(response).sourceFreshness?.find((entry) => entry.capability.startsWith("forecast_wave"))
     ).toMatchObject({
       sourceId: "cdip:mop-forecast",
       expectedCadenceMinutes: 360,

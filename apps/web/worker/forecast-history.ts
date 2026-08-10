@@ -92,6 +92,7 @@ export async function forecastSourceIssueFingerprint(response: ForecastResponse)
     observation: response.observation ?? null,
     observations: response.observations ?? [],
     tideEvents: (response.tideEvents ?? []).map(({ sourceRunId: _sourceRunId, ...event }) => event),
+    hazards: (response.hazards ?? []).map(({ sourceRunId: _sourceRunId, ...hazard }) => hazard),
     sunPhases: response.sunPhases ?? [],
     issueDelta: response.issueDelta ?? null
   });

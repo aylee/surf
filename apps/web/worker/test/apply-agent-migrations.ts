@@ -10,7 +10,7 @@ const testEnv = env as Cloudflare.Env & { TEST_MIGRATIONS: D1Migration[] };
 beforeEach(async () => {
   await applyD1Migrations(testEnv.DB, testEnv.TEST_MIGRATIONS);
   await testEnv.DB.prepare(
-    `insert into spots (
+    `insert or ignore into spots (
        id, name, region, lat, lon, timezone, shore_normal_deg, config_json, active
      ) values (?, ?, 'norcal', ?, ?, 'America/Los_Angeles', ?, '{}', 1),
               (?, ?, 'norcal', ?, ?, 'America/Los_Angeles', ?, '{}', 1)`

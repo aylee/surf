@@ -48,19 +48,20 @@ function outcomeCycleAt(outcome: AdapterOutcome<unknown, unknown>): string | nul
   return cycles.length === 1 ? cycles[0]! : null;
 }
 
-export async function recordSourceRun<Row>(
-  db: D1Database,
-  outcome: AdapterOutcome<Row>,
-  options: {
-    startedAt: string;
-    completedAt: string;
-    idSuffix: string;
-  }
-): Promise<SourceRunRecord> {
-  const id = sourceRunId(outcome.sourceId, options.idSuffix);
-  const runKey = `${outcome.sourceId}:${options.idSuffix}`;
-  const rowCount = outcomeRowCount(outcome as AdapterOutcome<unknown>);
-  const cycleAt = outcomeCycleAt(outcome as AdapterOutcome<unknown>);
+export type SourceRunInput = {
+  outcome: AdapterOutcome<unknown, unknown>;
+  startedAt: string;
+  completedAt: string;
+  idSuffix: string;
+};
+
+function initialSourceRun(input: SourceRunInput): {
+  record: SourceRunRecord;
+  value: Record<string, unknown>;
+} {
+  const { outcome } = input;
+  const id = sourceRunId(outcome.sourceId, input.idSuffix);
+  const rowCount = outcomeRowCount(outcome);
   const error = outcome.errors.length > 0 ? outcome.errors.join("\n").slice(0, 2000) : null;
   const metadataJson = JSON.stringify({
     provider: outcome.provider,
@@ -71,91 +72,198 @@ export async function recordSourceRun<Row>(
     metadata: outcome.metadata,
     dbContract: SOURCE_RUNS_CONTRACT
   });
-
-  if (typeof db.prepare !== "function") {
-    return {
+  return {
+    record: {
       id,
       sourceId: outcome.sourceId,
-      status: outcome.status,
-      recorded: false,
-      rowCount,
-      caveatCount: outcome.caveats.length,
-      errorCount: outcome.errors.length,
-      error: "DB binding does not expose prepare()."
-    };
-  }
-
-  try {
-    await db
-      .prepare(
-        `insert into source_runs (
-          id,
-          run_key,
-          source_id,
-          run_kind,
-          cycle_at,
-          forecast_hour,
-          valid_start_at,
-          valid_end_at,
-          started_at,
-          completed_at,
-          status,
-          raw_r2_key,
-          metadata_json,
-          error
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        on conflict(id) do update set
-          run_key = excluded.run_key,
-          run_kind = excluded.run_kind,
-          cycle_at = excluded.cycle_at,
-          valid_start_at = excluded.valid_start_at,
-          valid_end_at = excluded.valid_end_at,
-          started_at = excluded.started_at,
-          completed_at = excluded.completed_at,
-          status = excluded.status,
-          metadata_json = excluded.metadata_json,
-          error = excluded.error
-        where excluded.started_at >= source_runs.started_at`
-      )
-      .bind(
-        id,
-        runKey,
-        outcome.sourceId,
-        "ingest",
-        cycleAt,
-        null,
-        null,
-        null,
-        options.startedAt,
-        null,
-        "running",
-        null,
-        metadataJson,
-        error
-      )
-      .run();
-
-    return {
-      id,
-      sourceId: outcome.sourceId,
+      startedAt: input.startedAt,
       status: outcome.status,
       recorded: true,
       rowCount,
       caveatCount: outcome.caveats.length,
       errorCount: outcome.errors.length,
       error
-    };
-  } catch (caught) {
-    return {
+    },
+    value: {
       id,
+      runKey: `${outcome.sourceId}:${input.idSuffix}`,
       sourceId: outcome.sourceId,
-      status: outcome.status,
+      cycleAt: outcomeCycleAt(outcome),
+      startedAt: input.startedAt,
+      metadataJson,
+      error
+    }
+  };
+}
+
+export async function recordSourceRuns(
+  db: D1Database,
+  inputs: readonly SourceRunInput[]
+): Promise<SourceRunRecord[]> {
+  const prepared = inputs.map(initialSourceRun);
+  if (prepared.length === 0) return [];
+  if (typeof db.prepare !== "function") {
+    return prepared.map(({ record }) => ({
+      ...record,
       recorded: false,
-      rowCount,
-      caveatCount: outcome.caveats.length,
-      errorCount: outcome.errors.length,
+      error: "DB binding does not expose prepare()."
+    }));
+  }
+
+  try {
+    await db.prepare(
+      `insert into source_runs (
+        id, run_key, source_id, run_kind, cycle_at, forecast_hour,
+        valid_start_at, valid_end_at, started_at, completed_at, status,
+        raw_r2_key, metadata_json, error
+      )
+      select
+        json_extract(item.value, '$.id'),
+        json_extract(item.value, '$.runKey'),
+        json_extract(item.value, '$.sourceId'),
+        'ingest',
+        json_extract(item.value, '$.cycleAt'),
+        null,
+        null,
+        null,
+        json_extract(item.value, '$.startedAt'),
+        null,
+        'running',
+        null,
+        json_extract(item.value, '$.metadataJson'),
+        json_extract(item.value, '$.error')
+      from json_each(?) as item
+      where 1
+      on conflict(id) do update set
+        run_key = excluded.run_key,
+        run_kind = excluded.run_kind,
+        cycle_at = excluded.cycle_at,
+        valid_start_at = excluded.valid_start_at,
+        valid_end_at = excluded.valid_end_at,
+        started_at = excluded.started_at,
+        completed_at = excluded.completed_at,
+        status = excluded.status,
+        metadata_json = excluded.metadata_json,
+        error = excluded.error
+      where excluded.started_at >= source_runs.started_at`
+    ).bind(JSON.stringify(prepared.map(({ value }) => value))).run();
+    return prepared.map(({ record }) => record);
+  } catch (caught) {
+    return prepared.map(({ record }) => ({
+      ...record,
+      recorded: false,
       error: `source_runs write failed: ${errorMessage(caught)}`
-    };
+    }));
+  }
+}
+
+export async function recordSourceRun<Row>(
+  db: D1Database,
+  outcome: AdapterOutcome<Row>,
+  options: {
+    startedAt: string;
+    completedAt: string;
+    idSuffix: string;
+  }
+): Promise<SourceRunRecord> {
+  return (await recordSourceRuns(db, [{
+    outcome: outcome as AdapterOutcome<unknown, unknown>,
+    ...options
+  }]))[0]!;
+}
+
+export type SourceRunFinalization = {
+  run: SourceRunRecord;
+  outcome: AdapterOutcome<unknown, unknown>;
+  normalized: PersistenceResult;
+  artifacts: ArtifactPersistenceResult;
+  completedAt: string;
+};
+
+function finalizedSourceRun(input: SourceRunFinalization): {
+  record: SourceRunRecord;
+  value: Record<string, unknown>;
+} {
+  const errors = [
+    ...input.outcome.errors,
+    ...input.normalized.errors,
+    ...input.artifacts.errors
+  ];
+  const status = combineStatus([
+    input.outcome.status,
+    errors.length > 0 ? "failure" : "success"
+  ]);
+  const error = errors.length > 0 ? errors.join("\n").slice(0, 2000) : null;
+  const metadataJson = JSON.stringify({
+    provider: input.outcome.provider,
+    capabilities: input.outcome.capabilities,
+    adapterStatus: input.outcome.status,
+    adapterRows: outcomeRowCount(input.outcome),
+    normalizedRowsWritten: input.normalized.rowsWritten,
+    rawArtifactsWritten: input.artifacts.rowsWritten,
+    caveats: input.outcome.caveats,
+    metadata: input.outcome.metadata,
+    dbContract: SOURCE_RUNS_CONTRACT
+  });
+  return {
+    record: {
+      ...input.run,
+      status,
+      recorded: true,
+      rowCount: input.normalized.rowsWritten,
+      errorCount: errors.length,
+      error
+    },
+    value: {
+      id: input.run.id,
+      completedAt: input.completedAt,
+      status,
+      rawR2Key: input.artifacts.manifestKey,
+      artifactManifestJson: input.artifacts.manifestJson,
+      metadataJson,
+      error
+    }
+  };
+}
+
+export async function finalizeSourceRuns(
+  db: D1Database,
+  inputs: readonly SourceRunFinalization[]
+): Promise<SourceRunRecord[]> {
+  const prepared = inputs.map(finalizedSourceRun);
+  if (prepared.length === 0) return [];
+  try {
+    await db.prepare(
+      `update source_runs
+       set
+         completed_at = updates.completed_at,
+         status = updates.status,
+         raw_r2_key = updates.raw_r2_key,
+         artifact_manifest_json = updates.artifact_manifest_json,
+         metadata_json = updates.metadata_json,
+         error = updates.error
+       from (
+         select
+           json_extract(item.value, '$.id') as id,
+           json_extract(item.value, '$.completedAt') as completed_at,
+           json_extract(item.value, '$.status') as status,
+           json_extract(item.value, '$.rawR2Key') as raw_r2_key,
+           json_extract(item.value, '$.artifactManifestJson') as artifact_manifest_json,
+           json_extract(item.value, '$.metadataJson') as metadata_json,
+           json_extract(item.value, '$.error') as error
+         from json_each(?) as item
+       ) as updates
+       where source_runs.id = updates.id`
+    ).bind(JSON.stringify(prepared.map(({ value }) => value))).run();
+    return prepared.map(({ record }) => record);
+  } catch (caught) {
+    return prepared.map(({ record }) => ({
+      ...record,
+      status: "failure",
+      recorded: false,
+      errorCount: record.errorCount + 1,
+      error: `source_runs finalization failed: ${errorMessage(caught)}`
+    }));
   }
 }
 
@@ -167,55 +275,11 @@ export async function finalizeSourceRun<Row>(
   artifacts: ArtifactPersistenceResult,
   completedAt: string
 ): Promise<SourceRunRecord> {
-  const errors = [...outcome.errors, ...normalized.errors, ...artifacts.errors];
-  const status = combineStatus([outcome.status, errors.length > 0 ? "failure" : "success"]);
-  const error = errors.length > 0 ? errors.join("\n").slice(0, 2000) : null;
-  const metadataJson = JSON.stringify({
-    provider: outcome.provider,
-    capabilities: outcome.capabilities,
-    adapterStatus: outcome.status,
-    adapterRows: outcomeRowCount(outcome as AdapterOutcome<unknown>),
-    normalizedRowsWritten: normalized.rowsWritten,
-    rawArtifactsWritten: artifacts.rowsWritten,
-    caveats: outcome.caveats,
-    metadata: outcome.metadata,
-    dbContract: SOURCE_RUNS_CONTRACT
-  });
-
-  try {
-    await db
-      .prepare(
-        `update source_runs
-         set completed_at = ?, status = ?, raw_r2_key = ?, artifact_manifest_json = ?,
-             metadata_json = ?, error = ?
-         where id = ?`
-      )
-      .bind(
-        completedAt,
-        status,
-        artifacts.manifestKey,
-        artifacts.manifestJson,
-        metadataJson,
-        error,
-        run.id
-      )
-      .run();
-    return {
-      ...run,
-      status,
-      recorded: true,
-      rowCount: normalized.rowsWritten,
-      errorCount: errors.length,
-      error
-    };
-  } catch (caught) {
-    return {
-      ...run,
-      status: "failure",
-      recorded: false,
-      rowCount: normalized.rowsWritten,
-      errorCount: errors.length + 1,
-      error: `source_runs finalization failed: ${errorMessage(caught)}`
-    };
-  }
+  return (await finalizeSourceRuns(db, [{
+    run,
+    outcome: outcome as AdapterOutcome<unknown, unknown>,
+    normalized,
+    artifacts,
+    completedAt
+  }]))[0]!;
 }

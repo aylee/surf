@@ -3,6 +3,7 @@ import {
   isNorcalSpotId,
   NORCAL_SPOTS
 } from "@surf/forecast-core";
+import type { SpotId } from "@surf/contracts";
 import { fetchCdipMopForecastsForSpots } from "../adapters/cdip-mop";
 import { fetchCoopsTidePredictionsForSpots } from "../adapters/coops";
 import { fetchNdbcRealtimeObservationsForStations } from "../adapters/ndbc";
@@ -14,6 +15,7 @@ import { combineStatus } from "../adapters/types";
 import { sha256StableJson } from "../forecast-history";
 import { materializeForecastReadModels } from "../forecast-read-model";
 import type { Env } from "../index";
+import { forecastDisplayHorizonEnd, stableHourlyForecastTimes } from "../time";
 import {
   persistCdipMopForecasts,
   persistIssuedForecasts,
@@ -31,29 +33,66 @@ import {
 import { pruneRetainedData } from "./retention";
 import {
   defaultRunIdSuffix,
-  finalizeSourceRun,
-  recordSourceRun,
+  finalizeSourceRuns,
+  recordSourceRuns,
   SOURCE_RUNS_CONTRACT
 } from "./source-runs";
+import {
+  canonicalSourceBatchSpotIds,
+  NORCAL_SOURCE_BATCHES,
+  SOURCE_BATCH_SCHEMA_VERSION,
+  sourceBatchKey
+} from "./source-batches";
 import type {
   CaptureBuffer,
   IngestKind,
   IngestQueueMessage,
   IngestSummary
 } from "./types";
-
-const NDBC_REALTIME_STATIONS = [
-  ...new Set(
-    NORCAL_SPOTS.flatMap((spot) =>
-      getOperationalObservedWaveSources(spot).map((source) => source.stationId)
-    )
-  )
-];
+import { SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION } from "./types";
 
 export function shouldCaptureForecastHistory(kind: IngestKind, requestedAt: string): boolean {
   if (kind === "manual-ingest") return true;
   const time = new Date(requestedAt);
   return !Number.isNaN(time.getTime()) && time.getUTCHours() % 6 === 0;
+}
+
+const DISPLAY_HORIZON_HOURS = 120;
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+export type SourceProviderHorizon = {
+  endAt: string;
+  hours: number;
+};
+
+export function sourceProviderHorizon(
+  now: Date,
+  spots: readonly { timezone: string }[]
+): SourceProviderHorizon {
+  if (!Number.isFinite(now.getTime()) || spots.length === 0) {
+    throw new Error("Source provider horizon requires a valid time and at least one spot");
+  }
+  const horizonEnds = [...new Set(spots.map(({ timezone }) => timezone))].map((timezone) =>
+    forecastDisplayHorizonEnd(
+      stableHourlyForecastTimes(now, DISPLAY_HORIZON_HOURS, timezone),
+      "1h"
+    )
+  );
+  const endMs = Math.max(...horizonEnds.map((value) => Date.parse(value ?? "")));
+  if (!Number.isFinite(endMs) || endMs <= now.getTime()) {
+    throw new Error("Source provider horizon could not resolve the fifth local-date boundary");
+  }
+  return {
+    endAt: new Date(endMs).toISOString(),
+    hours: Math.ceil((endMs - now.getTime()) / ONE_HOUR_MS)
+  };
+}
+
+export function sourceProviderHorizonHours(
+  now: Date,
+  spots: readonly { timezone: string }[]
+): number {
+  return sourceProviderHorizon(now, spots).hours;
 }
 
 function bodyString(value: unknown): string | null {
@@ -66,6 +105,93 @@ export function normalizeIngestMessage(value: unknown, fallbackRegion: string): 
   }
 
   const record = value as Record<string, unknown>;
+  if (record.job === "analysis-signal") {
+    const ingestId = bodyString(record.ingestId);
+    const spotId = bodyString(record.spotId);
+    const generationId = bodyString(record.generationId);
+    const generatedAt = bodyString(record.generatedAt);
+    const materializedAt = bodyString(record.materializedAt);
+    if (
+      record.schemaVersion !== SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION ||
+      record.domain !== "surf" ||
+      !ingestId ||
+      !spotId ||
+      !isNorcalSpotId(spotId) ||
+      !generationId ||
+      generationId.length > 320 ||
+      !generatedAt ||
+      !materializedAt ||
+      !Number.isFinite(Date.parse(generatedAt)) ||
+      !Number.isFinite(Date.parse(materializedAt))
+    ) {
+      throw new Error("Analysis signal queue message is invalid");
+    }
+    return {
+      job: "analysis-signal",
+      schemaVersion: SURF_ANALYSIS_SIGNAL_SCHEMA_VERSION,
+      domain: "surf",
+      ingestId,
+      spotId,
+      generationId,
+      generatedAt,
+      materializedAt,
+      region: bodyString(record.region) ?? fallbackRegion
+    };
+  }
+  if (record.job === "source-batch") {
+    const ingestId = bodyString(record.ingestId);
+    const batchKey = bodyString(record.batchKey);
+    const requestedAt = bodyString(record.requestedAt);
+    const forecastGeneratedAt = bodyString(record.forecastGeneratedAt);
+    const kind =
+      record.kind === "manual-ingest" || record.kind === "scheduled-ingest"
+        ? record.kind
+        : null;
+    if (
+      record.schemaVersion !== SOURCE_BATCH_SCHEMA_VERSION ||
+      !kind ||
+      !ingestId ||
+      !batchKey ||
+      !requestedAt ||
+      !forecastGeneratedAt ||
+      !Number.isFinite(Date.parse(requestedAt)) ||
+      !Number.isFinite(Date.parse(forecastGeneratedAt)) ||
+      !Array.isArray(record.spotIds) ||
+      !record.spotIds.every((spotId) => typeof spotId === "string")
+    ) {
+      throw new Error("Source batch queue message is invalid");
+    }
+    let spotIds: SpotId[];
+    try {
+      spotIds = canonicalSourceBatchSpotIds(record.spotIds);
+    } catch {
+      throw new Error("Source batch queue message has invalid spot IDs");
+    }
+    if (batchKey !== sourceBatchKey(spotIds)) {
+      throw new Error("Source batch queue message has a mismatched batch key");
+    }
+    if (
+      !NORCAL_SOURCE_BATCHES.some(
+        (configured) =>
+          configured.batchKey === batchKey &&
+          configured.spotIds.length === spotIds.length &&
+          configured.spotIds.every((spotId, index) => spotId === spotIds[index])
+      )
+    ) {
+      throw new Error("Source batch queue message does not match a configured batch");
+    }
+    return {
+      job: "source-batch",
+      schemaVersion: SOURCE_BATCH_SCHEMA_VERSION,
+      kind,
+      ingestId,
+      batchKey,
+      spotIds,
+      requestedAt,
+      forecastGeneratedAt,
+      region: bodyString(record.region) ?? fallbackRegion
+    };
+  }
   if (record.job === "forecast-materialization") {
     const spotId = bodyString(record.spotId);
     const ingestId = bodyString(record.ingestId);
@@ -143,6 +269,7 @@ export async function runNorcalIngest(
     idSuffix?: string;
     ingestId?: string;
     deferForecastMaterialization?: boolean;
+    spotIds?: readonly SpotId[];
   }
 ): Promise<IngestSummary> {
   const startedAt = new Date().toISOString();
@@ -156,8 +283,24 @@ export async function runNorcalIngest(
   const ingestId = options.ingestId ?? options.idSuffix ?? defaultRunIdSuffix();
   const idSuffix = options.idSuffix ?? ingestId;
   const captureHistory = shouldCaptureForecastHistory(options.kind, requestedAt);
-  const horizonHours = 120;
   const caveats: SourceCaveat[] = [];
+  const requestedSpotIds = options.spotIds ?? NORCAL_SPOTS.map(({ id }) => id);
+  if (requestedSpotIds.length === 0 || new Set(requestedSpotIds).size !== requestedSpotIds.length) {
+    throw new Error("Ingest spot IDs must be a non-empty unique set");
+  }
+  const spots = requestedSpotIds.map((spotId) => {
+    if (!isNorcalSpotId(spotId)) throw new Error(`Unknown NorCal ingest spot: ${spotId}`);
+    return NORCAL_SPOTS.find(({ id }) => id === spotId)!;
+  });
+  const allowedSpotIds = new Set(spots.map(({ id }) => id));
+  const providerHorizon = sourceProviderHorizon(now, spots);
+  const ndbcRealtimeStations = [
+    ...new Set(
+      spots.flatMap((spot) =>
+        getOperationalObservedWaveSources(spot).map((source) => source.stationId)
+      )
+    )
+  ];
 
   if (region !== "norcal") {
     caveats.push({
@@ -178,25 +321,28 @@ export async function runNorcalIngest(
     { items: [], errors: [] }
   ];
   const [coops, nws, nwsWave, cdipMop, ndbc] = await Promise.all([
-    fetchCoopsTidePredictionsForSpots(NORCAL_SPOTS, {
+    fetchCoopsTidePredictionsForSpots(spots, {
       fetcher: capturingFetcher(baseFetcher, captures[0]),
       now,
-      horizonHours
+      horizonHours: providerHorizon.hours,
+      horizonEndAt: providerHorizon.endAt
     }),
-    fetchNwsContextForSpots(NORCAL_SPOTS, {
+    fetchNwsContextForSpots(spots, {
       fetcher: capturingFetcher(baseFetcher, captures[1])
     }),
-    fetchNwsGridWaveForSpots(NORCAL_SPOTS, {
+    fetchNwsGridWaveForSpots(spots, {
       fetcher: capturingFetcher(baseFetcher, captures[2]),
       now,
-      horizonHours
+      horizonHours: DISPLAY_HORIZON_HOURS,
+      horizonEndAt: providerHorizon.endAt
     }),
-    fetchCdipMopForecastsForSpots(NORCAL_SPOTS, {
+    fetchCdipMopForecastsForSpots(spots, {
       fetcher: capturingFetcher(baseFetcher, captures[3], CDIP_RAW_CAPTURE_LIMIT_BYTES),
       now,
-      horizonHours
+      horizonHours: providerHorizon.hours,
+      horizonEndAt: providerHorizon.endAt
     }),
-    fetchNdbcRealtimeObservationsForStations(NDBC_REALTIME_STATIONS, {
+    fetchNdbcRealtimeObservationsForStations(ndbcRealtimeStations, {
       fetcher: capturingFetcher(baseFetcher, captures[4]),
       now
     })
@@ -204,56 +350,49 @@ export async function runNorcalIngest(
 
   const fetchedAt = new Date().toISOString();
   const outcomes = [coops, nws, nwsWave, cdipMop, ndbc] as const;
+  const tideRows = coops.rows.filter(({ spotId }) => allowedSpotIds.has(spotId));
+  const tideEventRows = coops.events.filter(({ spotId }) => allowedSpotIds.has(spotId));
+  const nwsRows = nws.rows.filter(({ spotId }) => allowedSpotIds.has(spotId));
+  const nwsWaveRows = nwsWave.rows.filter(({ spotId }) => allowedSpotIds.has(spotId));
+  const cdipMopRows = cdipMop.rows.filter(({ spotId }) => allowedSpotIds.has(spotId));
   const sourceIssueFingerprint = await sha256StableJson({
-    coops: coops.rows,
-    nws: nws.rows,
-    nwsWave: nwsWave.rows,
-    cdipMop: cdipMop.rows
+    coops: tideRows,
+    nws: nwsRows,
+    nwsWave: nwsWaveRows,
+    cdipMop: cdipMopRows
   });
-  const sourceRuns = [
-    await recordSourceRun(env.DB, coops, {
+  const sourceRuns = await recordSourceRuns(
+    env.DB,
+    outcomes.map((outcome) => ({
+      outcome,
       startedAt: sourceGenerationAt,
       completedAt: fetchedAt,
       idSuffix
-    }),
-    await recordSourceRun(env.DB, nws, {
-      startedAt: sourceGenerationAt,
-      completedAt: fetchedAt,
-      idSuffix
-    }),
-    await recordSourceRun(env.DB, nwsWave, {
-      startedAt: sourceGenerationAt,
-      completedAt: fetchedAt,
-      idSuffix
-    }),
-    await recordSourceRun(env.DB, cdipMop, {
-      startedAt: sourceGenerationAt,
-      completedAt: fetchedAt,
-      idSuffix
-    }),
-    await recordSourceRun(env.DB, ndbc, {
-      startedAt: sourceGenerationAt,
-      completedAt: fetchedAt,
-      idSuffix
-    })
-  ];
+    }))
+  );
   const coopsRun = sourceRuns[0]!;
   const nwsRun = sourceRuns[1]!;
   const nwsWaveRun = sourceRuns[2]!;
   const cdipMopRun = sourceRuns[3]!;
   const ndbcRun = sourceRuns[4]!;
-  const tidePersistence = await persistTideForecasts(env.DB, coopsRun.id, coops.rows, fetchedAt);
-  const tideEventPersistence = await persistTideEvents(env.DB, coopsRun.id, coops.events, fetchedAt);
+  const tidePersistence = await persistTideForecasts(env.DB, coopsRun.id, tideRows, fetchedAt);
+  const tideEventPersistence = await persistTideEvents(env.DB, coopsRun.id, tideEventRows, fetchedAt);
   const nwsPersistence = await persistNwsRows(
     env.DB,
     nwsRun.id,
-    nws.rows,
+    nwsRows,
     fetchedAt,
     captureHistory
   );
-  const wavePersistence = await persistWaveForecasts(env.DB, nwsWaveRun.id, nwsWave.rows, fetchedAt);
-  const cdipMopPersistence = await persistCdipMopForecasts(env.DB, cdipMopRun.id, cdipMop.rows, fetchedAt);
-  const observationPersistence = await persistWaveObservations(env.DB, ndbcRun.id, ndbc.rows, fetchedAt);
+  const wavePersistence = await persistWaveForecasts(env.DB, nwsWaveRun.id, nwsWaveRows, fetchedAt);
+  const cdipMopPersistence = await persistCdipMopForecasts(env.DB, cdipMopRun.id, cdipMopRows, fetchedAt);
+  const observationPersistence = await persistWaveObservations(
+    env.DB,
+    ndbcRun.id,
+    ndbc.rows,
+    fetchedAt,
+    spots
+  );
   const artifactPersistence = [
     await persistRawArtifacts(env.RAW_ARTIFACTS, env.DB, coopsRun, captures[0], idSuffix, fetchedAt),
     await persistRawArtifacts(env.RAW_ARTIFACTS, env.DB, nwsRun, captures[1], idSuffix, fetchedAt),
@@ -262,23 +401,22 @@ export async function runNorcalIngest(
     await persistRawArtifacts(env.RAW_ARTIFACTS, env.DB, ndbcRun, captures[4], idSuffix, fetchedAt)
   ];
   const completedAt = new Date().toISOString();
-  const finalizedRuns = [
-    await finalizeSourceRun(
-      env.DB,
-      coopsRun,
-      coops,
-      {
+  const finalizedRuns = await finalizeSourceRuns(env.DB, [
+    {
+      run: coopsRun,
+      outcome: coops,
+      normalized: {
         rowsWritten: tidePersistence.rowsWritten + tideEventPersistence.rowsWritten,
         errors: [...tidePersistence.errors, ...tideEventPersistence.errors]
       },
-      artifactPersistence[0]!,
+      artifacts: artifactPersistence[0]!,
       completedAt
-    ),
-    await finalizeSourceRun(env.DB, nwsRun, nws, nwsPersistence, artifactPersistence[1]!, completedAt),
-    await finalizeSourceRun(env.DB, nwsWaveRun, nwsWave, wavePersistence, artifactPersistence[2]!, completedAt),
-    await finalizeSourceRun(env.DB, cdipMopRun, cdipMop, cdipMopPersistence, artifactPersistence[3]!, completedAt),
-    await finalizeSourceRun(env.DB, ndbcRun, ndbc, observationPersistence, artifactPersistence[4]!, completedAt)
-  ];
+    },
+    { run: nwsRun, outcome: nws, normalized: nwsPersistence, artifacts: artifactPersistence[1]!, completedAt },
+    { run: nwsWaveRun, outcome: nwsWave, normalized: wavePersistence, artifacts: artifactPersistence[2]!, completedAt },
+    { run: cdipMopRun, outcome: cdipMop, normalized: cdipMopPersistence, artifacts: artifactPersistence[3]!, completedAt },
+    { run: ndbcRun, outcome: ndbc, normalized: observationPersistence, artifacts: artifactPersistence[4]!, completedAt }
+  ]);
   const snapshotPersistence = captureHistory && !options.deferForecastMaterialization
     ? await persistIssuedForecasts(env, now, completedAt)
     : { rowsWritten: 0, errors: [] };
@@ -330,7 +468,8 @@ export async function runNorcalIngest(
         now,
         sourceIssueFingerprint,
         completedAt,
-        ingestId
+        ingestId,
+        spots.map(({ id }) => id)
       );
   const persistenceErrors = [
     ...sourceRunRecordErrors,
@@ -366,12 +505,12 @@ export async function runNorcalIngest(
     status,
     sourceRuns: finalizedRuns,
     counts: {
-      tidePredictionRows: coops.rows.length,
-      nwsSpotContexts: nws.rows.length,
+      tidePredictionRows: tideRows.length,
+      nwsSpotContexts: nwsRows.length,
       nwsWindForecastRows: nws.metadata.windRowCount,
       nwsHazards: nws.metadata.hazardCount,
-      nwsWaveForecastRows: nwsWave.rows.length,
-      cdipMopWaveForecastRows: cdipMop.rows.length,
+      nwsWaveForecastRows: nwsWaveRows.length,
+      cdipMopWaveForecastRows: cdipMopRows.length,
       ndbcObservationRows: ndbc.rows.length,
       forecastSnapshotRows: snapshotPersistence.rowsWritten,
       forecastReadModelRows: readModelPersistence.forecastRowsWritten,

@@ -4,6 +4,7 @@ import {
   type CalibrationStatus,
   type FieldResolution,
   type ForecastInterval,
+  type ForecastHazard,
   type ForecastIssueDelta,
   type ForecastResponse,
   type ForecastWindowInput,
@@ -21,7 +22,10 @@ import {
 import {
   getOperationalObservedWaveSources,
   getSpotProfile,
+  intervalOverlapsCivilLight,
+  intervalOverlapsRange,
   scoreSpotWindow,
+  selectCanonicalRecommendationWindows,
   surfaceConditionForWind,
   type NorcalSpotProfile
 } from "@surf/forecast-core";
@@ -53,6 +57,7 @@ import {
 import type { Env } from "./index";
 import { boundedErrorName } from "./logging";
 import {
+  forecastDisplayHorizonEnd,
   localDateForTime,
   solarPhasesForDates,
   stableHourlyForecastTimes,
@@ -109,6 +114,7 @@ type WaveRow = {
 };
 
 type HazardRow = {
+  source_id: string;
   starts_at: string | null;
   ends_at: string | null;
   headline: string;
@@ -559,27 +565,28 @@ function swellComponent(heightM: unknown, periodS: unknown, directionDeg: unknow
 
 function activeHazardsAt(
   rows: HazardRow[],
-  forecastTimes: Array<{ forecastAt: string; timeMs: number }>
-): Map<number, HazardRow> {
+  forecastTimes: Array<{ forecastAt: string; timeMs: number; displayValidTo: string }>
+): Map<number, HazardRow[]> {
   const sortedForecastTimes = [...forecastTimes]
     .filter((entry) => Number.isFinite(entry.timeMs))
     .sort((left, right) => left.timeMs - right.timeMs);
-  const indexedTimes = sortedForecastTimes.map((entry, order) => ({
-    row: entry,
-    timeMs: entry.timeMs,
-    order
-  }));
-  const hazardsByTime = new Map<number, HazardRow>();
+  const hazardsByTime = new Map<number, HazardRow[]>();
 
   for (const row of rows) {
-    const startsAtMs = row.starts_at ? Date.parse(row.starts_at) : Number.NEGATIVE_INFINITY;
-    const endsAtMs = row.ends_at ? Date.parse(row.ends_at) : Number.POSITIVE_INFINITY;
-    if (Number.isNaN(startsAtMs) || Number.isNaN(endsAtMs)) continue;
-    const firstTarget = lowerBoundByTime(indexedTimes, startsAtMs);
-    for (let index = firstTarget; index < indexedTimes.length; index += 1) {
-      const targetMs = indexedTimes[index]!.timeMs;
-      if (targetMs >= endsAtMs) break;
-      if (!hazardsByTime.has(targetMs)) hazardsByTime.set(targetMs, row);
+    for (const slot of sortedForecastTimes) {
+      if (
+        !intervalOverlapsRange(
+          slot.forecastAt,
+          slot.displayValidTo,
+          row.starts_at,
+          row.ends_at
+        )
+      ) {
+        continue;
+      }
+      const hazards = hazardsByTime.get(slot.timeMs) ?? [];
+      hazards.push(row);
+      hazardsByTime.set(slot.timeMs, hazards);
     }
   }
 
@@ -747,7 +754,7 @@ function unavailableWindows(
 ): ScoredForecastWindow[] {
   const spot = getSpotProfile(spotId);
   const forecastTimes = interval === "1h"
-    ? stableHourlyForecastTimes(now, 120)
+    ? stableHourlyForecastTimes(now, 120, spot.timezone)
     : stableThreeHourForecastTimes(now, 120, spot.timezone);
   return forecastTimes.map((forecastAt) => {
     const displayIntervalMinutes = interval === "1h" ? 60 : 180;
@@ -811,6 +818,7 @@ function unavailableForecast(
     observation: null,
     observations: [],
     tideEvents: [],
+    hazards: [],
     sunPhases: [],
     issueDelta: null
   });
@@ -846,10 +854,13 @@ async function loadForecastSourceRows(
   db: D1Database,
   spotId: SpotId,
   now: Date,
-  forecastTimes: string[]
+  forecastTimes: string[],
+  interval: ForecastInterval
 ): Promise<ForecastSourceRows> {
   const horizonStart = forecastTimes[0]!;
   const horizonEnd = forecastTimes.at(-1)!;
+  const displayHorizonEnd = forecastDisplayHorizonEnd(forecastTimes, interval);
+  if (!displayHorizonEnd) throw new Error("Forecast display horizon is invalid");
   const waveHorizonStart = new Date(
     new Date(horizonStart).getTime() - 3 * 60 * 60 * 1000
   ).toISOString();
@@ -869,11 +880,11 @@ async function loadForecastSourceRows(
       db,
       `select station_id, event_at, tide_ft_mllw, event_type, source_run_id
        from tide_events
-       where spot_id = ? and event_at >= ? and event_at <= ?
+       where spot_id = ? and event_at >= ? and event_at < ?
        order by event_at asc`,
       spotId,
       horizonStart,
-      horizonEnd
+      displayHorizonEnd
     ),
     preparedQuery(
       db,
@@ -920,22 +931,15 @@ async function loadForecastSourceRows(
     ),
     preparedQuery(
       db,
-      `select starts_at, ends_at, headline, source_run_id
+      `select source_id, starts_at, ends_at, headline, source_run_id
        from hazard_events
        where spot_id = ?
-         and (ends_at is null or ends_at >= ?)
-         and (starts_at is null or starts_at <= ?)
+         and (ends_at is null or ends_at > ?)
+         and (starts_at is null or starts_at < ?)
        order by starts_at asc`,
       spotId,
       horizonStart,
-      horizonEnd
-    ),
-    preparedQuery(
-      db,
-      `select id, source_id, status, completed_at
-       from source_runs
-       order by completed_at desc
-       limit 100`
+      displayHorizonEnd
     ),
     preparedQuery(
       db,
@@ -962,17 +966,11 @@ async function loadForecastSourceRows(
   const waveRows = asRows(results[3] as D1Result<WaveRow>);
   const observationRows = asRows(results[4] as D1Result<ObservationRow>);
   const hazardRows = asRows(results[5] as D1Result<HazardRow>);
-  const recentSourceRuns = asRows(results[6] as D1Result<SourceRunRow>);
-  const forecastIssues = asRows(results[7] as D1Result<ForecastIssueRow>);
-  // Retention is reference-driven, not window-guessed: served rows stay
-  // pinned to the run that wrote them, and during a single-source or
-  // per-station outage that run can outlive the recent-100 window (five runs
-  // land per hour; the slowest declared late boundary — tide, cadence+grace —
-  // is 30 hours). Any referenced run the window missed is fetched exactly, so
-  // freshness ages honestly to "late" instead of flipping to "missing".
-  // Steady state resolves every reference from the window and skips the
-  // follow-up query entirely.
-  const presentRunIds = new Set(recentSourceRuns.map((run) => run.id));
+  const forecastIssues = asRows(results[6] as D1Result<ForecastIssueRow>);
+  // Source-run freshness is reference-driven. Global recency windows can evict
+  // the still-authoritative run for a retained tide, wind, wave, observation,
+  // or hazard row during a provider/station outage. Resolve exactly the IDs
+  // carried by the served rows in one indexed JSON-backed query instead.
   const referencedRunIds = [
     ...new Set(
       [
@@ -982,19 +980,19 @@ async function loadForecastSourceRows(
         ...waveRows.map((row) => row.source_run_id),
         ...observationRows.map((row) => row.source_run_id),
         ...hazardRows.map((row) => row.source_run_id)
-      ].filter((id): id is string => typeof id === "string" && id.length > 0 && !presentRunIds.has(id))
+      ].filter((id): id is string => typeof id === "string" && id.length > 0)
     )
-  ].slice(0, 40);
-  const referencedSourceRuns = referencedRunIds.length > 0
+  ];
+  const sourceRuns = referencedRunIds.length > 0
     ? await queryRows<SourceRunRow>(
         db,
-        `select id, source_id, status, completed_at
-         from source_runs
-         where id in (${referencedRunIds.map(() => "?").join(", ")})`,
-        ...referencedRunIds
+        `select run.id, run.source_id, run.status, run.completed_at
+         from json_each(?) as referenced
+         join source_runs as run on run.id = referenced.value
+         order by referenced.key asc`,
+        JSON.stringify(referencedRunIds)
       )
     : [];
-  const sourceRuns = [...recentSourceRuns, ...referencedSourceRuns];
   const forecastSnapshotRows = forecastIssues.length >= 2
     ? await queryRows<ForecastSnapshotRow>(
         db,
@@ -1043,7 +1041,7 @@ export async function buildForecastResponse(
   try {
     const spot = getSpotProfile(spotId);
     const forecastTimes = interval === "1h"
-      ? stableHourlyForecastTimes(now, 120)
+      ? stableHourlyForecastTimes(now, 120, spot.timezone)
       : stableThreeHourForecastTimes(now, 120, spot.timezone);
     const {
       tideRows: loadedTideRows,
@@ -1051,13 +1049,24 @@ export async function buildForecastResponse(
       windRows: loadedWindRows,
       waveRows: loadedWaveRows,
       observationRows,
-      hazardRows,
+      hazardRows: loadedHazardRows,
       sourceRuns,
       forecastIssues,
       forecastSnapshotRows
-    } = options.sourceRows ?? await loadForecastSourceRows(env.DB, spotId, now, forecastTimes);
+    } = options.sourceRows ?? await loadForecastSourceRows(
+      env.DB,
+      spotId,
+      now,
+      forecastTimes,
+      interval
+    );
     const horizonStartMs = Date.parse(forecastTimes[0]!);
     const horizonEndMs = Date.parse(forecastTimes.at(-1)!);
+    const displayHorizonEnd = forecastDisplayHorizonEnd(forecastTimes, interval);
+    const displayHorizonEndMs = Date.parse(displayHorizonEnd ?? "");
+    if (!Number.isFinite(displayHorizonEndMs)) {
+      throw new Error("Forecast display horizon is invalid");
+    }
     const waveHorizonStartMs = horizonStartMs - 3 * HOUR_MS;
     const waveHorizonEndMs = horizonEndMs + 90 * 60 * 1000;
     const within = (timestamp: string, startMs: number, endMs: number): boolean => {
@@ -1069,14 +1078,27 @@ export async function buildForecastResponse(
     const tideRows = loadedTideRows.filter((row) =>
       within(row.forecast_at, horizonStartMs, horizonEndMs)
     );
-    const tideEventRows = loadedTideEventRows.filter((row) =>
-      within(row.event_at, horizonStartMs, horizonEndMs)
-    );
+    const tideEventRows = loadedTideEventRows.filter((row) => {
+      const eventAtMs = Date.parse(row.event_at);
+      return (
+        Number.isFinite(eventAtMs) &&
+        eventAtMs >= horizonStartMs &&
+        eventAtMs < displayHorizonEndMs
+      );
+    });
     const windRows = loadedWindRows.filter((row) =>
       within(row.forecast_at, horizonStartMs, horizonEndMs)
     );
     const waveRows = loadedWaveRows.filter((row) =>
       within(row.forecast_at, waveHorizonStartMs, waveHorizonEndMs)
+    );
+    const hazardRows = loadedHazardRows.filter((row) =>
+      intervalOverlapsRange(
+        new Date(horizonStartMs).toISOString(),
+        new Date(displayHorizonEndMs).toISOString(),
+        row.starts_at,
+        row.ends_at
+      )
     );
 
     const observedSources = getOperationalObservedWaveSources(spot);
@@ -1130,7 +1152,7 @@ export async function buildForecastResponse(
         : worstWindInWindowFromIndex(windIndex, timeMs, spot);
       const waveSelection = waveSelectionsByTime.get(timeMs) ?? null;
       const selectedWave = waveSelection?.row ?? null;
-      const hazard = hazardsByTime.get(timeMs) ?? null;
+      const hazards = hazardsByTime.get(timeMs) ?? [];
       const waveDetails = selectedWave ? waveDetailsFor(selectedWave) : null;
       const payload = waveDetails?.payload ?? {};
       const waveClassification = waveDetails?.classification ?? null;
@@ -1175,9 +1197,9 @@ export async function buildForecastResponse(
       else if (observation && !observation.isFresh) {
         caveats.push(`Buoy ${observation.summary.stationId} observation is stale.`);
       }
-      if (hazard) {
+      if (hazards.length > 0) {
         activeCapabilities.push("hazard");
-        caveats.push(`Active NWS hazard: ${hazard.headline}`);
+        caveats.push(...hazards.map((hazard) => `Active NWS hazard: ${hazard.headline}`));
       }
 
       const runIds = sourceRunIds(
@@ -1185,7 +1207,7 @@ export async function buildForecastResponse(
         wind?.source_run_id,
         wave?.source_run_id,
         observationSupportsWindow ? observation?.row.source_run_id : null,
-        hazard?.source_run_id
+        ...hazards.map((hazard) => hazard.source_run_id)
       );
       // Wave cadence follows the selected source; a window with no wave row
       // declares the CDIP expectation so its missing/late judgment reflects
@@ -1359,7 +1381,7 @@ export async function buildForecastResponse(
         };
         caveats.push(
           pointRelationship === "outside_cove_approach_proxy"
-            ? `Linda Mar uses CDIP ${modelPointId} modeled Hs outside the cove × ${cdipNearshoreHeightScale.toFixed(2)} final cove scale; this is not breaking-wave face truth.`
+            ? `${spot.name} uses CDIP ${modelPointId} modeled approach Hs × ${cdipNearshoreHeightScale.toFixed(2)} explicit spot scale; this proxy is not break-specific or breaking-wave face truth.`
             : `CDIP ${modelPointId} is modeled significant wave height at ${modelPointWaterDepthM} m, not observed breaking-wave face height.`
         );
         if (experimentalBreakingHeightM !== null) {
@@ -1471,10 +1493,11 @@ export async function buildForecastResponse(
       };
     });
     const usesCdipMop = windows.some((window) => window.waveProvenance?.sourceId === CDIP_MOP_SOURCE_ID);
+    const hasMappedCdipMopPoint = spot.sourceMap.cdipMop.modelPoint !== null;
     const sourceNote = usesCdipMop
-      ? "Wave conditions prefer public CDIP MOP modeled significant wave height at the mapped 10/15 m point, with NOAA/NWS MTR coastal-grid waves retained as fallback and NOAA/NDBC buoys as current context. CDIP Hs is not observed breaking-wave face height; Linda Mar alone keeps the visible 0.60 final cove scale. An experimental breaking proxy is retained for future evaluation but does not affect the displayed height or score. HTTP Last-Modified is a source-file update, not a model cycle."
-      : spotId === "bolinas"
-        ? "Bolinas has no safe direct CDIP MOP mapping and remains uncalibrated on official NOAA/NWS MTR coastal-grid data as the fallback. Its visible spot scale is a cold-start estimate, not breaking-wave truth; NOAA/NDBC buoys provide current context."
+      ? "Wave conditions prefer public CDIP MOP modeled significant wave height at the mapped 10/15 m point, with NOAA/NWS MTR coastal-grid waves retained as fallback and NOAA/NDBC buoys as current context. CDIP Hs is not observed breaking-wave face height; any mapped approach proxy retains its explicit per-spot scale and relationship. An experimental breaking proxy is retained for future evaluation but does not affect the displayed height or score. HTTP Last-Modified is a source-file update, not a model cycle."
+      : !hasMappedCdipMopPoint
+        ? `${spot.name} has no verified CDIP MOP point mapping and remains uncalibrated on official NOAA/NWS MTR coastal-grid data as the fallback. Its visible spot scale is a cold-start estimate, not breaking-wave truth; NOAA/NDBC buoys provide current context.`
         : "CDIP MOP is mapped but no usable row was available for this window, so wave conditions use the official NOAA/NWS MTR coastal-grid fallback with NOAA/NDBC buoy context. The NWS spot scale is a visible cold-start breaking-height estimate. Missing wave data returns an unknown call.";
     const tideEvents: TideEvent[] = tideEventRows.flatMap((row) => {
       if (row.event_type !== "high" && row.event_type !== "low") return [];
@@ -1483,6 +1506,16 @@ export async function buildForecastResponse(
         eventAt: row.event_at,
         type: row.event_type,
         heightFtMllw: row.tide_ft_mllw,
+        sourceRunId: row.source_run_id
+      }];
+    });
+    const forecastHazards: ForecastHazard[] = hazardRows.flatMap((row) => {
+      if (!row.headline.trim() || !row.source_id.trim()) return [];
+      return [{
+        headline: row.headline,
+        startsAt: row.starts_at,
+        endsAt: row.ends_at,
+        sourceId: row.source_id,
         sourceRunId: row.source_run_id
       }];
     });
@@ -1496,6 +1529,7 @@ export async function buildForecastResponse(
       observation: observation?.summary ?? null,
       observations,
       tideEvents,
+      hazards: forecastHazards,
       sunPhases,
       issueDelta: issueDelta(forecastIssues, forecastSnapshotRows)
     });
@@ -1554,11 +1588,17 @@ export async function buildSynchronizedForecastResponses(
     const spot = getSpotProfile(spotId);
     const forecastTimes = [
       ...new Set([
-        ...stableHourlyForecastTimes(now, 120),
+        ...stableHourlyForecastTimes(now, 120, spot.timezone),
         ...stableThreeHourForecastTimes(now, 120, spot.timezone)
       ])
     ].sort();
-    const sourceRows = await loadForecastSourceRows(env.DB, spotId, now, forecastTimes);
+    const sourceRows = await loadForecastSourceRows(
+      env.DB,
+      spotId,
+      now,
+      forecastTimes,
+      "1h"
+    );
     // Assembly is deterministic and read-free once the shared source snapshot
     // is loaded. Fail the pair together so 1h and 3h can never publish from
     // different D1 reads or generation times.
@@ -1568,7 +1608,67 @@ export async function buildSynchronizedForecastResponses(
     };
     const threeHour = await buildForecastResponse(env, spotId, now, "3h", buildOptions);
     const hourly = await buildForecastResponse(env, spotId, now, "1h", buildOptions);
-    return { threeHour, hourly };
+    const phasesByDate = new Map(
+      (hourly.sunPhases ?? []).map((phase) => [phase.localDate, phase])
+    );
+    const localDates = [
+      ...new Set(
+        hourly.windows.map((window) =>
+          localDateForTime(window.forecastAt, hourly.spot.timezone)
+        )
+      )
+    ];
+    const recommendations = localDates.flatMap((localDate) => {
+      const phase = phasesByDate.get(localDate);
+      const startMs = phase ? Date.parse(phase.firstLight) : Number.NaN;
+      const endMs = phase ? Date.parse(phase.lastLight) : Number.NaN;
+      const candidates = hourly.windows
+        .filter(
+          (window) =>
+            localDateForTime(window.forecastAt, hourly.spot.timezone) === localDate
+        )
+        .map((window) => {
+          const forecastAtMs = Date.parse(window.forecastAt);
+          return {
+            windowId: window.forecastAt,
+            forecastAt: window.forecastAt,
+            isDaylight:
+              Number.isFinite(startMs) &&
+              Number.isFinite(endMs) &&
+              intervalOverlapsCivilLight(
+                window.forecastAt,
+                new Date(forecastAtMs + HOUR_MS).toISOString(),
+                phase!.firstLight,
+                phase!.lastLight
+              ),
+            civilLightStartAt: phase?.firstLight ?? null,
+            civilLightEndAt: phase?.lastLight ?? null,
+            ratingStatus: window.ratingStatus,
+            surfaceCondition:
+              window.surfaceCondition ?? surfaceConditionForWind(hourly.spot, window),
+            score: window.score,
+            confidence: window.confidence
+          };
+        });
+      return selectCanonicalRecommendationWindows(candidates, now).flatMap((selection) => {
+        const representative = hourly.windows.find(
+          (window) => window.forecastAt === selection.representativeWindowId
+        );
+        return representative
+          ? [{
+              localDate,
+              representative,
+              constituentWindowIds: selection.constituentWindowIds,
+              startAt: selection.startAt,
+              endAt: selection.endAt
+            }]
+          : [];
+      });
+    });
+    return {
+      threeHour: publicForecastResponse({ ...threeHour, recommendations }),
+      hourly: publicForecastResponse({ ...hourly, recommendations })
+    };
   } catch (error) {
     console.error(
       JSON.stringify({

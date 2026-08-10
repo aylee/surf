@@ -8,6 +8,8 @@
     "ENVIRONMENT": "test",
     "SURF_REGION": "norcal",
     "SURF_USER_AGENT": "surf-agent-test/1.0",
+    // Dormant compatibility suite only. Supported instance configs must keep
+    // this false and Analysis v3 never signals this Agent.
     "FORECAST_BRIEF_ENABLED": "true"
   },
   "durable_objects": {

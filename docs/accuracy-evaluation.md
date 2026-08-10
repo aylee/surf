@@ -133,14 +133,15 @@ issue cycle or lead. It is therefore a peer-alignment dataset, not ground truth.
 Surfline historical mode required a subscription in the test browser and was
 not bypassed.
 
-### 4. Trust-workbench acceptance snapshot (2026-08-02)
+### 4. Historical trust-workbench snapshot (2026-08-02; superseded)
 
 The first local end-to-end run after the trust-contract changes ingested all
-six configured spots without source errors. The table below compares Surf's
-first daylight window with the commercial pages Alex would otherwise open.
-This is a product-alignment snapshot, **not** a forecast-accuracy label: the
-capture times, spatial footprints, and displayed semantics differ, and none of
-the commercial calls were used to tune Surf.
+six spots configured at that time without source errors. The table below
+compares Surf's first daylight window with the commercial pages Alex would
+otherwise open. This is a historical product-alignment snapshot, **not** a
+forecast-accuracy label or current UI documentation: the capture times,
+spatial footprints, and displayed semantics differ, and none of the commercial
+calls were used to tune Surf.
 
 | Spot | Surf at Sunday 6 AM | Surfline captured late Aug 1 | Surf Captain Sunday 6 AM | Interpretation |
 |---|---|---|---|---|
@@ -151,19 +152,26 @@ the commercial calls were used to tune Surf.
 | Stinson | 2.9 ft direct nearshore Hs, fair, 65 confidence | 2–3 ft, poor-to-fair | 2+ ft, clean | Broad size alignment; surface vocabularies remain product-specific. |
 | Bolinas — Wharf/Brighton | 5.0 ft NWS fallback wave state, clean, 73 confidence | 1–2 ft, poor-to-fair | 2+ ft, clean | Material size divergence. Do not treat this fallback as breaking surf or promote it without a direct target/labels. |
 
-The trust UI makes the mismatch inspectable rather than hiding it. For the
-selected Linda Mar 10 AM hour it independently showed a held 8–11 AM wave
-interval, exact hourly wind and tide, and separate source ages (nearshore wave
-model about 5 hours, NWS wind about 17 minutes, NOAA tide about 5 minutes, buoy
-context about 1 hour in this run). The San Francisco Bar observation appeared
-only as context, never as the spot forecast.
+The superseded trust UI made the mismatch inspectable rather than hiding it.
+For the selected Linda Mar 10 AM hour it independently showed a held 8–11 AM
+wave interval, exact hourly wind and tide, and separate source ages (nearshore
+wave model about 5 hours, NWS wind about 17 minutes, NOAA tide about 5 minutes,
+buoy context about 1 hour in this run). The San Francisco Bar observation
+appeared only as context, never as the spot forecast.
 
-Responsive browser acceptance covered 390, 768, and 1440 CSS pixels. The phone
-and tablet surfaces used expandable rows; desktop exposed the semantic sticky
-table; Table/Graph, 1h/3h, day, and selected timestamp persisted in the URL;
-the graph kept the selected 10 AM timestamp across all four panels; and the
-browser console remained free of warnings and errors. Captures are checked in
-at `docs/images/surf-workbench-before.png` (the prior bar timeline),
+The current workbench keeps those source-validity and provenance facts in one
+inspectable disclosure, but no longer repeats held-interval copy, `Check
+source` badges, source age on every row, or graph time buttons. It presents the
+deterministic surf-size range first and keeps modeled nearshore Hs as supporting
+detail.
+
+Historical responsive acceptance covered 390, 768, and 1440 CSS pixels. The
+phone and tablet surfaces used expandable rows; desktop exposed the semantic
+sticky table; Table/Graph, 1h/3h, day, and selected timestamp persisted in the
+URL; the graph kept the selected 10 AM timestamp across all four panels; and
+the browser console remained free of warnings and errors. These superseded UI
+captures remain checked in as evaluation history at
+`docs/images/surf-workbench-before.png` (the prior bar timeline),
 `docs/images/surf-workbench-phone.jpg`,
 `docs/images/surf-workbench-desktop.jpg`, and
 `docs/images/surf-workbench-graph.jpg`.

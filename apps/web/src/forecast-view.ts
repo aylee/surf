@@ -1,7 +1,14 @@
-import type { ForecastResponse, ScoredForecastWindow, SpotId, SpotProfile } from "@surf/contracts";
+import type {
+  ForecastRecommendationWindow,
+  ForecastResponse,
+  ScoredForecastWindow,
+  SpotId,
+  SpotProfile
+} from "@surf/contracts";
 import {
   directionInCircularWindow,
-  selectCanonicalRecommendationIds,
+  selectCanonicalRecommendationWindows,
+  surfSizeRange,
   surfaceConditionForWind,
   type SurfaceCondition as CoreSurfaceCondition
 } from "@surf/forecast-core";
@@ -136,13 +143,7 @@ export function cardinalDirection(value: number | null): string {
 }
 
 export function surfHeightRange(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return "Size unavailable";
-  if (value < 1) return "0–1 ft";
-  if (value >= 10) return `${Math.round(value)} ft+`;
-  const rounded = Math.round(value * 10) / 10;
-  const lower = Number.isInteger(rounded) ? Math.max(0, rounded - 1) : Math.floor(rounded);
-  const upper = Math.max(lower + 1, Math.ceil(rounded));
-  return `${lower}–${upper} ft`;
+  return surfSizeRange(value);
 }
 
 export function confidenceLabel(value: number): "High" | "Medium" | "Low" {
@@ -151,31 +152,130 @@ export function confidenceLabel(value: number): "High" | "Medium" | "Low" {
   return "Low";
 }
 
-export function calmestWindow(
+export type BestWindowSelection = {
+  window: ScoredForecastWindow;
+  constituentWindowIds: string[];
+  startAt: string;
+  endAt: string;
+};
+
+export function bestWindowSelection(
   spot: SpotProfile,
   windows: ScoredForecastWindow[],
   now = new Date(),
   dateKey?: string,
-  sunPhases?: ForecastResponse["sunPhases"]
-): ScoredForecastWindow | undefined {
-  const eligible = windows.filter(
-    (window) =>
-      (!dateKey || localDateParts(window.forecastAt, spot.timezone).key === dateKey) &&
-      isPlanningWindow(window, spot.timezone, now, sunPhases)
+  sunPhases?: ForecastResponse["sunPhases"],
+  recommendations?: ForecastRecommendationWindow[]
+): BestWindowSelection | undefined {
+  const published = recommendations?.find(
+    (recommendation) =>
+      (!dateKey || recommendation.localDate === dateKey) &&
+      new Date(recommendation.endAt).getTime() >= now.getTime()
   );
-  const selectedId = selectCanonicalRecommendationIds(
-    eligible.map((window) => ({
-      windowId: window.forecastAt,
-      forecastAt: window.forecastAt,
-      isDaylight: true,
-      ratingStatus: window.ratingStatus,
-      surfaceCondition: window.surfaceCondition ?? surfaceCondition(spot, window),
-      score: window.score,
-      confidence: window.confidence
-    })),
-    now
-  )[0];
-  return eligible.find((window) => window.forecastAt === selectedId);
+  if (published) {
+    return {
+      window: published.representative,
+      constituentWindowIds: published.constituentWindowIds,
+      startAt: published.startAt,
+      endAt: published.endAt
+    };
+  }
+  // A present recommendation projection is authoritative, including an empty
+  // list or a date with no remaining recommendation. Only legacy payloads
+  // which omit the field entirely may derive a coarse fallback in the client.
+  if (recommendations !== undefined) return undefined;
+
+  const candidates = windows
+    .filter(
+      (window) =>
+        !dateKey || localDateParts(window.forecastAt, spot.timezone).key === dateKey
+    )
+    .map((window) => {
+      const localDate = localDateParts(window.forecastAt, spot.timezone).key;
+      const phase = sunPhases?.find((candidate) => candidate.localDate === localDate);
+      return {
+        windowId: window.forecastAt,
+        forecastAt: window.forecastAt,
+        isDaylight: isPlanningWindow(window, spot.timezone, new Date(0), sunPhases),
+        civilLightStartAt: phase?.firstLight ?? null,
+        civilLightEndAt: phase?.lastLight ?? null,
+        ratingStatus: window.ratingStatus,
+        surfaceCondition: window.surfaceCondition ?? surfaceCondition(spot, window),
+        score: window.score,
+        confidence: window.confidence
+      };
+    });
+  const selection = selectCanonicalRecommendationWindows(candidates, now)[0];
+  const window = selection
+    ? windows.find((candidate) => candidate.forecastAt === selection.representativeWindowId)
+    : undefined;
+  if (!selection || !window) return undefined;
+
+  // Compatibility for a pre-recommendation 3h payload: core grouping is
+  // intentionally hourly, so preserve the coarser row's actual display span
+  // only when no published hourly boundaries were available.
+  const sortedTimes = windows
+    .map((candidate) => new Date(candidate.forecastAt).getTime())
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const positiveGaps = sortedTimes.flatMap((time, index) => {
+    const next = sortedTimes[index + 1];
+    return next !== undefined && next > time ? [next - time] : [];
+  });
+  const roundedGapHours = positiveGaps.map((gap) => Math.round(gap / (60 * 60 * 1000)));
+  const commonGapHours = [...new Set(roundedGapHours)]
+    .map((hours) => ({
+      hours,
+      count: roundedGapHours.filter((candidate) => candidate === hours).length
+    }))
+    .sort((left, right) => right.count - left.count || left.hours - right.hours)[0]?.hours ?? 3;
+  const isHourlyPayload = commonGapHours <= 1;
+  const localDate = localDateParts(window.forecastAt, spot.timezone).key;
+  const windowStartMs = new Date(window.forecastAt).getTime();
+  const nextSameDateMs = sortedTimes.find(
+    (candidate) =>
+      candidate > windowStartMs &&
+      localDateParts(new Date(candidate), spot.timezone).key === localDate
+  );
+  // For coarse local-time rows, the next row is the correct boundary across
+  // 23/25-hour DST days (00:00→03:00 can be two or four real hours). Hourly
+  // payloads retain a one-hour display interval even when a row is missing.
+  const inferredEndMs = isHourlyPayload
+    ? windowStartMs + 60 * 60 * 1000
+    : nextSameDateMs ?? windowStartMs + 3 * 60 * 60 * 1000;
+  const phaseEndMs = sunPhases
+    ?.find((phase) => phase.localDate === localDate)
+    ?.lastLight;
+  const clippedFallbackEndMs = phaseEndMs
+    ? Math.min(inferredEndMs, new Date(phaseEndMs).getTime())
+    : inferredEndMs;
+  return {
+    window,
+    constituentWindowIds: selection.constituentWindowIds,
+    startAt: selection.startAt,
+    endAt:
+      selection.constituentWindowIds.length === 1 && !isHourlyPayload
+        ? new Date(clippedFallbackEndMs).toISOString()
+        : selection.endAt
+  };
+}
+
+export function bestWindow(
+  spot: SpotProfile,
+  windows: ScoredForecastWindow[],
+  now = new Date(),
+  dateKey?: string,
+  sunPhases?: ForecastResponse["sunPhases"],
+  recommendations?: ForecastRecommendationWindow[]
+): ScoredForecastWindow | undefined {
+  return bestWindowSelection(
+    spot,
+    windows,
+    now,
+    dateKey,
+    sunPhases,
+    recommendations
+  )?.window;
 }
 
 export function availableLocalDateKeys(
@@ -185,6 +285,20 @@ export function availableLocalDateKeys(
   sunPhases?: ForecastResponse["sunPhases"]
 ): string[] {
   return [...new Set(windows.filter((window) => isPlanningWindow(window, spot.timezone, now, sunPhases)).map((window) =>
+    localDateParts(window.forecastAt, spot.timezone).key
+  ))].sort();
+}
+
+/**
+ * Dates that can be inspected in the workbench, including elapsed dates whose
+ * rows remain useful context. Recommendation eligibility is intentionally a
+ * separate concern handled by `availableLocalDateKeys`.
+ */
+export function availableDisplayLocalDateKeys(
+  spot: SpotProfile,
+  windows: ScoredForecastWindow[]
+): string[] {
+  return [...new Set(windows.map((window) =>
     localDateParts(window.forecastAt, spot.timezone).key
   ))].sort();
 }
@@ -224,11 +338,19 @@ export function formatClock(value: string, timeZone: string): string {
   }).format(new Date(value));
 }
 
-export function formatWindowSpan(value: string, timeZone: string): string {
+export function formatWindowSpan(value: string, timeZone: string, endAt?: string): string {
   const start = new Date(value);
-  const end = new Date(start.getTime() + 3 * 60 * 60 * 1000);
+  const end = endAt ? new Date(endAt) : new Date(start.getTime() + 3 * 60 * 60 * 1000);
+  const minute = (date: Date) => Number(
+    new Intl.DateTimeFormat("en-US", {
+      minute: "2-digit",
+      timeZone
+    }).formatToParts(date).find((part) => part.type === "minute")?.value ?? 0
+  );
+  const showMinutes = minute(start) !== 0 || minute(end) !== 0;
   const formatter = new Intl.DateTimeFormat(undefined, {
     hour: "numeric",
+    ...(showMinutes ? { minute: "2-digit" as const } : {}),
     timeZone
   });
   return `${formatter.format(start)}–${formatter.format(end)}`;

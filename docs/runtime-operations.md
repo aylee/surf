@@ -9,20 +9,27 @@ rollback commands.
 
 - Cron enqueues one ingest cycle every hour at minute 17.
 - Queue retries isolate public-provider failures from the scheduler.
-- A source-ingest invocation persists public inputs, then fans out one
-  materialization message per configured spot. Queue batch size and concurrency
-  stay at one so every spot receives a fresh Worker CPU budget.
+- A root `source-ingest` invocation dispatches three deterministic, versioned
+  `source-batch` messages of at most four spots. Each batch attempts all five
+  providers for only those spots, persists only that scoped input set, then
+  fans out one materialization message per batch spot. Queue batch size and
+  concurrency stay at one so every source batch and spot receives a fresh
+  Worker budget.
 - Latest normalized rows and validated 1-hour/3-hour forecast read models
   refresh each cycle.
 - Immutable issued history is sampled at 00/06/12/18 UTC and keeps only the
   6 AM–6 PM local planning horizon.
 - The report layer reads the best available normalized rows; it never replaces
   stale inputs with fixture data.
-- The optional per-spot daily brief lets Gemini synthesize natural prose from
-  role-tagged public facts. Recommendation order, measurements, and hard
-  caveats stay code-owned; model prose must pass citation, policy, and quality
-  validation. Missing keys, quota, or rejected output falls back to local
-  fact-based copy without delaying ingest.
+- When optional Analysis is enabled, a published spot generation emits one
+  versioned `analysis-signal` message through the ingest Queue. Its separate
+  invocation reloads all current local-date fact bundles, ledgers each exact
+  Analysis job, and sends it to a dedicated narrative Queue. An out-of-band runner
+  HTTP-pulls available work, calls local oMLX, and posts a bounded result to the
+  authenticated Worker endpoint. Code owns all values and recommendation
+  semantics; the cloud validates connective prose and derives provenance from
+  used slots. Failure never delays forecast publication and never creates a
+  pseudo-report: the UI reports published, pending, or unavailable honestly.
 
 ## Health checks
 
@@ -49,12 +56,15 @@ unavailable. Cloudflare `1102` or an invocation outcome of `exceededCpu` means
 request-time work has regressed past the Worker CPU budget and should be fixed
 in the read path rather than translated into an unknown surf call.
 
-Successful forecast and brief responses use a one-minute shared-cache TTL with
-five minutes of stale-while-revalidate. The Worker cache is version-scoped, so
-a deployment cannot serve a response produced by the version it replaced.
-Health, errors, ingest responses, and other API responses are explicitly
-uncacheable. Treat the cache as request-load protection, not as the source of
-truth; D1 read models remain the durable last-good generation.
+Successful forecast responses use a one-minute shared-cache TTL with five
+minutes of stale-while-revalidate. `/brief` is always `Cache-Control: no-store`
+because its stable date URL must never serve an exact-value report after the
+underlying fact or Analysis-contract identity changes. The forecast Worker
+cache is version-scoped, so a deployment cannot serve a response produced by
+the version it replaced. Health, errors, ingest responses, and other API
+responses are explicitly uncacheable. Treat the forecast cache as request-load
+protection, not as the source of truth; D1 read models remain the durable
+last-good generation.
 
 ### Local missing-read-model proof
 
@@ -65,12 +75,21 @@ remote binding. The recovery path is a normal local ingest.
 1. Start `pnpm dev` and retain its output, then in a second terminal run
    `pnpm ingest:local` followed by `pnpm smoke:local` to establish a healthy
    baseline. In the dev output, take the `ingestId` from the one
-   `source_ingest_published` terminal object. Require exactly 12
-   `forecast_materialization_published` terminal objects with that same
-   `ingestId`: one for every configured spot × `1h|3h`, each with a nonempty
+   `source_ingest_dispatched` terminal object. Require exactly three healthy
+   `source_ingest_published` terminal objects with that same ID, one distinct
+   configured `batchKey` each and 11 total `spotCount`. Then require exactly one
+   `forecast_materialization_published` terminal object with that same
+   `ingestId` for every configured spot × `1h|3h` pair (22 for the current
+   catalog), each with a nonempty
    `generationId`, `outcome: "publish"`, and a stable `reasonCode`. Started
    events and optional-brief diagnostics are not terminal objects; do not count
-   them. Any missing or duplicate spot/interval terminal fails this proof.
+   them. Require exactly one `publish` terminal per spot/interval. An
+   at-least-once redelivery may add a nonretryable
+   `forecast_materialization_skipped` terminal with
+   `reasonCode: "forecast_generation_already_active"` and the same generation;
+   do not count that idempotent skip as a second publication. Any missing or
+   duplicate publication, different skip reason, or retryable skip fails this
+   proof.
 2. Stop the dev process so the local D1 file has no listener holding it, then
    delete exactly the `obsf-central` 3-hour row:
 
@@ -99,8 +118,8 @@ remote binding. The recovery path is a normal local ingest.
    pnpm smoke:local
    ```
 
-   Apply the same one-source/12-interval terminal-set assertion to this recovery
-   ingest, using its new `ingestId`.
+   Apply the same one-dispatch/three-source-batch/22-interval terminal-set
+   assertion to this recovery ingest, using its new `ingestId`.
 
 If the check is interrupted after deletion, step 4 is the rollback. Do not
 substitute a remote D1 command for this procedure.
@@ -129,16 +148,17 @@ Expected results:
   explicit Queue-quiescence and payload-compatibility proof.
 - `pnpm ops:status` prints four compact `PASS` rows: HTTPS health and the exact
   serving Worker version; one active deployment at 100%; one ingest consumer
-  with batch/concurrency `1/1` and the configured DLQ; and `12/12` ready
-  read-model rows as six synchronized 1h/3h spot pairs. Any missing proof exits
+  with batch/concurrency `1/1` and the configured DLQ; and one ready read-model
+  row for each active spot/interval pair (`22/22` for the current 11-spot
+  catalog). Any missing proof exits
   nonzero. It performs one health GET
   plus exactly three read-only Wrangler operations and never triggers ingest,
   prints forecast JSON, or changes D1/Queue state.
-- `pnpm smoke:cloudflare` reports six spots, 12 ready read models, zero pending,
+- `pnpm smoke:cloudflare` reports 11 spots, 22 ready read models, zero pending,
   and scored forecasts. Run it once with the custom hostname and once with the
   emitted `workers.dev` origin when both are part of the deployment.
-- At the next actual `:17` cycle, inspect Logfire for the cron, source job, six
-  serialized spot jobs, and 12 publication outcomes, with the same structured
+- At the next actual `:17` cycle, inspect Logfire for the cron, source job, 11
+  serialized spot jobs, and 22 publication outcomes, with the same structured
   `ingestId`/spot/generation evidence and no `exceededCpu`/1102 outcome.
 
 For the authoritative answer to “what is live,” use:
@@ -288,13 +308,33 @@ other healthy spots continue advancing. A typed retryable 503 appears only
 when that spot has never published a valid generation.
 
 Do not raise the ingest consumer's `max_batch_size` or `max_concurrency` above
-one. Source fetching and normalized persistence run in one invocation. Each
-spot's history capture, synchronized 1-hour/3-hour assembly, and fact generation
-then share a separate child invocation with a fresh Worker CPU budget. Queue
-delivery is at-least-once and unordered; stable ingest IDs, indexed
+one. Each source batch attempts all five providers and completes scoped raw and
+normalized persistence in one invocation. Its configured worst-case external
+request count is locked at 36, 36, or 25 (including CDIP metadata `HEAD`
+fallbacks), below the Free Worker ceiling of 50; any spot/source-map change
+must update and pass that exact URL-budget test. Normalized provider rows and
+source-artifact metadata fan out inside bounded JSON-backed SQL, not through
+one D1 statement per row. The production-shaped real-D1 regression contains
+nonempty 120/121-hour inputs and locks the source pipeline at 31 statements;
+the full Queue child uses 32 after its generation-fence read, below D1 Free's
+50-query invocation ceiling. Each spot's history capture, synchronized
+1-hour/3-hour assembly, and fact generation then share a separate child
+invocation with a fresh Worker CPU budget. The conservative instrumented
+materialization fixture uses 17 D1 statements and emits only one versioned
+Analysis signal. That signal gets a separate ingest-Queue invocation;
+reloading five active bundles and ledgering all five narrative jobs uses 36
+statements. Both budgets are independently below D1 Free's 50-query ceiling,
+and a partial-date failure is recorded and ACKed as advisory. The next exact
+generation signal or hourly ledger reconciliation recovers it while stable
+ledger identity deduplicates dates already created. Source-ingest delivery
+remains at-least-once
+and unordered; canonical batch keys/suffixes, stable root ingest IDs, indexed
 logical-generation checks, and idempotent writes make duplicate or superseded
 jobs safe. A normalized-data or source-run persistence failure does not fan out
-children; retained rows cannot be relabeled as a fresh ingest.
+that batch's children; retained rows cannot be relabeled as a fresh ingest.
+NWS active-alert withdrawals reconcile only after a successful alerts response;
+a successful empty set removes the prior active rows, while a failed response
+preserves the last good alert state.
 
 Inspect all expected spot/interval pairs without printing forecast JSON:
 
@@ -303,41 +343,94 @@ pnpm wrangler -- d1 execute DB --remote --command \
   "with intervals(interval) as (values ('1h'), ('3h')) select s.id as spot_id, i.interval, case when r.spot_id is null then 'missing' else 'ready' end as state, r.generated_at, r.materialized_at, length(r.forecast_json) as json_chars from spots s cross join intervals i left join forecast_read_models r on r.spot_id=s.id and r.interval=i.interval where s.active=1 order by s.id,i.interval"
 ```
 
-The NorCal reference configuration should return 12 `ready` rows. If any pair
+The NorCal reference configuration should return 22 `ready` rows. If any pair
 is missing, tail structured Worker logs, run one authenticated
 `pnpm ingest:remote` (it waits and names every missing pair), rerun the query,
 then run `pnpm smoke:cloudflare`. Inspect `forecast materialization failed for
 <spot>` and the configured `<instance>-ingest-dlq` before retrying again. Do not
-insert or hand-edit read-model JSON. A Gemini credential, quota, or Agent
-failure cannot remove these rows.
+insert or hand-edit read-model JSON. A narrative Queue, runner, oMLX, or result
+validation failure cannot remove these rows.
 
-## Daily brief failure
+## Analysis failure
 
-The forecast API remains healthy when Gemini is disabled or unavailable. Check
-the brief response status first: `deterministic_fallback` is expected when the
-feature flag/key is absent, quota is exhausted, or output fails validation.
-Inspect structured Worker logs by spot, fingerprint, attempt, and failure code;
-the implementation never logs the API key or full provider request. Retry is
-bounded and material fingerprints prevent freshness-only regeneration. The UI
-does not expose these internal provider/fallback labels.
+Start with the public response for one spot/date. `/brief` v3 is always
+`Cache-Control: no-store` and returns exactly one lifecycle:
 
-The Agent retries network failures, rate limits, and server errors after 5
-minutes, 30 minutes, and 2 hours, then marks the transient budget exhausted.
-Policy or structured-output rejection receives one delayed regeneration. Bad
-credentials, corrupt stored input, unknown defects, and retry-scheduling
-failure become terminal instead of looping. The exact failed input stays
-suppressed. After a five-minute cooldown, a later ingest with a new full-input
-fingerprint may reclaim the same material forecast—this is the recovery path
-after fixing credentials or provider configuration without forcing a physical
-forecast change.
+- `published` means the revision matches the current exact Analysis fact
+  fingerprint;
+- `pending` means an active matching job exists before its inference deadline;
+- `unavailable` means generation is disabled, no matching report/job exists,
+  work expired or was rejected, or the underlying bundle is unavailable.
 
-`generating` is a ten-minute lease rather than a permanent lock. A later
-signal reclaims an interrupted generation after that lease and rotates the
-generation token, so a delayed callback from the old claim cannot publish.
-Each delayed retry carries its attempt number; this keeps the 5m/30m/2h
-schedules distinct while still using idempotent callback submission. Queue and
-schedule callbacks each have one framework attempt; Surf's explicit state
-machine owns recovery and backoff.
+Never replace `pending` or `unavailable` with local deterministic prose. The
+Forecast tab remains the authoritative fallback product surface. While visible,
+the UI polls a pending report at three-second intervals for exactly 20 requests;
+if the Worker is still pending, that bounded wait resolves to the same honest
+unavailable presentation instead of an idle state that can never advance.
+
+Inspect only bounded ledger metadata, not stored prompts or snapshots:
+
+```bash
+pnpm wrangler -- d1 execute DB --remote --command \
+  "select status, count(*) as jobs from narrative_jobs group by status order by status"
+pnpm wrangler -- d1 execute DB --remote --command \
+  "select entity_id, local_date, status, enqueue_attempts, deadline_at, last_reason_code, updated_at from narrative_jobs order by updated_at desc limit 30"
+```
+
+Then check the runner without printing credentials or job payloads:
+
+```bash
+pnpm --filter @surf/narrative-runner config:check
+pnpm --filter @surf/narrative-runner status
+```
+
+The Worker inserts the ledger before Queue send. A send failure or expired
+enqueue lease remains recoverable: the scheduled path claims it with a lease
+token and resends the authoritative stored envelope. Queue and result delivery
+are at least once. Stable generation identity deduplicates unchanged exact
+facts, while each bounded rearm gets a new submission ID; delayed generated or
+terminal callbacks from an older attempt cannot mutate the active attempt.
+Generated output is published only while job ID, active submission ID,
+deadline, and current exact fact fingerprint all match.
+
+If unpublished exact facts move A-to-B-to-A, the superseded A ledger row is
+reactivated with a fresh submission ID while retaining its accumulated
+three-send ceiling. Delayed A or B callbacks cannot mutate that active attempt,
+and an A row that exhausted its ceiling cannot supersede the still-active B
+row.
+
+A successfully enqueued row that stays pending for 12 hours is also reissued
+before the Free-plan 24-hour Queue retention window. Delivery reissues keep the
+same job/submission identity, use a lease-token CAS, and stop after three sends
+per active submission. A delayed original and replacement can both infer, but only one revision
+publishes; the other result is duplicate. When the final delivery has itself
+aged through 24 hours, reconciliation records
+`queue_delivery_attempts_exhausted` instead of claiming work still exists.
+If a later materialization renews the same exact facts and deadline, the one
+bounded inference rearm gets a fresh submission ID and its own three-send
+delivery budget; callbacks from the exhausted submission then fail the active
+submission CAS.
+Reconciliation is capped at 15 jobs: two base D1 statements plus at most three
+per job is 47, leaving headroom below
+[D1 Free's 50-query invocation limit](https://developers.cloudflare.com/d1/platform/limits/).
+
+Runner inference and callback network/429/5xx failures receive one short local
+retry inside the same lease only when the remaining job deadline and cumulative
+visibility budgets fit. A second failure requests Queue retry, which the Free
+reference's zero-retry consumer sends to DLQ before bounded D1-ledger reissue.
+Malformed generated output is reported as an identifiable terminal rejection before ACK. Expired
+or deadline-starved jobs are reported as terminal when identity is trustworthy.
+An undecodable message cannot supply a trustworthy callback identity, so it is
+ACKed locally and the cloud deadline reconciler expires its ledger row. Inspect
+the instance narrative DLQ, runner status error code, D1 reason code, and oMLX
+health before a deliberate one-shot retry. Logs contain identifiers and bounded
+reason codes, never tokens, full prompts, snapshots, or model payloads.
+
+For rollout/quiescence, follow [local narrative runner](narrative-runner.md).
+Stop new production by deploying `NARRATIVE_ENABLED=false`; stop pulls by
+removing the HTTP pull consumer. Wait for in-flight leases to settle before
+revoking the target result token or Queue API token. Do not delete Queue/DLQ or
+D1 ledger rows as recovery.
 
 ## Backup and restore
 
@@ -376,12 +469,74 @@ spot configurations are removed. The active forecast read models are replaced
 in place; obsolete per-date fact bundles are removed after the same two-day
 operational tail once no active 3-hour generation references them.
 
-Daily-brief retention is intentionally unpruned at the current bounded personal
-scale: D1 keeps every published validated brief revision, while each per-spot
-Durable Object keeps one coordination job row per local date. Treat pruning,
-archival, and retention metrics as follow-up work before materially expanding
-the spot catalog or usage; any cleanup must ship with the same D1 backup and
-rollback discipline as other retention changes.
+Narrative jobs and revisions keep a seven-day terminal/report history. The ingest
+retention pass deletes old `narrative_revisions` first, then deletes their
+unreferenced terminal `narrative_jobs`, preserving foreign-key order. It never
+deletes current/future local dates, and active pending/enqueue work is preserved
+until its deadline; an old active row is eligible only after both its deadline
+and retention cutoff have passed. The owner of this constant is
+`NARRATIVE_RETENTION_DAYS` in `apps/web/worker/ingest/retention.ts`.
+
+The current 11-spot, five-date planning envelope is 55 exact-fact generations
+per materially changed forecast issue; identical hourly materializations
+deduplicate rather than enqueueing another 55. The
+[Free Queue allowance](https://developers.cloudflare.com/queues/platform/pricing/)
+is 10,000 account-wide operations/day. Cloudflare bills reads, writes, and
+deletes per decimal 64,000-byte chunk and adds roughly 100 bytes of message
+metadata, so the shared application envelope is capped at 60,000 serialized
+bytes to remain one chunk.
+
+The current ingest topology adds 26 small messages/hour, or 1,872 operations
+per day. Its 11 hourly Analysis signals are advisory and ACK even after a
+recorded signaling failure; raw malformed or version-skewed Analysis envelopes
+also ACK without redelivery, and an equal-generation materialization skip does
+not emit a second signal. The other 15 messages retain three source-ingest
+retries, but a degraded source batch ACKs after its complete usable
+materialization child set is accepted; the next hourly root retries providers
+without multiplying those children. The envelope reserves another 1,080
+reads/day plus 720 ingest-DLQ write/retention deletes for failures before a
+complete child handoff. The earliest
+recommendation-bearing local date refreshes hourly, while four later dates
+refresh on a three-hour spot-local cadence: at most 616 initial narrative
+sends/day. Hourly reconciliation admits at most another 360 stale-ledger
+reissues. The Free reference allows zero Queue-level delivery
+retries and relies on bounded D1-ledger reissue for recovery. If every first
+delivery transfers to the DLQ, its source write/read/delete, DLQ write, and
+eventual retention delete cost five operations, or 4,880 across all 976
+initial and reconciliation sends. The ten-minute empty-pull cap is about
+144 reads/day at steady state; the capacity regression conservatively reserves
+336 for hourly backoff resets and fastest jitter. The configured account
+envelope is therefore 1,872 + 1,080 + 720 + 4,880 + 336 = 8,888
+operations/day, leaving 1,112 operations of headroom.
+Treat 8,000 projected or observed account operations as an early warning and
+review the measured end-of-day projection. Stop new narrative admission before
+that projection reaches 9,500. Do not add retries, increase polling, drain the
+DLQ, or admit another region/domain on Free unless a new combined projection
+remains below 10,000. Per-domain Queues
+and runner processes isolate credentials and failures, not the account quota.
+If the projection cannot stay below 10,000, deploy
+`NARRATIVE_ENABLED=false`, let the active lease settle, and stop the runner so
+empty pulls cease; deterministic Forecast remains available. Do not manually
+drain the DLQ as a quota workaround because that adds billed reads/deletes.
+
+At the observed complete-generation storage size of about 12.3 KB, the
+cadence-capped 616-generation/day envelope retains about 53 MB of row payload
+over seven days. A 50% reserve for indexes and SQLite overhead models about
+80 MB, roughly 16% of D1 Free's 500 MB database before core forecast data.
+Alert at 175 MB of narrative storage or 250 MB total D1 size and shorten the
+horizon or reduce admission before either threshold grows. The cutoff-leading
+`narrative_revisions(published_at, local_date)` and
+`narrative_jobs(updated_at, local_date, status, deadline_at)` indexes keep the
+hourly FK-ordered retention pass from full-scanning the ledgers; monitor rows
+read as well as rows deleted.
+
+Before adding ski, another surf region, or MTB, measure serialized job chunks,
+Queue operations/depth/retries/DLQ rate, terminal job rate, average stored
+job/snapshot bytes, revision bytes, rejection/expiry rate, and the seven-day D1
+total. Change the horizon only with a capacity estimate, fresh-D1 retention
+tests, and the same backup/rollback discipline as other data retention changes.
+Do not place another domain's ledger in the Surf D1 database without its own
+explicit capacity decision; separate Queues alone do not isolate D1 storage.
 
 R2 objects are not deleted by the D1 retention job. This is deliberate: D1
 metadata retention must not silently destroy raw evidence.
@@ -457,6 +612,19 @@ after independently proving the Queue is quiescent, no consumer is in flight,
 and every queued payload is compatible with the predecessor. Additive D1
 tables remain in place.
 
+The version-1 `source-batch` and `analysis-signal` payloads are intentionally
+distinct and are not understood by their predecessors. Before rolling back
+across either boundary, first deploy `NARRATIVE_ENABLED=false`, then pause cron
+and manual ingest, pause Queue delivery, wait for every root, source-batch,
+materialization, and Analysis-signal job to settle, and prove the ingest Queue
+has no available, delayed, leased, or retrying messages. Inspect the ingest DLQ
+as well; do not replay a `source-batch` or `analysis-signal` message into the
+predecessor. No D1 schema migration is coupled to these Queue payloads, so
+rollback leaves D1 and R2 data intact once Queue quiescence is established.
+With `NARRATIVE_ENABLED=false`, the public read path still serves an exact
+published revision but reports every non-published ledger row unavailable; it
+never promises that stopped work is still being prepared.
+
 If a later problem is found while the schema remains backward compatible, use
 Wrangler's version rollback:
 
@@ -469,11 +637,12 @@ Do not roll Worker code behind an incompatible schema. For a risky migration,
 the pull request and release notes must name a forward-fix or recovery-database
 plan before deployment.
 
-The first deployment declaring `ForecastBriefAgent` is a Durable Object class
-lifecycle change and cannot be rolled back to a version from before that class
-existed. Deploy it with `FORECAST_BRIEF_ENABLED=false`, smoke it, and keep that
-disabled post-Agent version as the rollback target for later code/model
-versions. Do not remove or tombstone the export during routine rollback.
+Historical compatibility boundary: `ForecastBriefAgent`, its Durable Object
+binding, and migration 0002 were declared by an earlier architecture, so the
+export remains present and a rollback target must stay post-class. The active
+ingest path does not signal it and `FORECAST_BRIEF_ENABLED` stays false. Do not
+enable, remove, or tombstone that dormant compatibility surface during routine
+Analysis rollout or rollback.
 
 If ingest must be stopped during recovery, pause Queue delivery and remove the
 cron trigger, wait for in-flight work to finish, and confirm `source_runs` has

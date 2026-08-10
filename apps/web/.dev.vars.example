@@ -1,3 +1,8 @@
 # Local Worker-only secrets. Copy this file to .dev.vars and keep the copy private.
+# Dormant v2 ForecastBriefAgent compatibility only; Analysis v3 does not use
+# Gemini and this flag must remain false.
 GEMINI_API_KEY=replace_with_your_google_ai_studio_key
-FORECAST_BRIEF_ENABLED=true
+FORECAST_BRIEF_ENABLED=false
+# Active Analysis v3 is separately disabled until its Queue and local runner exist.
+NARRATIVE_ENABLED=false
+NARRATIVE_RESULT_TOKEN=replace_with_a_dedicated_result_token

@@ -13,6 +13,9 @@ import {
 import { getSpotProfile } from "@surf/forecast-core";
 import { buildFixtureForecast } from "@surf/forecast-core/test-support";
 import { App } from "./App";
+import { hazardNoticesForDate } from "./App";
+import { localDayDomain } from "./features/workbench/workbench-time";
+import { earliestAvailableLocalDateKey, formatDay, localDateParts } from "./forecast-view";
 
 const referenceSpot = getSpotProfile("bolinas");
 
@@ -39,8 +42,8 @@ const spotsResponse = {
   sourceNote: "DOM-test catalog."
 } satisfies SpotsResponse;
 
-function fixtureForecast(forecastSpot: ApiSpot = spot): ForecastResponse {
-  const fixture = buildFixtureForecast("bolinas");
+function fixtureForecast(forecastSpot: ApiSpot = spot, now = new Date()): ForecastResponse {
+  const fixture = buildFixtureForecast("bolinas", now);
   return ForecastResponseSchema.parse({
     ...fixture,
     spot: forecastSpot,
@@ -58,6 +61,38 @@ function unavailableForecast(forecast = fixtureForecast()): ForecastResponse {
   });
 }
 
+function forecastWithDateScopedHazards(): ForecastResponse {
+  const forecast = fixtureForecast();
+  const reportDate = earliestAvailableLocalDateKey(
+    [{ spot, windows: forecast.windows, sunPhases: forecast.sunPhases }],
+    new Date()
+  );
+  if (!reportDate) throw new Error("Fixture has no report date");
+  const laterDate = [...new Set(
+    forecast.windows.map((window) => localDateParts(window.forecastAt, spot.timezone).key)
+  )].find((date) => date > reportDate);
+  if (!laterDate) throw new Error("Fixture has no later hazard date");
+
+  const hazardForDate = (localDate: string, headline: string) => {
+    const dayEnd = localDayDomain(localDate, spot.timezone).end;
+    return {
+      headline,
+      startsAt: new Date(dayEnd - 60 * 60_000).toISOString(),
+      endsAt: new Date(dayEnd).toISOString(),
+      sourceId: "nws:point-forecast-alerts",
+      sourceRunId: "hazard-run"
+    };
+  };
+
+  return ForecastResponseSchema.parse({
+    ...forecast,
+    hazards: [
+      hazardForDate(reportDate, "Report-day advisory"),
+      hazardForDate(laterDate, "Later-day advisory")
+    ]
+  });
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return {
     ok: status >= 200 && status < 300,
@@ -69,6 +104,24 @@ function jsonResponse(body: unknown, status = 200): Response {
 function requestPath(input: URL | RequestInfo): string {
   if (typeof input === "string") return input;
   return input instanceof URL ? input.pathname : input.url;
+}
+
+function firstUpcomingWindowIndex(forecast: ForecastResponse, now = new Date()): number {
+  const index = forecast.windows.findIndex(
+    (window) => Date.parse(window.forecastAt) >= now.getTime()
+  );
+  return index >= 0 ? index : Math.max(0, forecast.windows.length - 1);
+}
+
+function forecastWithSourceAge(forecastSpot: ApiSpot, ageMinutes: number): ForecastResponse {
+  const forecast = fixtureForecast(forecastSpot);
+  return ForecastResponseSchema.parse({
+    ...forecast,
+    windows: forecast.windows.map((window) => ({
+      ...window,
+      sourceFreshnessMinutes: ageMinutes
+    }))
+  });
 }
 
 function installSuccessfulApi() {
@@ -107,6 +160,191 @@ describe("App", () => {
       "/api/spots",
       "/api/forecast/test-break"
     ]);
+  });
+
+  it("does not promote an all-wind-unavailable forecast as the best overall window", async () => {
+    const base = fixtureForecast();
+    const forecast = ForecastResponseSchema.parse({
+      ...base,
+      windows: base.windows.map((window) => ({
+        ...window,
+        windDirectionDeg: null
+      })),
+      recommendations: []
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    await screen.findByText("NorCal daily surf report");
+    expect(screen.getByRole("heading", { name: "No reliable regional call yet" })).toBeTruthy();
+    expect(screen.queryByText(/best overall window/i)).toBeNull();
+    expect(screen.getAllByText("Test Break").length).toBeGreaterThan(0);
+  });
+
+  it("keeps home hazards scoped to the local report date", async () => {
+    const forecast = forecastWithDateScopedHazards();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Report-day advisory")).toBeTruthy();
+    expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
+    expect(screen.queryByText("Later-day advisory")).toBeNull();
+  });
+
+  it("labels active typed hazards and hides expired typed hazards on home", async () => {
+    const forecast = ForecastResponseSchema.parse({
+      ...fixtureForecast(),
+      hazards: [
+        {
+          headline: "Active beach advisory",
+          startsAt: null,
+          endsAt: null,
+          sourceId: "nws:point-forecast-alerts",
+          sourceRunId: "active-run"
+        },
+        {
+          headline: "Expired beach advisory",
+          startsAt: "2020-01-01T00:00:00.000Z",
+          endsAt: "2020-01-01T01:00:00.000Z",
+          sourceId: "nws:point-forecast-alerts",
+          sourceRunId: "expired-run"
+        }
+      ]
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Active beach advisory")).toBeTruthy();
+    expect(screen.getByText("Active NWS hazard")).toBeTruthy();
+    expect(screen.queryByText("Expired beach advisory")).toBeNull();
+  });
+
+  it("keeps spot hazards scoped to the spot report date", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = forecastWithDateScopedHazards();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+      if (path === `/api/forecast/${spot.id}?interval=1h`) return jsonResponse({ ...forecast, interval: "1h" });
+      if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    render(<App />);
+
+    expect(await screen.findByText("Report-day advisory")).toBeTruthy();
+    expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
+    expect(screen.queryByText("Later-day advisory")).toBeNull();
+
+    const laterHazard = forecast.hazards?.find(
+      (hazard) => hazard.headline === "Later-day advisory"
+    );
+    expect(laterHazard?.startsAt).toBeTruthy();
+    const laterDayLabel = formatDay(laterHazard!.startsAt!, spot.timezone);
+    const laterDayButton = screen.getAllByRole("button").find((button) =>
+      button.closest(".forecastDayPicker") && button.textContent?.includes(laterDayLabel)
+    );
+    expect(laterDayButton).toBeTruthy();
+    fireEvent.click(laterDayButton!);
+
+    expect(await screen.findByText("Later-day advisory")).toBeTruthy();
+    expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText("Report-day advisory")).toBeNull());
+  });
+
+  it("classifies active and selected-date future hazards with half-open boundaries", () => {
+    const now = new Date("2026-08-02T14:00:00.000Z");
+    const hazards = [
+      {
+        headline: "Active advisory",
+        startsAt: "2026-08-02T13:00:00.000Z",
+        endsAt: "2026-08-02T15:00:00.000Z",
+        sourceId: "nws:point-forecast-alerts",
+        sourceRunId: "active-run"
+      },
+      {
+        headline: "Future today",
+        startsAt: "2026-08-02T16:00:00.000Z",
+        endsAt: "2026-08-02T18:00:00.000Z",
+        sourceId: "nws:point-forecast-alerts",
+        sourceRunId: "future-run"
+      },
+      {
+        headline: "Expires exactly now",
+        startsAt: "2026-08-02T12:00:00.000Z",
+        endsAt: "2026-08-02T14:00:00.000Z",
+        sourceId: "nws:point-forecast-alerts",
+        sourceRunId: "expired-run"
+      },
+      {
+        headline: "Starts next midnight",
+        startsAt: "2026-08-03T07:00:00.000Z",
+        endsAt: "2026-08-03T09:00:00.000Z",
+        sourceId: "nws:point-forecast-alerts",
+        sourceRunId: "boundary-run"
+      }
+    ];
+
+    expect(
+      hazardNoticesForDate(hazards, now, "2026-08-02", "America/Los_Angeles")
+    ).toEqual([
+      { headline: "Active advisory", status: "active" },
+      { headline: "Future today", status: "upcoming" }
+    ]);
+    expect(
+      hazardNoticesForDate(hazards, now, "2026-08-03", "America/Los_Angeles")
+    ).toEqual([
+      { headline: "Starts next midnight", status: "upcoming" }
+    ]);
+  });
+
+  it("keeps a multi-day CAP advisory on intervening report dates until its event end", () => {
+    const advisory = [{
+      headline: "Coastal Flood Advisory until August 13 at 2:00 AM PDT",
+      startsAt: "2026-08-09T17:28:00.000Z",
+      endsAt: "2026-08-13T09:00:00.000Z",
+      sourceId: "nws:point-forecast-alerts",
+      sourceRunId: "multi-day-advisory"
+    }];
+
+    expect(
+      hazardNoticesForDate(
+        advisory,
+        new Date("2026-08-10T04:00:00.000Z"),
+        "2026-08-10",
+        "America/Los_Angeles"
+      )
+    ).toEqual([{
+      headline: "Coastal Flood Advisory until August 13 at 2:00 AM PDT",
+      status: "active"
+    }]);
+    expect(
+      hazardNoticesForDate(
+        advisory,
+        new Date("2026-08-13T09:00:00.000Z"),
+        "2026-08-13",
+        "America/Los_Angeles"
+      )
+    ).toEqual([]);
   });
 
   it("uses nontechnical delayed-update copy when a forecast is unavailable on first load", async () => {
@@ -188,7 +426,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByText(/The calmest surface forecast is Healthy Break/)).toBeTruthy();
+    expect(await screen.findByText(/Healthy Break has the best overall window/)).toBeTruthy();
     expect(screen.queryByText("No reliable regional call yet")).toBeNull();
     expect(screen.getAllByText("Healthy Break").length).toBeGreaterThan(0);
     expect(screen.getByText("Forecast update delayed. Open for available details.")).toBeTruthy();
@@ -198,7 +436,7 @@ describe("App", () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     installSuccessfulApi();
 
-    render(<App />);
+    const { container } = render(<App />);
 
     expect(await screen.findByRole("heading", { level: 1, name: "Test Break" })).toBeTruthy();
     // Forecast is the default tab: deterministic data first, zero AI content,
@@ -211,6 +449,129 @@ describe("App", () => {
     expect(screen.queryByText(/deterministic fallback/i)).toBeNull();
     expect(screen.getByRole("link", { name: /Daily report/ }).getAttribute("href")).toBe("/");
     expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
+    const hero = container.querySelector(".spotHero");
+    expect(hero?.nextElementSibling?.classList.contains("spotWorkbench")).toBe(true);
+  });
+
+  it("keeps an authoritative selected-date no-call out of the spot hero", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    const forecast = ForecastResponseSchema.parse({
+      ...fixtureForecast(),
+      recommendations: []
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    const { container } = render(<App />);
+
+    await screen.findByRole("heading", { level: 1, name: "Test Break" });
+    expect(container.querySelector(".spotCall")?.textContent).toContain(
+      "No reliable wave call yet"
+    );
+    expect(container.querySelector(".spotCall")?.textContent).not.toContain("surf with");
+  });
+
+  it("keeps an elapsed workbench day shared with the hero, hazard, and Analysis", async () => {
+    const now = new Date("2026-08-03T03:00:00.000Z"); // Aug 2, 8 PM PDT
+    vi.useFakeTimers({ toFake: ["Date"], now });
+    try {
+      window.history.replaceState({}, "", "/?spot=test-break");
+      const elapsedDate = "2026-08-02";
+      const forecast = ForecastResponseSchema.parse({
+        ...fixtureForecast(spot, new Date("2026-08-02T07:00:00.000Z")),
+        hazards: [{
+          headline: "Elapsed-day advisory",
+          startsAt: "2026-08-03T02:30:00.000Z",
+          endsAt: "2026-08-03T03:30:00.000Z",
+          sourceId: "nws:point-forecast-alerts",
+          sourceRunId: "elapsed-hazard-run"
+        }]
+      });
+      const requestedUrls: string[] = [];
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        requestedUrls.push(path);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+        if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) {
+          return jsonResponse({ error: "not generated" }, 404);
+        }
+        return jsonResponse({ error: "not found" }, 404);
+      }));
+
+      const { container } = render(<App />);
+      await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ });
+      expect(screen.queryByText("Elapsed-day advisory")).toBeNull();
+
+      const elapsedDayButton = screen.getAllByRole("button").find((button) =>
+        button.closest(".forecastDayPicker") &&
+        button.textContent?.includes(formatDay(forecast.windows[0]!.forecastAt, spot.timezone))
+      );
+      expect(elapsedDayButton).toBeTruthy();
+      fireEvent.click(elapsedDayButton!);
+
+      expect(await screen.findByText("Elapsed-day advisory")).toBeTruthy();
+      await waitFor(() => expect(container.querySelector(".spotCall")?.textContent).toContain(
+        "No reliable wave call yet"
+      ));
+      expect(new URLSearchParams(window.location.search).get("date")).toBe(elapsedDate);
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), {
+        button: 0,
+        ctrlKey: false
+      });
+      await waitFor(() => expect(requestedUrls).toContain(
+        `/api/forecast/${spot.id}/brief?date=${elapsedDate}`
+      ));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("announces and reveals the active item in an overflowing spot navigation", async () => {
+    const laterSpot = { ...spot, id: "later-break", name: "Later Break" } satisfies ApiSpot;
+    const catalog = {
+      spots: [spot, laterSpot],
+      sourceNote: "DOM-test navigation catalog."
+    } satisfies SpotsResponse;
+    const firstForecast = fixtureForecast();
+    const laterForecast = fixtureForecast(laterSpot);
+    window.history.replaceState({}, "", "/?spot=later-break");
+    const originalScrollIntoView = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(catalog);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(firstForecast);
+      if (path === `/api/forecast/${laterSpot.id}`) return jsonResponse(laterForecast);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    try {
+      render(<App />);
+
+      const activeLink = await screen.findByRole("link", { name: "Later Break" });
+      expect(activeLink.getAttribute("aria-current")).toBe("page");
+      await waitFor(() => expect(scrollIntoView).toHaveBeenCalledWith({
+        block: "nearest",
+        inline: "nearest"
+      }));
+      expect(screen.getByRole("link", { name: "Test Break" }).hasAttribute("aria-current")).toBe(false);
+    } finally {
+      if (originalScrollIntoView) {
+        Object.defineProperty(Element.prototype, "scrollIntoView", originalScrollIntoView);
+      } else {
+        Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+      }
+    }
   });
 
   it("deep-links to Analysis, fetches the brief only there, and round-trips the tab param", async () => {
@@ -225,9 +586,9 @@ describe("App", () => {
     expect(briefCalls()).toBe(0);
 
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Analysis" }), { button: 0, ctrlKey: false });
-    // The Worker publishes no brief here (404), so the card is the local
-    // forecast read and must be labelled as one rather than as an outlook.
-    expect(await screen.findByText("Forecast read")).toBeTruthy();
+    // The Worker publishes no report here (404), so Analysis must state that
+    // honestly instead of synthesizing a local pseudo-report.
+    expect(await screen.findByText("Analysis unavailable")).toBeTruthy();
     expect(screen.queryByText("Daily outlook")).toBeNull();
     expect(screen.getByText("Data, confidence & provenance")).toBeTruthy();
     await waitFor(() => expect(briefCalls()).toBeGreaterThan(0));
@@ -240,83 +601,15 @@ describe("App", () => {
     expect(new URLSearchParams(window.location.search).get("tab")).toBeNull();
   });
 
-  it("renders the slim-header freshness badge from the worst cadence-bearing source", async () => {
-    const badgeCase = async (
-      entries: Array<Record<string, unknown>>,
-      activeCapabilities?: string[]
-    ): Promise<string | null> => {
-      cleanup();
-      window.history.replaceState({}, "", "/?spot=test-break");
-      const base = fixtureForecast();
-      const forecast = ForecastResponseSchema.parse({
-        ...base,
-        generatedAt: new Date().toISOString(),
-        windows: base.windows.map((window) => ({
-          ...window,
-          sourceFreshness: entries,
-          ...(activeCapabilities ? { activeCapabilities } : {})
-        }))
-      });
-      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
-        const path = requestPath(input);
-        if (path === "/api/spots") return jsonResponse(spotsResponse);
-        if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
-        if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
-        return jsonResponse({ error: "not found" }, 404);
-      }));
-      const { container } = render(<App />);
-      await screen.findByRole("heading", { level: 1, name: "Test Break" });
-      return container.querySelector(".freshnessBadge")?.textContent?.trim() ?? null;
-    };
+  it("keeps steady-state source freshness out of the spot hero", async () => {
+    window.history.replaceState({}, "", "/?spot=test-break");
+    installSuccessfulApi();
 
-    const entry = (overrides: Record<string, unknown>) => ({
-      capability: "wind",
-      sourceId: "nws:point-forecast-alerts",
-      sourceRunId: "run",
-      updatedAt: "2026-08-05T12:00:00.000Z",
-      freshnessMinutes: 30,
-      status: "fresh",
-      expectedCadenceMinutes: 360,
-      graceMinutes: 180,
-      ...overrides
-    });
+    const { container } = render(<App />);
+    await screen.findByRole("heading", { level: 1, name: "Test Break" });
 
-    // All fresh → fresh; one aging → aging; one late → late (worst wins).
-    expect(await badgeCase([entry({}), entry({ capability: "tide", sourceId: "coops:tide-predictions" })])).toBe("Data fresh");
-    expect(await badgeCase([entry({}), entry({ capability: "tide", sourceId: "coops:tide-predictions", freshnessMinutes: 500 })])).toBe("Data aging");
-    expect(await badgeCase([entry({ freshnessMinutes: 900 }), entry({ capability: "tide", sourceId: "coops:tide-predictions" })])).toBe("Data late");
-
-    // A whole-source absence is "missing", not late: the badge must agree with
-    // the banner's exclusion and the provenance panel's "Missing" label.
-    expect(
-      await badgeCase([entry({}), entry({ capability: "observed_wave", sourceId: "ndbc:preferred", updatedAt: null, freshnessMinutes: null, status: "missing" })])
-    ).toBe("Data fresh");
-
-    // No cadence anywhere → no badge rather than a re-judged guess.
-    expect(
-      await badgeCase([entry({ expectedCadenceMinutes: undefined, graceMinutes: undefined })])
-    ).toBeNull();
-
-    // A late buoy leaves the worker's activeCapabilities set at exactly the age
-    // its verdict turns late. The badge must still report it, because the
-    // banner names that source and the provenance panel labels it Stale —
-    // silently upgrading it to "Data fresh" would be the contradiction.
-    expect(
-      await badgeCase(
-        [
-          entry({}),
-          entry({
-            capability: "observed_wave",
-            sourceId: "ndbc-46237",
-            freshnessMinutes: 180,
-            status: "stale",
-            expectedCadenceMinutes: 60,
-            graceMinutes: 60
-          })
-        ],
-        ["forecast_wave_nearshore", "wind", "tide"]
-      )
-    ).toBe("Data late");
+    expect(container.querySelector(".freshnessBadge")).toBeNull();
+    expect(screen.queryByText(/^Data (fresh|aging|late)$/i)).toBeNull();
   });
 
   it("renders exactly one home link per catalog spot with no shortlist or source-count claim", async () => {
@@ -353,7 +646,7 @@ describe("App", () => {
     const { container } = render(<App />);
 
     expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
-    expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+    expect(container.querySelector(".spotCall")?.textContent).toContain("surf with");
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
@@ -361,7 +654,7 @@ describe("App", () => {
       await screen.findByText(/Test Break is refreshing — showing data from/)
     ).toBeTruthy();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
-    expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+    expect(container.querySelector(".spotCall")?.textContent).toContain("surf with");
     expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
   });
 
@@ -389,11 +682,11 @@ describe("App", () => {
       await screen.findByText(/Test Break is refreshing — showing data from/)
     ).toBeTruthy();
     expect(screen.getByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
-    expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+    expect(container.querySelector(".spotCall")?.textContent).toContain("surf with");
     expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
   });
 
-  it("banners a late source by name and cadence, from the payload's own verdict inputs", async () => {
+  it("does not duplicate late-source age below the header", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     const forecast = fixtureForecast();
     const lateForecast = ForecastResponseSchema.parse({
@@ -423,9 +716,193 @@ describe("App", () => {
       return jsonResponse({ error: "not found" }, 404);
     }));
 
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(container.querySelector(".noticeBanner")).toBeNull();
+  });
+
+  it.each([
+    {
+      name: "late wave input",
+      entry: {
+        capability: "forecast_wave_nearshore" as const,
+        sourceId: "wave:required",
+        sourceRunId: "wave-run",
+        updatedAt: new Date(Date.now() - 300 * 60_000).toISOString(),
+        freshnessMinutes: 300,
+        status: "stale" as const,
+        expectedCadenceMinutes: 60,
+        graceMinutes: 60
+      },
+      label: "Wave model delayed",
+      detail: /Wave model at Test Break is 5h old; expected hourly/
+    },
+    {
+      name: "missing tide input",
+      entry: {
+        capability: "tide" as const,
+        sourceId: "tide:required",
+        sourceRunId: null,
+        updatedAt: null,
+        freshnessMinutes: null,
+        status: "missing" as const,
+        expectedCadenceMinutes: 1_440,
+        graceMinutes: 360
+      },
+      label: "Tide data unavailable",
+      detail: /Tide data at Test Break is unavailable/
+    }
+  ])("uses the single header indicator for a $name", async ({ entry, label, detail }) => {
+    const forecast = fixtureForecast(spot, new Date(Date.now() + 60_000));
+    const referenceIndex = firstUpcomingWindowIndex(forecast);
+    const degradedForecast = ForecastResponseSchema.parse({
+      ...forecast,
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshness: index === referenceIndex ? [entry] : window.sourceFreshness
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(degradedForecast);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
+    const { container } = render(<App />);
+
+    const indicator = await screen.findByTestId("source-status");
+    expect(indicator.textContent).toContain(label);
+    expect(indicator.getAttribute("aria-label")).toMatch(detail);
+    expect(indicator.classList.contains("degraded")).toBe(true);
+    expect(container.querySelector(".noticeBanner")).toBeNull();
+  });
+
+  it("does not globalize a missing historical midnight source over a healthy live row", async () => {
+    const now = new Date("2026-08-03T03:00:00.000Z"); // Aug 2, 8 PM PDT
+    vi.useFakeTimers({ toFake: ["Date"], now });
+    try {
+      const freshWave = {
+        capability: "forecast_wave_nearshore" as const,
+        sourceId: "nws:mtr-grid-wave",
+        sourceRunId: "live-wave-run",
+        updatedAt: "2026-08-03T02:15:00.000Z",
+        freshnessMinutes: 45,
+        status: "fresh" as const,
+        expectedCadenceMinutes: 720,
+        graceMinutes: 240
+      };
+      const missingWave = {
+        ...freshWave,
+        sourceId: "wave:unavailable",
+        sourceRunId: null,
+        updatedAt: null,
+        freshnessMinutes: null,
+        status: "missing" as const
+      };
+      const forecast = fixtureForecast(spot, new Date("2026-08-02T07:00:00.000Z"));
+      const fullDayForecast = ForecastResponseSchema.parse({
+        ...forecast,
+        generatedAt: now.toISOString(),
+        windows: forecast.windows.map((window, index) => ({
+          ...window,
+          sourceFreshnessMinutes: index === 0 ? 30 : 45,
+          sourceFreshness: index === 0 ? [missingWave] : [freshWave]
+        }))
+      });
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) return jsonResponse(fullDayForecast);
+        return jsonResponse({ error: "not found" }, 404);
+      }));
+
+      render(<App />);
+
+      const indicator = await screen.findByTestId("source-status");
+      expect(indicator.textContent).toContain("Source data 45m old");
+      expect(indicator.classList.contains("degraded")).toBe(false);
+      expect(indicator.textContent).not.toContain("unavailable");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses the final retained row for header health when the entire forecast is elapsed", async () => {
+    const now = new Date("2026-08-10T00:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"], now });
+    try {
+      const forecast = fixtureForecast(spot, new Date("2026-08-02T07:00:00.000Z"));
+      const missingTide = {
+        capability: "tide" as const,
+        sourceId: "tide:unavailable",
+        sourceRunId: null,
+        updatedAt: null,
+        freshnessMinutes: null,
+        status: "missing" as const,
+        expectedCadenceMinutes: 1_440,
+        graceMinutes: 360
+      };
+      const elapsedForecast = ForecastResponseSchema.parse({
+        ...forecast,
+        generatedAt: now.toISOString(),
+        windows: forecast.windows.map((window, index) => ({
+          ...window,
+          sourceFreshness: index === forecast.windows.length - 1
+            ? [missingTide]
+            : window.sourceFreshness
+        }))
+      });
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) return jsonResponse(elapsedForecast);
+        return jsonResponse({ error: "not found" }, 404);
+      }));
+
+      render(<App />);
+
+      const indicator = await screen.findByTestId("source-status");
+      expect(indicator.textContent).toContain("Tide data unavailable");
+      expect(indicator.classList.contains("degraded")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not promote an edge-of-horizon missing slot to a global source outage", async () => {
+    const forecast = fixtureForecast();
+    const forecastWithFutureGap = ForecastResponseSchema.parse({
+      ...forecast,
+      windows: forecast.windows.map((window, index) => ({
+        ...window,
+        sourceFreshness: index === forecast.windows.length - 1
+          ? [{
+              capability: "wind" as const,
+              sourceId: "wind:future-gap",
+              sourceRunId: null,
+              updatedAt: null,
+              freshnessMinutes: null,
+              status: "missing" as const,
+              expectedCadenceMinutes: 360,
+              graceMinutes: 180
+            }]
+          : window.sourceFreshness
+      }))
+    });
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+      const path = requestPath(input);
+      if (path === "/api/spots") return jsonResponse(spotsResponse);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecastWithFutureGap);
+      return jsonResponse({ error: "not found" }, 404);
+    }));
+
     render(<App />);
 
-    expect(await screen.findByText("Buoy observations 3.1h old; expected hourly.")).toBeTruthy();
+    const indicator = await screen.findByTestId("source-status");
+    expect(indicator.classList.contains("degraded")).toBe(false);
+    expect(indicator.textContent).not.toContain("unavailable");
   });
 
   it("shows no banner when sources are merely aging within their declared grace", async () => {
@@ -466,19 +943,18 @@ describe("App", () => {
 
   it("collapses the header chip range when distinct ages format to the same label", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
-    const forecast = fixtureForecast();
-    const spreadForecast = ForecastResponseSchema.parse({
-      ...forecast,
-      generatedAt: new Date().toISOString(),
-      windows: forecast.windows.map((window, index) => ({
-        ...window,
-        sourceFreshnessMinutes: index === 0 ? 181 : 200
-      }))
-    });
+    const otherSpot = { ...spot, id: "other-break", name: "Other Break" } satisfies ApiSpot;
+    const catalog = {
+      spots: [spot, otherSpot],
+      sourceNote: "DOM-test age range catalog."
+    } satisfies SpotsResponse;
+    const firstForecast = forecastWithSourceAge(spot, 181);
+    const otherForecast = forecastWithSourceAge(otherSpot, 200);
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
       const path = requestPath(input);
-      if (path === "/api/spots") return jsonResponse(spotsResponse);
-      if (path === `/api/forecast/${spot.id}`) return jsonResponse(spreadForecast);
+      if (path === "/api/spots") return jsonResponse(catalog);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(firstForecast);
+      if (path === `/api/forecast/${otherSpot.id}`) return jsonResponse(otherForecast);
       if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
       return jsonResponse({ error: "not found" }, 404);
     }));
@@ -491,19 +967,18 @@ describe("App", () => {
 
   it("renders a genuine chip range when ages format differently", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
-    const forecast = fixtureForecast();
-    const spreadForecast = ForecastResponseSchema.parse({
-      ...forecast,
-      generatedAt: new Date().toISOString(),
-      windows: forecast.windows.map((window, index) => ({
-        ...window,
-        sourceFreshnessMinutes: index === 0 ? 45 : 300
-      }))
-    });
+    const otherSpot = { ...spot, id: "other-break", name: "Other Break" } satisfies ApiSpot;
+    const catalog = {
+      spots: [spot, otherSpot],
+      sourceNote: "DOM-test age range catalog."
+    } satisfies SpotsResponse;
+    const firstForecast = forecastWithSourceAge(spot, 45);
+    const otherForecast = forecastWithSourceAge(otherSpot, 300);
     vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
       const path = requestPath(input);
-      if (path === "/api/spots") return jsonResponse(spotsResponse);
-      if (path === `/api/forecast/${spot.id}`) return jsonResponse(spreadForecast);
+      if (path === "/api/spots") return jsonResponse(catalog);
+      if (path === `/api/forecast/${spot.id}`) return jsonResponse(firstForecast);
+      if (path === `/api/forecast/${otherSpot.id}`) return jsonResponse(otherForecast);
       if (path.startsWith(`/api/forecast/${spot.id}/brief?`)) return jsonResponse({ error: "not generated" }, 404);
       return jsonResponse({ error: "not found" }, 404);
     }));
@@ -586,7 +1061,7 @@ describe("App", () => {
     ).toBeTruthy();
   });
 
-  it("banners the worst late source and renders non-hourly cadence labels", async () => {
+  it("keeps multiple late-source ages out of the steady-state banner", async () => {
     window.history.replaceState({}, "", "/?spot=test-break");
     const forecast = fixtureForecast();
     const lateForecast = ForecastResponseSchema.parse({
@@ -628,13 +1103,13 @@ describe("App", () => {
       return jsonResponse({ error: "not found" }, 404);
     }));
 
-    render(<App />);
+    const { container } = render(<App />);
 
-    // Wind at 900/540 (ratio 1.67) beats the buoy at 186/120 (ratio 1.55).
-    expect(await screen.findByText("Wind forecast 15h old; expected every 6 hours.")).toBeTruthy();
+    expect(await screen.findByRole("table", { name: /Three-hour surf-planning inputs/ })).toBeTruthy();
+    expect(container.querySelector(".noticeBanner")).toBeNull();
   });
 
-  it("scopes the late banner to the affected spot when other spots' sources are fresh", async () => {
+  it("does not turn a spot-specific source age into a regional banner", async () => {
     const spotB = { ...spot, id: "second-break", name: "Second Break" } satisfies ApiSpot;
     const twoSpots = { spots: [spot, spotB], sourceNote: "DOM-test catalog." } satisfies SpotsResponse;
     const entry = (freshnessMinutes: number, status: "fresh" | "stale") => ({
@@ -667,13 +1142,10 @@ describe("App", () => {
       return jsonResponse({ error: "not found" }, 404);
     }));
 
-    render(<App />);
+    const { container } = render(<App />);
 
-    // The buoy is late for Test Break only, so the banner names the spot
-    // instead of contradicting Second Break's fresh source panel.
-    expect(
-      await screen.findByText("Buoy observations at Test Break 3.1h old; expected hourly.")
-    ).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 1 })).toBeTruthy();
+    expect(container.querySelector(".noticeBanner")).toBeNull();
   });
 
   it("never banners null-age placeholders or pre-cadence entries", async () => {
@@ -736,7 +1208,15 @@ describe("App", () => {
     await waitFor(() => {
       expect(new URLSearchParams(window.location.search).get("view")).toBe("graph");
     });
-    expect(await screen.findByRole("img", { name: "Stepped modeled nearshore wave-height chart" })).toBeTruthy();
+    const surfGraph = await screen.findByRole("img", { name: "Stepped surf-size estimate chart" });
+    fireEvent.keyDown(surfGraph, { key: "Home" });
+    const firstChartAt = new URLSearchParams(window.location.search).get("at");
+    expect(firstChartAt).toBeTruthy();
+    fireEvent.keyDown(surfGraph, { key: "End" });
+    await waitFor(() => {
+      expect(new URLSearchParams(window.location.search).get("at")).not.toBe(firstChartAt);
+    });
+    expect(document.getElementById("forecast-graph-selection")?.textContent).toContain("selected");
 
     fireEvent.click(screen.getByRole("radio", { name: "One-hour resolution" }));
     await waitFor(() => {
@@ -780,7 +1260,7 @@ describe("App", () => {
 
     releaseRecovery();
     await waitFor(() => {
-      expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+      expect(container.querySelector(".spotCall")?.textContent).toContain("surf with");
       expect(container.querySelector(".spotCall")?.textContent).not.toContain("No reliable wave call yet");
       expect(screen.queryByText("Some forecasts are temporarily unavailable. We'll try again automatically.")).toBeNull();
     });
@@ -834,7 +1314,7 @@ describe("App", () => {
 
     releaseRecovery();
     await waitFor(() => {
-      expect(container.querySelector(".spotCall")?.textContent).toContain("modeled nearshore Hs");
+      expect(container.querySelector(".spotCall")?.textContent).toContain("surf with");
     });
     expect(screen.getByText("The latest update is delayed. Showing the last forecast we loaded.")).toBeTruthy();
   });

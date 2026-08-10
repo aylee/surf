@@ -254,12 +254,24 @@ export async function fetchCoopsTidePredictionsForSpots(
     fetcher?: SourceFetch;
     now?: Date;
     horizonHours?: number;
+    horizonEndAt?: string;
   } = {}
 ): Promise<AdapterOutcome<TidePredictionRow, CoopsTideMetadata> & { events: TideEventRow[] }> {
   const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
   const now = options.now ?? new Date();
   const start = new Date(now);
-  const end = new Date(now.getTime() + (options.horizonHours ?? 72) * 60 * 60 * 1000);
+  const explicitEndMs = options.horizonEndAt === undefined
+    ? null
+    : Date.parse(options.horizonEndAt);
+  if (
+    explicitEndMs !== null &&
+    (!Number.isFinite(explicitEndMs) || explicitEndMs <= now.getTime())
+  ) {
+    throw new Error("CO-OPS horizonEndAt must be a valid instant after now");
+  }
+  const end = explicitEndMs === null
+    ? new Date(now.getTime() + (options.horizonHours ?? 72) * 60 * 60 * 1000)
+    : new Date(explicitEndMs);
   const stationIds = [
     ...new Set(spots.map((spot) => spot.sourceMap.coopsTide.stationId).filter(Boolean))
   ].sort();

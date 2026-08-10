@@ -3,14 +3,18 @@ import {
   LEGACY_WAVE_FALLBACK_CADENCE_MINUTES,
   LEGACY_WAVE_FALLBACK_GRACE_MINUTES,
   sourceFreshnessVerdict,
+  SurfAnalysisResponseV3Schema,
   type ApiSpot,
   type ForecastResponse,
   type FreshnessVerdict,
   type ScoredForecastWindow,
   type SourceFreshness,
+  type SunPhases,
+  type SurfAnalysisResponseV3,
   type SwellComponent,
   type WaveObservationSummary
 } from "@surf/contracts";
+import { intervalOverlapsCivilLight } from "@surf/forecast-core";
 import { cardinalDirection, confidenceLabel, localDateParts, surfaceCondition, windRelation } from "../../forecast-view";
 
 export type ForecastInterval = "1h" | "3h";
@@ -76,6 +80,9 @@ export type SourceHealth = {
 export type WorkbenchForecast = {
   interval: ForecastInterval;
   windows: WorkbenchWindow[];
+  /** null means a legacy payload omitted the field; [] is an authoritative no-call. */
+  recommendations: WorkbenchRecommendation[] | null;
+  sunPhases: SunPhases[];
   tideEvents: TideEvent[];
   sourceHealth: SourceHealth[];
   observations: WaveObservationSummary[];
@@ -84,19 +91,15 @@ export type WorkbenchForecast = {
   sourceNote: string;
 };
 
-export type DailyBrief = {
-  status: "model" | "deterministic_fallback" | "stale";
-  provider: "google" | "deterministic";
-  fallbackReason: string | null;
-  availableRevisions: number | null;
-  headline: string;
-  setup: string;
-  picks: Array<{ windowId: string | null; label: string | null; why: string; tradeoff: string | null }>;
-  bustFactors: string[];
-  lesson: { topic: string | null; text: string } | null;
-  revision: number | null;
-  generatedAt: string | null;
+export type WorkbenchRecommendation = {
+  localDate: string;
+  representative: WorkbenchWindow;
+  constituentWindowIds: string[];
+  startAt: string;
+  endAt: string;
 };
+
+export type DailyAnalysis = SurfAnalysisResponseV3;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -232,25 +235,6 @@ function waveVerdictFor(waveFreshness: SourceFreshness | undefined, sourceAge: n
     expectedCadenceMinutes: LEGACY_WAVE_FALLBACK_CADENCE_MINUTES,
     graceMinutes: LEGACY_WAVE_FALLBACK_GRACE_MINUTES
   });
-}
-
-function localMinuteOfDay(value: string, timeZone: string): number {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-    timeZone
-  }).formatToParts(new Date(value));
-  const hour = Number(parts.find((part) => part.type === "hour")?.value ?? 0);
-  const minute = Number(parts.find((part) => part.type === "minute")?.value ?? 0);
-  return hour * 60 + minute;
-}
-
-function phaseMinuteOfDay(value: string, timeZone: string): number | null {
-  const clock = value.match(/^(\d{1,2}):(\d{2})/);
-  if (clock) return Number(clock[1]) * 60 + Number(clock[2]);
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : localMinuteOfDay(value, timeZone);
 }
 
 function adaptWindow(window: ScoredForecastWindow, spot: ApiSpot): WorkbenchWindow {
@@ -468,15 +452,19 @@ export function adaptForecastResponse(
   const windows = response.windows
     .map((window) => adaptWindow(window, spot))
     .sort((left, right) => left.forecastAt.localeCompare(right.forecastAt));
-  for (const window of windows) {
+  for (const [index, window] of windows.entries()) {
     const phase = response.sunPhases?.find((candidate) => candidate.localDate === window.localDateKey);
     if (!phase) continue;
-    const firstLight = phaseMinuteOfDay(phase.firstLight, spot.timezone);
-    const lastLight = phaseMinuteOfDay(phase.lastLight, spot.timezone);
-    const windowMinute = localMinuteOfDay(window.forecastAt, spot.timezone);
-    if (firstLight !== null && lastLight !== null) {
-      window.isDaylight = windowMinute >= firstLight && windowMinute <= lastLight;
-    }
+    const next = windows[index + 1];
+    const displayEndAt = next?.localDateKey === window.localDateKey
+      ? next.forecastAt
+      : addHours(window.forecastAt, interval === "1h" ? 1 : 3);
+    window.isDaylight = intervalOverlapsCivilLight(
+      window.forecastAt,
+      displayEndAt,
+      phase.firstLight,
+      phase.lastLight
+    );
   }
   windows.forEach((window, index) => {
     if (!window.tideTrend) window.tideTrend = inferTideTrend(windows, index);
@@ -484,6 +472,17 @@ export function adaptForecastResponse(
   return {
     interval,
     windows,
+    recommendations:
+      response.recommendations === undefined
+        ? null
+        : response.recommendations.map((recommendation) => ({
+            localDate: recommendation.localDate,
+            representative: adaptWindow(recommendation.representative, spot),
+            constituentWindowIds: recommendation.constituentWindowIds,
+            startAt: recommendation.startAt,
+            endAt: recommendation.endAt
+          })),
+    sunPhases: response.sunPhases ?? [],
     tideEvents: adaptTideEvents(raw),
     sourceHealth: adaptSourceHealth(raw, windows),
     observations: adaptObservations(response, raw),
@@ -503,62 +502,9 @@ export function formatSwell(component: WorkbenchSwell): string {
   return `${height} @ ${period} ${cardinalDirection(component.directionDeg)}`;
 }
 
-export function parseBriefResponse(payload: unknown): DailyBrief | null {
-  const envelope = record(payload);
-  if (!envelope) return null;
-  const source = record(envelope.brief) ?? envelope;
-  const headline = stringValue(source.headline);
-  const setup = stringValue(source.setup) ?? stringValue(source.summary);
-  if (!headline || !setup) return null;
-  const picks = Array.isArray(source.picks)
-    ? source.picks.flatMap((value) => {
-        const pick = record(value);
-        const why = pick ? stringValue(pick.why) ?? stringValue(pick.explanation) : null;
-        return why
-          ? [{
-              windowId: stringValue(pick?.windowId),
-              label: stringValue(pick?.label),
-              why,
-              tradeoff: stringValue(pick?.tradeoff)
-            }]
-          : [];
-      })
-    : [];
-  const bustFactors = Array.isArray(source.bustFactors)
-    ? source.bustFactors
-        .map((value) => stringValue(value) ?? stringValue(record(value)?.text))
-        .filter((value): value is string => value !== null)
-    : [];
-  const lessonRecord = record(source.lesson) ?? record(source.learningNote);
-  const lessonText = lessonRecord
-    ? stringValue(lessonRecord.text) ?? stringValue(lessonRecord.explanation)
-    : stringValue(source.lesson);
-  const rawStatus = stringValue(envelope.status);
-  const rawProvider = stringValue(source.provider);
-  const status = rawStatus === "model" || rawStatus === "deterministic_fallback" || rawStatus === "stale"
-    ? rawStatus
-    : rawProvider === "google"
-      ? "model"
-      : "deterministic_fallback";
-  const provider = rawProvider === "google" && status === "model" ? "google" : "deterministic";
-  return {
-    status,
-    provider,
-    fallbackReason: stringValue(envelope.fallbackReason),
-    availableRevisions: finiteNumber(envelope.availableRevisions),
-    headline,
-    setup,
-    picks,
-    bustFactors,
-    lesson: lessonText
-      ? { topic: lessonRecord ? stringValue(lessonRecord.topic) : null, text: lessonText }
-      : null,
-    revision: finiteNumber(source.revision),
-    generatedAt: (() => {
-      const value = stringValue(source.generatedAt);
-      return value && Number.isFinite(new Date(value).getTime()) ? value : null;
-    })()
-  };
+export function parseBriefResponse(payload: unknown): DailyAnalysis | null {
+  const parsed = SurfAnalysisResponseV3Schema.safeParse(payload);
+  return parsed.success ? parsed.data : null;
 }
 
 export function readWorkbenchUrl(search: string): {

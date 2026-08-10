@@ -52,12 +52,20 @@ export function wranglerStructureFailures(config, configPath) {
   const consumers = config?.queues?.consumers ?? [];
   const ingestQueue = `${name}-ingest`;
   const deadLetterQueue = `${name}-ingest-dlq`;
+  const narrativeQueue = `${name}-narrative`;
+  const ingestProducers = producers.filter((producer) => producer.binding === "INGEST_QUEUE");
+  const narrativeProducers = producers.filter(
+    (producer) => producer.binding === "NARRATIVE_QUEUE"
+  );
   if (
-    producers.length !== 1 ||
-    producers[0]?.binding !== "INGEST_QUEUE" ||
-    producers[0]?.queue !== ingestQueue
+    producers.length !== 2 ||
+    ingestProducers.length !== 1 ||
+    ingestProducers[0]?.queue !== ingestQueue
   ) {
     failures.push(`INGEST_QUEUE must produce to ${ingestQueue}.`);
+  }
+  if (narrativeProducers.length !== 1 || narrativeProducers[0]?.queue !== narrativeQueue) {
+    failures.push(`NARRATIVE_QUEUE must produce to ${narrativeQueue}.`);
   }
   if (
     consumers.length !== 1 ||
@@ -68,6 +76,9 @@ export function wranglerStructureFailures(config, configPath) {
   }
   if (consumers[0]?.max_batch_size !== 1 || consumers[0]?.max_concurrency !== 1) {
     failures.push("Ingest queue consumption must be serialized one message at a time.");
+  }
+  if (consumers.some((consumer) => consumer.queue === narrativeQueue)) {
+    failures.push("The narrative queue must use an out-of-band HTTP pull consumer, not a Worker consumer.");
   }
   if (
     !Array.isArray(config?.triggers?.crons) ||
@@ -119,15 +130,26 @@ export function wranglerStructureFailures(config, configPath) {
   }
   const isTrackedCanonicalConfig = basename(configPath) === "wrangler.jsonc";
   const briefEnabled = config?.vars?.FORECAST_BRIEF_ENABLED;
-  if (isTrackedCanonicalConfig && briefEnabled !== "false") {
+  if (briefEnabled !== "false") {
     failures.push(
-      "The tracked config must keep FORECAST_BRIEF_ENABLED=false for the first Durable Object lifecycle deploy."
+      "FORECAST_BRIEF_ENABLED must remain false; ForecastBriefAgent is dormant rollback compatibility, not the active Analysis path."
     );
-  } else if (!isTrackedCanonicalConfig && briefEnabled !== "false" && briefEnabled !== "true") {
-    failures.push("FORECAST_BRIEF_ENABLED must be either 'true' or 'false'.");
   }
   if (config?.vars?.GEMINI_API_KEY !== undefined) {
     failures.push("GEMINI_API_KEY must be a Wrangler secret, never a tracked Worker var.");
+  }
+  const narrativeEnabled = config?.vars?.NARRATIVE_ENABLED;
+  if (isTrackedCanonicalConfig && narrativeEnabled !== "false") {
+    failures.push("The tracked config must keep NARRATIVE_ENABLED=false until pull infrastructure exists.");
+  } else if (
+    !isTrackedCanonicalConfig &&
+    narrativeEnabled !== "false" &&
+    narrativeEnabled !== "true"
+  ) {
+    failures.push("NARRATIVE_ENABLED must be either 'true' or 'false'.");
+  }
+  if (config?.vars?.NARRATIVE_RESULT_TOKEN !== undefined) {
+    failures.push("NARRATIVE_RESULT_TOKEN must be a Wrangler secret, never a tracked Worker var.");
   }
   if (config?.observability?.enabled !== true) {
     failures.push("Worker observability must be enabled at the top level.");
