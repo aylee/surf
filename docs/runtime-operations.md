@@ -84,18 +84,39 @@ because the limit is not a reservation. Increasing the guard is not the default
 response to renewed `exceededCpu`: first inspect CPU traces and D1 rows read,
 then optimize or split the work.
 
+D1 `rows_read` bounds database work and cost; it is not a Worker CPU proxy.
+Database-query wait is excluded from Worker CPU, while returned fallback rows
+are still merged in JavaScript, so runtime traces remain the CPU authority.
+
 This deployment contract requires the Standard usage model. Cloudflare
 documents [configurable limits as Standard-only](https://developers.cloudflare.com/workers/wrangler/configuration/#limits)
 and currently prices Standard under Workers Paid; Workers Free's 10 ms
 per-invocation budget cannot run the measured materialization path. The
 pre-deploy config validator rejects a missing or different CPU limit. Project
-automation never changes account usage models, subscriptions, or billing. If a
-read-only account check does not already report Standard, stop before deploying
-instead of turning a runtime repair into a plan upgrade.
+automation never changes account usage models, subscriptions, or billing. An
+existing version's `resources.script_runtime.usage_model = standard` is not
+proof of current account entitlement: a Worker on a Free account can still
+report that version metadata while rejecting a new custom CPU limit. For an
+existing Worker, `pnpm deploy` first idempotently reconciles configured Queues
+because Wrangler refuses `versions upload` when any referenced Queue is
+missing. It then stages the exact target. Acceptance by that upload API is the
+capability proof and gates every D1 migration/seed; Cloudflare error `100328`
+means the account does not support the 2,000 ms limit, and the command stops
+without a Free fallback. Missing Queues may therefore have been created before
+an entitlement rejection, but D1 is untouched. For first-time setup, verify
+Workers Paid in the Cloudflare billing dashboard before authorizing
+provisioning; a Worker version cannot be staged before the Worker and its
+bindings exist.
 
 Before deploying a CPU-limit change, record the active Worker version and a D1
 Time Travel bookmark. Run `pnpm check:cloudflare`, then deploy through the
-supported `pnpm deploy` path. From the returned exact version ID, verify:
+supported `pnpm deploy` path. That path uploads an inactive version, parses
+Wrangler's exact `Worker Version ID`, and verifies the staged version reports
+the configured runtime guard before preparing D1. Queue reconciliation happens
+first because it is a Wrangler upload precondition. It activates only that ID
+at 100% after storage preparation succeeds and an immediate control-plane
+recheck proves the original predecessor is still active. From the returned
+exact version ID, verify:
 
 ```bash
 pnpm wrangler -- versions view <version-id> --json
@@ -115,8 +136,9 @@ Follow the global version-1 rollback gate in [Deploy and
 rollback](#deploy-and-rollback): first prove Queue quiescence, no consumer in
 flight, DLQ and retry state, and predecessor payload compatibility. Additive D1
 indexes can remain in place, but that does not make a Worker rollback
-Queue-safe. Returning to the former effective 50 ms CPU cap also restores the
-known stale-report failure mode.
+Queue-safe. Returning to the Free-plan 10 ms budget—or relying on its
+non-guaranteed over-limit flexibility—also restores the known stale-report
+failure mode; failed historical deliveries clustered around 50–85 ms.
 
 Successful forecast responses use a one-minute shared-cache TTL with five
 minutes of stale-while-revalidate. `/brief` is always `Cache-Control: no-store`
@@ -204,10 +226,14 @@ Expected results:
 
 - `pnpm verify` completes the fresh-D1, test, build, and secretless bundle
   gates before production changes.
-- `pnpm deploy` activates one version, publishes one complete generation, and
-  finishes its strict smoke. After Worker activation, recover a failed
-  readiness/publication check by fixing forward; rollback still requires
-  explicit Queue-quiescence and payload-compatibility proof.
+- `pnpm deploy` reconciles configured Queues, stages and verifies one inactive
+  target version, then prepares D1, rechecks the predecessor, activates only
+  the target, synchronizes triggers, publishes one complete generation, and
+  finishes its strict smoke. A staging or runtime-proof failure happens before
+  D1 mutation, although Queue creation may already have occurred. After Worker
+  activation, recover a failed settings patch, trigger, readiness, or
+  publication check by fixing forward; rollback still requires explicit Queue
+  quiescence and payload-compatibility proof.
 - `pnpm ops:status` prints four compact `PASS` rows: HTTPS health and the exact
   serving Worker version; one active deployment at 100%; one ingest consumer
   with batch/concurrency `1/1` and the configured DLQ; and one ready read-model
@@ -656,9 +682,18 @@ a secretless Wrangler dry-run. It leaves the normal local development database
 untouched.
 
 For additive changes, back up D1 and export the required
-`SURF_INGEST_TOKEN`, then use the supported `pnpm deploy` path. Deployment
-applies migrations, deploys the Worker, parses Wrangler's exact version ID,
-proves that version is reachable with an exact override, and then requires
+`SURF_INGEST_TOKEN`, set `SURF_BASE_URL` to the bare HTTPS production origin,
+then use the supported `pnpm deploy` path. Deployment first proves the
+predecessor is one version at 100% and reconciles configured Queues. Wrangler
+prechecks those Queues before `versions upload`, so Queue creation is the one
+allowed mutation before account capability is proven. Deployment then stages
+the exact target, parses Wrangler's `Worker Version ID`, and reads that inactive
+version back to require Standard plus `limits.cpu_ms = 2000`. Only then does it
+apply D1 migrations/seed. Immediately before activation it proves the original
+predecessor remains the sole 100% version, refusing to overwrite a concurrent
+deployment. It activates the target ID at 100% with `wrangler versions deploy`,
+synchronizes workers.dev, cron, and Queue-consumer triggers, proves the version
+is reachable with an exact override, and then requires
 three consecutive cache-busted, unpinned version-matched health responses
 before requiring the active deployment JSON to contain exactly that one version
 at 100%. It samples bounded fresh affinity sessions; a session freezes one key
@@ -678,10 +713,11 @@ all-target round passes, and `versionConvergenceRounds` records recovery when
 more than one round was needed. It then
 rechecks the one-version/100% control-plane state. A callable 0%-traffic version
 therefore cannot cross the initial gate. These control-plane reads are strong
-before/after checkpoints, not an atomic deployment lock: a concurrent split can
-begin between them. The Worker UUID precondition is the mutation-safety
-boundary—it guarantees the PATCH can enqueue only on the expected version—and
-the final checkpoint detects a split that remains after smoke.
+before/immediately-before/after checkpoints, not an atomic deployment lock: a
+concurrent split can begin between them. The Worker UUID precondition is the
+mutation-safety boundary—it guarantees the PATCH can enqueue only on the
+expected version—and the final checkpoint detects a split that remains after
+smoke.
 
 Worker activation is the rollback safety boundary, not the deploy command's
 own ingest handoff. Cron, authenticated traffic, or an existing backlog can
@@ -696,6 +732,24 @@ Worker active and must be treated as an urgent fix-forward. Only roll back
 after independently proving the Queue is quiescent, no consumer is in flight,
 and every queued payload is compatible with the predecessor. Additive D1
 tables remain in place.
+
+Wrangler creates a version deployment before patching non-versioned
+observability settings, so `versions deploy` can exit nonzero after the target
+is already active. On any activation-command error, automation immediately
+reads deployment status. It continues trigger synchronization and readiness
+only if the staged target is the sole version at 100%, emitting an explicit
+active/fix-forward event. Any different, split, or unreadable status is treated
+as ambiguous activation: enqueue is stopped and the operator must inspect the
+deployment before retrying or rolling back.
+
+Wrangler's staged upload may leave an inactive, callable preview version when a
+later D1, predecessor-recheck, or activation step fails. It receives no
+ordinary production traffic and must not be mistaken for an active rollback
+boundary. Diagnose and
+retry the supported deploy; do not activate the orphan manually. A failure
+after `versions deploy` is different: the new Worker is active even if trigger
+synchronization or later verification fails, so fix forward under the Queue
+safety rules below.
 
 The version-1 `source-batch` and `analysis-signal` payloads are intentionally
 distinct and are not understood by their predecessors. Before rolling back

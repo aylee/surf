@@ -47,7 +47,7 @@ test("deployment preflight requires one active version at 100 percent", () => {
   }
 });
 
-test("preflight proves Standard without requiring an existing explicit CPU limit", () => {
+test("usage_model is version metadata and can be parsed without a CPU-limit assertion", () => {
   assert.deepEqual(parseWorkerRuntime(versionDetail(), { expectedVersionId: versionId }), {
     workerVersion: versionId,
     usageModel: "standard",
@@ -62,7 +62,7 @@ test("preflight proves Standard without requiring an existing explicit CPU limit
   );
 });
 
-test("post-deploy runtime proof requires the exact version and 2000 ms guard", () => {
+test("staged-target runtime proof requires the exact version and 2000 ms guard", () => {
   assert.deepEqual(
     parseWorkerRuntime(versionDetail({ limits: { cpu_ms: 2_000 } }), {
       expectedVersionId: versionId,

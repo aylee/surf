@@ -7,11 +7,17 @@ import {
   runWrangler
 } from "./lib/cloudflare-commands.mjs";
 import { bootstrapDeployedWorker } from "./lib/deploy-bootstrap.mjs";
-import { deployExistingWorker } from "./lib/deploy-orchestration.mjs";
+import {
+  deployExistingWorker,
+  workerTriggerSyncArgs,
+  workerVersionActivationArgs,
+  workerVersionUploadArgs
+} from "./lib/deploy-orchestration.mjs";
 import {
   resolveActiveDeploymentId,
   resolveDeployedUrl,
-  resolveDeployedVersionId
+  resolveDeployedVersionId,
+  resolveUploadedVersionId
 } from "./lib/deploy-url.mjs";
 import {
   parseWorkerRuntime,
@@ -21,6 +27,7 @@ import {
   assertWorkerVersionId,
   waitForWorkerVersion
 } from "./lib/worker-version.mjs";
+import { workerVersionUploadFailure } from "./lib/worker-release-errors.mjs";
 
 const mode = process.argv[2];
 const dryRun = process.argv.includes("--dry-run");
@@ -58,6 +65,34 @@ function deployWorker() {
   });
 }
 
+function uploadWorkerVersion() {
+  let output;
+  try {
+    output = runWrangler(workerVersionUploadArgs(), {
+      capture: true,
+      env: { CI: "true" }
+    });
+  } catch (error) {
+    throw workerVersionUploadFailure(error);
+  }
+  return {
+    output,
+    versionId: resolveUploadedVersionId(output)
+  };
+}
+
+function activateUploadedVersion({ versionId }) {
+  runWrangler(workerVersionActivationArgs(versionId), {
+    env: { CI: "true" }
+  });
+}
+
+function syncTriggers() {
+  // `versions deploy` syncs non-versioned Worker settings, but routes, cron,
+  // and Queue consumers remain a separate Wrangler operation.
+  runWrangler(workerTriggerSyncArgs(), { env: { CI: "true" } });
+}
+
 function migrateAndSeed() {
   runWrangler(["d1", "migrations", "apply", "DB", "--remote"], {
     env: { CI: "true" }
@@ -77,19 +112,7 @@ function deployedUrl(output) {
   return resolveDeployedUrl(output, process.env.SURF_BASE_URL);
 }
 
-function smoke(
-  output,
-  requireForecastData,
-  expectedVersionId,
-  expectedWorkerName
-) {
-  const url = deployedUrl(output);
-  if (!url) {
-    throw new Error(
-      "Deployment completed, but its URL could not be inferred. Set SURF_BASE_URL and rerun pnpm deploy so the required smoke test can finish."
-    );
-  }
-
+function smoke(url, requireForecastData, expectedVersionId, expectedWorkerName) {
   runPnpm(["--filter", "@surf/web", "smoke:cloudflare"], {
     env: {
       SURF_BASE_URL: url,
@@ -105,16 +128,10 @@ function smoke(
 }
 
 function refreshForecastReadModels(
-  output,
+  url,
   expectedVersionId,
   expectedWorkerName
 ) {
-  const url = deployedUrl(output);
-  if (!url) {
-    throw new Error(
-      "Deployment completed, but its URL could not be inferred. Set SURF_BASE_URL before deployment so forecast read models can be published."
-    );
-  }
   runPnpm(["ingest:remote"], {
     env: {
       SURF_BASE_URL: url,
@@ -162,28 +179,53 @@ function inspectWorkerRuntime(expectedVersionId, { requireCpuLimit, checkpoint }
   return runtime;
 }
 
-function assertExistingDeploymentRuntime() {
+function assertExistingDeploymentState() {
   const deploymentOutput = runWrangler(
     ["deployments", "status", "--json"],
     { capture: true, echo: false }
   );
   const activeVersionId = resolveSoleActiveWorkerVersionId(deploymentOutput);
-  // The predecessor may inherit Cloudflare's historical 50 ms guard, so only
-  // the Standard account/runtime prerequisite is required before mutation.
-  return inspectWorkerRuntime(activeVersionId, {
-    requireCpuLimit: false,
-    checkpoint: "pre-mutation"
-  });
+  // A predecessor's usage_model is version metadata, not account-plan proof.
+  // The target versions-upload request below is the capability gate.
+  console.log(JSON.stringify({
+    status: "predecessor-deployment",
+    workerVersion: activeVersionId,
+    percentage: 100
+  }));
+  return activeVersionId;
 }
 
-async function waitUntilServing(output, expectedWorkerName) {
-  const url = deployedUrl(output);
-  if (!url) {
+function assertPredecessorStillActive(expectedVersionId) {
+  try {
+    return assertDeploymentActive(
+      expectedVersionId,
+      "pre-activation-predecessor"
+    );
+  } catch (error) {
     throw new Error(
-      "Deployment completed, but its URL could not be inferred. Set SURF_BASE_URL so exact-version readiness can run."
+      `The active Worker changed after staging/storage preparation; refusing to overwrite a concurrent deployment. Expected predecessor ${expectedVersionId}. Inspect deployments before retrying.`,
+      { cause: error }
     );
   }
-  const expectedVersionId = resolveDeployedVersionId(output);
+}
+
+function assertUploadedVersionActive({ versionId }) {
+  const deploymentId = assertDeploymentActive(
+    versionId,
+    "activation-error-reconciled"
+  );
+  console.warn(
+    JSON.stringify({
+      status: "activation-command-failed-target-active",
+      deploymentId,
+      workerVersion: versionId,
+      action: "continue-fix-forward-through-trigger-sync-and-readiness"
+    })
+  );
+  return deploymentId;
+}
+
+async function waitUntilServing(url, expectedVersionId, expectedWorkerName) {
   const result = await waitForWorkerVersion({
     baseUrl: url,
     expectedVersionId,
@@ -209,6 +251,13 @@ if (mode === "deploy" && !process.env.SURF_INGEST_TOKEN?.trim()) {
   );
 }
 
+const updateDeploymentUrl = mode === "deploy" ? deployedUrl("") : undefined;
+if (mode === "deploy" && !updateDeploymentUrl) {
+  throw new Error(
+    "Deployment requires SURF_BASE_URL to be a bare HTTPS production origin. Wrangler versions upload emits a preview URL, which is deliberately never used as production readiness evidence."
+  );
+}
+
 runWrangler(["whoami"]);
 
 let output;
@@ -227,9 +276,20 @@ if (mode === "setup") {
       { cause: error }
     );
   }
-  const rollout = await waitUntilServing(output, expectedWorkerName);
+  const setupUrl = deployedUrl(output);
+  if (!setupUrl) {
+    throw new Error(
+      "Setup completed, but its production URL could not be inferred. Set SURF_BASE_URL and rerun pnpm setup:cloudflare so the required smoke test can finish."
+    );
+  }
+  const setupVersionId = resolveDeployedVersionId(output);
+  const rollout = await waitUntilServing(
+    setupUrl,
+    setupVersionId,
+    expectedWorkerName
+  );
   smoke(
-    output,
+    setupUrl,
     false,
     rollout.expectedVersionId,
     rollout.expectedWorkerName
@@ -237,8 +297,14 @@ if (mode === "setup") {
   assertDeploymentActive(rollout.expectedVersionId, "post-smoke");
 } else {
   let rollout;
-  output = await deployExistingWorker({
-    assertExistingDeploymentRuntime,
+  await deployExistingWorker({
+    assertExistingDeploymentState,
+    uploadWorkerVersion,
+    inspectUploadedRuntime: ({ versionId }) =>
+      inspectWorkerRuntime(versionId, {
+        requireCpuLimit: true,
+        checkpoint: "staged-pre-mutation"
+      }),
     ensureQueues,
     migrateAndSeed: () => {
       try {
@@ -250,29 +316,31 @@ if (mode === "setup") {
         );
       }
     },
-    deployWorker,
-    inspectUploadedRuntime: (deployOutput) =>
-      inspectWorkerRuntime(resolveDeployedVersionId(deployOutput), {
-        requireCpuLimit: true,
-        checkpoint: "post-upload"
-      }),
-    completeRollout: async (deployOutput) => {
+    assertPredecessorStillActive,
+    activateUploadedVersion,
+    assertUploadedVersionActive,
+    syncTriggers,
+    completeRollout: async ({ versionId }) => {
       await bootstrapDeployedWorker({
         waitUntilServing: async () => {
-          rollout = await waitUntilServing(deployOutput, expectedWorkerName);
+          rollout = await waitUntilServing(
+            updateDeploymentUrl,
+            versionId,
+            expectedWorkerName
+          );
         },
         // Forecast GETs intentionally serve precomputed D1 read models. Queue
         // the first generation only after the exact rollout version is stable,
         // then wait for publication before strict post-deploy smoke.
         enqueueAndWait: () =>
           refreshForecastReadModels(
-            deployOutput,
+            updateDeploymentUrl,
             rollout.expectedVersionId,
             rollout.expectedWorkerName
           ),
         smoke: () => {
           smoke(
-            deployOutput,
+            updateDeploymentUrl,
             true,
             rollout.expectedVersionId,
             rollout.expectedWorkerName
