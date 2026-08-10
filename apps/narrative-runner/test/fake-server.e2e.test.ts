@@ -51,7 +51,7 @@ describe("domain-neutral runner fake-server e2e", () => {
       makeJob({
         domain: "surf",
         jobId: "surf-job",
-        target: "surf.analysis.v3",
+        target: "surf.analysis.v5",
         submissionId: "surf-submission"
       }),
       makeJob({
@@ -86,6 +86,29 @@ describe("domain-neutral runner fake-server e2e", () => {
         body
       });
 
+      if (path.endsWith("/queues/queue-test") && request.method === "GET") {
+        json(response, {
+          success: true,
+          result: {
+            queue_id: "queue-test",
+            queue_name: "surf-narrative",
+            consumers_total_count: 1,
+            consumers: [
+              {
+                type: "http_pull",
+                dead_letter_queue: "surf-narrative-dlq",
+                settings: {
+                  batch_size: 1,
+                  max_retries: 0,
+                  retry_delay: 30,
+                  visibility_timeout_ms: 180_000
+                }
+              }
+            ]
+          }
+        });
+        return;
+      }
       if (path.endsWith("/messages/pull")) {
         const batchSize = Number((body as { batch_size: number }).batch_size);
         json(response, {
@@ -115,6 +138,7 @@ describe("domain-neutral runner fake-server e2e", () => {
       }
       if (path === "/v1/chat/completions") {
         json(response, {
+          model: "local-model",
           choices: [{ message: { content: JSON.stringify({ summary: "generated locally" }) } }]
         });
         return;
@@ -140,7 +164,7 @@ describe("domain-neutral runner fake-server e2e", () => {
     const port = (server.address() as AddressInfo).port;
     const origin = `http://127.0.0.1:${port}`;
     const targets = new Map(
-      ["surf.analysis.v3", "ski.summary.v1", "mtb.summary.v1"].map((target) => [
+      ["surf.analysis.v5", "ski.summary.v1", "mtb.summary.v1"].map((target) => [
         target,
         {
           url: `${origin}/api/internal/narratives/results`,
@@ -158,6 +182,8 @@ describe("domain-neutral runner fake-server e2e", () => {
     const status = new StatusTracker(
       config.runnerId,
       config.omlx.modelId,
+      config.releaseSha,
+      config.runtimeFingerprint,
       new MemoryStatusStore(),
       clock.now
     );
@@ -189,8 +215,13 @@ describe("domain-neutral runner fake-server e2e", () => {
     ]);
 
     const modelIndex = requests.findIndex(({ path }) => path === "/v1/models");
+    const queueIdentityIndex = requests.findIndex(({ path }) =>
+      path.endsWith("/queues/queue-test")
+    );
     const pullIndex = requests.findIndex(({ path }) => path.endsWith("/messages/pull"));
+    expect(queueIdentityIndex).toBeGreaterThanOrEqual(0);
     expect(modelIndex).toBeGreaterThanOrEqual(0);
+    expect(pullIndex).toBeGreaterThan(queueIdentityIndex);
     expect(pullIndex).toBeGreaterThan(modelIndex);
     const pull = requests[pullIndex]!;
     expect(pull.authorization).toBe("Bearer queue-secret");
@@ -214,7 +245,10 @@ describe("domain-neutral runner fake-server e2e", () => {
         },
         max_tokens: 256,
         temperature: 0,
-        stream: false
+        stream: false,
+        chat_template_kwargs: {
+          enable_thinking: false
+        }
       });
     }
 
@@ -234,9 +268,15 @@ describe("domain-neutral runner fake-server e2e", () => {
         "jobId",
         "modelId",
         "output",
+        "providerId",
+        "route",
         "schemaVersion",
         "submissionId"
       ]);
+      expect(submission.body).toMatchObject({
+        providerId: "omlx",
+        route: "primary"
+      });
     }
     expect(
       submissions.find(

@@ -61,11 +61,11 @@ function unavailableForecast(forecast = fixtureForecast()): ForecastResponse {
   });
 }
 
-function forecastWithDateScopedHazards(): ForecastResponse {
-  const forecast = fixtureForecast();
+function forecastWithDateScopedHazards(now: Date): ForecastResponse {
+  const forecast = fixtureForecast(spot, now);
   const reportDate = earliestAvailableLocalDateKey(
     [{ spot, windows: forecast.windows, sunPhases: forecast.sunPhases }],
-    new Date()
+    now
   );
   if (!reportDate) throw new Error("Fixture has no report date");
   const laterDate = [...new Set(
@@ -188,19 +188,25 @@ describe("App", () => {
   });
 
   it("keeps home hazards scoped to the local report date", async () => {
-    const forecast = forecastWithDateScopedHazards();
-    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
-      const path = requestPath(input);
-      if (path === "/api/spots") return jsonResponse(spotsResponse);
-      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
-      return jsonResponse({ error: "not found" }, 404);
-    }));
+    const now = new Date("2026-08-10T14:00:00.000Z"); // Aug 10, 7 AM PDT
+    vi.useFakeTimers({ toFake: ["Date"], now });
+    try {
+      const forecast = forecastWithDateScopedHazards(now);
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+        return jsonResponse({ error: "not found" }, 404);
+      }));
 
-    render(<App />);
+      render(<App />);
 
-    expect(await screen.findByText("Report-day advisory")).toBeTruthy();
-    expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
-    expect(screen.queryByText("Later-day advisory")).toBeNull();
+      expect(await screen.findByText("Report-day advisory")).toBeTruthy();
+      expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
+      expect(screen.queryByText("Later-day advisory")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("labels active typed hazards and hides expired typed hazards on home", async () => {
@@ -238,37 +244,43 @@ describe("App", () => {
   });
 
   it("keeps spot hazards scoped to the spot report date", async () => {
-    window.history.replaceState({}, "", "/?spot=test-break");
-    const forecast = forecastWithDateScopedHazards();
-    vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
-      const path = requestPath(input);
-      if (path === "/api/spots") return jsonResponse(spotsResponse);
-      if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
-      if (path === `/api/forecast/${spot.id}?interval=1h`) return jsonResponse({ ...forecast, interval: "1h" });
-      if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
-      return jsonResponse({ error: "not found" }, 404);
-    }));
+    const now = new Date("2026-08-10T14:00:00.000Z"); // Aug 10, 7 AM PDT
+    vi.useFakeTimers({ toFake: ["Date"], now });
+    try {
+      window.history.replaceState({}, "", "/?spot=test-break");
+      const forecast = forecastWithDateScopedHazards(now);
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+        const path = requestPath(input);
+        if (path === "/api/spots") return jsonResponse(spotsResponse);
+        if (path === `/api/forecast/${spot.id}`) return jsonResponse(forecast);
+        if (path === `/api/forecast/${spot.id}?interval=1h`) return jsonResponse({ ...forecast, interval: "1h" });
+        if (path.includes("/brief?")) return jsonResponse({ error: "not generated" }, 404);
+        return jsonResponse({ error: "not found" }, 404);
+      }));
 
-    render(<App />);
+      render(<App />);
 
-    expect(await screen.findByText("Report-day advisory")).toBeTruthy();
-    expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
-    expect(screen.queryByText("Later-day advisory")).toBeNull();
+      expect(await screen.findByText("Report-day advisory")).toBeTruthy();
+      expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
+      expect(screen.queryByText("Later-day advisory")).toBeNull();
 
-    const laterHazard = forecast.hazards?.find(
-      (hazard) => hazard.headline === "Later-day advisory"
-    );
-    expect(laterHazard?.startsAt).toBeTruthy();
-    const laterDayLabel = formatDay(laterHazard!.startsAt!, spot.timezone);
-    const laterDayButton = screen.getAllByRole("button").find((button) =>
-      button.closest(".forecastDayPicker") && button.textContent?.includes(laterDayLabel)
-    );
-    expect(laterDayButton).toBeTruthy();
-    fireEvent.click(laterDayButton!);
+      const laterHazard = forecast.hazards?.find(
+        (hazard) => hazard.headline === "Later-day advisory"
+      );
+      expect(laterHazard?.startsAt).toBeTruthy();
+      const laterDayLabel = formatDay(laterHazard!.startsAt!, spot.timezone);
+      const laterDayButton = screen.getAllByRole("button").find((button) =>
+        button.closest(".forecastDayPicker") && button.textContent?.includes(laterDayLabel)
+      );
+      expect(laterDayButton).toBeTruthy();
+      fireEvent.click(laterDayButton!);
 
-    expect(await screen.findByText("Later-day advisory")).toBeTruthy();
-    expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
-    await waitFor(() => expect(screen.queryByText("Report-day advisory")).toBeNull());
+      expect(await screen.findByText("Later-day advisory")).toBeTruthy();
+      expect(screen.getByText("Upcoming NWS hazard")).toBeTruthy();
+      await waitFor(() => expect(screen.queryByText("Report-day advisory")).toBeNull());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("classifies active and selected-date future hazards with half-open boundaries", () => {

@@ -15,7 +15,12 @@ import {
   selectSurfAnalysisBundlesForSignal,
   SURF_ANALYSIS_FUTURE_CADENCE_HOURS
 } from "../narrative";
-import { buildSurfAnalysisSnapshot, buildSurfNarrativeJob } from "../analysis";
+import {
+  buildSurfAnalysisSnapshot,
+  buildSurfNarrativeJob,
+  type SurfAnalysisPlanV5,
+  type SurfAnalysisValidationSnapshot
+} from "../analysis";
 import { localDateForTime, stableHourlyForecastTimes, stableThreeHourForecastTimes } from "../time";
 import {
   processIngestQueueMessage,
@@ -118,9 +123,41 @@ async function fixtureGeneration(generatedAt?: string) {
   return { threeHour, hourly, factBundles };
 }
 
+function validAnalysisPlan(snapshot: SurfAnalysisValidationSnapshot): SurfAnalysisPlanV5 {
+  const cards = (placement: SurfAnalysisValidationSnapshot["cards"][number]["placement"]) =>
+    snapshot.cards.filter((candidate) => candidate.placement === placement);
+  const outlook = cards("outlook");
+  const surfaceOutlook = outlook.find(({ domains }) =>
+    domains.some((domain) => domain === "surface" || domain === "wind")
+  );
+  const waveOutlook = outlook.find(({ domains }) => domains.includes("wave"));
+  const support = cards("primary_support")[0];
+  const tradeoff = cards("primary_tradeoff")[0];
+  const alternate = cards("alternate")[0];
+  const watch = cards("watch")[0];
+  if (!surfaceOutlook || !waveOutlook || !support || !watch) {
+    throw new Error("Incomplete Analysis fixture");
+  }
+  return {
+    schemaVersion: 1,
+    outlook: {
+      leadCardId: surfaceOutlook.id,
+      supportingCardId: waveOutlook.id
+    },
+    call: {
+      primarySupportCardId: support.id,
+      primaryTradeoffCardId: tradeoff?.id ?? null,
+      alternateCardId:
+        snapshot.callMode === "primary_and_alternate" ? alternate?.id ?? null : null
+    },
+    close: { watchCardId: watch.id }
+  };
+}
+
 function baseEnv(db: D1Database, options: {
   ingestSend?: (body: unknown) => Promise<void>;
   narrativeSend?: (body: unknown) => Promise<void>;
+  fallbackSend?: (body: unknown) => Promise<void>;
 } = {}): Env {
   return {
     ENVIRONMENT: "test",
@@ -135,12 +172,17 @@ function baseEnv(db: D1Database, options: {
     NARRATIVE_QUEUE: {
       send: options.narrativeSend ?? (async () => undefined)
     } as unknown as Queue,
+    NARRATIVE_FALLBACK_QUEUE: {
+      send: options.fallbackSend ?? (async () => undefined)
+    } as unknown as Queue,
     NARRATIVE_ENABLED: "true",
-    NARRATIVE_RESULT_TOKEN: "test-result-token"
+    NARRATIVE_RESULT_TOKEN: "test-result-token",
+    GEMINI_API_KEY: "test-gemini-key"
   };
 }
 
 beforeEach(async () => {
+  await env.DB.prepare("delete from narrative_fallback_attempts").run();
   await env.DB.prepare("delete from narrative_revisions").run();
   await env.DB.prepare("delete from narrative_jobs").run();
   await env.DB.prepare("delete from forecast_fact_bundles where spot_id = 'linda-mar'").run();
@@ -148,6 +190,61 @@ beforeEach(async () => {
 });
 
 describe("versioned Analysis signal query budgets", () => {
+  it("re-enqueues exactly one fallback watchdog when pre-claim reads fail", async () => {
+    const fallbackSend = vi.fn(async () => undefined);
+    const failedDb = {
+      prepare() {
+        throw new Error("temporary D1 read failure");
+      }
+    } as unknown as D1Database;
+    const settlements = [0, 1].map(() => ({ ack: vi.fn(), retry: vi.fn() }));
+    const body = {
+      schemaVersion: 1 as const,
+      job: "narrative-fallback-watchdog" as const,
+      jobId: "narrative.preclaim",
+      submissionId: "submission.preclaim",
+      eligibleAt: "2026-08-10T00:00:00.000Z",
+      trigger: "delayed_watchdog" as const
+    };
+
+    await worker.queue(
+      {
+        queue: "surf-narrative-fallback",
+        messages: [
+          {
+            id: "fallback-preclaim-first",
+            timestamp: new Date("2026-08-10T00:01:00.000Z"),
+            attempts: 1,
+            body: { ...body, preclaimRetryCount: 0 },
+            ...settlements[0]!
+          },
+          {
+            id: "fallback-preclaim-final",
+            timestamp: new Date("2026-08-10T00:02:00.000Z"),
+            attempts: 1,
+            body: { ...body, preclaimRetryCount: 1 },
+            ...settlements[1]!
+          }
+        ]
+      } as unknown as MessageBatch,
+      baseEnv(failedDb, { fallbackSend })
+    );
+
+    expect(fallbackSend).toHaveBeenCalledOnce();
+    expect(fallbackSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId: body.jobId,
+        submissionId: body.submissionId,
+        preclaimRetryCount: 1
+      }),
+      expect.objectContaining({ contentType: "json", delaySeconds: 60 })
+    );
+    for (const settlement of settlements) {
+      expect(settlement.ack).toHaveBeenCalledOnce();
+      expect(settlement.retry).not.toHaveBeenCalled();
+    }
+  });
+
   it("ACKs malformed and version-skewed Analysis signals without Queue redelivery", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
@@ -549,13 +646,13 @@ describe("versioned Analysis signal query budgets", () => {
     await enqueueSurfAnalysis({
       db: env.DB,
       queue: { send: async () => undefined } as unknown as Queue,
+      fallbackQueue: { send: async () => undefined } as unknown as Queue,
       bundle: recommended,
       now: new Date("2099-08-02T13:06:00.000Z")
     });
     const snapshot = await buildSurfAnalysisSnapshot(recommended);
     const job = await buildSurfNarrativeJob(snapshot);
-    const example = job.inference.messages.find(({ role }) => role === "assistant");
-    if (!example) throw new Error("Narrative job did not include its valid output example");
+    const plan = validAnalysisPlan(snapshot);
 
     const noCallForecast = expandedForecast("1h", generation.hourly.generatedAt);
     noCallForecast.recommendations = [];
@@ -586,8 +683,10 @@ describe("versioned Analysis signal query budgets", () => {
           schemaVersion: 1,
           jobId: job.jobId,
           submissionId: job.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId: "fixture-model",
-          output: JSON.parse(example.content)
+          output: plan
         })
       }) as unknown as Parameters<typeof worker.fetch>[0],
       baseEnv(env.DB),

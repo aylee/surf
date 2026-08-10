@@ -18,9 +18,10 @@ export type NarrativeJobStatus =
   | "superseded"
   | "enqueue_failed";
 
-// Cloudflare Queues Free retains messages for 24 hours. Reissue unresolved
-// delivery halfway through that window: this respects the runner's supported
-// 12-hour visibility lease while the final bounded copy survives >24h offline.
+// Use a conservative 24-hour retention floor even when the active plan offers
+// longer retention. Reissue unresolved delivery halfway through that floor;
+// this respects the runner's supported 12-hour visibility lease while the
+// final bounded copy survives more than 24 hours offline.
 export const NARRATIVE_PENDING_REDELIVERY_MS = 12 * 60 * 60 * 1_000;
 export const NARRATIVE_QUEUE_RETENTION_MS = 24 * 60 * 60 * 1_000;
 export const NARRATIVE_MAX_ENQUEUE_ATTEMPTS = 3;

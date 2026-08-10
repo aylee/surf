@@ -18,9 +18,12 @@ flowchart LR
   facts --> signal["Versioned Analysis signal via ingest Queue"]
   signal --> ledger["D1 narrative ledger + exact fact snapshot"]
   ledger --> narrativeq["Dedicated narrative Queue"]
+  ledger --> watchdogq["Delayed cloud-watchdog Queue"]
   narrativeq --> runner["Out-of-band HTTP pull runner"]
   runner --> model["Local oMLX · OpenAI-compatible API"]
   model --> result["Authenticated result endpoint"]
+  watchdogq --> gemini["Bounded Gemini fallback"]
+  gemini --> validate
   result --> validate["Cloud policy + rendering validators"]
   validate --> rows
   python["Python GRIB/netCDF evaluation"] -. validates .-> ingest
@@ -35,7 +38,7 @@ flowchart LR
 | `packages/contracts` | Validate API and forecast data at package boundaries |
 | `packages/forecast-core` | Own the reference spot catalog, wave transforms, surface classification, and scoring |
 | `packages/db` | Own the SQL migration history, generated reference seed, and migration checks |
-| Narrative control plane | Snapshot code-owned facts, persist a D1 job ledger, produce domain-neutral Queue jobs, reconcile ambiguous sends, and publish exact-fact revisions |
+| Narrative control plane | Snapshot code-owned facts, persist a D1 job/fallback ledger, produce local-primary and delayed-watchdog jobs, reconcile ambiguous sends, and publish exact-fact revisions |
 | `apps/narrative-runner` | Pull Queue work over HTTPS, call a configurable local oMLX model, post generated or terminal results, and settle messages with bounded leases |
 | Surf Analysis validator | Derive provenance from used code-owned slots, reject changed recommendations or unsupported claims, render the report, and expose published/pending/unavailable lifecycle states |
 | `services/extractor` | Decode/evaluate GRIB2 and netCDF data that is too heavy or specialized for a Worker |
@@ -49,8 +52,9 @@ flowchart LR
   1-hour/3-hour API read models, per-date fact bundles, and the narrative
   job/revision ledger.
 - **Queues** isolate scheduled ingestion from the cron trigger and provide
-  retries/dead-letter handling. Analysis uses a separate producer-only Queue;
-  its consumer is an out-of-band HTTP pull runner, not a Worker consumer.
+  retries/dead-letter handling. Analysis uses a producer-only local-primary
+  Queue whose consumer is the out-of-band runner, plus a delayed watchdog
+  Queue consumed by the Worker for host-independent fallback.
 
 Bindings are the only runtime path to these Cloudflare resources. Account IDs,
 database IDs, namespace IDs, and secrets are instance state and do not belong
@@ -64,10 +68,12 @@ invocation sends one versioned, generation-fenced `analysis-signal` message
 through the ingest Queue. That separate Queue invocation reloads the current
 active local-date bundles instead of trusting facts in the signal. For each
 date it builds a stable fingerprint from only output-visible code-owned values,
-writes the exact job and validation snapshot to D1, then sends the authoritative
-stored envelope to a dedicated Queue. This hop keeps both the forecast
-publication invocation and five-date Analysis signaling below D1 Free's
-50-query limit. Ledger-first insertion and scheduled reconciliation cover the
+writes the exact job and validation snapshot to D1, then sends a delayed cloud
+watchdog before sending the authoritative stored envelope to the local-primary
+Queue. A row is never marked pending unless both Queue sends were accepted.
+This hop keeps both the forecast publication invocation and five-date Analysis
+signaling far below D1 Paid's 1,000-query limit. Ledger-first insertion and
+scheduled reconciliation cover the
 non-atomic D1-to-Queue boundary. Stable generation identity deduplicates
 redelivery and unchanged facts; a fresh per-attempt submission ID keeps late
 callbacks from an older attempt from terminating or publishing a rearm. The
@@ -86,7 +92,15 @@ posts either generated output or an identifiable terminal outcome to
 bounded request body, validates the current submission and exact fact
 fingerprint, derives provenance from the value slots used, renders the report,
 and conditionally publishes it. Queue delivery is at least once, so result and
-settlement paths are idempotent.
+settlement paths are idempotent. If no valid revision exists after ten minutes,
+the Worker watchdog atomically claims a D1 paid-attempt row, calls Gemini at
+most once for that job/submission, persists a successful raw output before
+validation, and submits it through the same validator/CAS. Primary semantic
+failure schedules an immediate duplicate watchdog. Duplicate messages and
+local/cloud races converge on the job/revision CAS; a late valid oMLX result can
+still win when fallback fails. Rolling 24-hour and 31-day claim caps bound paid
+calls, and generated-but-unpublished output replays from D1 without another
+provider call.
 
 `ForecastBriefAgent`, its `FORECAST_BRIEF_AGENT` binding, and migration 0002
 remain checked in and exported only as dormant rollback compatibility. They are

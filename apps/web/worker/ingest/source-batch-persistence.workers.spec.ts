@@ -333,7 +333,7 @@ describe("source-batch persistence in real Workerd D1", () => {
     expect(normalized.flatMap(({ errors }) => errors)).toEqual([]);
     expect(artifactResults.flatMap(({ errors }) => errors)).toEqual([]);
     expect(retention.errors).toEqual([]);
-    expect(counted.count()).toBe(31);
+    expect(counted.count()).toBe(32);
     expect(bucketKeys).toHaveLength(SOURCE_IDS.length * 3);
     expect(
       await env.DB.prepare("select count(*) as count from tide_forecasts").first<{ count: number }>()

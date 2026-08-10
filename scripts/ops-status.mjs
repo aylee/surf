@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import {
   assertActiveWranglerConfig,
+  pinActiveWranglerConfigForDeploy,
   probeWrangler
 } from "./lib/cloudflare-commands.mjs";
 import { resolveActiveDeploymentId } from "./lib/deploy-url.mjs";
@@ -475,9 +476,15 @@ export async function runOpsStatus({
   config,
   fetcher = globalThis.fetch,
   wranglerProbe = probeWrangler,
-  requestTimeoutMs = OPS_STATUS_REQUEST_TIMEOUT_MS
+  requestTimeoutMs = OPS_STATUS_REQUEST_TIMEOUT_MS,
+  prepareWrangler = config
+    ? () => config
+    : () => {
+        pinActiveWranglerConfigForDeploy(env, { required: true });
+        return assertActiveWranglerConfig(env);
+      }
 } = {}) {
-  const activeConfig = config ?? assertActiveWranglerConfig();
+  const activeConfig = prepareWrangler();
   const baseUrl = resolveBaseUrl(env);
   const workerName = activeConfig.name;
   const queueConfig = activeConfig.queues.consumers[0];

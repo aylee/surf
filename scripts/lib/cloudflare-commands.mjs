@@ -8,6 +8,7 @@ import {
   wranglerEnvironmentFailures,
   wranglerStructureFailures
 } from "./validate-wrangler-config.mjs";
+import { verifyWranglerConfigSnapshot } from "./wrangler-config-snapshot.mjs";
 
 loadRootEnv();
 
@@ -20,12 +21,74 @@ export const CLOUDFLARE_COMMAND_TIMEOUT_MS = 45 * 60_000;
 export const wranglerConfigPath = fileURLToPath(
   new URL("../../apps/web/wrangler.jsonc", import.meta.url)
 );
-const configuredWranglerPath = process.env.SURF_WRANGLER_CONFIG;
-export const activeWranglerConfigPath = configuredWranglerPath
-  ? isAbsolute(configuredWranglerPath)
-    ? configuredWranglerPath
-    : resolve(dirname(wranglerConfigPath), configuredWranglerPath)
+const initialWranglerPath = process.env.SURF_WRANGLER_CONFIG;
+export let activeWranglerConfigPath = initialWranglerPath
+  ? isAbsolute(initialWranglerPath)
+    ? initialWranglerPath
+    : resolve(dirname(wranglerConfigPath), initialWranglerPath)
   : wranglerConfigPath;
+let useActiveConfigArgument = Boolean(initialWranglerPath);
+let pinnedWranglerConfigSha256 = null;
+let cloudflareCommandGuard = null;
+
+export function setCloudflareCommandGuard(guard) {
+  if (cloudflareCommandGuard) {
+    throw new Error("Cloudflare command guard is already configured");
+  }
+  if (typeof guard !== "function") throw new Error("Cloudflare command guard must be callable");
+  cloudflareCommandGuard = guard;
+}
+
+export function pinActiveWranglerConfigForDeploy(
+  environment = process.env,
+  { required = false } = {}
+) {
+  const configuredWranglerPath = environment.SURF_WRANGLER_CONFIG?.trim();
+  if (!configuredWranglerPath) {
+    if (required) {
+      throw new Error(
+        "SURF_WRANGLER_CONFIG and SURF_WRANGLER_CONFIG_SHA256 are required for this operational Wrangler command"
+      );
+    }
+    return null;
+  }
+  activeWranglerConfigPath = isAbsolute(configuredWranglerPath)
+    ? configuredWranglerPath
+    : resolve(dirname(wranglerConfigPath), configuredWranglerPath);
+  const pinned = verifyWranglerConfigSnapshot({
+    path: activeWranglerConfigPath,
+    releaseRoot: repoRoot,
+    expectedSha256: environment.SURF_WRANGLER_CONFIG_SHA256
+  });
+  activeWranglerConfigPath = pinned.path;
+  useActiveConfigArgument = true;
+  pinnedWranglerConfigSha256 = pinned.sha256;
+  console.log(
+    JSON.stringify({
+      status: "wrangler-config-pinned",
+      path: pinned.path,
+      sha256: pinned.sha256,
+      workerName: pinned.config.name
+    })
+  );
+  return pinned;
+}
+
+export function selectTrackedWranglerConfigForSecretlessDryRun() {
+  activeWranglerConfigPath = wranglerConfigPath;
+  useActiveConfigArgument = true;
+  pinnedWranglerConfigSha256 = null;
+  return assertActiveWranglerConfig({});
+}
+
+function assertPinnedWranglerConfigUnchanged() {
+  if (!pinnedWranglerConfigSha256) return;
+  verifyWranglerConfigSnapshot({
+    path: activeWranglerConfigPath,
+    releaseRoot: repoRoot,
+    expectedSha256: pinnedWranglerConfigSha256
+  });
+}
 
 function displayCommand(args) {
   return ["pnpm", ...args].join(" ");
@@ -130,19 +193,35 @@ export function runPnpm(args, options = {}) {
   return output;
 }
 
+function assertCloudflareCommandInputsUnchanged() {
+  cloudflareCommandGuard?.();
+  assertPinnedWranglerConfigUnchanged();
+}
+
 function wranglerPnpmArgs(args) {
-  const configArgs = configuredWranglerPath
+  assertCloudflareCommandInputsUnchanged();
+  const configArgs = useActiveConfigArgument
     ? ["--config", activeWranglerConfigPath]
     : [];
   return ["--filter", "@surf/web", "exec", "wrangler", ...args, ...configArgs];
 }
 
 export function runWrangler(args, options = {}) {
-  return runPnpm(wranglerPnpmArgs(args), options);
+  const pnpmArgs = wranglerPnpmArgs(args);
+  try {
+    return runPnpm(pnpmArgs, options);
+  } finally {
+    assertCloudflareCommandInputsUnchanged();
+  }
 }
 
 export function probeWrangler(args, options = {}) {
-  return invokePnpm(wranglerPnpmArgs(args), { ...options, capture: true });
+  const pnpmArgs = wranglerPnpmArgs(args);
+  try {
+    return invokePnpm(pnpmArgs, { ...options, capture: true });
+  } finally {
+    assertCloudflareCommandInputsUnchanged();
+  }
 }
 
 export function readWranglerConfig(path = activeWranglerConfigPath) {
@@ -176,11 +255,11 @@ export function configuredQueueNames(config = readWranglerConfig()) {
   return [...names];
 }
 
-export function assertActiveWranglerConfig() {
+export function assertActiveWranglerConfig(environment = process.env) {
   const config = readWranglerConfig(activeWranglerConfigPath);
   const failures = [
     ...wranglerStructureFailures(config, activeWranglerConfigPath),
-    ...wranglerEnvironmentFailures(config)
+    ...wranglerEnvironmentFailures(config, environment)
   ];
   if (failures.length > 0) {
     throw new Error(

@@ -88,6 +88,14 @@ export function intervalOverlapsRange(
  */
 export const CANONICAL_RECOMMENDATION_SCORE_BAND = 5;
 
+/**
+ * A recommendation is a practical surf session, not merely any positive
+ * overlap with civil light. Partial first/last-light hours may still extend an
+ * adjacent viable group, but a standalone clipped sliver must provide at least
+ * 45 minutes before it can be published as a call.
+ */
+export const CANONICAL_RECOMMENDATION_MIN_DURATION_MS = 45 * 60 * 1000;
+
 type RankedCandidate = CanonicalRecommendationCandidate & {
   forecastAtMs: number;
   clippedStartMs: number;
@@ -210,11 +218,16 @@ export function selectCanonicalRecommendationWindows<
         left.forecastAtMs - right.forecastAtMs || left.windowId.localeCompare(right.windowId)
     );
     grouped.forEach(({ windowId }) => remainingWindowIds.delete(windowId));
+    const groupedStartMs = grouped[0]!.clippedStartMs;
+    const groupedEndMs = grouped.at(-1)!.clippedEndMs;
+    if (groupedEndMs - groupedStartMs < CANONICAL_RECOMMENDATION_MIN_DURATION_MS) {
+      continue;
+    }
     selected.push({
       representativeWindowId: leader.windowId,
       constituentWindowIds: grouped.map(({ windowId }) => windowId),
-      startAt: new Date(grouped[0]!.clippedStartMs).toISOString(),
-      endAt: new Date(grouped.at(-1)!.clippedEndMs).toISOString(),
+      startAt: new Date(groupedStartMs).toISOString(),
+      endAt: new Date(groupedEndMs).toISOString(),
       surfaceCondition: leader.surfaceCondition,
       score: leader.score,
       confidence: leader.confidence

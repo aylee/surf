@@ -19,8 +19,8 @@ async function insertJob(options: {
        material_fingerprint, generation_fingerprint, prompt_version,
        output_schema_version, result_target, submission_id, deadline_at, status,
        job_json, validation_snapshot_json, enqueue_attempts, created_at, updated_at
-     ) values (?, 1, 'surf', 'linda-mar', ?, ?, ?, ?, 'surf-analysis-v3', 3,
-       'surf.analysis.v3', ?, ?, ?, '{}', '{}', 1, ?, ?)`
+     ) values (?, 1, 'surf', 'linda-mar', ?, ?, ?, ?, 'surf-analysis-v4-natural-1', 5,
+       'surf.analysis.v4', ?, ?, ?, '{}', '{}', 1, ?, ?)`
   )
     .bind(
       options.id,
@@ -42,10 +42,12 @@ describe("narrative retention in workerd D1", () => {
     const indexes = await env.DB.prepare(
       `select name from sqlite_master
        where type = 'index' and name in (
+         'narrative_fallback_attempts_claimed_idx',
          'narrative_jobs_retention_idx', 'narrative_revisions_retention_idx'
        ) order by name`
     ).all<{ name: string }>();
     expect(indexes.results.map(({ name }) => name)).toEqual([
+      "narrative_fallback_attempts_claimed_idx",
       "narrative_jobs_retention_idx",
       "narrative_revisions_retention_idx"
     ]);
@@ -105,6 +107,16 @@ describe("narrative retention in workerd D1", () => {
     )
       .bind("6".padStart(64, "0"), old, old)
       .run();
+    await env.DB.prepare(
+      `insert into narrative_fallback_attempts (
+         attempt_id, job_id, submission_id, provider_id, model_id,
+         inference_route, trigger, state, claimed_at, updated_at
+       ) values ('fallback.old', 'job.old-rejected',
+         'submission.job.old-rejected', 'google-ai', 'gemini-3.6-flash',
+         'fallback', 'delayed_watchdog', 'failed', ?, ?)`
+    )
+      .bind(old, old)
+      .run();
 
     const result = await pruneRetainedData(env.DB, now);
 
@@ -119,6 +131,11 @@ describe("narrative retention in workerd D1", () => {
     expect(
       await env.DB.prepare(
         "select revision_id from narrative_revisions where revision_id = 'revision.old'"
+      ).first()
+    ).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "select attempt_id from narrative_fallback_attempts where attempt_id = 'fallback.old'"
       ).first()
     ).toBeNull();
   });

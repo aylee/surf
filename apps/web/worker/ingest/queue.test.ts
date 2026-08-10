@@ -163,7 +163,9 @@ function narrativeTestEnv(
     INGEST_QUEUE: { sendBatch, send } as unknown as Queue,
     NARRATIVE_ENABLED: "true",
     NARRATIVE_QUEUE: {} as Queue,
-    NARRATIVE_RESULT_TOKEN: "test-result-token"
+    NARRATIVE_FALLBACK_QUEUE: {} as Queue,
+    NARRATIVE_RESULT_TOKEN: "test-result-token",
+    GEMINI_API_KEY: "test-gemini-token"
   };
 }
 

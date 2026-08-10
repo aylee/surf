@@ -1,6 +1,7 @@
 import { SurfAnalysisReportV3Schema, type SurfAnalysisReportV3 } from "@surf/contracts";
 import type {
-  SurfAnalysisDraftV3,
+  SurfAnalysisEditorialCard,
+  SurfAnalysisPlanV5,
   SurfAnalysisValidationSnapshot
 } from "./types";
 
@@ -20,12 +21,45 @@ function renderTemplate(
   return rendered.replace(/\s+/g, " ").trim();
 }
 
+function selectedCard(
+  id: string,
+  snapshot: SurfAnalysisValidationSnapshot
+): SurfAnalysisEditorialCard {
+  const card = snapshot.cards.find((candidate) => candidate.id === id);
+  if (!card) throw new Error(`Cannot render unknown Analysis card ${id}`);
+  return card;
+}
+
+function renderCard(id: string, snapshot: SurfAnalysisValidationSnapshot): string {
+  return renderTemplate(selectedCard(id, snapshot).template, snapshot);
+}
+
 export function renderSurfAnalysisReport(options: {
-  draft: SurfAnalysisDraftV3;
+  draft: SurfAnalysisPlanV5;
   snapshot: SurfAnalysisValidationSnapshot;
   revisionId: string;
   publishedAt: string;
 }): SurfAnalysisReportV3 {
+  const primary = renderTemplate(
+    "{{primary_session}} is the main call: {{primary_surf_size}} surf from {{primary_swell}}, with {{primary_wind_surface}}.",
+    options.snapshot
+  );
+  const tide = options.snapshot.slots.find(({ id }) => id === "primary_tide_sentence")?.value;
+  const confidence = renderTemplate("{{confidence_sentence}}", options.snapshot);
+  const callSentences = [
+    primary,
+    ...(options.draft.call.primarySupportCardId
+      ? [renderCard(options.draft.call.primarySupportCardId, options.snapshot)]
+      : []),
+    ...(options.draft.call.primaryTradeoffCardId
+      ? [renderCard(options.draft.call.primaryTradeoffCardId, options.snapshot)]
+      : []),
+    ...(tide ? [tide] : []),
+    ...(options.draft.call.alternateCardId
+      ? [renderCard(options.draft.call.alternateCardId, options.snapshot)]
+      : [])
+  ];
+
   return SurfAnalysisReportV3Schema.parse({
     schemaVersion: 3,
     spotId: options.snapshot.spotId,
@@ -33,9 +67,12 @@ export function renderSurfAnalysisReport(options: {
     revisionId: options.revisionId,
     headline: renderTemplate("{{headline_call}}", options.snapshot),
     paragraphs: [
-      renderTemplate(options.draft.paragraphs.setup.template, options.snapshot),
-      renderTemplate(options.draft.paragraphs.plan.template, options.snapshot),
-      renderTemplate(options.draft.paragraphs.confidence.template, options.snapshot)
+      [
+        renderCard(options.draft.outlook.leadCardId, options.snapshot),
+        renderCard(options.draft.outlook.supportingCardId, options.snapshot)
+      ].join(" "),
+      callSentences.join(" "),
+      [confidence, renderCard(options.draft.close.watchCardId, options.snapshot)].join(" ")
     ],
     updatedAt: options.publishedAt
   });

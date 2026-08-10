@@ -4,7 +4,10 @@ import {
 } from "@surf/contracts";
 import type { ForecastFactBundle } from "../brief/types";
 import { boundedErrorName } from "../logging";
-import { getLatestNarrativeJobForFacts } from "../narrative/repository";
+import {
+  getLatestNarrativeJobForFacts,
+  NARRATIVE_MAX_ENQUEUE_ATTEMPTS
+} from "../narrative/repository";
 import { buildSurfAnalysisSnapshot } from "./snapshot";
 import {
   SURF_ANALYSIS_OUTPUT_SCHEMA_VERSION,
@@ -74,11 +77,15 @@ export async function buildSurfAnalysisResponse(
       job?.enqueueLeaseUntil !== null &&
       job?.enqueueLeaseUntil !== undefined &&
       new Date(job.enqueueLeaseUntil).getTime() > now.getTime();
+    const hasEnqueueAttemptRemaining =
+      job !== null && job.enqueueAttempts < NARRATIVE_MAX_ENQUEUE_ATTEMPTS;
     const pending =
       job !== null &&
       new Date(job.job.deadlineAt).getTime() > now.getTime() &&
       ((job.status === "pending" && job.enqueuedAt !== null) ||
-        (job.status === "enqueueing" && activeLease));
+        (job.status === "enqueueing" &&
+          (activeLease || hasEnqueueAttemptRemaining)) ||
+        (job.status === "enqueue_failed" && hasEnqueueAttemptRemaining));
     if (pending) {
       return SurfAnalysisResponseV3Schema.parse({
         schemaVersion: 3,

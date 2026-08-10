@@ -40,6 +40,10 @@ const FingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const IsoTimestampSchema = z.string().datetime({ offset: false, precision: 3 });
 const LocalDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 
+export const NarrativeProviderIdSchema = IdentifierSchema;
+export const NarrativeInferenceRouteSchema = z.enum(["primary", "fallback"]);
+export type NarrativeInferenceRoute = z.infer<typeof NarrativeInferenceRouteSchema>;
+
 export const NarrativeMessageSchema = z
   .object({
     role: z.enum(["system", "user", "assistant"]),
@@ -94,6 +98,8 @@ export const NarrativeGeneratedResultSubmissionSchema = z
     schemaVersion: z.literal(1),
     jobId: IdentifierSchema,
     submissionId: IdentifierSchema,
+    providerId: NarrativeProviderIdSchema,
+    route: NarrativeInferenceRouteSchema,
     modelId: z.string().min(1).max(200),
     output: JsonValueSchema
   })
@@ -149,6 +155,8 @@ export type NarrativeResultSubmission = z.infer<typeof NarrativeResultSubmission
 export const NarrativeResultDispositionSchema = z.enum([
   "published",
   "duplicate",
+  "fallback_requested",
+  "fallback_failed",
   "rejected",
   "expired",
   "superseded"
@@ -162,6 +170,19 @@ export const NarrativeResultResponseSchema = z
   })
   .strict();
 export type NarrativeResultResponse = z.infer<typeof NarrativeResultResponseSchema>;
+
+export const NarrativeFallbackWatchdogSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    job: z.literal("narrative-fallback-watchdog"),
+    jobId: IdentifierSchema,
+    submissionId: IdentifierSchema,
+    eligibleAt: IsoTimestampSchema,
+    trigger: z.enum(["delayed_watchdog", "primary_validation_failed"]),
+    preclaimRetryCount: z.number().int().min(0).max(1)
+  })
+  .strict();
+export type NarrativeFallbackWatchdog = z.infer<typeof NarrativeFallbackWatchdogSchema>;
 
 export function serializedNarrativeJobBytes(job: NarrativeJob): number {
   return new TextEncoder().encode(JSON.stringify(NarrativeJobSchema.parse(job))).byteLength;

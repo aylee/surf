@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   assertNarrativeJobSize,
   NARRATIVE_JOB_MAX_BYTES,
+  NarrativeFallbackWatchdogSchema,
+  NarrativeGeneratedResultSubmissionSchema,
   NarrativeJobSchema,
   NarrativeTerminalResultSubmissionSchema,
   type NarrativeJob
@@ -95,6 +97,51 @@ describe("NarrativeJob", () => {
         jobId: "surf.job",
         submissionId: "surf.submission",
         terminal: { status: "expired", reasonCode: "inference_request_rejected" }
+      })
+    ).toThrow();
+  });
+
+  it("requires exact inference provenance on generated results", () => {
+    const result = NarrativeGeneratedResultSubmissionSchema.parse({
+      schemaVersion: 1,
+      jobId: "surf.job",
+      submissionId: "surf.submission",
+      providerId: "omlx",
+      route: "primary",
+      modelId: "qwen3.6-27b",
+      output: { paragraphs: {} }
+    });
+    expect(result).toMatchObject({ providerId: "omlx", route: "primary" });
+    expect(() =>
+      NarrativeGeneratedResultSubmissionSchema.parse({
+        ...result,
+        providerId: "omlx",
+        route: "unknown"
+      })
+    ).toThrow();
+  });
+
+  it("keeps fallback watchdogs identity-bound and URL-free", () => {
+    const watchdog = NarrativeFallbackWatchdogSchema.parse({
+      schemaVersion: 1,
+      job: "narrative-fallback-watchdog",
+      jobId: "surf.job",
+      submissionId: "surf.submission",
+      eligibleAt: "2026-08-10T00:10:00.000Z",
+      trigger: "delayed_watchdog",
+      preclaimRetryCount: 0
+    });
+    expect(watchdog.jobId).toBe("surf.job");
+    expect(() =>
+      NarrativeFallbackWatchdogSchema.parse({
+        ...watchdog,
+        callbackUrl: "https://example.com/callback"
+      })
+    ).toThrow();
+    expect(() =>
+      NarrativeFallbackWatchdogSchema.parse({
+        ...watchdog,
+        preclaimRetryCount: 2
       })
     ).toThrow();
   });

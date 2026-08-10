@@ -1,311 +1,390 @@
 import {
-  SurfAnalysisDraftV3Schema,
+  SurfAnalysisPlanV5Schema,
   SurfAnalysisValidationSchema,
-  type SurfAnalysisBlockName,
-  type SurfAnalysisDraftV3,
+  type SurfAnalysisCardPlacement,
+  type SurfAnalysisEditorialCard,
+  type SurfAnalysisPlanV5,
   type SurfAnalysisValidation,
-  type SurfAnalysisValidationSnapshot
+  type SurfAnalysisValidationSnapshot,
+  type SurfAnalysisValueSlot
 } from "./types";
+import type { ForecastFact } from "../brief/types";
 
 const SLOT_PATTERN = /\{\{([a-z][a-z_]*)\}\}/g;
-const UNSAFE_PATTERN = /(?:https?:\/\/|www\.|<\/?[a-z][^>]*>|\b(?:you|your)\b|\b(?:enter the water|paddle out|swim out|ignore (?:an )?(?:advisory|warning|hazard)|guaranteed safe)\b)/i;
-const IMPERATIVE_PATTERN = /(?:^|[.!?;:]\s+|\bso\s+)(?:please\s+)?(?:go|head|paddle|enter|swim|avoid|ignore|skip|wait|bring|wear|take)\b/i;
-const MODEL_OWNED_VALUE_PATTERN = /(?:\d|\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(?:ft|feet|knots?|kt|seconds?|s|percent|%)\b|\b(?:ft|feet|knots?|kt|mph|mllw|am|pm)\b|\b(?:high|medium|low)\s+(?:confidence|tide)\b)/i;
-const UNSUPPORTED_DESCRIPTOR_PATTERN = /\b(?:punchy|peaky|hollow|barreling|powerful|soft|weak|strong|consistent|inconsistent|crowded|uncrowded|waist-high|chest-high|head-high|overhead|morning|afternoon|evening|dawn|sunrise|sunset|noon|overnight|clean|fair|choppy|glassy|excellent|good|great|poor|bad|quality|promising|inviting|fun|epic|solid|favorable|favourable|optimal|ideal|offshore|onshore|cross-shore|north|northeast|east|southeast|south|southwest|west|northwest)\b/i;
-const UNSUPPORTED_TREND_PATTERN = /\b(?:hold(?:s|ing)?|build(?:s|ing)?|ease(?:s|d|ing)?|vary(?:ing|ies)?|lengthen(?:s|ing)?|shorten(?:s|ing)?|shift(?:s|ing)?|rise(?:s|n|ing)?|fall(?:s|en|ing)?|steady|increase(?:s|d|ing)?|decrease(?:s|d|ing)?)\b/i;
-const UNSUPPORTED_CAUSATION_PATTERN = /\b(?:cause|causes|guarantee|guarantees|improve|improves|produce|produces|create|creates|mean|means|ensure|ensures)\b/i;
-const IMPLEMENTATION_JARGON_PATTERN = /\b(?:deterministic|schema|fact refs?|source health|guardrails?|validation payload)\b/i;
-const MODEL_OWNED_SAFETY_PATTERN = /\b(?:safe|unsafe|safety|risk[- ]?free|no[- ]risk|without risk)\b/i;
-const RECOMMENDATION_NEGATION_PATTERN = /\b(?:not|never|avoid|ignore|skip|forget|reject|dismiss|worst|inferior|last choice|do not|don't|should not|shouldn't|instead of|rather than)\b/i;
-const PRIMARY_FRAME_PATTERN = /\b(?:best|lead(?:ing|s)?|recommend(?:ed|s)?|top choice|first choice|strongest (?:window|call)|the pick)\b/i;
-const BACKUP_FRAME_PATTERN = /\b(?:backup|alternate|alternative|second choice)\b/i;
-const UNCERTAINTY_FRAME_PATTERN = /\b(?:uncertainty|risk|bust|caveat|could change|thing to watch|watch item|question mark|wildcard|limitation)\b/i;
-const MODEL_OWNED_ASCII_PATTERN = /^[A-Za-z\t\n\r .,;:!?'"()-]*$/;
 
-// Values, conditions, and physical subjects belong to code-owned slots. The
-// model may vary connective forecaster phrasing, but an allowlist prevents an
-// otherwise grammatical extra clause (for example rain or beach safety) from
-// becoming an ungrounded claim that no slot can support.
-const CONNECTIVE_WORDS: Record<SurfAnalysisBlockName, ReadonlySet<string>> = {
-  headline: new Set(),
-  setup: new Set([
-    "a", "across", "and", "are", "as", "be", "day", "daylight", "for",
-    "forecast", "is", "looks", "over", "set", "should", "surf", "swell",
-    "the", "through", "to", "while"
-  ]),
-  plan: new Set([
-    "a", "along", "alongside", "alternate", "alternative", "and", "as", "at",
-    "backup", "best", "call", "carrying", "choice", "context", "first", "for",
-    "has", "is", "lead", "leading", "leads", "of", "on", "pairing", "pick",
-    "recommended", "recommendation", "remains", "session", "strongest", "surf",
-    "the", "tide", "top", "with", "window"
-  ]),
-  confidence: new Set([
-    "a", "call", "caveat", "change", "confidence", "could", "forecast", "here",
-    "in", "is", "limitation", "main", "mark", "of", "overall", "question",
-    "read", "remains", "risk", "the", "thing", "this", "to", "uncertainty",
-    "watch", "wildcard", "with"
-  ])
-};
-
-function blocks(draft: SurfAnalysisDraftV3): Array<{
-  name: SurfAnalysisBlockName;
-  template: string;
-}> {
-  return [
-    { name: "setup", ...draft.paragraphs.setup },
-    { name: "plan", ...draft.paragraphs.plan },
-    { name: "confidence", ...draft.paragraphs.confidence }
-  ];
+function renderTemplate(
+  template: string,
+  slots: Map<string, SurfAnalysisValueSlot>
+): string {
+  const rendered = template.replace(SLOT_PATTERN, (_token, id: string) => {
+    const value = slots.get(id)?.value;
+    if (!value) throw new Error(`Analysis card references unknown value slot ${id}`);
+    return value;
+  });
+  if (/[{}]/.test(rendered)) throw new Error("Analysis card contains a malformed value slot");
+  return rendered.replace(/\s+/g, " ").trim();
 }
 
 function slotIds(template: string): string[] {
   return [...template.matchAll(SLOT_PATTERN)].map((match) => match[1]!);
 }
 
-function withoutSlots(template: string): string {
-  return template.replace(SLOT_PATTERN, " supplied-value ");
-}
+function assertCardFactAllowed(options: {
+  card: SurfAnalysisEditorialCard;
+  fact: ForecastFact;
+  slots: Map<string, SurfAnalysisValueSlot>;
+  primaryId: string;
+  backupId: string | undefined;
+}): void {
+  const { card, fact, slots, primaryId, backupId } = options;
+  const fail = (): never => {
+    throw new Error(`Analysis card ${card.id} has provenance outside its placement`);
+  };
 
-function sentences(template: string): string[] {
-  return (template.replace(/\s+/g, " ").trim().match(/[^.!?]+(?:[.!?]+|$)/g) ?? [])
-    .map((sentence) => sentence.trim())
-    .filter(Boolean);
-}
+  if (card.placement === "outlook") {
+    if (fact.windowId === null) fail();
+    const matchesDomain =
+      (fact.kind === "wave" && card.domains.includes("wave")) ||
+      (fact.kind === "condition" && card.domains.includes("surface")) ||
+      (fact.kind === "wind" && card.domains.includes("wind"));
+    if (!matchesDomain) fail();
+    return;
+  }
 
-function assertTopicHasSlot(sentence: string, topic: RegExp, slotIds: string[]): void {
-  if (!topic.test(sentence)) return;
-  if (slotIds.some((id) => sentence.includes(`{{${id}}}`))) return;
-  throw new Error("Analysis prose makes a factual topic claim outside its code-owned value slot");
-}
+  if (card.placement === "primary_support") {
+    if (fact.windowId !== primaryId) fail();
+    if (card.semanticKey === "primary:surface") {
+      if (
+        fact.kind !== "condition" ||
+        slots.get("primary_surface_condition")?.value !== "clean"
+      ) fail();
+      return;
+    }
+    if (card.semanticKey === "primary:wind") {
+      if (fact.kind !== "wind" || fact.role !== "support") fail();
+      return;
+    }
+    if (card.semanticKey === "primary:ranking") {
+      if (fact.kind !== "recommendation" || fact.role !== "support") fail();
+      return;
+    }
+    fail();
+  }
 
-function assertNaturalParagraph(name: SurfAnalysisBlockName, template: string): void {
-  const residualBraces = template.replace(SLOT_PATTERN, "");
-  if (/[{}]/.test(residualBraces)) {
-    throw new Error(`${name} contains an unknown or malformed value placeholder`);
+  if (card.placement === "primary_tradeoff") {
+    if (fact.windowId !== primaryId) fail();
+    if (card.semanticKey === "primary:surface") {
+      if (
+        fact.kind !== "condition" ||
+        slots.get("primary_surface_condition")?.value !== "choppy"
+      ) fail();
+      return;
+    }
+    if (card.semanticKey === "primary:wind") {
+      if (fact.kind !== "wind" || fact.role !== "tradeoff") fail();
+      return;
+    }
+    fail();
   }
-  if (!MODEL_OWNED_ASCII_PATTERN.test(residualBraces)) {
-    throw new Error(`${name} contains non-ASCII model-owned text`);
+
+  if (card.placement === "alternate") {
+    if (
+      fact.windowId === backupId &&
+      ["recommendation", "wave", "wind", "condition"].includes(fact.kind)
+    ) return;
+    if (
+      fact.windowId === primaryId &&
+      ((card.id === "alternate:size-contrast" && fact.kind === "wave") ||
+        (card.id === "alternate:surface-contrast" && fact.kind === "condition"))
+    ) return;
+    fail();
   }
-  const stripped = withoutSlots(template).trim();
-  if (UNSAFE_PATTERN.test(stripped)) throw new Error(`${name} contains a link, markup, or directive`);
-  if (MODEL_OWNED_SAFETY_PATTERN.test(stripped)) {
-    throw new Error(`${name} contains a model-authored safety claim`);
-  }
-  if (IMPERATIVE_PATTERN.test(stripped)) throw new Error(`${name} contains an imperative directive`);
-  if (MODEL_OWNED_VALUE_PATTERN.test(stripped)) {
-    throw new Error(`${name} contains a model-authored measurement, time, or score`);
-  }
+
+  if (fact.id === "uncertainty:modeled_breaking_calibration") return;
   if (
-    UNSUPPORTED_DESCRIPTOR_PATTERN.test(stripped) ||
-    UNSUPPORTED_TREND_PATTERN.test(stripped) ||
-    UNSUPPORTED_CAUSATION_PATTERN.test(stripped)
-  ) {
-    throw new Error(`${name} contains an unsupported condition, rating, trend, or causation claim`);
-  }
-  if (IMPLEMENTATION_JARGON_PATTERN.test(stripped)) {
-    throw new Error(`${name} exposes implementation vocabulary`);
-  }
-  const modelOwnedWords = template.replace(SLOT_PATTERN, " ").toLowerCase();
-  const unsupportedWords = (modelOwnedWords.match(/[a-z]+(?:'[a-z]+)?/g) ?? [])
-    .filter((word) => !CONNECTIVE_WORDS[name].has(word));
-  if (unsupportedWords.length > 0) {
-    throw new Error(`${name} contains unsupported model-owned factual vocabulary`);
-  }
-  for (const sentence of sentences(template)) {
-    assertTopicHasSlot(sentence, /\bsurf\b/i, ["day_surf_evolution", "primary_surf_size"]);
-    assertTopicHasSlot(sentence, /\bswell\b/i, ["day_swell_evolution"]);
-    assertTopicHasSlot(sentence, /\b(?:wind|surface|conditions?)\b/i, ["primary_wind_surface"]);
-    assertTopicHasSlot(sentence, /\btide\b/i, ["primary_tide_timing"]);
-    assertTopicHasSlot(sentence, /\bconfidence\b/i, ["forecast_confidence"]);
-  }
-  if (name !== "headline" && stripped.length < 45) {
-    throw new Error(`${name} is too short to be a useful forecast paragraph`);
-  }
+    fact.windowId === primaryId &&
+    fact.role === "tradeoff" &&
+    (fact.kind === "source" || fact.kind === "caveat")
+  ) return;
+  fail();
 }
 
-function assertRecommendationSemantics(template: string): void {
-  const normalized = template.replace(/\s+/g, " ").trim();
-  const planSentences = sentences(normalized);
-  if (planSentences.length !== 2) {
-    throw new Error("plan must contain one best-window sentence and one later backup sentence");
+function assertSlotFactAllowed(options: {
+  slot: SurfAnalysisValueSlot;
+  fact: ForecastFact;
+  primaryId: string;
+  backupId: string | undefined;
+}): void {
+  const { slot, fact, primaryId, backupId } = options;
+  const fail = (): never => {
+    throw new Error(`Analysis slot ${slot.id} has provenance outside its rendered frame`);
+  };
+  if (slot.id === "headline_call") {
+    if (
+      (fact.kind === "spot" && fact.windowId === null) ||
+      (fact.kind === "recommendation" && fact.windowId === primaryId)
+    ) return;
+    fail();
   }
-  const primary = planSentences[0]!;
-  const backup = planSentences[1]!;
-  for (const id of [
-    "primary_session",
-    "primary_surf_size",
-    "primary_wind_surface",
-    "primary_tide_timing"
-  ]) {
-    if (!primary.includes(`{{${id}}}`)) {
-      throw new Error("plan best-window sentence is missing a required code-owned value");
+  if (slot.id === "day_surf_evolution" || slot.id === "day_swell_evolution") {
+    if (fact.kind === "wave" && fact.windowId !== null) return;
+    fail();
+  }
+  if (slot.id === "day_surface_evolution") {
+    if ((fact.kind === "condition" || fact.kind === "wind") && fact.windowId !== null) return;
+    fail();
+  }
+  if (slot.id === "confidence_sentence") {
+    if (fact.kind === "confidence" && fact.windowId === primaryId) return;
+    fail();
+  }
+  if (slot.id === "primary_tide_sentence") {
+    if (fact.kind === "tide" && (fact.windowId === primaryId || fact.windowId === null)) return;
+    fail();
+  }
+
+  const isPrimary = slot.id.startsWith("primary_");
+  const isBackup = slot.id.startsWith("backup_");
+  const windowId = isPrimary ? primaryId : isBackup ? backupId : undefined;
+  if (!windowId || fact.windowId !== windowId) fail();
+  if (slot.id.endsWith("_session") && fact.kind === "recommendation") return;
+  if (
+    (slot.id.endsWith("_surf_size") || slot.id.endsWith("_swell")) &&
+    fact.kind === "wave"
+  ) return;
+  if (
+    slot.id.endsWith("_wind_surface") &&
+    (fact.kind === "wind" || fact.kind === "condition")
+  ) return;
+  if (slot.id.endsWith("_surface_condition") && fact.kind === "condition") return;
+  fail();
+}
+
+function validateCatalog(snapshot: SurfAnalysisValidationSnapshot): {
+  cards: Map<string, SurfAnalysisEditorialCard>;
+  slots: Map<string, SurfAnalysisValueSlot>;
+} {
+  const facts = new Map(snapshot.facts.map((fact) => [fact.id, fact]));
+  if (facts.size !== snapshot.facts.length) throw new Error("Analysis snapshot repeats a fact ID");
+  const slots = new Map<string, SurfAnalysisValueSlot>();
+  const primaryId = snapshot.recommendationWindowIds[0]!;
+  const backupId = snapshot.recommendationWindowIds[1];
+  for (const candidate of snapshot.slots) {
+    if (slots.has(candidate.id)) throw new Error(`Analysis snapshot repeats slot ${candidate.id}`);
+    slots.set(candidate.id, candidate);
+    for (const factRef of candidate.factRefs) {
+      const fact = facts.get(factRef);
+      if (!fact) {
+        throw new Error(`Analysis slot ${candidate.id} references unknown fact ${factRef}`);
+      }
+      assertSlotFactAllowed({ slot: candidate, fact, primaryId, backupId });
     }
   }
-  if (primary.includes("{{backup_session}}") || !backup.includes("{{backup_session}}")) {
-    throw new Error("plan must keep the backup in a distinct later sentence");
-  }
-  if (!PRIMARY_FRAME_PATTERN.test(primary) || BACKUP_FRAME_PATTERN.test(primary)) {
-    throw new Error("plan must clearly recommend the primary window without a backup frame");
-  }
-  if (!BACKUP_FRAME_PATTERN.test(backup) || PRIMARY_FRAME_PATTERN.test(backup)) {
-    throw new Error("plan must label the later window only as a backup or alternate");
-  }
+
+  const cards = new Map<string, SurfAnalysisEditorialCard>();
+  const confidenceSlot = slots.get("confidence_sentence");
+  const confidenceFact =
+    confidenceSlot?.factRefs.length === 1
+      ? facts.get(confidenceSlot.factRefs[0]!)
+      : undefined;
   if (
-    RECOMMENDATION_NEGATION_PATTERN.test(primary) ||
-    RECOMMENDATION_NEGATION_PATTERN.test(backup)
+    !confidenceSlot ||
+    confidenceFact?.kind !== "confidence" ||
+    confidenceFact.windowId !== primaryId
   ) {
-    throw new Error("plan must not negate, reverse, or down-rank the code-owned recommendation");
+    throw new Error("Analysis confidence sentence lacks exact primary confidence provenance");
   }
+  const confidenceBand = confidenceFact.statement.match(/\b(low|medium|high)\b/i)?.[1]?.toLowerCase();
+  if (
+    !confidenceBand ||
+    confidenceSlot.value !== `Confidence in this timing call is ${confidenceBand}.`
+  ) {
+    throw new Error("Analysis confidence sentence does not match its primary confidence fact");
+  }
+  for (const candidate of snapshot.cards) {
+    if (cards.has(candidate.id)) throw new Error(`Analysis snapshot repeats card ${candidate.id}`);
+    cards.set(candidate.id, candidate);
+    if (renderTemplate(candidate.template, slots) !== candidate.preview) {
+      throw new Error(`Analysis card ${candidate.id} preview does not match its code template`);
+    }
+    const templateSlots = slotIds(candidate.template).map((id) => {
+      const referenced = slots.get(id);
+      if (!referenced) throw new Error(`Analysis card ${candidate.id} references unknown slot ${id}`);
+      return referenced;
+    });
+    const allowedClaims =
+      candidate.placement === "outlook"
+        ? new Set(["outlook_wave", "outlook_surface"])
+        : candidate.placement === "alternate"
+          ? new Set(["alternate"])
+          : candidate.placement === "watch"
+            ? new Set(["confidence"])
+            : new Set(["primary"]);
+    for (const referenced of templateSlots) {
+      if (!allowedClaims.has(referenced.claim)) {
+        throw new Error(`Analysis card ${candidate.id} references a slot outside its placement`);
+      }
+      for (const factRef of referenced.factRefs) {
+        if (!candidate.factRefs.includes(factRef)) {
+          throw new Error(`Analysis card ${candidate.id} omits provenance for slot ${referenced.id}`);
+        }
+      }
+    }
+    for (const factRef of candidate.factRefs) {
+      const fact = facts.get(factRef);
+      if (!fact) {
+        throw new Error(`Analysis card ${candidate.id} references unknown fact ${factRef}`);
+      }
+      assertCardFactAllowed({ card: candidate, fact, slots, primaryId, backupId });
+    }
+    if (candidate.placement === "primary_support") {
+      if (candidate.stance !== "support" || candidate.windowId !== primaryId) {
+        throw new Error(`Analysis primary support card ${candidate.id} has invalid framing`);
+      }
+    } else if (candidate.placement === "primary_tradeoff") {
+      if (candidate.stance !== "tradeoff" || candidate.windowId !== primaryId) {
+        throw new Error(`Analysis primary tradeoff card ${candidate.id} has invalid framing`);
+      }
+    } else if (candidate.placement === "alternate") {
+      if (!backupId || candidate.windowId !== backupId) {
+        throw new Error(`Analysis alternate card ${candidate.id} is not tied to the backup`);
+      }
+    } else if (candidate.placement === "watch") {
+      if (candidate.stance !== "tradeoff") {
+        throw new Error(`Analysis watch card ${candidate.id} is not a tradeoff`);
+      }
+      if (candidate.windowId !== null && candidate.windowId !== primaryId) {
+        throw new Error(`Analysis watch card ${candidate.id} is not tied to the primary call`);
+      }
+    } else if (candidate.stance !== "context" || candidate.windowId !== null) {
+      throw new Error(`Analysis outlook card ${candidate.id} has invalid framing`);
+    }
+  }
+  return { cards, slots };
 }
 
-function assertSetupGrammar(template: string): void {
-  const normalized = template.replace(/\s+/g, " ").trim();
-  const setupSentences = sentences(normalized);
-  if (setupSentences.length < 1 || setupSentences.length > 2) {
-    throw new Error("setup must contain one or two compact evolution sentences");
+function selectCard(options: {
+  id: string;
+  placement: SurfAnalysisCardPlacement;
+  cards: Map<string, SurfAnalysisEditorialCard>;
+  usedIds: Set<string>;
+  semanticKeys: Set<string>;
+}): SurfAnalysisEditorialCard {
+  const card = options.cards.get(options.id);
+  if (!card) throw new Error(`Analysis selected unknown card ${options.id}`);
+  if (card.placement !== options.placement) {
+    throw new Error(`Analysis card ${options.id} belongs in ${card.placement}`);
   }
-  const surfAt = normalized.indexOf("{{day_surf_evolution}}");
-  const swellAt = normalized.indexOf("{{day_swell_evolution}}");
-  if (surfAt < 0 || swellAt < 0 || surfAt >= swellAt) {
-    throw new Error("setup must describe surf before swell");
+  if (options.usedIds.has(card.id)) throw new Error(`Analysis repeats card ${card.id}`);
+  if (options.semanticKeys.has(card.semanticKey)) {
+    throw new Error(`Analysis repeats semantic point ${card.semanticKey}`);
   }
-  if (
-    !/\bsurf\b[^.!?]{0,56}\{\{day_surf_evolution\}\}/i.test(normalized) ||
-    !/\bswell\b[^.!?]{0,56}\{\{day_swell_evolution\}\}/i.test(normalized)
-  ) {
-    throw new Error("setup must place each evolution value after its matching surf or swell noun");
-  }
-  if (
-    setupSentences.some(
-      (sentence) =>
-        !sentence.includes("{{day_surf_evolution}}") &&
-        !sentence.includes("{{day_swell_evolution}}")
-    )
-  ) {
-    throw new Error("setup may not append an ungrounded sentence");
-  }
-  if (RECOMMENDATION_NEGATION_PATTERN.test(normalized)) {
-    throw new Error("setup must not negate a code-owned evolution value");
-  }
-}
-
-function assertConfidenceGrammar(template: string): void {
-  const normalized = template.replace(/\s+/g, " ").trim();
-  const confidenceAt = normalized.indexOf("{{forecast_confidence}}");
-  const bustAt = normalized.indexOf("{{bust_factor}}");
-  const confidenceSentences = sentences(normalized);
-  if (
-    confidenceAt < 0 ||
-    bustAt < 0 ||
-    confidenceAt >= bustAt ||
-    !normalized.endsWith("{{bust_factor}}")
-  ) {
-    throw new Error("confidence must lead with the confidence band and end at the bust factor");
-  }
-  if (confidenceSentences.length < 1 || confidenceSentences.length > 2) {
-    throw new Error("confidence must contain one or two compact sentences");
-  }
-  if (
-    confidenceSentences.some(
-      (sentence) =>
-        !sentence.includes("{{forecast_confidence}}") && !sentence.includes("{{bust_factor}}")
-    )
-  ) {
-    throw new Error("confidence may not append an ungrounded sentence");
-  }
-  const confidenceSentence = confidenceSentences.find((sentence) =>
-    sentence.includes("{{forecast_confidence}}")
-  )!;
-  const bustSentence = confidenceSentences.find((sentence) =>
-    sentence.includes("{{bust_factor}}")
-  )!;
-  if (!/\b(?:confidence|call|read)\b/i.test(confidenceSentence)) {
-    throw new Error("confidence band must be framed as confidence in the call");
-  }
-  if (!UNCERTAINTY_FRAME_PATTERN.test(bustSentence)) {
-    throw new Error("bust factor must follow an uncertainty or risk frame");
-  }
-  if (!/:\s*\{\{bust_factor\}\}$/.test(normalized)) {
-    throw new Error("bust factor must be introduced by a colon as a complete final sentence");
-  }
-  if (RECOMMENDATION_NEGATION_PATTERN.test(normalized)) {
-    throw new Error("confidence must not negate its code-owned values");
-  }
+  options.usedIds.add(card.id);
+  options.semanticKeys.add(card.semanticKey);
+  return card;
 }
 
 export function validateSurfAnalysisDraft(
   value: unknown,
   snapshot: SurfAnalysisValidationSnapshot,
   now = new Date()
-): { draft: SurfAnalysisDraftV3; validation: SurfAnalysisValidation } {
-  const draft = SurfAnalysisDraftV3Schema.parse(value);
-  const knownFacts = new Set(snapshot.facts.map((fact) => fact.id));
-  const knownSlots = new Map(snapshot.slots.map((candidate) => [candidate.id, candidate]));
-  const usedSlots: string[] = ["headline_call"];
-  const headline = knownSlots.get("headline_call");
-  if (!headline || headline.block !== "headline") {
-    throw new Error("Analysis snapshot is missing the code-owned headline slot");
-  }
-  const allowedHeadlineFacts = new Set(snapshot.allowedFactRefs.headline);
-  const referencedFacts: string[] = [];
-  for (const factRef of headline.factRefs) {
-    if (!knownFacts.has(factRef) || !allowedHeadlineFacts.has(factRef)) {
-      throw new Error("Code-owned headline provenance is outside its allowed facts");
-    }
-    referencedFacts.push(factRef);
+): { draft: SurfAnalysisPlanV5; validation: SurfAnalysisValidation } {
+  const draft = SurfAnalysisPlanV5Schema.parse(value);
+  const { cards, slots } = validateCatalog(snapshot);
+  const usedIds = new Set<string>();
+  const semanticKeys = new Set<string>();
+  const selected: Array<{ path: string; card: SurfAnalysisEditorialCard }> = [];
+  const add = (path: string, id: string, placement: SurfAnalysisCardPlacement) => {
+    const card = selectCard({ id, placement, cards, usedIds, semanticKeys });
+    selected.push({ path, card });
+    return card;
+  };
+
+  const outlookLead = add("outlook.leadCardId", draft.outlook.leadCardId, "outlook");
+  const outlookSupporting = add(
+    "outlook.supportingCardId",
+    draft.outlook.supportingCardId,
+    "outlook"
+  );
+  const outlookDomains = new Set([
+    ...outlookLead.domains,
+    ...outlookSupporting.domains
+  ]);
+  if (
+    !outlookDomains.has("wave") ||
+    (!outlookDomains.has("surface") && !outlookDomains.has("wind"))
+  ) {
+    throw new Error("Analysis outlook must cover wave plus surface or wind context");
   }
 
-  for (const block of blocks(draft)) {
-    assertNaturalParagraph(block.name, block.template);
-    if (block.name === "setup") assertSetupGrammar(block.template);
-    if (block.name === "plan") assertRecommendationSemantics(block.template);
-    if (block.name === "confidence") assertConfidenceGrammar(block.template);
-    const ids = slotIds(block.template);
-    for (const id of ids) {
-      const candidate = knownSlots.get(id);
-      if (!candidate) throw new Error(`${block.name} references unknown value slot ${id}`);
-      if (candidate.block !== block.name) {
-        throw new Error(`${block.name} uses ${id}, which belongs in ${candidate.block}`);
-      }
-      if (usedSlots.includes(id)) throw new Error(`Value slot ${id} is used more than once`);
-      usedSlots.push(id);
-    }
-
-    const allowedFacts = new Set(snapshot.allowedFactRefs[block.name]);
-    for (const id of ids) {
-      for (const factRef of knownSlots.get(id)!.factRefs) {
-        if (!knownFacts.has(factRef)) {
-          throw new Error(`${block.name} slot ${id} has unknown fact provenance ${factRef}`);
-        }
-        if (!allowedFacts.has(factRef)) {
-          throw new Error(`${block.name} slot ${id} has provenance outside its allowed facts`);
-        }
-        referencedFacts.push(factRef);
-      }
-    }
+  const supportCards = snapshot.cards.filter(
+    ({ placement }) => placement === "primary_support"
+  );
+  if (supportCards.length > 0 && draft.call.primarySupportCardId === null) {
+    throw new Error("Analysis omitted the required primary support selection");
+  }
+  if (draft.call.primarySupportCardId !== null) {
+    add("call.primarySupportCardId", draft.call.primarySupportCardId, "primary_support");
   }
 
-  for (const required of snapshot.slots.filter((candidate) => candidate.required)) {
-    if (!usedSlots.includes(required.id)) throw new Error(`Required value slot ${required.id} is missing`);
+  const tradeoffCards = snapshot.cards.filter(
+    ({ placement }) => placement === "primary_tradeoff"
+  );
+  if (tradeoffCards.length > 0 && draft.call.primaryTradeoffCardId === null) {
+    throw new Error("Analysis omitted the required primary tradeoff selection");
+  }
+  if (tradeoffCards.length === 0 && draft.call.primaryTradeoffCardId !== null) {
+    throw new Error("Analysis invented a primary tradeoff selection");
+  }
+  if (draft.call.primaryTradeoffCardId !== null) {
+    add("call.primaryTradeoffCardId", draft.call.primaryTradeoffCardId, "primary_tradeoff");
   }
 
-  const paragraphTemplates = [
-    draft.paragraphs.setup.template,
-    draft.paragraphs.plan.template,
-    draft.paragraphs.confidence.template
-  ].map((template) => withoutSlots(template).replace(/\s+/g, " ").trim().toLowerCase());
-  if (new Set(paragraphTemplates).size !== paragraphTemplates.length) {
-    throw new Error("Analysis paragraphs repeat the same prose");
+  if (snapshot.callMode === "primary_only" && draft.call.alternateCardId !== null) {
+    throw new Error("Analysis invented an alternate when no backup recommendation exists");
   }
+  if (draft.call.alternateCardId !== null) {
+    add("call.alternateCardId", draft.call.alternateCardId, "alternate");
+  }
+
+  add("close.watchCardId", draft.close.watchCardId, "watch");
+
+  const renderedSlotIds = new Set([
+    "headline_call",
+    "primary_session",
+    "primary_surf_size",
+    "primary_swell",
+    "primary_wind_surface",
+    "confidence_sentence"
+  ]);
+  if (slots.has("primary_tide_sentence")) renderedSlotIds.add("primary_tide_sentence");
+  for (const { card } of selected) {
+    slotIds(card.template).forEach((id) => renderedSlotIds.add(id));
+  }
+  for (const id of renderedSlotIds) {
+    if (!slots.has(id)) throw new Error(`Analysis is missing rendered value slot ${id}`);
+  }
+  const frameClaimRefs = snapshot.slots
+    .filter(({ id }) => renderedSlotIds.has(id))
+    .map((candidate) => ({
+      path: `codeOwned.${candidate.id}`,
+      factRefs: [...candidate.factRefs]
+    }));
+  const selectedClaimRefs = selected.map(({ path, card }) => ({
+    path,
+    factRefs: [...card.factRefs]
+  }));
+  const claimRefs = [...frameClaimRefs, ...selectedClaimRefs];
+  const referencedFactIds = [...new Set(claimRefs.flatMap(({ factRefs }) => factRefs))].sort();
 
   return {
     draft,
     validation: SurfAnalysisValidationSchema.parse({
       valid: true,
       checkedAt: now.toISOString(),
-      referencedFactIds: [...new Set(referencedFacts)].sort(),
-      usedSlotIds: [...usedSlots].sort()
+      referencedFactIds,
+      usedCardIds: [...usedIds].sort(),
+      claimRefs
     })
   };
 }

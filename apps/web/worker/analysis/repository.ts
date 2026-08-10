@@ -185,6 +185,8 @@ export async function acceptSurfAnalysisResult(options: {
     facts: stored.job.factFingerprint,
     prompt: stored.job.promptVersion,
     schema: stored.job.outputSchemaVersion,
+    provider: options.submission.providerId,
+    route: options.submission.route,
     model: options.submission.modelId
   });
   const revisionId = `revision.${revisionFingerprint}`;
@@ -200,15 +202,16 @@ export async function acceptSurfAnalysisResult(options: {
       publishedAt
     });
   } catch {
-    const disposition = await markResultTerminal({
-      db: options.db,
-      jobId: stored.job.jobId,
-      submissionId: options.submission.submissionId,
-      status: "rejected",
-      reasonCode: "draft_validation_failed",
-      now
-    });
-    return { disposition, jobId: stored.job.jobId };
+    // A provider's semantic miss is not a terminal fact-lifecycle outcome.
+    // The cloud watchdog may still publish a grounded fallback, and a late
+    // primary result may still win if the fallback also misses validation.
+    return {
+      disposition:
+        options.submission.route === "primary"
+          ? "fallback_requested"
+          : "fallback_failed",
+      jobId: stored.job.jobId
+    };
   }
   const [insertResult, publishResult] = await options.db.batch([
     options.db
@@ -216,12 +219,13 @@ export async function acceptSurfAnalysisResult(options: {
         `insert into narrative_revisions (
            revision_id, job_id, domain, entity_id, local_date, fact_fingerprint,
            material_fingerprint, revision_fingerprint, prompt_version,
-           output_schema_version, model_id, report_json, validation_json,
+           output_schema_version, model_id, provider_id, inference_route,
+           report_json, validation_json,
            generated_at, published_at
          )
          select ?, job_id, domain, entity_id, local_date, fact_fingerprint,
                 material_fingerprint, ?, prompt_version, output_schema_version,
-                ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?
          from narrative_jobs
          where job_id = ? and submission_id = ? and fact_fingerprint = ?
            and deadline_at > ? and status in ('enqueueing', 'pending', 'enqueue_failed')
@@ -231,6 +235,8 @@ export async function acceptSurfAnalysisResult(options: {
         revisionId,
         revisionFingerprint,
         options.submission.modelId,
+        options.submission.providerId,
+        options.submission.route,
         JSON.stringify(report),
         JSON.stringify(validated.validation),
         publishedAt,

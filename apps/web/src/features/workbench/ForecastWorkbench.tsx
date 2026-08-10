@@ -1047,8 +1047,10 @@ type AnalysisRequestState =
   | { status: "settled"; analysis: DailyAnalysis }
   | { status: "failed" };
 
-const ANALYSIS_PENDING_POLL_MS = 3_000;
-const ANALYSIS_PENDING_MAX_REQUESTS = 20;
+const ANALYSIS_PENDING_FAST_POLL_MS = 3_000;
+const ANALYSIS_PENDING_FAST_REQUESTS = 20;
+const ANALYSIS_PENDING_SLOW_POLL_MS = 30_000;
+const ANALYSIS_PENDING_POLL_MAX_MS = 40 * 60_000;
 
 function unavailableLine(busy: boolean) {
   return (
@@ -1070,20 +1072,25 @@ function DailyAnalysis({
 }) {
   const [state, setState] = useState<AnalysisRequestState>({ status: "loading" });
   const [busy, setBusy] = useState(Boolean(selectedDate));
+  const [pollingExhausted, setPollingExhausted] = useState(false);
+  const [refreshCycle, setRefreshCycle] = useState(0);
 
   useEffect(() => {
     if (!selectedDate) {
       setBusy(false);
+      setPollingExhausted(false);
       setState({ status: "failed" });
       return;
     }
     const controller = new AbortController();
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    const pollingStartedAt = Date.now();
     // A canonical refresh may change exact code-owned values even when broad
     // condition bands are unchanged. Clear the old report until the Worker
     // proves it still matches the current fact fingerprint.
     setState({ status: "loading" });
     setBusy(true);
+    setPollingExhausted(false);
     const requestAnalysis = async (requestNumber: number): Promise<void> => {
       try {
         const response = await fetch(
@@ -1099,26 +1106,36 @@ function DailyAnalysis({
         if (!analysis) throw new Error("Analysis response was malformed");
         if (controller.signal.aborted) return;
         if (analysis.status === "pending") {
-          if (requestNumber < ANALYSIS_PENDING_MAX_REQUESTS) {
-            setState({ status: "settled", analysis });
-            setBusy(true);
-            pollTimer = setTimeout(() => {
-              pollTimer = null;
-              void requestAnalysis(requestNumber + 1);
-            }, ANALYSIS_PENDING_POLL_MS);
+          setState({ status: "settled", analysis });
+          const elapsedMs = Date.now() - pollingStartedAt;
+          if (elapsedMs >= ANALYSIS_PENDING_POLL_MAX_MS) {
+            setBusy(false);
+            setPollingExhausted(true);
             return;
           }
-          // The bounded wait ended without a validated report. Do not leave a
-          // visually idle "pending" state that can never advance on its own.
-          setState({ status: "failed" });
-          setBusy(false);
+          setBusy(true);
+          setPollingExhausted(false);
+          const intervalMs =
+            requestNumber < ANALYSIS_PENDING_FAST_REQUESTS
+              ? ANALYSIS_PENDING_FAST_POLL_MS
+              : ANALYSIS_PENDING_SLOW_POLL_MS;
+          const delayMs = Math.min(
+            intervalMs,
+            ANALYSIS_PENDING_POLL_MAX_MS - elapsedMs
+          );
+          pollTimer = setTimeout(() => {
+            pollTimer = null;
+            void requestAnalysis(requestNumber + 1);
+          }, delayMs);
           return;
         }
         setState({ status: "settled", analysis });
         setBusy(false);
+        setPollingExhausted(false);
       } catch {
         if (controller.signal.aborted) return;
         setBusy(false);
+        setPollingExhausted(false);
         setState({ status: "failed" });
       }
     };
@@ -1127,7 +1144,7 @@ function DailyAnalysis({
       controller.abort();
       if (pollTimer !== null) clearTimeout(pollTimer);
     };
-  }, [canonicalGeneratedAt, selectedDate, spot.id]);
+  }, [canonicalGeneratedAt, refreshCycle, selectedDate, spot.id]);
 
   if (state.status === "loading") {
     return (
@@ -1142,9 +1159,21 @@ function DailyAnalysis({
   }
   if (state.analysis.status === "pending") {
     return (
-      <p className="quietBriefLine" role="status" aria-busy={busy}>
-        {state.analysis.message}
-      </p>
+      <div className="quietBriefLine" role="status" aria-busy={busy}>
+        <span>{state.analysis.message}</span>
+        {pollingExhausted && (
+          <>
+            <span>Automatic checks are paused, but the queued Analysis may still publish.</span>
+            <button
+              className="analysisRetryButton"
+              type="button"
+              onClick={() => setRefreshCycle((cycle) => cycle + 1)}
+            >
+              Check again
+            </button>
+          </>
+        )}
+      </div>
     );
   }
   return unavailableLine(busy);

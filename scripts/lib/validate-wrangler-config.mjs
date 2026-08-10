@@ -59,12 +59,16 @@ export function wranglerStructureFailures(config, configPath) {
   const ingestQueue = `${name}-ingest`;
   const deadLetterQueue = `${name}-ingest-dlq`;
   const narrativeQueue = `${name}-narrative`;
+  const narrativeFallbackQueue = `${name}-narrative-fallback`;
   const ingestProducers = producers.filter((producer) => producer.binding === "INGEST_QUEUE");
   const narrativeProducers = producers.filter(
     (producer) => producer.binding === "NARRATIVE_QUEUE"
   );
+  const narrativeFallbackProducers = producers.filter(
+    (producer) => producer.binding === "NARRATIVE_FALLBACK_QUEUE"
+  );
   if (
-    producers.length !== 2 ||
+    producers.length !== 3 ||
     ingestProducers.length !== 1 ||
     ingestProducers[0]?.queue !== ingestQueue
   ) {
@@ -74,14 +78,40 @@ export function wranglerStructureFailures(config, configPath) {
     failures.push(`NARRATIVE_QUEUE must produce to ${narrativeQueue}.`);
   }
   if (
-    consumers.length !== 1 ||
-    consumers[0]?.queue !== ingestQueue ||
-    consumers[0]?.dead_letter_queue !== deadLetterQueue
+    narrativeFallbackProducers.length !== 1 ||
+    narrativeFallbackProducers[0]?.queue !== narrativeFallbackQueue
+  ) {
+    failures.push(
+      `NARRATIVE_FALLBACK_QUEUE must produce to ${narrativeFallbackQueue}.`
+    );
+  }
+  const ingestConsumers = consumers.filter((consumer) => consumer.queue === ingestQueue);
+  const fallbackConsumers = consumers.filter(
+    (consumer) => consumer.queue === narrativeFallbackQueue
+  );
+  if (
+    consumers.length !== 2 ||
+    ingestConsumers.length !== 1 ||
+    ingestConsumers[0]?.dead_letter_queue !== deadLetterQueue
   ) {
     failures.push(`Queue consumer must read ${ingestQueue} and dead-letter to ${deadLetterQueue}.`);
   }
-  if (consumers[0]?.max_batch_size !== 1 || consumers[0]?.max_concurrency !== 1) {
+  if (
+    ingestConsumers[0]?.max_batch_size !== 1 ||
+    ingestConsumers[0]?.max_concurrency !== 1
+  ) {
     failures.push("Ingest queue consumption must be serialized one message at a time.");
+  }
+  if (
+    fallbackConsumers.length !== 1 ||
+    fallbackConsumers[0]?.max_batch_size !== 1 ||
+    fallbackConsumers[0]?.max_concurrency !== 1 ||
+    fallbackConsumers[0]?.max_retries !== 0 ||
+    fallbackConsumers[0]?.dead_letter_queue !== undefined
+  ) {
+    failures.push(
+      "Narrative fallback consumption must be serialized with max_retries=0 and no DLQ; D1 owns paid-call idempotency."
+    );
   }
   if (consumers.some((consumer) => consumer.queue === narrativeQueue)) {
     failures.push("The narrative queue must use an out-of-band HTTP pull consumer, not a Worker consumer.");
@@ -146,7 +176,7 @@ export function wranglerStructureFailures(config, configPath) {
   }
   const narrativeEnabled = config?.vars?.NARRATIVE_ENABLED;
   if (isTrackedCanonicalConfig && narrativeEnabled !== "false") {
-    failures.push("The tracked config must keep NARRATIVE_ENABLED=false until pull infrastructure exists.");
+    failures.push("The tracked config must keep NARRATIVE_ENABLED=false; activation belongs in the ignored instance overlay.");
   } else if (
     !isTrackedCanonicalConfig &&
     narrativeEnabled !== "false" &&
@@ -156,6 +186,19 @@ export function wranglerStructureFailures(config, configPath) {
   }
   if (config?.vars?.NARRATIVE_RESULT_TOKEN !== undefined) {
     failures.push("NARRATIVE_RESULT_TOKEN must be a Wrangler secret, never a tracked Worker var.");
+  }
+  const fallbackDefaults = {
+    NARRATIVE_FALLBACK_MODEL: "gemini-3.6-flash",
+    NARRATIVE_FALLBACK_DELAY_SECONDS: "600",
+    NARRATIVE_FALLBACK_DAILY_CAP: "4",
+    NARRATIVE_FALLBACK_ROLLING_31_DAY_CAP: "100"
+  };
+  if (isTrackedCanonicalConfig) {
+    for (const [key, value] of Object.entries(fallbackDefaults)) {
+      if (config?.vars?.[key] !== value) {
+        failures.push(`${key} must remain ${value} in the tracked canonical config.`);
+      }
+    }
   }
   if (config?.observability?.enabled !== true) {
     failures.push("Worker observability must be enabled at the top level.");
