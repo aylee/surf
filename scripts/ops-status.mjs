@@ -11,17 +11,25 @@ import {
   isWorkerVersionId,
   responseWorkerVersion
 } from "./lib/worker-version.mjs";
+import { NORCAL_SPOTS } from "../packages/forecast-core/src/spot-registry.ts";
 
 export const OPS_STATUS_REQUEST_TIMEOUT_MS = 10_000;
 export const OPS_STATUS_WRANGLER_TIMEOUT_MS = 60_000;
+export const OPS_STATUS_GENERATION_CADENCE_MS = 60 * 60_000;
+export const OPS_STATUS_GENERATION_SETTLE_MS = 10 * 60_000;
+export const OPS_STATUS_MAX_GENERATION_AGE_MS =
+  OPS_STATUS_GENERATION_CADENCE_MS + OPS_STATUS_GENERATION_SETTLE_MS;
 
 // Keep this as one metadata-only SELECT. A single statement gives the status
 // command one D1 snapshot and never retrieves forecast_json.
 export const READ_MODEL_STATUS_SQL =
-  "with intervals(interval) as (values ('1h'), ('3h')) select s.id as spot_id, i.interval, case when r.spot_id is null then 'missing' else 'ready' end as state, r.generation_id, r.generated_at, r.materialized_at, length(r.forecast_json) as json_chars from spots s cross join intervals i left join forecast_read_models r on r.spot_id=s.id and r.interval=i.interval where s.active=1 order by s.id,i.interval";
+  "with intervals(interval) as (values ('1h'), ('3h')), latest_completed_generation(latest_completed_generation_at) as (select max(started_at) from source_runs where run_kind='ingest' and completed_at is not null), latest_source_health as (select count(*) as source_run_count, coalesce(sum(case when completed_at is not null then 1 else 0 end),0) as completed_source_run_count, coalesce(sum(case when status='failure' then 1 else 0 end),0) as failed_source_run_count, coalesce(sum(case when status='partial' then 1 else 0 end),0) as partial_source_run_count from source_runs cross join latest_completed_generation where run_kind='ingest' and started_at=latest_completed_generation_at), status_observation(status_observed_at) as (select strftime('%Y-%m-%dT%H:%M:%fZ','now')) select s.id as spot_id, i.interval, case when r.spot_id is null then 'missing' else 'ready' end as state, r.generation_id, r.generated_at, r.materialized_at, length(r.forecast_json) as json_chars, latest_completed_generation_at, status_observed_at, source_run_count, completed_source_run_count, failed_source_run_count, partial_source_run_count from spots s cross join intervals i cross join latest_completed_generation cross join latest_source_health cross join status_observation left join forecast_read_models r on r.spot_id=s.id and r.interval=i.interval where s.active=1 order by s.id,i.interval";
 
 const FORECAST_GENERATION_PATTERN =
   /^sha256:[a-f0-9]{64}(?::ingest:[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$/;
+const CANONICAL_NORCAL_SPOT_IDS = Object.freeze(
+  NORCAL_SPOTS.map(({ id }) => id).sort()
+);
 
 function parseJson(output, label) {
   try {
@@ -236,6 +244,8 @@ export function parseReadModelStatus(output) {
   const keys = new Set();
   const intervalsBySpot = new Map();
   const generatedTimes = [];
+  let sourceEvidence;
+  let maxGenerationLagMs = 0;
   for (const row of rows) {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
       throw new Error("D1 read-model rows must be JSON objects.");
@@ -253,6 +263,45 @@ export function parseReadModelStatus(output) {
     }
     keys.add(key);
 
+    const latestCompletedGenerationAtMs = canonicalTimestampMs(
+      row.latest_completed_generation_at
+    );
+    const statusObservedAtMs = canonicalTimestampMs(row.status_observed_at);
+    const sourceRunCounts = [
+      row.source_run_count,
+      row.completed_source_run_count,
+      row.failed_source_run_count,
+      row.partial_source_run_count
+    ];
+    if (
+      !Number.isFinite(latestCompletedGenerationAtMs) ||
+      !Number.isFinite(statusObservedAtMs) ||
+      latestCompletedGenerationAtMs > statusObservedAtMs ||
+      sourceRunCounts.some((count) => !Number.isInteger(count) || count < 0) ||
+      row.source_run_count === 0 ||
+      row.completed_source_run_count === 0 ||
+      row.completed_source_run_count > row.source_run_count ||
+      row.failed_source_run_count + row.partial_source_run_count >
+        row.completed_source_run_count
+    ) {
+      throw new Error("D1 read-model SELECT returned invalid source-generation evidence.");
+    }
+    const rowSourceEvidence = {
+      latestCompletedGenerationAt: row.latest_completed_generation_at,
+      statusObservedAt: row.status_observed_at,
+      sourceRunCount: row.source_run_count,
+      completedSourceRunCount: row.completed_source_run_count,
+      failedSourceRunCount: row.failed_source_run_count,
+      partialSourceRunCount: row.partial_source_run_count
+    };
+    if (
+      sourceEvidence &&
+      JSON.stringify(sourceEvidence) !== JSON.stringify(rowSourceEvidence)
+    ) {
+      throw new Error("D1 read-model rows disagree on source-generation evidence.");
+    }
+    sourceEvidence = rowSourceEvidence;
+
     const generatedAtMs = canonicalTimestampMs(row.generated_at);
     const materializedAtMs = canonicalTimestampMs(row.materialized_at);
     if (
@@ -262,11 +311,18 @@ export function parseReadModelStatus(output) {
       !Number.isFinite(generatedAtMs) ||
       !Number.isFinite(materializedAtMs) ||
       materializedAtMs < generatedAtMs ||
+      materializedAtMs > statusObservedAtMs ||
       !Number.isInteger(row.json_chars) ||
       row.json_chars <= 0
     ) {
       throw new Error(`Read model ${key} is missing or invalid.`);
     }
+
+    const generationLagMs = latestCompletedGenerationAtMs - generatedAtMs;
+    if (generationLagMs < 0) {
+      throw new Error(`Read model ${key} is newer than the latest completed source generation.`);
+    }
+    maxGenerationLagMs = Math.max(maxGenerationLagMs, generationLagMs);
 
     const pair = intervalsBySpot.get(row.spot_id) ?? {
       intervals: new Set(),
@@ -293,7 +349,41 @@ export function parseReadModelStatus(output) {
     throw new Error("D1 read-model SELECT did not return complete 1h/3h pairs for every active spot.");
   }
 
-  const expected = intervalsBySpot.size * 2;
+  const activeSpotIds = [...intervalsBySpot.keys()].sort();
+  const activeSpotIdSet = new Set(activeSpotIds);
+  const canonicalSpotIdSet = new Set(CANONICAL_NORCAL_SPOT_IDS);
+  const missingSpotIds = CANONICAL_NORCAL_SPOT_IDS.filter(
+    (spotId) => !activeSpotIdSet.has(spotId)
+  );
+  const unexpectedSpotIds = activeSpotIds.filter(
+    (spotId) => !canonicalSpotIdSet.has(spotId)
+  );
+  if (missingSpotIds.length > 0 || unexpectedSpotIds.length > 0) {
+    throw new Error(
+      `D1 active spot catalog does not match the checked-in NorCal catalog (missing: ${missingSpotIds.join(",") || "none"}; unexpected: ${unexpectedSpotIds.join(",") || "none"}).`
+    );
+  }
+
+  const expected = CANONICAL_NORCAL_SPOT_IDS.length * 2;
+  const latestCompletedGenerationAtMs = Date.parse(
+    sourceEvidence.latestCompletedGenerationAt
+  );
+  const statusObservedAtMs = Date.parse(sourceEvidence.statusObservedAt);
+  const latestGenerationAgeMs = statusObservedAtMs - latestCompletedGenerationAtMs;
+  if (latestGenerationAgeMs > OPS_STATUS_MAX_GENERATION_AGE_MS) {
+    throw new Error(
+      `Latest completed source generation is ${Math.ceil(latestGenerationAgeMs / 60_000)} minutes old; policy allows ${OPS_STATUS_MAX_GENERATION_AGE_MS / 60_000}.`
+    );
+  }
+  const settling = latestGenerationAgeMs <= OPS_STATUS_GENERATION_SETTLE_MS;
+  const allowedGenerationLagMs = settling
+    ? OPS_STATUS_GENERATION_CADENCE_MS
+    : 0;
+  if (maxGenerationLagMs > allowedGenerationLagMs) {
+    throw new Error(
+      `Read models lag the latest completed source generation by ${Math.ceil(maxGenerationLagMs / 60_000)} minutes; policy allows ${allowedGenerationLagMs / 60_000}${settling ? " during the settle window" : " after the settle window"}.`
+    );
+  }
   generatedTimes.sort((left, right) => Date.parse(left) - Date.parse(right));
   return {
     status: "PASS",
@@ -301,7 +391,16 @@ export function parseReadModelStatus(output) {
     expected,
     spots: intervalsBySpot.size,
     oldestGeneratedAt: generatedTimes[0],
-    newestGeneratedAt: generatedTimes.at(-1)
+    newestGeneratedAt: generatedTimes.at(-1),
+    latestCompletedGenerationAt: sourceEvidence.latestCompletedGenerationAt,
+    statusObservedAt: sourceEvidence.statusObservedAt,
+    latestGenerationAgeMinutes: latestGenerationAgeMs / 60_000,
+    maxGenerationLagMinutes: maxGenerationLagMs / 60_000,
+    settling,
+    sourceRunCount: sourceEvidence.sourceRunCount,
+    completedSourceRunCount: sourceEvidence.completedSourceRunCount,
+    failedSourceRunCount: sourceEvidence.failedSourceRunCount,
+    partialSourceRunCount: sourceEvidence.partialSourceRunCount
   };
 }
 
@@ -329,6 +428,10 @@ function generatedRange(readModels) {
     : `${readModels.oldestGeneratedAt} → ${readModels.newestGeneratedAt}`;
 }
 
+function displayMinutes(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
 export function formatOpsStatus(result) {
   const rows = [
     [
@@ -349,7 +452,7 @@ export function formatOpsStatus(result) {
     [
       "Read models",
       result.readModels.status,
-      `${result.readModels.ready}/${result.readModels.expected} ready · ${result.readModels.spots} spots · generated ${generatedRange(result.readModels)}`
+      `${result.readModels.ready}/${result.readModels.expected} ready · ${result.readModels.spots} spots · generated ${generatedRange(result.readModels)} · watermark ${result.readModels.latestCompletedGenerationAt} · max lag ${displayMinutes(result.readModels.maxGenerationLagMinutes)}m${result.readModels.settling ? " (settling)" : ""} · source runs ${result.readModels.completedSourceRunCount}/${result.readModels.sourceRunCount} complete, ${result.readModels.failedSourceRunCount} failed, ${result.readModels.partialSourceRunCount} partial`
     ]
   ];
   const headers = ["Check", "Status", "Evidence"];

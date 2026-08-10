@@ -56,6 +56,68 @@ unavailable. Cloudflare `1102` or an invocation outcome of `exceededCpu` means
 request-time work has regressed past the Worker CPU budget and should be fixed
 in the read path rather than translated into an unknown surf call.
 
+### Worker CPU budget
+
+The canonical and instance Worker configurations pin `limits.cpu_ms` to 2,000
+ms. This is a per-invocation ceiling, not reserved or prepaid CPU: Cloudflare
+bills actual CPU used. The limit applies to HTTP, scheduled, Queue, and Durable
+Object invocations in the Worker and is enforced only on Cloudflare's network.
+Local development does not prove it.
+
+The value is intentionally bounded. A fixed Logfire sample selected
+`span_name = 'queue'`, `cloudflare.outcome = 'ok'`, and
+`start_timestamp >= '2026-08-05T00:00:00Z' AND start_timestamp <
+'2026-08-10T14:40:00Z'`. Across its 912 successful Queue invocations,
+`cpu_time_ms` measured 887 ms at p99 and 1,149 ms at the maximum. Two seconds
+is 2.25 times that p99 and 74% above the observed maximum.
+At the current forecast-only cadence—one root, three source batches, and 11 spot
+materializations per hour—the nominal no-retry Queue load is capped at 21.6
+million CPU-ms in a 30-day month if every one of those jobs consumes the entire
+allowance. That remains below
+[Standard's included 30 million CPU-ms](https://developers.cloudflare.com/workers/platform/pricing/#workers).
+If optional Analysis also emits 11 `analysis-signal` messages every hour, the
+deliberately pessimistic ceiling becomes 37.44 million CPU-ms, an overage of
+about $0.15/month at current pricing. These figures are not an account billing
+ceiling: scheduled, HTTP, Durable Object, retry, and Cloudflare limit-flexibility
+usage is outside this nominal calculation. Normal usage is materially lower
+because the limit is not a reservation. Increasing the guard is not the default
+response to renewed `exceededCpu`: first inspect CPU traces and D1 rows read,
+then optimize or split the work.
+
+This deployment contract requires the Standard usage model. Cloudflare
+documents [configurable limits as Standard-only](https://developers.cloudflare.com/workers/wrangler/configuration/#limits)
+and currently prices Standard under Workers Paid; Workers Free's 10 ms
+per-invocation budget cannot run the measured materialization path. The
+pre-deploy config validator rejects a missing or different CPU limit. Project
+automation never changes account usage models, subscriptions, or billing. If a
+read-only account check does not already report Standard, stop before deploying
+instead of turning a runtime repair into a plan upgrade.
+
+Before deploying a CPU-limit change, record the active Worker version and a D1
+Time Travel bookmark. Run `pnpm check:cloudflare`, then deploy through the
+supported `pnpm deploy` path. From the returned exact version ID, verify:
+
+```bash
+pnpm wrangler -- versions view <version-id> --json
+```
+
+Require `resources.script_runtime.usage_model` to be `standard`, one active
+deployment at 100%, a complete exact-lineage ingest, and zero `exceededCpu`
+Queue outcomes for that cycle. Compare `cpu_time_ms` with the 2,000 ms guard;
+do not treat Cloudflare's occasional limit flexibility as headroom.
+
+Treat Worker activation as the rollback boundary and fix forward by default.
+The CPU-limit edit itself changes neither D1 nor Queue contracts, but a release
+containing it may also include additive D1/query work, and PR 35's version-1
+`source-batch` and `analysis-signal` messages are not understood by the active
+pre-35 predecessor. Do not use that predecessor as a routine rollback target.
+Follow the global version-1 rollback gate in [Deploy and
+rollback](#deploy-and-rollback): first prove Queue quiescence, no consumer in
+flight, DLQ and retry state, and predecessor payload compatibility. Additive D1
+indexes can remain in place, but that does not make a Worker rollback
+Queue-safe. Returning to the former effective 50 ms CPU cap also restores the
+known stale-report failure mode.
+
 Successful forecast responses use a one-minute shared-cache TTL with five
 minutes of stale-while-revalidate. `/brief` is always `Cache-Control: no-store`
 because its stable date URL must never serve an exact-value report after the
@@ -150,7 +212,15 @@ Expected results:
   serving Worker version; one active deployment at 100%; one ingest consumer
   with batch/concurrency `1/1` and the configured DLQ; and one ready read-model
   row for each active spot/interval pair (`22/22` for the current 11-spot
-  catalog). Any missing proof exits
+  catalog). The active D1 spot IDs must exactly equal the checked-in NorCal
+  catalog; a stale six-spot database cannot pass by reporting `12/12`. The
+  models are checked against the latest completed source-generation watermark.
+  The hourly policy allows one prior generation only during the first 10
+  minutes while serialized Queue work drains. After that settle window every
+  spot/interval must equal the watermark. The watermark itself may be at most
+  70 minutes old (one hourly cadence plus the same settle budget). The row also
+  reports bounded completed/failed/partial source-run counts without printing
+  provider errors or forecast payloads. Any missing proof exits
   nonzero. It performs one health GET
   plus exactly three read-only Wrangler operations and never triggers ingest,
   prints forecast JSON, or changes D1/Queue state.
@@ -160,6 +230,21 @@ Expected results:
 - At the next actual `:17` cycle, inspect Logfire for the cron, source job, 11
   serialized spot jobs, and 22 publication outcomes, with the same structured
   `ingestId`/spot/generation evidence and no `exceededCpu`/1102 outcome.
+
+The Queue status row proves consumer serialization and DLQ wiring, not queue
+quiescence, backlog depth, DLQ emptiness, retries, or historical Worker CPU
+outcomes. Wrangler 4 does not expose those as one finite structured status
+command. `wrangler tail` is a live stream, and pulling a DLQ message leases it,
+reveals its body, and changes delivery state. For causal diagnosis, use
+[Cloudflare Queue metrics](https://developers.cloudflare.com/queues/observability/metrics/)
+for bounded backlog/operation evidence and
+[Workers Observability](https://developers.cloudflare.com/workers/observability/errors/)
+or Logfire for `exceededCpu`/1102 outcomes. Keep those operator
+checks separate from `ops:status`; direct Queue REST/GraphQL metrics require an
+account identifier and additional token scopes that are not available to every
+Wrangler OAuth or self-hosted instance. A generation-watermark failure proves
+publication degradation downstream of the Queue, but does not by itself assign
+the cause to Queue delivery, provider input, or Worker CPU.
 
 For the authoritative answer to “what is live,” use:
 

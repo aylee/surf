@@ -8,8 +8,9 @@ or resource identifiers.
 
 - Node.js 24 (see `.node-version`)
 - pnpm 11 through Corepack
-- For deployment: a Cloudflare account with Workers, D1, R2, and Queues,
-  plus a registered `workers.dev` subdomain
+- For deployment: a Cloudflare account whose Workers settings report the
+  Standard usage model, with D1, R2, and Queues, plus a registered `workers.dev`
+  subdomain
 
 The forecast feeds used by the reference configuration do not require paid API
 keys. Optional Analysis can run on a self-hosted oMLX server; it has no hosted
@@ -18,6 +19,17 @@ Analysis is disabled, pending, or unavailable. Cloudflare usage is the expected
 hosting cost. Python 3.12 and
 [uv](https://docs.astral.sh/uv/) are needed only for the contributor gate and
 optional scientific extractor.
+
+The checked-in Worker configuration deliberately pins a 2,000 ms CPU limit.
+Cloudflare supports [configurable runtime limits](https://developers.cloudflare.com/workers/wrangler/configuration/#limits)
+only with the Standard usage model and currently makes Standard available on
+Workers Paid. Workers Free is not a supported deployment target: its 10 ms CPU
+budget is below this application's measured forecast-materialization workload.
+The config validator rejects removing or changing the limit so a fork cannot
+silently fall back to an account- or dashboard-specific CPU cap. Project setup
+does not change account usage models, subscriptions, or billing; if the account
+does not already report Standard, stop before deployment and let the operator
+choose whether to change plans.
 
 ## Local setup
 
@@ -89,6 +101,13 @@ portability check enforces those relationships so one renamed instance cannot
 silently attach to another instance's storage. Keep binding names (`DB`,
 `RAW_ARTIFACTS`, `INGEST_QUEUE`, and `NARRATIVE_QUEUE`) unchanged unless the
 Worker types and code change with them.
+
+`pnpm ops:status` deliberately uses the active Wrangler profile/config plus one
+metadata-only D1 query. It does not require a checked-in account ID or a second
+Queue analytics token, so the same generation-lag proof works for OAuth-backed
+forks and ignored instance overlays. Queue backlog/DLQ and historical CPU
+metrics remain account-console or explicitly scoped observability checks; see
+the runtime operations guide for that evidence boundary.
 
 Also replace `vars.SURF_USER_AGENT` with an application name and URL or email
 that the instance operator monitors. NOAA/NWS asks API clients to identify a

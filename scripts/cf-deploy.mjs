@@ -7,11 +7,16 @@ import {
   runWrangler
 } from "./lib/cloudflare-commands.mjs";
 import { bootstrapDeployedWorker } from "./lib/deploy-bootstrap.mjs";
+import { deployExistingWorker } from "./lib/deploy-orchestration.mjs";
 import {
   resolveActiveDeploymentId,
   resolveDeployedUrl,
   resolveDeployedVersionId
 } from "./lib/deploy-url.mjs";
+import {
+  parseWorkerRuntime,
+  resolveSoleActiveWorkerVersionId
+} from "./lib/worker-runtime.mjs";
 import {
   assertWorkerVersionId,
   waitForWorkerVersion
@@ -140,6 +145,37 @@ function assertDeploymentActive(expectedVersionId, checkpoint) {
   return deploymentId;
 }
 
+function inspectWorkerRuntime(expectedVersionId, { requireCpuLimit, checkpoint }) {
+  const versionOutput = runWrangler(
+    ["versions", "view", expectedVersionId, "--json"],
+    { capture: true, echo: false }
+  );
+  const runtime = parseWorkerRuntime(versionOutput, {
+    expectedVersionId,
+    requireCpuLimit
+  });
+  console.log(JSON.stringify({
+    status: "worker-runtime",
+    checkpoint,
+    ...runtime
+  }));
+  return runtime;
+}
+
+function assertExistingDeploymentRuntime() {
+  const deploymentOutput = runWrangler(
+    ["deployments", "status", "--json"],
+    { capture: true, echo: false }
+  );
+  const activeVersionId = resolveSoleActiveWorkerVersionId(deploymentOutput);
+  // The predecessor may inherit Cloudflare's historical 50 ms guard, so only
+  // the Standard account/runtime prerequisite is required before mutation.
+  return inspectWorkerRuntime(activeVersionId, {
+    requireCpuLimit: false,
+    checkpoint: "pre-mutation"
+  });
+}
+
 async function waitUntilServing(output, expectedWorkerName) {
   const url = deployedUrl(output);
   if (!url) {
@@ -174,11 +210,15 @@ if (mode === "deploy" && !process.env.SURF_INGEST_TOKEN?.trim()) {
 }
 
 runWrangler(["whoami"]);
-ensureQueues();
 
 let output;
 if (mode === "setup") {
+  ensureQueues();
   output = deployWorker();
+  inspectWorkerRuntime(resolveDeployedVersionId(output), {
+    requireCpuLimit: true,
+    checkpoint: "post-upload"
+  });
   try {
     migrateAndSeed();
   } catch (error) {
@@ -196,37 +236,50 @@ if (mode === "setup") {
   );
   assertDeploymentActive(rollout.expectedVersionId, "post-smoke");
 } else {
-  try {
-    migrateAndSeed();
-  } catch (error) {
-    throw new Error(
-      "Cloudflare storage is not initialized. For a first deployment, run pnpm setup:cloudflare; for an existing deployment, fix the reported D1 error before retrying pnpm deploy.",
-      { cause: error }
-    );
-  }
-  output = deployWorker();
   let rollout;
-  await bootstrapDeployedWorker({
-    waitUntilServing: async () => {
-      rollout = await waitUntilServing(output, expectedWorkerName);
+  output = await deployExistingWorker({
+    assertExistingDeploymentRuntime,
+    ensureQueues,
+    migrateAndSeed: () => {
+      try {
+        migrateAndSeed();
+      } catch (error) {
+        throw new Error(
+          "Cloudflare storage is not initialized. For a first deployment, run pnpm setup:cloudflare; for an existing deployment, fix the reported D1 error before retrying pnpm deploy.",
+          { cause: error }
+        );
+      }
     },
-    // Forecast GETs intentionally serve precomputed D1 read models. Queue the
-    // first generation only after the exact rollout version is stable, then
-    // wait for publication before strict post-deploy smoke.
-    enqueueAndWait: () =>
-      refreshForecastReadModels(
-        output,
-        rollout.expectedVersionId,
-        rollout.expectedWorkerName
-      ),
-    smoke: () => {
-      smoke(
-        output,
-        true,
-        rollout.expectedVersionId,
-        rollout.expectedWorkerName
-      );
-      assertDeploymentActive(rollout.expectedVersionId, "post-smoke");
+    deployWorker,
+    inspectUploadedRuntime: (deployOutput) =>
+      inspectWorkerRuntime(resolveDeployedVersionId(deployOutput), {
+        requireCpuLimit: true,
+        checkpoint: "post-upload"
+      }),
+    completeRollout: async (deployOutput) => {
+      await bootstrapDeployedWorker({
+        waitUntilServing: async () => {
+          rollout = await waitUntilServing(deployOutput, expectedWorkerName);
+        },
+        // Forecast GETs intentionally serve precomputed D1 read models. Queue
+        // the first generation only after the exact rollout version is stable,
+        // then wait for publication before strict post-deploy smoke.
+        enqueueAndWait: () =>
+          refreshForecastReadModels(
+            deployOutput,
+            rollout.expectedVersionId,
+            rollout.expectedWorkerName
+          ),
+        smoke: () => {
+          smoke(
+            deployOutput,
+            true,
+            rollout.expectedVersionId,
+            rollout.expectedWorkerName
+          );
+          assertDeploymentActive(rollout.expectedVersionId, "post-smoke");
+        }
+      });
     }
   });
 }

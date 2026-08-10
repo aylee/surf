@@ -48,6 +48,27 @@ test("canonical Wrangler configuration satisfies the supported instance contract
   assert.deepEqual(wranglerStructureFailures(canonical, configPath), []);
 });
 
+test("supported deployments pin a bounded Standard-plan CPU budget", () => {
+  assert.deepEqual(canonical.limits, { cpu_ms: 2_000 });
+
+  for (const cpuMs of [undefined, 50, 1_999, 2_001, 30_000, "2000"]) {
+    const config = structuredClone(canonical);
+    if (cpuMs === undefined) delete config.limits;
+    else config.limits.cpu_ms = cpuMs;
+
+    assert.deepEqual(wranglerStructureFailures(config, configPath), [
+      "Worker CPU limit must be exactly 2000 ms; the supported deployment requires the Standard usage model."
+    ]);
+  }
+
+  const instanceConfigPath = resolve(root, "apps/web/wrangler.instance.jsonc");
+  const ignoredOverlay = structuredClone(canonical);
+  ignoredOverlay.limits.cpu_ms = 50;
+  assert.deepEqual(wranglerStructureFailures(ignoredOverlay, instanceConfigPath), [
+    "Worker CPU limit must be exactly 2000 ms; the supported deployment requires the Standard usage model."
+  ]);
+});
+
 test("instance Worker names remain addressable by exact version overrides", () => {
   for (const invalidName of ["Surf-Dev", "1surf", "surf_dev", "surf.dev"]) {
     const config = structuredClone(canonical);

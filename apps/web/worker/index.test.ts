@@ -35,7 +35,10 @@ function dbMock(options: {
       preparedSql.push(sql);
       const allFor = async (values: unknown[]) => {
         if (!options.forecastAssemblyRows) return { results: [], success: true, meta: {} };
-        const horizonStart = typeof values[1] === "string" ? values[1] : null;
+        const horizonStart = values.find(
+          (value): value is string =>
+            typeof value === "string" && Number.isFinite(Date.parse(value))
+        ) ?? null;
         const waveStart = horizonStart ? new Date(horizonStart).getTime() : Number.NaN;
         const waveForecastAt = Number.isFinite(waveStart)
           ? new Date(waveStart + 3 * 60 * 60 * 1000).toISOString()
@@ -91,7 +94,10 @@ function dbMock(options: {
                 significantHeightM: 1.3,
                 estimatedBreakingHeightM: 1
               }),
-              source_run_id: "wave-run"
+              source_run_id: "wave-run",
+              created_at: new Date(
+                new Date(waveForecastAt).getTime() - 3 * 60 * 60 * 1000
+              ).toISOString()
             }],
             success: true,
             meta: {}
