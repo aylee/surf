@@ -772,6 +772,30 @@ test("ops status rejects subprocess failures without leaking stderr or running l
   assert.equal(calls.length, 1);
 });
 
+test("ops status never performs network or Wrangler probes when activation pinning fails", async () => {
+  let fetches = 0;
+  let subprocesses = 0;
+  await assert.rejects(
+    runOpsStatus({
+      env: { SURF_BASE_URL: "https://surf.example" },
+      fetcher: async () => {
+        fetches += 1;
+        return healthResponse();
+      },
+      wranglerProbe: async () => {
+        subprocesses += 1;
+        return { status: 0, stdout: "{}", stderr: "" };
+      },
+      prepareWrangler: () => {
+        throw new Error("Wrangler config snapshot SHA-256 does not match activation");
+      }
+    }),
+    /SHA-256 does not match activation/
+  );
+  assert.equal(fetches, 0);
+  assert.equal(subprocesses, 0);
+});
+
 test("ops status converts thrown subprocess errors to bounded diagnostics", async () => {
   await assert.rejects(
     runOpsStatus({

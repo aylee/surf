@@ -44,16 +44,51 @@ const MutationResponseSchema = z
   })
   .passthrough();
 
+const QueueMetadataResponseSchema = z
+  .object({
+    success: z.literal(true),
+    result: z
+      .object({
+        queue_name: z.string().min(1),
+        consumers_total_count: z.number().int().nonnegative(),
+        consumers: z.array(z.unknown())
+      })
+      .passthrough()
+  })
+  .passthrough();
+
+const HttpPullConsumerSchema = z
+  .object({
+    type: z.literal("http_pull"),
+    dead_letter_queue: z.string().min(1),
+    settings: z
+      .object({
+        batch_size: z.number().int().positive(),
+        max_retries: z.number().int().nonnegative(),
+        retry_delay: z.number().int().nonnegative(),
+        visibility_timeout_ms: z.number().int().positive()
+      })
+      .passthrough()
+  })
+  .passthrough();
+
 const ENCODED_JOB_MAX_BYTES = Math.ceil(NARRATIVE_JOB_MAX_BYTES / 3) * 4 + 4;
 const QUEUE_RESPONSE_BASE_MAX_BYTES = 16_384;
 const QUEUE_MESSAGE_WIRE_MAX_BYTES = ENCODED_JOB_MAX_BYTES + 4_096;
 const QUEUE_MUTATION_RESPONSE_MAX_BYTES = 16_384;
+const QUEUE_METADATA_RESPONSE_MAX_BYTES = 16_384;
 
 export type PulledQueueMessage = z.infer<typeof PulledMessageSchema>;
 
 export type QueuePullResult = {
   messages: PulledQueueMessage[];
   backlogCount: number | null;
+};
+
+export type QueueIdentity = {
+  queueName: string;
+  consumerType: "http_pull";
+  deadLetterQueueName: string;
 };
 
 function decodeBase64(value: string): Uint8Array {
@@ -117,13 +152,17 @@ export function decodeNarrativeJob(message: PulledQueueMessage): NarrativeJob {
 }
 
 export interface QueueClient {
+  preflight(): Promise<QueueIdentity>;
   pull(batchSize: number): Promise<QueuePullResult>;
   ack(leaseId: string): Promise<void>;
   retry(leaseId: string, delaySeconds: number): Promise<void>;
 }
 
 export class CloudflareQueueClient implements QueueClient {
+  private readonly queueUrl: string;
   private readonly messagesUrl: string;
+  private verifiedIdentity: QueueIdentity | null = null;
+  private preflightInFlight: Promise<QueueIdentity> | null = null;
 
   constructor(
     private readonly config: RunnerConfig["queue"],
@@ -132,7 +171,84 @@ export class CloudflareQueueClient implements QueueClient {
     private readonly fetcher: Fetcher = fetch
   ) {
     const base = config.apiBaseUrl.replace(/\/$/, "");
-    this.messagesUrl = `${base}/accounts/${encodeURIComponent(config.accountId)}/queues/${encodeURIComponent(config.queueId)}/messages`;
+    this.queueUrl = `${base}/accounts/${encodeURIComponent(config.accountId)}/queues/${encodeURIComponent(config.queueId)}`;
+    this.messagesUrl = `${this.queueUrl}/messages`;
+  }
+
+  async preflight(): Promise<QueueIdentity> {
+    if (this.verifiedIdentity) return this.verifiedIdentity;
+    if (this.preflightInFlight) return this.preflightInFlight;
+    const operation = this.fetchQueueIdentity();
+    this.preflightInFlight = operation;
+    try {
+      const identity = await operation;
+      this.verifiedIdentity = identity;
+      return identity;
+    } finally {
+      if (this.preflightInFlight === operation) this.preflightInFlight = null;
+    }
+  }
+
+  private async fetchQueueIdentity(): Promise<QueueIdentity> {
+    let response: Response;
+    try {
+      response = await this.fetcher(this.queueUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.config.apiToken}` },
+        signal: AbortSignal.timeout(this.requestTimeoutMs)
+      });
+    } catch {
+      throw new RunnerFailure("queue_preflight_network", "transient");
+    }
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        throw new RunnerFailure("queue_api_auth", "terminal");
+      }
+      const transient =
+        [408, 409, 425, 429].includes(response.status) || response.status >= 500;
+      throw new RunnerFailure(
+        transient ? "queue_preflight_http_transient" : "queue_preflight_http_terminal",
+        transient ? "transient" : "terminal"
+      );
+    }
+
+    let parsed: z.infer<typeof QueueMetadataResponseSchema>;
+    try {
+      parsed = QueueMetadataResponseSchema.parse(
+        await readBoundedJson(response, QUEUE_METADATA_RESPONSE_MAX_BYTES)
+      );
+    } catch {
+      throw new RunnerFailure("queue_preflight_response_invalid", "terminal");
+    }
+    if (parsed.result.queue_name !== this.config.name) {
+      throw new RunnerFailure("queue_identity_mismatch", "terminal");
+    }
+    if (
+      parsed.result.consumers_total_count !== 1 ||
+      parsed.result.consumers.length !== 1
+    ) {
+      throw new RunnerFailure("queue_consumer_topology_mismatch", "terminal");
+    }
+    let consumer: z.infer<typeof HttpPullConsumerSchema>;
+    try {
+      consumer = HttpPullConsumerSchema.parse(parsed.result.consumers[0]);
+    } catch {
+      throw new RunnerFailure("queue_consumer_topology_mismatch", "terminal");
+    }
+    if (
+      consumer.dead_letter_queue !== this.config.deadLetterQueueName ||
+      consumer.settings.batch_size !== 1 ||
+      consumer.settings.max_retries !== 0 ||
+      consumer.settings.retry_delay !== this.config.retryDelaySeconds ||
+      consumer.settings.visibility_timeout_ms !== this.visibilityTimeoutMs
+    ) {
+      throw new RunnerFailure("queue_consumer_settings_mismatch", "terminal");
+    }
+    return {
+      queueName: parsed.result.queue_name,
+      consumerType: consumer.type,
+      deadLetterQueueName: consumer.dead_letter_queue
+    };
   }
 
   private async request(
@@ -158,7 +274,8 @@ export class CloudflareQueueClient implements QueueClient {
       if (response.status === 401 || response.status === 403) {
         throw new RunnerFailure("queue_api_auth", "terminal");
       }
-      const transient = response.status === 429 || response.status >= 500;
+      const transient =
+        [408, 409, 425, 429].includes(response.status) || response.status >= 500;
       throw new RunnerFailure(
         transient ? "queue_api_http_transient" : "queue_api_http_terminal",
         transient ? "transient" : "terminal"
@@ -175,6 +292,7 @@ export class CloudflareQueueClient implements QueueClient {
     if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100) {
       throw new RunnerFailure("queue_pull_capacity_invalid", "terminal");
     }
+    await this.preflight();
     let parsed: z.infer<typeof PullResponseSchema>;
     try {
       parsed = PullResponseSchema.parse(
@@ -197,6 +315,7 @@ export class CloudflareQueueClient implements QueueClient {
   }
 
   async ack(leaseId: string): Promise<void> {
+    await this.preflight();
     await this.mutate(
       { acks: [{ lease_id: leaseId }], retries: [] },
       { ackCount: 1, retryCount: 0 }
@@ -204,6 +323,7 @@ export class CloudflareQueueClient implements QueueClient {
   }
 
   async retry(leaseId: string, delaySeconds: number): Promise<void> {
+    await this.preflight();
     await this.mutate(
       {
         acks: [],

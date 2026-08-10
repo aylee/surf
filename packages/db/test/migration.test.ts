@@ -25,7 +25,11 @@ const narrativeMigrationSql = readFileSync(
   new URL("../migrations/0004_narrative_jobs.sql", import.meta.url),
   "utf8"
 );
-const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}\n${readModelMigrationSql}\n${narrativeMigrationSql}`;
+const narrativeFallbackMigrationSql = readFileSync(
+  new URL("../migrations/0005_narrative_fallback.sql", import.meta.url),
+  "utf8"
+);
+const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}\n${readModelMigrationSql}\n${narrativeMigrationSql}\n${narrativeFallbackMigrationSql}`;
 const seedSql = readFileSync(new URL("../seeds/0000_v1_norcal.sql", import.meta.url), "utf8");
 
 const appliedMigrationHashes = {
@@ -137,6 +141,16 @@ describe("D1 migration", () => {
       "model_id text not null",
       "report_json text not null",
       "validation_json text not null"
+    ],
+    narrative_fallback_attempts: [
+      "attempt_id text primary key",
+      "job_id text not null",
+      "submission_id text not null",
+      "provider_id text not null",
+      "model_id text not null",
+      "inference_route text not null",
+      "state text not null",
+      "claimed_at text not null"
     ]
   };
 
@@ -236,6 +250,30 @@ describe("D1 migration", () => {
     );
     expect(normalizedNarrative).toContain(
       "narrative_revisions_retention_idx on narrative_revisions (published_at, local_date)"
+    );
+  });
+
+  it("adds a bounded fallback ledger and revision provenance without destructive rewrites", () => {
+    const normalizedFallback = narrativeFallbackMigrationSql
+      .replace(/\s+/g, " ")
+      .toLowerCase();
+
+    expect(normalizedFallback).not.toContain("drop table");
+    expect(normalizedFallback).toContain(
+      "alter table narrative_revisions add column provider_id text not null default 'legacy'"
+    );
+    expect(normalizedFallback).toContain(
+      "alter table narrative_revisions add column inference_route text not null default 'legacy'"
+    );
+    expect(normalizedFallback).toContain("unique (job_id, submission_id)");
+    expect(normalizedFallback).toContain("inference_route = 'fallback'");
+    expect(normalizedFallback).toContain("provider_id = 'google-ai'");
+    expect(normalizedFallback).toContain("'fallback_failed'");
+    expect(normalizedFallback).toContain(
+      "narrative_fallback_attempts_claimed_idx on narrative_fallback_attempts (claimed_at)"
+    );
+    expect(normalizedFallback).toContain(
+      "narrative_fallback_attempts_replay_idx on narrative_fallback_attempts (state, updated_at)"
     );
   });
 });

@@ -14,6 +14,7 @@ coverage/
 .dev.vars*
 !/apps/web/.dev.vars.example
 /apps/web/wrangler.instance.jsonc
+/apps/web/.worker-secrets
 
 .venv/
 __pycache__/
@@ -22,6 +23,11 @@ __pycache__/
 
 data/raw/
 data/tmp/
+
+# Local Analysis model bakeoff inputs/results can contain forecast payloads and
+# model output. They are reproducible operator artifacts, not repository data.
+.analysis-bakeoff/
+apps/narrative-runner/bakeoff.local.json
 
 # Local planning and agent session state are not part of the public product.
 /cc_state/

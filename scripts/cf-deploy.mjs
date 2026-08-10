@@ -3,8 +3,11 @@
 import {
   assertActiveWranglerConfig,
   ensureQueues,
+  pinActiveWranglerConfigForDeploy,
   runPnpm,
-  runWrangler
+  runWrangler,
+  selectTrackedWranglerConfigForSecretlessDryRun,
+  setCloudflareCommandGuard
 } from "./lib/cloudflare-commands.mjs";
 import { bootstrapDeployedWorker } from "./lib/deploy-bootstrap.mjs";
 import {
@@ -28,9 +31,15 @@ import {
   waitForWorkerVersion
 } from "./lib/worker-version.mjs";
 import { workerVersionUploadFailure } from "./lib/worker-release-errors.mjs";
+import {
+  assertNarrativeSetupDisabled,
+  resolveNarrativeDeploySecrets
+} from "./lib/deploy-secrets.mjs";
+import { repoRoot } from "./lib/root-env.mjs";
 
 const mode = process.argv[2];
 const dryRun = process.argv.includes("--dry-run");
+let workerSecretsFile = null;
 
 if (mode !== "setup" && mode !== "deploy") {
   throw new Error("Usage: node scripts/cf-deploy.mjs <setup|deploy> [--dry-run]");
@@ -48,18 +57,51 @@ if (legacyPatchlessVersionId) {
   );
 }
 
-function buildAndValidate() {
-  runPnpm(["--filter", "@surf/web", "build"]);
+function secretlessDryRunEnvironment(expectedWorkerName) {
+  return {
+    CF_ACCOUNT_ID: "",
+    CF_API_KEY: "",
+    CF_API_TOKEN: "",
+    CF_EMAIL: "",
+    CLOUDFLARE_ACCOUNT_ID: "",
+    CLOUDFLARE_API_KEY: "",
+    CLOUDFLARE_API_TOKEN: "",
+    CLOUDFLARE_EMAIL: "",
+    CLOUDFLARE_ENV: "",
+    GEMINI_API_KEY: "",
+    NARRATIVE_RESULT_TOKEN: "",
+    NARRATIVE_RUNNER_CF_API_TOKEN: "",
+    NARRATIVE_RUNNER_OMLX_API_TOKEN: "",
+    NARRATIVE_RUNNER_STATUS_HMAC_KEY: "",
+    SURF_BASE_URL: "",
+    SURF_INGEST_TOKEN: "",
+    SURF_NARRATIVE_RESULT_TOKEN: "",
+    SURF_NARRATIVE_RUNNER_ENV_FILE: "",
+    SURF_WORKER_SECRETS_FILE: "",
+    SURF_WORKER_SECRETS_SNAPSHOT: "",
+    SURF_WRANGLER_CONFIG: "",
+    SURF_WRANGLER_CONFIG_SHA256: "",
+    WRANGLER_CI_OVERRIDE_NAME: expectedWorkerName,
+    WRANGLER_LOG_PATH: `${repoRoot}/dist/wrangler-dry-run.log`
+  };
+}
+
+function buildAndValidate(environment) {
+  const options = environment ? { env: environment } : undefined;
+  runPnpm(["--filter", "@surf/web", "build"], options);
   runWrangler([
     "deploy",
     "--dry-run",
     "--outdir",
     "../../dist/wrangler-dry-run"
-  ]);
+  ], options);
 }
 
 function deployWorker() {
-  return runWrangler(["deploy"], {
+  return runWrangler([
+    "deploy",
+    ...(workerSecretsFile ? ["--secrets-file", workerSecretsFile] : [])
+  ], {
     capture: true,
     env: { CI: "true" }
   });
@@ -68,7 +110,10 @@ function deployWorker() {
 function uploadWorkerVersion() {
   let output;
   try {
-    output = runWrangler(workerVersionUploadArgs(), {
+    output = runWrangler([
+      ...workerVersionUploadArgs(),
+      ...(workerSecretsFile ? ["--secrets-file", workerSecretsFile] : [])
+    ], {
       capture: true,
       env: { CI: "true" }
     });
@@ -236,13 +281,35 @@ async function waitUntilServing(url, expectedVersionId, expectedWorkerName) {
   return { deploymentId, expectedVersionId, expectedWorkerName };
 }
 
-const activeWranglerConfig = assertActiveWranglerConfig();
+let activeWranglerConfig;
+if (dryRun) {
+  activeWranglerConfig = selectTrackedWranglerConfigForSecretlessDryRun();
+} else {
+  pinActiveWranglerConfigForDeploy(process.env, { required: true });
+  activeWranglerConfig = assertActiveWranglerConfig();
+}
+assertNarrativeSetupDisabled(mode, activeWranglerConfig);
 const expectedWorkerName = activeWranglerConfig.name;
-buildAndValidate();
+buildAndValidate(
+  dryRun ? secretlessDryRunEnvironment(expectedWorkerName) : undefined
+);
 
 if (dryRun) {
   console.log("Cloudflare dry run passed. No remote resources were changed.");
   process.exit(0);
+}
+
+const narrativeDeployInputs = resolveNarrativeDeploySecrets({
+  config: activeWranglerConfig,
+  environment: process.env,
+  root: repoRoot
+});
+if (narrativeDeployInputs) {
+  workerSecretsFile = narrativeDeployInputs.workerSecretsFile;
+  setCloudflareCommandGuard(narrativeDeployInputs.assertUnchanged);
+  console.log(
+    JSON.stringify({ status: "narrative-deploy-inputs-pinned", ...narrativeDeployInputs.receipt })
+  );
 }
 
 if (mode === "deploy" && !process.env.SURF_INGEST_TOKEN?.trim()) {

@@ -7,7 +7,10 @@ import {
   resolveCloudflareCommandTimeout,
   runPnpm
 } from "../lib/cloudflare-commands.mjs";
-import { runWranglerPassthrough } from "../wrangler.mjs";
+import {
+  isSecretlessLocalWranglerInvocation,
+  runWranglerPassthrough
+} from "../wrangler.mjs";
 
 test("shared pnpm boundary times out without exposing captured child output", () => {
   const secret = "timeout-secret-must-not-escape";
@@ -51,9 +54,11 @@ test("generic Wrangler passthrough makes only exact tail explicitly unbounded", 
   const calls = [];
   const runner = (args, options) => calls.push({ args, options });
 
-  runWranglerPassthrough(["--", "tail", "--format", "json"], runner);
-  runWranglerPassthrough(["deployments", "status", "--json"], runner);
-  runWranglerPassthrough(["versions", "list"], runner);
+  const prepared = [];
+  const prepare = () => prepared.push(true);
+  runWranglerPassthrough(["--", "tail", "--format", "json"], runner, prepare);
+  runWranglerPassthrough(["deployments", "status", "--json"], runner, prepare);
+  runWranglerPassthrough(["versions", "list"], runner, prepare);
 
   assert.deepEqual(calls, [
     {
@@ -75,6 +80,65 @@ test("generic Wrangler passthrough makes only exact tail explicitly unbounded", 
     CLOUDFLARE_COMMAND_TIMEOUT_MS
   );
   assert.ok(Number.isFinite(CLOUDFLARE_COMMAND_TIMEOUT_MS));
+  assert.equal(prepared.length, 3);
+});
+
+test("generic Wrangler passthrough never spawns when activation pinning fails", () => {
+  let spawned = false;
+  assert.throws(
+    () =>
+      runWranglerPassthrough(
+        ["deployments", "status", "--json"],
+        () => {
+          spawned = true;
+        },
+        () => {
+          throw new Error("Wrangler config snapshot SHA-256 does not match activation");
+        }
+      ),
+    /SHA-256 does not match activation/
+  );
+  assert.equal(spawned, false);
+});
+
+test("only exact local Wrangler --version bypasses activation pinning", () => {
+  const calls = [];
+  let prepared = 0;
+  runWranglerPassthrough(
+    ["--", "--version"],
+    (args, options) => calls.push({ args, options }),
+    () => {
+      prepared += 1;
+    }
+  );
+
+  assert.equal(isSecretlessLocalWranglerInvocation(["--version"]), true);
+  assert.equal(prepared, 0);
+  assert.deepEqual(calls, [{ args: ["--version"], options: {} }]);
+
+  for (const args of [
+    ["version"],
+    ["--version", "--help"],
+    ["--help"],
+    ["whoami", "--help"]
+  ]) {
+    let spawned = false;
+    assert.equal(isSecretlessLocalWranglerInvocation(args), false);
+    assert.throws(
+      () =>
+        runWranglerPassthrough(
+          args,
+          () => {
+            spawned = true;
+          },
+          () => {
+            throw new Error("activation snapshot required");
+          }
+        ),
+      /activation snapshot required/
+    );
+    assert.equal(spawned, false);
+  }
 });
 
 test("unbounded timeout policy rejects an ambiguous millisecond limit", () => {

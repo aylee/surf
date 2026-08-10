@@ -43,12 +43,18 @@
     "ENVIRONMENT": "production",
     "SURF_REGION": "norcal",
     "SURF_USER_AGENT": "surf-self-hosted/1.0 (+https://github.com/aylee/surf)",
-    // Dormant v2 Agent rollback compatibility; Analysis v3 uses the separate
+    // Dormant v2 Agent rollback compatibility; Analysis v5 uses the separate
     // narrative Queue and local pull runner below.
     "FORECAST_BRIEF_ENABLED": "false",
     // Queue production stays disabled until the out-of-band HTTP pull consumer
     // and result token are configured by an authorized operator.
-    "NARRATIVE_ENABLED": "false"
+    "NARRATIVE_ENABLED": "false",
+    // Cloud watchdog defaults are hard-capped again in Worker code. The API
+    // key and result token remain Wrangler secrets, never tracked variables.
+    "NARRATIVE_FALLBACK_MODEL": "gemini-3.6-flash",
+    "NARRATIVE_FALLBACK_DELAY_SECONDS": "600",
+    "NARRATIVE_FALLBACK_DAILY_CAP": "4",
+    "NARRATIVE_FALLBACK_ROLLING_31_DAY_CAP": "100"
   },
   "durable_objects": {
     "bindings": [
@@ -85,6 +91,10 @@
       {
         "binding": "NARRATIVE_QUEUE",
         "queue": "surf-narrative"
+      },
+      {
+        "binding": "NARRATIVE_FALLBACK_QUEUE",
+        "queue": "surf-narrative-fallback"
       }
     ],
     "consumers": [
@@ -98,6 +108,15 @@
         "max_concurrency": 1,
         "max_retries": 3,
         "dead_letter_queue": "surf-ingest-dlq"
+      },
+      {
+        // One delayed watchdog is produced before every local-primary job.
+        // The D1 claim ledger—not Queue redelivery—owns paid-call idempotency.
+        "queue": "surf-narrative-fallback",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5,
+        "max_concurrency": 1,
+        "max_retries": 0
       }
     ]
   },

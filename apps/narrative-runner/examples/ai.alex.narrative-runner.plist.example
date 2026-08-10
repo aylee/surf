@@ -7,22 +7,21 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>__PNPM_ABSOLUTE_PATH__</string>
-    <string>--dir</string>
-    <string>__REPOSITORY_ABSOLUTE_PATH__</string>
-    <string>--filter</string>
-    <string>@surf/narrative-runner</string>
-    <string>run</string>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=__HOME_ABSOLUTE_PATH__</string>
+    <string>LANG=en_US.UTF-8</string>
+    <string>PATH=__NODE_BIN_ABSOLUTE_DIRECTORY__:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>__NODE_ABSOLUTE_PATH__</string>
+    <string>__RUNNER_GUARD_ABSOLUTE_PATH__</string>
+    <string>--record</string>
+    <string>__ACTIVATION_RECORD_ABSOLUTE_PATH__</string>
+    <string>--command</string>
     <string>run</string>
   </array>
 
   <key>WorkingDirectory</key>
   <string>__REPOSITORY_ABSOLUTE_PATH__</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>__NODE_BIN_ABSOLUTE_DIRECTORY__:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -34,6 +33,8 @@
   <string>Background</string>
   <key>ThrottleInterval</key>
   <integer>30</integer>
+  <key>ExitTimeOut</key>
+  <integer>__RUNNER_EXIT_TIMEOUT_SECONDS__</integer>
 
   <key>StandardOutPath</key>
   <string>__LOG_DIRECTORY_ABSOLUTE_PATH__/narrative-runner.stdout.log</string>

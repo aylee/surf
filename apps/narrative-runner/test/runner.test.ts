@@ -19,7 +19,9 @@ describe("NarrativeRunner", () => {
       "duplicate",
       "rejected",
       "expired",
-      "superseded"
+      "superseded",
+      "fallback_requested",
+      "fallback_failed"
     ] as const) {
       const job = makeJob({ jobId: `job-${disposition}` });
       const queue = new FakeQueueClient([queueMessage(job)]);
@@ -37,6 +39,27 @@ describe("NarrativeRunner", () => {
       expect(queue.acked).toEqual([`lease-${job.jobId}`]);
       expect(queue.retried).toEqual([]);
     }
+  });
+
+  it("submits the verified provider-reported model identity", async () => {
+    const job = makeJob();
+    const queue = new FakeQueueClient([queueMessage(job)]);
+    const omlx = new FakeOmlxClient();
+    omlx.generateHandler = async () => ({
+      output: { summary: "verified" },
+      modelId: "provider-reported-model"
+    });
+    const results = new FakeResultClient();
+    const harness = makeRunnerHarness({ queue, omlx, results });
+
+    await harness.runner.runOnce();
+
+    expect(results.submitCalls).toEqual([
+      expect.objectContaining({
+        modelId: "provider-reported-model",
+        output: { summary: "verified" }
+      })
+    ]);
   });
 
   it("reports identifiable expiry, retries unknown targets, and ACKs unidentifiable malformed work", async () => {
@@ -214,7 +237,10 @@ describe("NarrativeRunner", () => {
     expect(queue.pullCalls).toEqual([1]);
 
     harness.clock.advance(10_000);
-    omlx.generateHandler = async () => ({ summary: "recovered" });
+    omlx.generateHandler = async () => ({
+      output: { summary: "recovered" },
+      modelId: "local-model"
+    });
     await harness.runner.runOnce();
     expect(omlx.preflightCalls).toBe(2);
     expect(queue.pullCalls).toEqual([1, 1]);
@@ -229,7 +255,10 @@ describe("NarrativeRunner", () => {
       if (attempts === 1) {
         throw new RunnerFailure("omlx_inference_network", "transient");
       }
-      return { summary: "recovered locally" };
+      return {
+        output: { summary: "recovered locally" },
+        modelId: "local-model"
+      };
     };
     const harness = makeRunnerHarness({ queue, omlx });
 
@@ -306,7 +335,12 @@ describe("NarrativeRunner", () => {
     expect(queue.retried).toEqual([{ leaseId: "lease-job-1", delaySeconds: 30 }]);
   });
 
-  it("retries the active lease and persistently halts without a terminal callback on oMLX auth failure", async () => {
+  it.each([
+    "omlx_inference_auth",
+    "omlx_inference_http_terminal",
+    "omlx_inference_model_identity_missing",
+    "omlx_inference_model_identity_mismatch"
+  ] as const)("retries the active lease and persistently halts after %s", async (code) => {
     const controller = new AbortController();
     const queue = new FakeQueueClient([
       queueMessage(makeJob({ jobId: "job-one" })),
@@ -314,7 +348,7 @@ describe("NarrativeRunner", () => {
     ]);
     const omlx = new FakeOmlxClient();
     omlx.generateHandler = async () => {
-      throw new RunnerFailure("omlx_inference_auth", "terminal");
+      throw new RunnerFailure(code, "terminal");
     };
     let harness!: ReturnType<typeof makeRunnerHarness>;
     harness = makeRunnerHarness({
@@ -334,21 +368,24 @@ describe("NarrativeRunner", () => {
     expect(harness.store.writes).toContainEqual(
       expect.objectContaining({
         state: "halted",
-        lastErrorCode: "omlx_inference_auth"
+        lastErrorCode: code
       })
     );
     expect(harness.status.current()).toMatchObject({
       state: "stopped",
-      lastErrorCode: "omlx_inference_auth"
+      lastErrorCode: code
     });
   });
 
-  it("persistently halts before pulling when oMLX model-list authentication fails", async () => {
+  it.each([
+    "omlx_inference_auth",
+    "omlx_preflight_http_terminal"
+  ] as const)("persistently halts before pulling when oMLX preflight fails with %s", async (code) => {
     const controller = new AbortController();
     const queue = new FakeQueueClient([queueMessage(makeJob())]);
     const omlx = new FakeOmlxClient();
     omlx.preflightHandler = async () => {
-      throw new RunnerFailure("omlx_inference_auth", "terminal");
+      throw new RunnerFailure(code, "terminal");
     };
     let harness!: ReturnType<typeof makeRunnerHarness>;
     harness = makeRunnerHarness({
@@ -366,25 +403,59 @@ describe("NarrativeRunner", () => {
     expect(harness.store.writes).toContainEqual(
       expect.objectContaining({
         state: "halted",
-        lastErrorCode: "omlx_inference_auth"
+        lastErrorCode: code
       })
     );
     expect(harness.status.current()).toMatchObject({
       state: "stopped",
-      lastErrorCode: "omlx_inference_auth"
+      lastErrorCode: code
     });
   });
 
   it.each([
-    [
-      "omlx_output_invalid",
-      "inference_output_invalid"
-    ],
-    [
-      "omlx_inference_http_terminal",
-      "inference_request_rejected"
-    ]
-  ] as const)("reports terminal %s before ACK", async (code, reasonCode) => {
+    "queue_api_auth",
+    "queue_preflight_http_terminal",
+    "queue_preflight_response_invalid",
+    "queue_identity_mismatch",
+    "queue_consumer_topology_mismatch",
+    "queue_consumer_settings_mismatch"
+  ] as const)("persistently halts before model preflight or pull when Queue identity proof fails with %s", async (code) => {
+    const queue = new FakeQueueClient([queueMessage(makeJob())]);
+    queue.preflightError = new RunnerFailure(code, "terminal");
+    const harness = makeRunnerHarness({ queue });
+
+    await expect(harness.runner.runOnce()).rejects.toMatchObject({
+      code,
+      disposition: "terminal"
+    });
+    expect(queue.preflightCalls).toBe(1);
+    expect(queue.pullCalls).toEqual([]);
+    expect(harness.omlx.preflightCalls).toBe(0);
+    expect(harness.status.current()).toMatchObject({
+      state: "halted",
+      lastErrorCode: code
+    });
+  });
+
+  it("backs off without pulling when Queue identity preflight fails transiently", async () => {
+    const queue = new FakeQueueClient([queueMessage(makeJob())]);
+    queue.preflightError = new RunnerFailure("queue_preflight_network", "transient");
+    const harness = makeRunnerHarness({ queue });
+
+    await expect(harness.runner.runOnce()).rejects.toMatchObject({
+      code: "queue_preflight_network",
+      disposition: "transient"
+    });
+    expect(queue.pullCalls).toEqual([]);
+    expect(harness.omlx.preflightCalls).toBe(0);
+    expect(harness.status.current()).toMatchObject({
+      state: "backing_off",
+      lastErrorCode: "queue_preflight_network"
+    });
+  });
+
+  it("leaves the cloud watchdog eligible after invalid local model output", async () => {
+    const code = "omlx_output_invalid";
     const job = makeJob();
     const queue = new FakeQueueClient([queueMessage(job)]);
     const omlx = new FakeOmlxClient();
@@ -395,13 +466,33 @@ describe("NarrativeRunner", () => {
     const harness = makeRunnerHarness({ queue, omlx, results });
 
     await expect(harness.runner.runOnce()).resolves.toEqual([
-      expect.objectContaining({ action: "ack", code, disposition: "rejected" })
-    ]);
-    expect(results.terminalCalls).toEqual([
       expect.objectContaining({
-        terminal: { status: "rejected", reasonCode }
+        action: "ack",
+        code,
+        disposition: "fallback_requested"
       })
     ]);
+    expect(results.terminalCalls).toEqual([]);
+    expect(queue.acked).toEqual(["lease-job-1"]);
+  });
+
+  it("leaves the watchdog eligible when the generated callback cannot encode output", async () => {
+    const job = makeJob();
+    const queue = new FakeQueueClient([queueMessage(job)]);
+    const results = new FakeResultClient();
+    results.submitHandler = async () => {
+      throw new RunnerFailure("result_submission_invalid", "terminal");
+    };
+    const harness = makeRunnerHarness({ queue, results });
+
+    await expect(harness.runner.runOnce()).resolves.toEqual([
+      expect.objectContaining({
+        action: "ack",
+        code: "result_submission_invalid",
+        disposition: "fallback_requested"
+      })
+    ]);
+    expect(results.terminalCalls).toEqual([]);
     expect(queue.acked).toEqual(["lease-job-1"]);
   });
 
@@ -551,7 +642,7 @@ describe("NarrativeRunner", () => {
     });
     omlx.generateHandler = async () => {
       await gate;
-      return { summary: "ok" };
+      return { output: { summary: "ok" }, modelId: "local-model" };
     };
     const harness = makeRunnerHarness({
       config: makeConfig({ concurrency: 2 }),
@@ -573,6 +664,45 @@ describe("NarrativeRunner", () => {
 
     release();
     await Promise.all([...firstPoll.tasks, ...secondPoll.tasks]);
+  });
+
+  it("stops intake on abort, drains the active lease, and records stopped", async () => {
+    const controller = new AbortController();
+    const first = makeJob({ jobId: "job-one" });
+    const second = makeJob({ jobId: "job-two" });
+    const queue = new FakeQueueClient([queueMessage(first), queueMessage(second)]);
+    const omlx = new FakeOmlxClient();
+    let release!: () => void;
+    let inferenceStarted!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      inferenceStarted = resolve;
+    });
+    omlx.generateHandler = async () => {
+      inferenceStarted();
+      await gate;
+      return { output: { summary: "drained" }, modelId: "local-model" };
+    };
+    const harness = makeRunnerHarness({ queue, omlx });
+    let settled = false;
+    const running = harness.runner.run(controller.signal).finally(() => {
+      settled = true;
+    });
+
+    await started;
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(queue.pullCalls).toEqual([1]);
+    expect(queue.messages).toHaveLength(1);
+
+    release();
+    await running;
+    expect(queue.acked).toEqual(["lease-job-one"]);
+    expect(queue.messages).toHaveLength(1);
+    expect(harness.status.current()).toMatchObject({ state: "stopped", inFlight: 0 });
   });
 
   it("continuous run persistently halts on Queue pull authentication failure", async () => {
@@ -705,7 +835,10 @@ describe("NarrativeRunner", () => {
     });
     omlx.generateHandler = async () => {
       await gate;
-      return { summary: "completed after a long local inference" };
+      return {
+        output: { summary: "completed after a long local inference" },
+        modelId: "local-model"
+      };
     };
     const results = new FakeResultClient();
     results.submitHandler = async (job) => {

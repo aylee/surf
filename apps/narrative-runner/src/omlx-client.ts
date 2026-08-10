@@ -14,6 +14,7 @@ const ModelListSchema = z.object({
 }).passthrough();
 
 const ChatCompletionSchema = z.object({
+  model: z.string().min(1).optional(),
   choices: z.array(
     z.object({
       message: z.object({ content: z.string().min(1) }).passthrough()
@@ -24,9 +25,14 @@ const ChatCompletionSchema = z.object({
 export const OMLX_MODELS_RESPONSE_MAX_BYTES = 256 * 1_024;
 export const OMLX_COMPLETION_RESPONSE_MAX_BYTES = 256 * 1_024;
 
+export type OmlxGeneration = {
+  output: JsonValue;
+  modelId: string;
+};
+
 export interface OmlxClient {
   preflight(): Promise<void>;
-  generate(job: NarrativeJob, timeoutMs?: number): Promise<JsonValue>;
+  generate(job: NarrativeJob, timeoutMs?: number): Promise<OmlxGeneration>;
 }
 
 function timeoutSignal(timeoutMs: number): AbortSignal {
@@ -60,7 +66,13 @@ export class OpenAiCompatibleOmlxClient implements OmlxClient {
     if ([401, 403].includes(response.status)) {
       throw new RunnerFailure("omlx_inference_auth", "terminal");
     }
-    if (!response.ok) throw new RunnerFailure("omlx_preflight_http", "transient");
+    if (!response.ok) {
+      const transient = [408, 409, 425, 429].includes(response.status) || response.status >= 500;
+      throw new RunnerFailure(
+        transient ? "omlx_preflight_http_transient" : "omlx_preflight_http_terminal",
+        transient ? "transient" : "terminal"
+      );
+    }
     try {
       const models = ModelListSchema.parse(
         await readBoundedJson(response, OMLX_MODELS_RESPONSE_MAX_BYTES)
@@ -74,7 +86,7 @@ export class OpenAiCompatibleOmlxClient implements OmlxClient {
     }
   }
 
-  async generate(job: NarrativeJob, timeoutMs = this.config.timeoutMs): Promise<JsonValue> {
+  async generate(job: NarrativeJob, timeoutMs = this.config.timeoutMs): Promise<OmlxGeneration> {
     let response: Response;
     try {
       response = await this.fetcher(`${this.config.baseUrl}/chat/completions`, {
@@ -97,6 +109,9 @@ export class OpenAiCompatibleOmlxClient implements OmlxClient {
           },
           max_tokens: job.inference.maxOutputTokens,
           temperature: job.inference.temperature,
+          chat_template_kwargs: {
+            enable_thinking: this.config.enableThinking
+          },
           stream: false
         })
       });
@@ -115,17 +130,26 @@ export class OpenAiCompatibleOmlxClient implements OmlxClient {
       );
     }
 
-    let content: string;
+    let completion: z.infer<typeof ChatCompletionSchema>;
     try {
-      const completion = ChatCompletionSchema.parse(
+      completion = ChatCompletionSchema.parse(
         await readBoundedJson(response, OMLX_COMPLETION_RESPONSE_MAX_BYTES)
       );
-      content = completion.choices[0]!.message.content;
     } catch {
       throw new RunnerFailure("omlx_inference_response_invalid", "transient");
     }
+    if (completion.model === undefined) {
+      throw new RunnerFailure("omlx_inference_model_identity_missing", "terminal");
+    }
+    if (completion.model !== this.config.modelId) {
+      throw new RunnerFailure("omlx_inference_model_identity_mismatch", "terminal");
+    }
+    const content = completion.choices[0]!.message.content;
     try {
-      return JsonValueSchema.parse(JSON.parse(content));
+      return {
+        output: JsonValueSchema.parse(JSON.parse(content)),
+        modelId: completion.model
+      };
     } catch {
       throw new RunnerFailure("omlx_output_invalid", "terminal");
     }

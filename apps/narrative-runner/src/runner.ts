@@ -2,7 +2,11 @@ import type { NarrativeJob, NarrativeResultDisposition } from "@surf/narrative-c
 import type { RunnerConfig } from "./config";
 import { RunnerFailure, runnerFailure } from "./errors";
 import { JsonLineLogger, type RunnerLogger } from "./logger";
-import { OpenAiCompatibleOmlxClient, type OmlxClient } from "./omlx-client";
+import {
+  OpenAiCompatibleOmlxClient,
+  type OmlxClient,
+  type OmlxGeneration
+} from "./omlx-client";
 import {
   CloudflareQueueClient,
   decodeNarrativeJob,
@@ -398,10 +402,10 @@ export class NarrativeRunner {
       );
     }
 
-    let output;
+    let generation: OmlxGeneration | undefined;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        output = await this.dependencies.omlx.generate(
+        generation = await this.dependencies.omlx.generate(
           job,
           Math.min(
             this.config.omlx.timeoutMs,
@@ -415,7 +419,14 @@ export class NarrativeRunner {
         break;
       } catch (error) {
         const failure = runnerFailure(error, "omlx_inference_failed", "transient");
-        if (failure.code === "omlx_inference_auth") {
+        if (
+          [
+            "omlx_inference_auth",
+            "omlx_inference_http_terminal",
+            "omlx_inference_model_identity_missing",
+            "omlx_inference_model_identity_mismatch"
+          ].includes(failure.code)
+        ) {
           await this.haltIntake(failure.code);
           return this.retry(message, job, failure.code);
         }
@@ -446,24 +457,16 @@ export class NarrativeRunner {
         }
         if (retryableInference) await this.blockModelIntake(failure.code);
         if (failure.disposition === "terminal") {
-          return this.reportTerminal(
-            message,
-            job,
-            {
-              status: "rejected",
-              reasonCode:
-                failure.code === "omlx_output_invalid"
-                  ? "inference_output_invalid"
-                  : "inference_request_rejected"
-            },
-            failure.code,
-            leaseStartedMs
-          );
+          // The cloud watchdog was accepted before this primary message. ACK
+          // terminal generated-output failures without terminalizing the D1
+          // job so the delayed fallback remains eligible. Request/config 4xx
+          // failures halt above instead of silently spending fallback quota.
+          return this.ack(message, job, failure.code, "fallback_requested");
         }
         return this.retry(message, job, failure.code);
       }
     }
-    if (output === undefined) {
+    if (generation === undefined) {
       return this.retry(message, job, "omlx_inference_retry_exhausted");
     }
 
@@ -481,8 +484,8 @@ export class NarrativeRunner {
       try {
         const result = await this.dependencies.results.submit(
           job,
-          this.config.omlx.modelId,
-          output,
+          generation.modelId,
+          generation.output,
           Math.min(
             this.config.resultTimeoutMs,
             this.remainingMs(job),
@@ -495,13 +498,7 @@ export class NarrativeRunner {
       } catch (error) {
         const failure = runnerFailure(error, "result_submit_failed", "transient");
         if (failure.code === "result_submission_invalid") {
-          return this.reportTerminal(
-            message,
-            job,
-            { status: "rejected", reasonCode: "inference_output_invalid" },
-            failure.code,
-            leaseStartedMs
-          );
+          return this.ack(message, job, failure.code, "fallback_requested");
         }
         if (
           attempt === 0 &&
@@ -597,10 +594,28 @@ export class NarrativeRunner {
     this.intakeBlockedCode = null;
 
     try {
+      await this.dependencies.queue.preflight();
+    } catch (error) {
+      const failure = runnerFailure(error, "queue_preflight_failed", "transient");
+      if (failure.disposition === "terminal") {
+        await this.haltIntake(failure.code);
+        throw failure;
+      }
+      await this.updateStatus({
+        state: "backing_off",
+        lastErrorCode: failure.code
+      });
+      this.dependencies.logger.event("narrative_queue_preflight_failed", {
+        code: failure.code
+      });
+      throw failure;
+    }
+
+    try {
       await this.ensureModelReady();
     } catch (error) {
       const failure = runnerFailure(error, "omlx_preflight_failed", "transient");
-      if (failure.code === "omlx_inference_auth") {
+      if (failure.disposition === "terminal") {
         await this.haltIntake(failure.code);
         throw failure;
       }
@@ -746,6 +761,8 @@ export function createNarrativeRunner(
     new StatusTracker(
       config.runnerId,
       config.omlx.modelId,
+      config.releaseSha,
+      config.runtimeFingerprint,
       new FileStatusStore(config.statusFile),
       now
     );

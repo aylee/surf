@@ -13,6 +13,7 @@ import type { Env } from "./index";
 import worker from "./index";
 import {
   FORECAST_HISTORY_RETENTION_DAYS,
+  NARRATIVE_FALLBACK_LEDGER_RETENTION_DAYS,
   NARRATIVE_RETENTION_DAYS,
   OPERATIONAL_FORECAST_RETENTION_DAYS,
   pruneRetainedData,
@@ -249,7 +250,10 @@ describe("worker api", () => {
     const result = await pruneRetainedData(db, now);
 
     expect(result.errors).toEqual([]);
-    expect(sqls).toHaveLength(15);
+    expect(sqls).toHaveLength(16);
+    const fallbackLedgerIndex = sqls.findIndex((sql) =>
+      sql.includes("delete from narrative_fallback_attempts")
+    );
     const narrativeRevisionIndex = sqls.findIndex((sql) =>
       sql.includes("delete from narrative_revisions")
     );
@@ -257,6 +261,13 @@ describe("worker api", () => {
       sql.includes("delete from narrative_jobs")
     );
     expect(narrativeRevisionIndex).toBeGreaterThanOrEqual(0);
+    expect(fallbackLedgerIndex).toBeGreaterThanOrEqual(0);
+    expect(runs[fallbackLedgerIndex]).toEqual([
+      new Date(
+        now.getTime() -
+          NARRATIVE_FALLBACK_LEDGER_RETENTION_DAYS * 24 * 60 * 60 * 1000
+      ).toISOString()
+    ]);
     expect(narrativeJobIndex).toBeGreaterThan(narrativeRevisionIndex);
     expect(runs[narrativeRevisionIndex]).toEqual([
       new Date(now.getTime() - NARRATIVE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString(),

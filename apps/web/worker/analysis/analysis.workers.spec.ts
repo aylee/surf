@@ -5,8 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { buildForecastFactBundle } from "../brief/facts";
 import { briefForecastFixture } from "../brief/test-helpers";
 import {
-  enqueueSurfAnalysis,
-  enqueueSurfAnalysisBundles,
+  enqueueSurfAnalysis as enqueueSurfAnalysisWithFallback,
+  enqueueSurfAnalysisBundles as enqueueSurfAnalysisBundlesWithFallback,
   acceptNarrativeTerminalResult,
   createAndClaimNarrativeJob,
   getNarrativeJob,
@@ -14,38 +14,94 @@ import {
   NARRATIVE_PENDING_REDELIVERY_MS,
   NARRATIVE_QUEUE_RETENTION_MS,
   NARRATIVE_RECONCILIATION_LIMIT,
-  reconcileNarrativeEnqueues
+  reconcileNarrativeEnqueues as reconcileNarrativeEnqueuesWithFallback
 } from "../narrative";
 import { acceptSurfAnalysisResult } from "./repository";
 import { buildSurfAnalysisResponse } from "./response";
 import { buildSurfAnalysisSnapshot, buildSurfNarrativeJob } from "./snapshot";
 import { localDateForTime, stableThreeHourForecastTimes } from "../time";
 import type {
-  SurfAnalysisDraftV3,
+  SurfAnalysisDraftV4,
   SurfAnalysisValidationSnapshot
 } from "./types";
 
-function validDraft(_snapshot: SurfAnalysisValidationSnapshot): SurfAnalysisDraftV3 {
+function validDraft(snapshot: SurfAnalysisValidationSnapshot): SurfAnalysisDraftV4 {
+  const cards = (placement: SurfAnalysisValidationSnapshot["cards"][number]["placement"]) =>
+    snapshot.cards.filter((candidate) => candidate.placement === placement);
+  const outlook = cards("outlook");
+  const support = cards("primary_support")[0];
+  const tradeoff = cards("primary_tradeoff")[0];
+  const alternate = cards("alternate")[0];
+  const watch = cards("watch")[0];
+  if (outlook.length < 2 || !support || !watch) throw new Error("Incomplete Analysis fixture");
+  const surfaceOutlook = outlook.find(({ domains }) =>
+    domains.some((domain) => domain === "surface" || domain === "wind")
+  )!;
+  const waveOutlook = outlook.find(({ domains }) => domains.includes("wave"))!;
   return {
-    paragraphs: {
-      setup: {
-        template:
-          "Surf is {{day_surf_evolution}}; swell is {{day_swell_evolution}}."
-      },
-      plan: {
-        template:
-          "The best window is {{primary_session}}, with {{primary_surf_size}} surf, {{primary_wind_surface}}, and {{primary_tide_timing}}. The alternate window is {{backup_session}}."
-      },
-      confidence: {
-        template:
-          "This is a {{forecast_confidence}} call. The main uncertainty remains: {{bust_factor}}"
-      }
-    }
+    schemaVersion: 1,
+    outlook: {
+      leadCardId: surfaceOutlook.id,
+      supportingCardId: waveOutlook.id
+    },
+    call: {
+      primarySupportCardId: support.id,
+      primaryTradeoffCardId: tradeoff?.id ?? null,
+      alternateCardId: snapshot.callMode === "primary_and_alternate" ? alternate?.id ?? null : null
+    },
+    close: { watchCardId: watch.id }
   };
 }
 
 function queue(send: (body: unknown) => Promise<void>): Queue {
   return { send } as unknown as Queue;
+}
+
+type EnqueueSurfAnalysisOptions = Parameters<
+  typeof enqueueSurfAnalysisWithFallback
+>[0];
+type EnqueueSurfAnalysisBundlesOptions = Parameters<
+  typeof enqueueSurfAnalysisBundlesWithFallback
+>[0];
+type ReconcileNarrativeEnqueuesOptions = Parameters<
+  typeof reconcileNarrativeEnqueuesWithFallback
+>[0];
+
+function noOpFallbackQueue(): Queue {
+  return queue(async () => undefined);
+}
+
+function enqueueSurfAnalysis(
+  options: Omit<EnqueueSurfAnalysisOptions, "fallbackQueue"> & {
+    fallbackQueue?: Queue;
+  }
+) {
+  return enqueueSurfAnalysisWithFallback({
+    ...options,
+    fallbackQueue: options.fallbackQueue ?? noOpFallbackQueue()
+  });
+}
+
+function enqueueSurfAnalysisBundles(
+  options: Omit<EnqueueSurfAnalysisBundlesOptions, "fallbackQueue"> & {
+    fallbackQueue?: Queue;
+  }
+) {
+  return enqueueSurfAnalysisBundlesWithFallback({
+    ...options,
+    fallbackQueue: options.fallbackQueue ?? noOpFallbackQueue()
+  });
+}
+
+function reconcileNarrativeEnqueues(
+  options: Omit<ReconcileNarrativeEnqueuesOptions, "fallbackQueue"> & {
+    fallbackQueue?: Queue;
+  }
+) {
+  return reconcileNarrativeEnqueuesWithFallback({
+    ...options,
+    fallbackQueue: options.fallbackQueue ?? noOpFallbackQueue()
+  });
 }
 
 function fiveCompleteDateForecast() {
@@ -169,7 +225,7 @@ beforeEach(async () => {
   await env.DB.prepare("delete from narrative_jobs").run();
 });
 
-describe("Surf Analysis v3 D1 lifecycle", () => {
+describe("Surf Analysis v5 D1 lifecycle", () => {
   it("enqueues every selectable local date in one materialized generation", async () => {
     const forecast = fiveCompleteDateForecast();
     const localDates = [
@@ -361,6 +417,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
           schemaVersion: 1,
           jobId: firstA.jobId,
           submissionId: firstA.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId: "delayed-a-model",
           output: validDraft(snapshotA)
         },
@@ -376,6 +434,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
           schemaVersion: 1,
           jobId: jobB.jobId,
           submissionId: jobB.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId: "delayed-b-model",
           output: validDraft(snapshotB)
         },
@@ -390,6 +450,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
           schemaVersion: 1,
           jobId: activeA.jobId,
           submissionId: activeA.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId: "current-a-model",
           output: validDraft(snapshotA)
         },
@@ -463,6 +525,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
       schemaVersion: 1 as const,
       jobId: job.jobId,
       submissionId: job.result.submissionId,
+      providerId: "omlx",
+      route: "primary" as const,
       modelId: "fixture-model",
       output: validDraft(snapshot)
     };
@@ -514,6 +578,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
       schemaVersion: 1 as const,
       jobId: job.jobId,
       submissionId: job.result.submissionId,
+      providerId: "omlx",
+      route: "primary" as const,
       modelId: "fixture-model",
       output: validDraft(snapshot)
     };
@@ -583,6 +649,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
         schemaVersion: 1,
         jobId: job.jobId,
         submissionId: job.result.submissionId,
+        providerId: "omlx",
+        route: "primary",
         modelId: "fixture-model",
         output: validDraft(snapshot)
       },
@@ -627,6 +695,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
           schemaVersion: 1,
           jobId: oldJob.jobId,
           submissionId: oldJob.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId: "obsolete-contract-model",
           output: validDraft(snapshot)
         },
@@ -700,6 +770,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
         schemaVersion: 1,
         jobId: job.jobId,
         submissionId: job.result.submissionId,
+        providerId: "omlx",
+        route: "primary",
         modelId: "fixture-model",
         output: validDraft(snapshot)
       },
@@ -724,6 +796,18 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
         now: new Date("2026-08-02T13:05:00.000Z")
       })
     ).rejects.toThrow(/ambiguous/);
+    expect((await getNarrativeJob(env.DB, expected.jobId))?.status).toBe("enqueue_failed");
+    await expect(
+      buildSurfAnalysisResponse(
+        env.DB,
+        bundle,
+        new Date("2026-08-02T13:05:30.000Z")
+      )
+    ).resolves.toMatchObject({
+      status: "pending",
+      report: null,
+      message: "Analysis is being prepared."
+    });
     const sent: unknown[] = [];
 
     const result = await reconcileNarrativeEnqueues({
@@ -738,6 +822,51 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
     expect(sent).toEqual([expected]);
     expect((await getNarrativeJob(env.DB, expected.jobId))?.status).toBe("pending");
     expect((await getNarrativeJob(env.DB, expected.jobId))?.enqueueAttempts).toBe(2);
+  });
+
+  it("reconciliation keeps future-date watchdogs behind the earliest date", async () => {
+    const forecast = fiveCompleteDateForecast();
+    const localDates = [
+      ...new Set(
+        forecast.windows.map((window) =>
+          localDateForTime(window.forecastAt, forecast.spot.timezone)
+        )
+      )
+    ].slice(0, 2);
+    const bundles = await Promise.all(
+      localDates.map((localDate) => buildForecastFactBundle(forecast, { localDate }))
+    );
+    for (const bundle of bundles) {
+      await expect(
+        enqueueSurfAnalysis({
+          db: env.DB,
+          queue: queue(async () => {
+            throw new Error("force ledger reconciliation");
+          }),
+          bundle,
+          now: new Date("2026-08-02T13:05:00.000Z"),
+          fallbackDelaySeconds: 600
+        })
+      ).rejects.toThrow(/force ledger reconciliation/);
+    }
+
+    const fallbackDelays: number[] = [];
+    const result = await reconcileNarrativeEnqueues({
+      db: env.DB,
+      queue: queue(async () => undefined),
+      fallbackQueue: {
+        send: async (_body: unknown, options?: { delaySeconds?: number }) => {
+          fallbackDelays.push(options?.delaySeconds ?? 0);
+        }
+      } as unknown as Queue,
+      now: new Date("2026-08-02T13:06:00.000Z"),
+      fallbackDelaySeconds: 600
+    });
+
+    expect(result).toEqual({ enqueued: 2 });
+    expect(fallbackDelays).toHaveLength(2);
+    expect(Math.min(...fallbackDelays)).toBeLessThan(720);
+    expect(Math.max(...fallbackDelays)).toBeGreaterThanOrEqual(900);
   });
 
   it("recovers a >24h or DLQ-equivalent stale delivery with the same submission and publishes once", async () => {
@@ -773,6 +902,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
       schemaVersion: 1 as const,
       jobId: sent[0]!.jobId,
       submissionId: sent[0]!.result.submissionId,
+      providerId: "omlx",
+      route: "primary" as const,
       modelId: "delayed-original-delivery",
       output: validDraft(snapshot)
     };
@@ -970,7 +1101,7 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
     expect(counted.queryCount()).toBeLessThanOrEqual(50);
   });
 
-  it("terminally rejects a structurally unrenderable draft instead of retry-looping", async () => {
+  it("requests one fallback for an invalid primary and fails an invalid fallback closed", async () => {
     const bundle = await buildForecastFactBundle(briefForecastFixture());
     const snapshot = await buildSurfAnalysisSnapshot(bundle);
     const job = await buildSurfNarrativeJob(snapshot);
@@ -981,7 +1112,7 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
       now: new Date("2026-08-02T13:05:00.000Z")
     });
     const invalid = validDraft(snapshot);
-    invalid.paragraphs.plan.template += " {{unknown_slot}}";
+    invalid.close.watchCardId = "watch:unknown-card";
 
     const result = await acceptSurfAnalysisResult({
       db: env.DB,
@@ -989,6 +1120,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
         schemaVersion: 1,
         jobId: job.jobId,
         submissionId: job.result.submissionId,
+        providerId: "omlx",
+        route: "primary",
         modelId: "fixture-model",
         output: invalid
       },
@@ -996,8 +1129,25 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
       now: new Date("2026-08-02T14:00:00.000Z")
     });
 
-    expect(result.disposition).toBe("rejected");
-    expect((await getNarrativeJob(env.DB, job.jobId))?.status).toBe("rejected");
+    expect(result.disposition).toBe("fallback_requested");
+    expect((await getNarrativeJob(env.DB, job.jobId))?.status).toBe("pending");
+
+    const fallback = await acceptSurfAnalysisResult({
+      db: env.DB,
+      submission: {
+        schemaVersion: 1,
+        jobId: job.jobId,
+        submissionId: job.result.submissionId,
+        providerId: "gemini",
+        route: "fallback",
+        modelId: "fallback-fixture-model",
+        output: invalid
+      },
+      currentFactFingerprint: snapshot.factFingerprint,
+      now: new Date("2026-08-02T14:01:00.000Z")
+    });
+    expect(fallback.disposition).toBe("fallback_failed");
+    expect((await getNarrativeJob(env.DB, job.jobId))?.status).toBe("pending");
   });
 
   it("does not let a delayed attempt-one callback terminate a rearmed attempt", async () => {
@@ -1056,6 +1206,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
           schemaVersion: 1,
           jobId: first.jobId,
           submissionId: first.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId: "delayed-first-model",
           output: validDraft(snapshot)
         },
@@ -1072,6 +1224,8 @@ describe("Surf Analysis v3 D1 lifecycle", () => {
           schemaVersion: 1,
           jobId: second.jobId,
           submissionId: second.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId: "current-second-model",
           output: validDraft(snapshot)
         },

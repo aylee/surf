@@ -7,6 +7,7 @@ import {
 import { ForecastIntervalSchema, SpotIdSchema, SpotsResponseSchema } from "@surf/contracts";
 import {
   NARRATIVE_RESULT_MAX_BYTES,
+  NarrativeFallbackWatchdogSchema,
   NarrativeResultResponseSchema,
   NarrativeResultSubmissionSchema,
   assertNarrativeResultSize
@@ -43,10 +44,14 @@ import {
 } from "./ingest/queue";
 import {
   acceptNarrativeTerminalResult,
+  enqueueNarrativeFallbackWatchdog,
   enqueueSurfAnalysisBundles,
   getNarrativeJob,
   narrativeEnabled,
+  narrativeFallbackConfig,
+  processNarrativeFallbackWatchdog,
   reconcileNarrativeEnqueues,
+  replayGeneratedNarrativeFallbacks,
   selectSurfAnalysisBundlesForSignal,
   SURF_ANALYSIS_FUTURE_CADENCE_HOURS
 } from "./narrative";
@@ -61,7 +66,12 @@ export type Env = Omit<
   | "FORECAST_BRIEF_ENABLED"
   | "NARRATIVE_ENABLED"
   | "NARRATIVE_QUEUE"
+  | "NARRATIVE_FALLBACK_QUEUE"
   | "NARRATIVE_RESULT_TOKEN"
+  | "NARRATIVE_FALLBACK_MODEL"
+  | "NARRATIVE_FALLBACK_DELAY_SECONDS"
+  | "NARRATIVE_FALLBACK_DAILY_CAP"
+  | "NARRATIVE_FALLBACK_ROLLING_31_DAY_CAP"
   | "CF_VERSION_METADATA"
   | "GEMINI_API_KEY"
 > & {
@@ -75,7 +85,12 @@ export type Env = Omit<
   GEMINI_API_KEY?: string;
   NARRATIVE_ENABLED?: string;
   NARRATIVE_QUEUE?: Queue;
+  NARRATIVE_FALLBACK_QUEUE?: Queue;
   NARRATIVE_RESULT_TOKEN?: string;
+  NARRATIVE_FALLBACK_MODEL?: string;
+  NARRATIVE_FALLBACK_DELAY_SECONDS?: string;
+  NARRATIVE_FALLBACK_DAILY_CAP?: string;
+  NARRATIVE_FALLBACK_ROLLING_31_DAY_CAP?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -170,7 +185,9 @@ async function signalSurfAnalysis(
   context: ForecastBriefSignalContext
 ): Promise<void> {
   const queue = env.NARRATIVE_QUEUE;
-  if (!queue || !narrativeEnabled(env)) return;
+  const fallbackQueue = env.NARRATIVE_FALLBACK_QUEUE;
+  if (!queue || !fallbackQueue || !narrativeEnabled(env)) return;
+  const fallback = narrativeFallbackConfig(env);
   const spot = NORCAL_SPOTS.find((candidate) => candidate.id === spotId);
   if (!spot) return;
   try {
@@ -220,7 +237,9 @@ async function signalSurfAnalysis(
     const outcomes = await enqueueSurfAnalysisBundles({
       db: env.DB,
       queue,
-      bundles: selected.bundles
+      fallbackQueue,
+      bundles: selected.bundles,
+      fallbackDelaySeconds: fallback.delaySeconds
     });
     let failed = 0;
     for (const result of outcomes) {
@@ -467,6 +486,11 @@ app.post("/api/internal/narratives/results", async (c) => {
       );
       return c.json(result, 200, { "Cache-Control": "no-store" });
     }
+    if (submission.providerId !== "omlx" || submission.route !== "primary") {
+      return c.json({ error: "invalid_narrative_result_route" }, 400, {
+        "Cache-Control": "no-store"
+      });
+    }
     const stored = await getNarrativeJob(c.env.DB, submission.jobId);
     let factFingerprint: string | null = null;
     if (stored?.job.domain === "surf") {
@@ -480,17 +504,29 @@ app.post("/api/internal/narratives/results", async (c) => {
           ? (await buildSurfAnalysisSnapshot(current)).factFingerprint
           : null;
     }
-    const result = NarrativeResultResponseSchema.parse(
-      await acceptSurfAnalysisResult({
-        db: c.env.DB,
-        submission,
-        currentFactFingerprint: factFingerprint
-      })
-    );
+    const accepted = await acceptSurfAnalysisResult({
+      db: c.env.DB,
+      submission,
+      currentFactFingerprint: factFingerprint
+    });
+    if (accepted.disposition === "fallback_requested") {
+      const fallbackQueue = c.env.NARRATIVE_FALLBACK_QUEUE;
+      if (!fallbackQueue || !narrativeEnabled(c.env)) {
+        throw new Error("Narrative fallback infrastructure is unavailable");
+      }
+      await enqueueNarrativeFallbackWatchdog({
+        queue: fallbackQueue,
+        jobId: submission.jobId,
+        submissionId: submission.submissionId,
+        delaySeconds: 0,
+        trigger: "primary_validation_failed"
+      });
+    }
+    const result = NarrativeResultResponseSchema.parse(accepted);
     console.info(
       JSON.stringify({
         event: "narrative_result_completed",
-        message: "Narrative result reached a terminal cloud disposition",
+        message: "Narrative result reached a cloud disposition",
         jobId: result.jobId,
         disposition: result.disposition,
         reasonCode: `narrative_result_${result.disposition}`
@@ -724,11 +760,22 @@ export default {
   },
   async scheduled(_controller, env) {
     const requestedAt = new Date().toISOString();
-    if (narrativeEnabled(env) && env.NARRATIVE_QUEUE) {
+    if (
+      narrativeEnabled(env) &&
+      env.NARRATIVE_QUEUE &&
+      env.NARRATIVE_FALLBACK_QUEUE
+    ) {
       try {
+        const fallback = narrativeFallbackConfig(env);
+        await replayGeneratedNarrativeFallbacks({
+          db: env.DB,
+          now: new Date(requestedAt)
+        });
         await reconcileNarrativeEnqueues({
           db: env.DB,
           queue: env.NARRATIVE_QUEUE,
+          fallbackQueue: env.NARRATIVE_FALLBACK_QUEUE,
+          fallbackDelaySeconds: fallback.delaySeconds,
           now: new Date(requestedAt)
         });
       } catch (error) {
@@ -752,6 +799,93 @@ export default {
     });
   },
   async queue(batch, env) {
+    if (batch.queue.endsWith("-narrative-fallback")) {
+      for (const message of batch.messages) {
+        const parsed = NarrativeFallbackWatchdogSchema.safeParse(message.body);
+        if (!parsed.success) {
+          console.error(
+            JSON.stringify({
+              event: "narrative_fallback_watchdog_discarded",
+              message: "Malformed narrative fallback watchdog was acknowledged",
+              queue: batch.queue,
+              messageId: message.id,
+              reasonCode: "fallback_watchdog_invalid"
+            })
+          );
+          message.ack();
+          continue;
+        }
+        const fallbackQueue = env.NARRATIVE_FALLBACK_QUEUE;
+        if (
+          !narrativeEnabled(env) ||
+          !env.GEMINI_API_KEY?.trim() ||
+          !fallbackQueue
+        ) {
+          console.info(
+            JSON.stringify({
+              event: "narrative_fallback_watchdog_discarded",
+              message: "Narrative fallback is disabled",
+              queue: batch.queue,
+              messageId: message.id,
+              jobId: parsed.data.jobId,
+              reasonCode: "narrative_fallback_disabled"
+            })
+          );
+          message.ack();
+          continue;
+        }
+        try {
+          const outcome = await processNarrativeFallbackWatchdog({
+            db: env.DB,
+            watchdog: parsed.data,
+            config: narrativeFallbackConfig(env),
+            geminiApiKey: env.GEMINI_API_KEY
+          });
+          if (
+            outcome.reasonCode === "fallback_preclaim_retryable" &&
+            parsed.data.preclaimRetryCount < 1
+          ) {
+            await enqueueNarrativeFallbackWatchdog({
+              queue: fallbackQueue,
+              jobId: parsed.data.jobId,
+              submissionId: parsed.data.submissionId,
+              delaySeconds: 60,
+              trigger: parsed.data.trigger,
+              preclaimRetryCount: parsed.data.preclaimRetryCount + 1
+            });
+          }
+          console.info(
+            JSON.stringify({
+              event: "narrative_fallback_watchdog_completed",
+              message: "Narrative fallback watchdog reached a bounded outcome",
+              queue: batch.queue,
+              messageId: message.id,
+              jobId: outcome.jobId,
+              action: outcome.action,
+              disposition: outcome.disposition ?? null,
+              reasonCode: outcome.reasonCode
+            })
+          );
+        } catch (error) {
+          // The fallback attempt ledger is the recovery authority. Queue-level
+          // retries are intentionally disabled so a crashed external call can
+          // never spend twice; generated outputs replay from D1 on cron.
+          console.error(
+            JSON.stringify({
+              event: "narrative_fallback_watchdog_failed",
+              message: "Narrative fallback watchdog failed and was acknowledged",
+              queue: batch.queue,
+              messageId: message.id,
+              jobId: parsed.data.jobId,
+              reasonCode: "fallback_watchdog_processing_failed",
+              errorName: boundedPipelineErrorName(error)
+            })
+          );
+        }
+        message.ack();
+      }
+      return;
+    }
     for (const message of batch.messages) {
       try {
         await processIngestQueueMessage(env, message.body, signalSurfAnalysis);

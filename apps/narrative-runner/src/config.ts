@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 import { z } from "zod";
@@ -21,16 +22,22 @@ export type ResultTargetConfig = {
 
 export type RunnerConfig = {
   runnerId: string;
+  releaseSha: string;
+  runtimeFingerprint: string;
   queue: {
     apiBaseUrl: string;
     accountId: string;
     queueId: string;
+    name: string;
+    deadLetterQueueName: string;
+    retryDelaySeconds: number;
     apiToken: string;
   };
   omlx: {
     baseUrl: string;
     modelId: string;
     apiToken: string | null;
+    enableThinking: boolean;
     timeoutMs: number;
   };
   targets: ReadonlyMap<string, ResultTargetConfig>;
@@ -54,6 +61,33 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+function boundedSecret(env: NodeJS.ProcessEnv, name: string): string {
+  const value = required(env, name);
+  if (
+    value.length < 32 ||
+    value !== env[name] ||
+    /[\x00-\x1f\x7f]/.test(value)
+  ) {
+    throw new Error(`${name} must be at least 32 characters without surrounding whitespace`);
+  }
+  return value;
+}
+
+function releaseSha(env: NodeJS.ProcessEnv, expectedReleaseSha: string): string {
+  const value = required(env, "NARRATIVE_RUNNER_RELEASE_SHA");
+  if (!/^[0-9a-f]{40}$/.test(value) || !/^[0-9a-f]{40}$/.test(expectedReleaseSha)) {
+    throw new Error(
+      "NARRATIVE_RUNNER_RELEASE_SHA and expected release argument must be exact lowercase 40-character release SHAs"
+    );
+  }
+  if (value !== expectedReleaseSha) {
+    throw new Error(
+      "NARRATIVE_RUNNER_RELEASE_SHA must equal the immutable expected release SHA"
+    );
+  }
+  return value;
+}
+
 function integer(
   env: NodeJS.ProcessEnv,
   name: string,
@@ -67,6 +101,18 @@ function integer(
     throw new Error(`${name} must be an integer from ${minimum} through ${maximum}`);
   }
   return value;
+}
+
+function booleanSetting(
+  env: NodeJS.ProcessEnv,
+  name: string,
+  fallback: boolean
+): boolean {
+  const raw = env[name]?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return fallback;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new Error(`${name} must be either true or false`);
 }
 
 function normalizedUrl(raw: string, options: { loopbackHttp: boolean; label: string }): string {
@@ -106,8 +152,18 @@ function parseTargets(env: NodeJS.ProcessEnv): ReadonlyMap<string, ResultTargetC
   return targets;
 }
 
-export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
+export function loadRunnerConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  expectedReleaseSha = ""
+): RunnerConfig {
   const concurrency = integer(env, "NARRATIVE_RUNNER_CONCURRENCY", 1, 1, 100);
+  const retryBaseSeconds = integer(
+    env,
+    "NARRATIVE_RUNNER_RETRY_BASE_SECONDS",
+    30,
+    1,
+    43_200
+  );
   const omlxTimeoutMs = integer(
     env,
     "NARRATIVE_RUNNER_OMLX_TIMEOUT_MS",
@@ -163,26 +219,43 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
   const idleMaxMs = integer(
     env,
     "NARRATIVE_RUNNER_IDLE_MAX_MS",
-    600_000,
+    120_000,
     pollIntervalMs,
     3_600_000
   );
 
-  return {
+  const resolvedReleaseSha = releaseSha(env, expectedReleaseSha);
+  const statusHmacKey = boundedSecret(env, "NARRATIVE_RUNNER_STATUS_HMAC_KEY");
+  const cloudflareApiBaseUrl = required(
+    env,
+    "NARRATIVE_RUNNER_CF_API_BASE_URL"
+  );
+  if (cloudflareApiBaseUrl !== "https://api.cloudflare.com/client/v4") {
+    throw new Error(
+      "NARRATIVE_RUNNER_CF_API_BASE_URL must be exactly https://api.cloudflare.com/client/v4"
+    );
+  }
+  const baseConfig = {
     runnerId: env.NARRATIVE_RUNNER_ID?.trim() || hostname(),
+    releaseSha: resolvedReleaseSha,
     queue: {
-      apiBaseUrl: normalizedUrl(required(env, "NARRATIVE_RUNNER_CF_API_BASE_URL"), {
-        loopbackHttp: false,
-        label: "NARRATIVE_RUNNER_CF_API_BASE_URL"
-      }),
+      apiBaseUrl: cloudflareApiBaseUrl,
       accountId: required(env, "NARRATIVE_RUNNER_CF_ACCOUNT_ID"),
       queueId: required(env, "NARRATIVE_RUNNER_CF_QUEUE_ID"),
+      name: required(env, "NARRATIVE_RUNNER_CF_QUEUE_NAME"),
+      deadLetterQueueName: required(env, "NARRATIVE_RUNNER_CF_DLQ_NAME"),
+      retryDelaySeconds: retryBaseSeconds,
       apiToken: required(env, "NARRATIVE_RUNNER_CF_API_TOKEN")
     },
     omlx: {
       baseUrl,
       modelId: required(env, "NARRATIVE_RUNNER_OMLX_MODEL"),
       apiToken: env.NARRATIVE_RUNNER_OMLX_API_TOKEN?.trim() || null,
+      enableThinking: booleanSetting(
+        env,
+        "NARRATIVE_RUNNER_OMLX_ENABLE_THINKING",
+        false
+      ),
       timeoutMs: omlxTimeoutMs
     },
     targets: parseTargets(env),
@@ -213,13 +286,7 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
       3_600_000
     ),
     resultTimeoutMs,
-    retryBaseSeconds: integer(
-      env,
-      "NARRATIVE_RUNNER_RETRY_BASE_SECONDS",
-      30,
-      1,
-      43_200
-    ),
+    retryBaseSeconds,
     retryMaxSeconds: integer(
       env,
       "NARRATIVE_RUNNER_RETRY_MAX_SECONDS",
@@ -231,12 +298,28 @@ export function loadRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
       env.NARRATIVE_RUNNER_STATUS_FILE?.trim() || "dist/narrative-runner/status.json"
     )
   };
+  const runtimeFingerprint = createHmac("sha256", statusHmacKey)
+    .update(
+      JSON.stringify({
+        ...baseConfig,
+        targets: [...baseConfig.targets.entries()].sort(([left], [right]) =>
+          left.localeCompare(right)
+        )
+      })
+    )
+    .digest("hex");
+  return { ...baseConfig, runtimeFingerprint };
 }
 
 export function redactedConfigSummary(config: RunnerConfig): Record<string, unknown> {
   return {
     runnerId: config.runnerId,
+    releaseSha: config.releaseSha,
+    runtimeFingerprint: config.runtimeFingerprint,
     modelId: config.omlx.modelId,
+    queueName: config.queue.name,
+    queueDeadLetterName: config.queue.deadLetterQueueName,
+    omlxThinkingEnabled: config.omlx.enableThinking,
     concurrency: config.concurrency,
     visibilityTimeoutMs: config.visibilityTimeoutMs,
     queueTimeoutMs: config.queueTimeoutMs,

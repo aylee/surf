@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CANONICAL_RECOMMENDATION_MIN_DURATION_MS,
   CANONICAL_RECOMMENDATION_SCORE_BAND,
   intervalOverlapsCivilLight,
   intervalOverlapsRange,
@@ -301,6 +302,58 @@ describe("selectCanonicalRecommendationWindows", () => {
       startAt: "2026-12-21T23:00:00.000Z",
       endAt: "2026-12-22T01:05:00.000Z"
     });
+  });
+
+  it("rejects standalone civil-light slivers while keeping a partial edge joined to a real session", () => {
+    const windows = selectCanonicalRecommendationWindows([
+      candidate("seven-minute-dawn", {
+        forecastAt: "2026-08-02T14:00:00.000Z",
+        civilLightStartAt: "2026-08-02T14:53:00.000Z",
+        civilLightEndAt: "2026-08-03T00:35:00.000Z",
+        score: 100
+      }),
+      candidate("thirty-five-minute-sunset", {
+        forecastAt: "2026-08-03T00:00:00.000Z",
+        civilLightStartAt: "2026-08-02T14:53:00.000Z",
+        civilLightEndAt: "2026-08-03T00:35:00.000Z",
+        score: 99,
+        surfaceCondition: "clean"
+      }),
+      candidate("partial-edge", {
+        forecastAt: "2026-08-02T15:00:00.000Z",
+        civilLightStartAt: "2026-08-02T15:52:00.000Z",
+        civilLightEndAt: "2026-08-03T00:35:00.000Z",
+        score: 80
+      }),
+      candidate("full-adjacent-hour", {
+        forecastAt: "2026-08-02T16:00:00.000Z",
+        civilLightStartAt: "2026-08-02T15:52:00.000Z",
+        civilLightEndAt: "2026-08-03T00:35:00.000Z",
+        score: 80
+      })
+    ], NOW);
+
+    expect(windows).toHaveLength(1);
+    expect(windows[0]).toMatchObject({
+      representativeWindowId: "partial-edge",
+      constituentWindowIds: ["partial-edge", "full-adjacent-hour"],
+      startAt: "2026-08-02T15:52:00.000Z",
+      endAt: "2026-08-02T17:00:00.000Z"
+    });
+  });
+
+  it("accepts a session exactly at the minimum practical duration", () => {
+    const [window] = selectCanonicalRecommendationWindows([
+      candidate("forty-five-minutes", {
+        forecastAt: "2026-08-02T15:00:00.000Z",
+        civilLightStartAt: "2026-08-02T15:15:00.000Z",
+        civilLightEndAt: "2026-08-03T00:00:00.000Z"
+      })
+    ], NOW);
+
+    expect(new Date(window!.endAt).getTime() - new Date(window!.startAt).getTime()).toBe(
+      CANONICAL_RECOMMENDATION_MIN_DURATION_MS
+    );
   });
 
   it("allows spot-specific deterministic scores to produce different leaders", () => {

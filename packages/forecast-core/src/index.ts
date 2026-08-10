@@ -10,6 +10,7 @@ export {
 export type { NorcalSpotProfile, NwsWaveGridSourceMapping } from "./spot-registry";
 export { scoreSpotWindow } from "./scoring";
 export {
+  CANONICAL_RECOMMENDATION_MIN_DURATION_MS,
   CANONICAL_RECOMMENDATION_SCORE_BAND,
   intervalOverlapsCivilLight,
   intervalOverlapsRange,

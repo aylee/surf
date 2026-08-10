@@ -6,7 +6,7 @@ import type {
 } from "@surf/narrative-contracts";
 import type { RunnerConfig } from "../src/config";
 import { MemoryLogger } from "../src/logger";
-import type { OmlxClient } from "../src/omlx-client";
+import type { OmlxClient, OmlxGeneration } from "../src/omlx-client";
 import type {
   PulledQueueMessage,
   QueueClient,
@@ -88,14 +88,30 @@ export function queueMessage(
 }
 
 export class FakeQueueClient implements QueueClient {
+  preflightCalls = 0;
   readonly pullCalls: number[] = [];
   readonly acked: string[] = [];
   readonly retried: Array<{ leaseId: string; delaySeconds: number }> = [];
   pullError: unknown = null;
   ackError: unknown = null;
   retryError: unknown = null;
+  preflightError: unknown = null;
 
   constructor(readonly messages: PulledQueueMessage[] = []) {}
+
+  async preflight(): Promise<{
+    queueName: string;
+    consumerType: "http_pull";
+    deadLetterQueueName: string;
+  }> {
+    this.preflightCalls += 1;
+    if (this.preflightError) throw this.preflightError;
+    return {
+      queueName: "surf-narrative",
+      consumerType: "http_pull",
+      deadLetterQueueName: "surf-narrative-dlq"
+    };
+  }
 
   async pull(batchSize: number): Promise<QueuePullResult> {
     this.pullCalls.push(batchSize);
@@ -121,16 +137,18 @@ export class FakeOmlxClient implements OmlxClient {
   preflightCalls = 0;
   readonly generateCalls: Array<{ job: NarrativeJob; timeoutMs: number | undefined }> = [];
   preflightHandler: () => Promise<void> = async () => undefined;
-  generateHandler: (job: NarrativeJob, timeoutMs?: number) => Promise<JsonValue> = async () => ({
-    summary: "ok"
-  });
+  generateHandler: (job: NarrativeJob, timeoutMs?: number) => Promise<OmlxGeneration> =
+    async () => ({
+      output: { summary: "ok" },
+      modelId: "local-model"
+    });
 
   async preflight(): Promise<void> {
     this.preflightCalls += 1;
     await this.preflightHandler();
   }
 
-  async generate(job: NarrativeJob, timeoutMs?: number): Promise<JsonValue> {
+  async generate(job: NarrativeJob, timeoutMs?: number): Promise<OmlxGeneration> {
     this.generateCalls.push({ job, timeoutMs });
     return this.generateHandler(job, timeoutMs);
   }
@@ -201,16 +219,22 @@ type ConfigOverrides = Partial<Omit<RunnerConfig, "queue" | "omlx" | "targets">>
 export function makeConfig(overrides: ConfigOverrides = {}): RunnerConfig {
   const base: RunnerConfig = {
     runnerId: "runner-test",
+    releaseSha: "a".repeat(40),
+    runtimeFingerprint: "b".repeat(64),
     queue: {
       apiBaseUrl: "https://api.cloudflare.com/client/v4",
       accountId: "account-test",
       queueId: "queue-test",
+      name: "surf-narrative",
+      deadLetterQueueName: "surf-narrative-dlq",
+      retryDelaySeconds: 30,
       apiToken: "queue-secret"
     },
     omlx: {
       baseUrl: "http://127.0.0.1:8000/v1",
       modelId: "local-model",
       apiToken: null,
+      enableThinking: false,
       timeoutMs: 120_000
     },
     targets: new Map([
@@ -266,7 +290,14 @@ export function makeRunnerHarness(options: {
   const results = options.results ?? new FakeResultClient();
   const clock = options.clock ?? new TestClock();
   const store = new MemoryStatusStore();
-  const status = new StatusTracker(config.runnerId, config.omlx.modelId, store, clock.now);
+  const status = new StatusTracker(
+    config.runnerId,
+    config.omlx.modelId,
+    config.releaseSha,
+    config.runtimeFingerprint,
+    store,
+    clock.now
+  );
   const logger = new MemoryLogger();
   const runner = new NarrativeRunner(config, {
     queue,

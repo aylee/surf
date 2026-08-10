@@ -68,6 +68,8 @@ export class MappedResultClient implements ResultClient {
           schemaVersion: 1,
           jobId: job.jobId,
           submissionId: job.result.submissionId,
+          providerId: "omlx",
+          route: "primary",
           modelId,
           output
         })

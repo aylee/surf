@@ -1,9 +1,13 @@
 # Runtime operations
 
 This runbook is instance-neutral. Run commands from the repository root. The
-`pnpm wrangler -- ...` wrapper honors the ignored `SURF_WRANGLER_CONFIG`
-override described in the self-hosting guide, including for remote D1 and
-rollback commands.
+Every operational `pnpm wrangler -- ...` call requires and hash-verifies the
+absolute external `SURF_WRANGLER_CONFIG` activation snapshot and its
+`SURF_WRANGLER_CONFIG_SHA256` described in the self-hosting guide, including
+remote D1 and rollback commands. The sole exception is the exact local,
+secretless wrapper check `pnpm wrangler -- --version`. Operational calls also
+reject unsafe ambient Wrangler environment variables before spawning. Never
+point one at the editable source or the obsolete relative ignored overlay.
 
 ## Normal cadence
 
@@ -24,9 +28,12 @@ rollback commands.
 - When optional Analysis is enabled, a published spot generation emits one
   versioned `analysis-signal` message through the ingest Queue. Its separate
   invocation reloads all current local-date fact bundles, ledgers each exact
-  Analysis job, and sends it to a dedicated narrative Queue. An out-of-band runner
+  Analysis job, sends a ten-minute delayed watchdog first, and then sends the
+  local-primary job to a dedicated narrative Queue. An out-of-band runner
   HTTP-pulls available work, calls local oMLX, and posts a bounded result to the
-  authenticated Worker endpoint. Code owns all values and recommendation
+  authenticated Worker endpoint. If the Mac/runner is offline or its output
+  fails validation, the separate Worker-consumed watchdog Queue can make one
+  budget-claimed Gemini call through the same validator/publication CAS. Code owns all values and recommendation
   semantics; the cloud validates connective prose and derives provenance from
   used slots. Failure never delays forecast publication and never creates a
   pseudo-report: the UI reports published, pending, or unavailable honestly.
@@ -211,9 +218,10 @@ substitute a remote D1 command for this procedure.
 ## Post-merge routine
 
 Use the supported path in this order after a merge. Set `SURF_BASE_URL` to the
-bare HTTPS origin being checked; `SURF_WRANGLER_CONFIG` may select the ignored
-instance overlay. `ops:status` is strictly read-only and honors that same
-overlay.
+bare HTTPS origin being checked; `SURF_WRANGLER_CONFIG` and
+`SURF_WRANGLER_CONFIG_SHA256` must select the preserved external activation
+snapshot. `ops:status` is strictly read-only and verifies that same snapshot
+before any health or Wrangler probe.
 
 ```bash
 pnpm verify
@@ -300,8 +308,9 @@ the matching `logfire-eu.pydantic.dev` endpoints.
 
 The tracked `wrangler.jsonc` remains destination-neutral. After the operator
 creates both account-level destinations, add only their names to the matching
-logs/traces `destinations` arrays in the ignored `wrangler.instance.jsonc`, run
-the normal config/verify gates, and deploy through the supported path. See the
+logs/traces `destinations` arrays in the private Wrangler source, stage a new
+mode-`0600` activation snapshot/hash, run the normal config/verify gates, and
+deploy through the supported path. See the
 [Cloudflare Workers OTLP export documentation](https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/)
 and [Logfire OTLP documentation](https://logfire.pydantic.dev/docs/how-to-guides/alternative-clients/).
 
@@ -312,8 +321,8 @@ correlation fallback and evidence for the limitation—not permission to rewrite
 the one-trace acceptance criterion silently.
 
 Rollback is configuration-only and does not mutate forecast data: disable or
-delete the two Cloudflare destinations and remove their names from the ignored
-instance overlay.
+delete the two Cloudflare destinations and remove their names from the private
+source before staging the rollback snapshot.
 
 ## Manual ingest
 
@@ -475,9 +484,10 @@ Start with the public response for one spot/date. `/brief` v3 is always
 
 Never replace `pending` or `unavailable` with local deterministic prose. The
 Forecast tab remains the authoritative fallback product surface. While visible,
-the UI polls a pending report at three-second intervals for exactly 20 requests;
-if the Worker is still pending, that bounded wait resolves to the same honest
-unavailable presentation instead of an idle state that can never advance.
+the UI polls a pending report every three seconds for the first 20 requests,
+then every 30 seconds through a hard 40-minute wall-clock bound. Reaching that
+bound keeps the honest pending presentation and exposes **Check again**; it does
+not rewrite an active job as unavailable or poll forever in the background.
 
 Inspect only bounded ledger metadata, not stored prompts or snapshots:
 
@@ -491,6 +501,7 @@ pnpm wrangler -- d1 execute DB --remote --command \
 Then check the runner without printing credentials or job payloads:
 
 ```bash
+export NARRATIVE_EXPECTED_RELEASE_SHA="$(git rev-parse HEAD)"
 pnpm --filter @surf/narrative-runner config:check
 pnpm --filter @surf/narrative-runner status
 ```
@@ -511,7 +522,7 @@ and an A row that exhausted its ceiling cannot supersede the still-active B
 row.
 
 A successfully enqueued row that stays pending for 12 hours is also reissued
-before the Free-plan 24-hour Queue retention window. Delivery reissues keep the
+before the deliberately conservative 24-hour Queue retention floor. Delivery reissues keep the
 same job/submission identity, use a lease-token CAS, and stop after three sends
 per active submission. A delayed original and replacement can both infer, but only one revision
 publishes; the other result is duplicate. When the final delivery has itself
@@ -522,26 +533,47 @@ bounded inference rearm gets a fresh submission ID and its own three-send
 delivery budget; callbacks from the exhausted submission then fail the active
 submission CAS.
 Reconciliation is capped at 15 jobs: two base D1 statements plus at most three
-per job is 47, leaving headroom below
-[D1 Free's 50-query invocation limit](https://developers.cloudflare.com/d1/platform/limits/).
+per job is 47, leaving ample headroom below
+[D1 Paid's 1,000-query invocation limit](https://developers.cloudflare.com/d1/platform/limits/).
 
 Runner inference and callback network/429/5xx failures receive one short local
 retry inside the same lease only when the remaining job deadline and cumulative
-visibility budgets fit. A second failure requests Queue retry, which the Free
-reference's zero-retry consumer sends to DLQ before bounded D1-ledger reissue.
-Malformed generated output is reported as an identifiable terminal rejection before ACK. Expired
-or deadline-starved jobs are reported as terminal when identity is trustworthy.
+visibility budgets fit. A second failure requests Queue retry, which the
+reference zero-retry consumer sends to DLQ before bounded D1-ledger reissue.
+Malformed generated output is ACKed as an identifiable nonterminal local
+failure so the already-accepted delayed fallback remains eligible. Persistent
+request/config/auth failures halt intake and retry the lease instead of spending
+fallback quota. Expired or deadline-starved jobs are reported as terminal when identity is trustworthy.
 An undecodable message cannot supply a trustworthy callback identity, so it is
 ACKed locally and the cloud deadline reconciler expires its ledger row. Inspect
 the instance narrative DLQ, runner status error code, D1 reason code, and oMLX
 health before a deliberate one-shot retry. Logs contain identifiers and bounded
 reason codes, never tokens, full prompts, snapshots, or model payloads.
 
+### Narrative rollback quiescence
+
 For rollout/quiescence, follow [local narrative runner](narrative-runner.md).
-Stop new production by deploying `NARRATIVE_ENABLED=false`; stop pulls by
-removing the HTTP pull consumer. Wait for in-flight leases to settle before
-revoking the target result token or Queue API token. Do not delete Queue/DLQ or
-D1 ledger rows as recovery.
+Install both production LaunchAgents only from a detached, clean release
+worktree whose `HEAD` equals the recorded merged SHA after a frozen install.
+Render both plists by executing that release's renderer, then use its supported
+installer/controller to place byte-attested mode-0600 copies in the current
+user's `~/Library/LaunchAgents`. The automatic runner guard reconstructs its
+environment only from the activation-record-bound runner file. Retain the
+prior release directory, activation record, and rendered plists as the
+rollback target. A
+mutable developer checkout is not a production service path.
+Stop new production by deploying `NARRATIVE_ENABLED=false`, then boot out the
+runner LaunchAgent. Because `launchctl bootout` is asynchronous, use the
+runner guide's fail-closed bounded poll through `ExitTimeOut` rather than a
+single immediate `launchctl print`. Prove its graceful drain completed
+(`state: "stopped"`, dead PID, and unloaded launchd label) before removing the HTTP pull consumer.
+Record that the local-primary Queue has no leased/retrying work; preserve and
+record any available backlog and DLQ rather than pulling or deleting it. Keep
+the disabled current Worker active for at least the fallback delay and prove
+the fallback Queue has zero available, delayed, leased, and retrying messages
+before activating a payload-incompatible predecessor. Revoke result or Queue
+credentials only after these proofs. Do not delete Queue/DLQ or D1 ledger rows
+as recovery.
 
 ## Backup and restore
 
@@ -591,8 +623,8 @@ and retention cutoff have passed. The owner of this constant is
 The current 11-spot, five-date planning envelope is 55 exact-fact generations
 per materially changed forecast issue; identical hourly materializations
 deduplicate rather than enqueueing another 55. The
-[Free Queue allowance](https://developers.cloudflare.com/queues/platform/pricing/)
-is 10,000 account-wide operations/day. Cloudflare bills reads, writes, and
+[Workers Paid Queue inclusion](https://developers.cloudflare.com/queues/platform/pricing/)
+is 1,000,000 account-wide operations/month. Cloudflare bills reads, writes, and
 deletes per decimal 64,000-byte chunk and adds roughly 100 bytes of message
 metadata, so the shared application envelope is capped at 60,000 serialized
 bytes to remain one chunk.
@@ -610,31 +642,47 @@ complete child handoff. The earliest
 recommendation-bearing local date refreshes hourly, while four later dates
 refresh on a three-hour spot-local cadence: at most 616 initial narrative
 sends/day. Hourly reconciliation admits at most another 360 stale-ledger
-reissues. The Free reference allows zero Queue-level delivery
+reissues. The local-primary consumer allows zero Queue-level delivery
 retries and relies on bounded D1-ledger reissue for recovery. If every first
 delivery transfers to the DLQ, its source write/read/delete, DLQ write, and
 eventual retention delete cost five operations, or 4,880 across all 976
-initial and reconciliation sends. The ten-minute empty-pull cap is about
-144 reads/day at steady state; the capacity regression conservatively reserves
-336 for hourly backoff resets and fastest jitter. The configured account
-envelope is therefore 1,872 + 1,080 + 720 + 4,880 + 336 = 8,888
-operations/day, leaving 1,112 operations of headroom.
-Treat 8,000 projected or observed account operations as an early warning and
-review the measured end-of-day projection. Stop new narrative admission before
-that projection reaches 9,500. Do not add retries, increase polling, drain the
-DLQ, or admit another region/domain on Free unless a new combined projection
-remains below 10,000. Per-domain Queues
-and runner processes isolate credentials and failures, not the account quota.
-If the projection cannot stay below 10,000, deploy
-`NARRATIVE_ENABLED=false`, let the active lease settle, and stop the runner so
-empty pulls cease; deterministic Forecast remains available. Do not manually
+initial and reconciliation sends. Every job also writes, delivers, and deletes
+one delayed cloud watchdog, reserving another 2,928 operations/day even though
+most watchdogs observe a published primary and make no Gemini call. A transient
+fact read before the paid claim may enqueue exactly one replacement watchdog;
+reserving that failure for every job adds another 2,928 operations/day. The
+local callback can also enqueue one immediate `fallback_requested` watchdog
+when its output fails the cloud validator; reserving that path for every job
+adds another 2,928 operations/day. The
+two-minute idle cap conservatively reserves 1,008 empty reads/day across hourly
+backoff resets and fastest jitter. The configured worst-case envelope is
+therefore 1,872 + 1,080 + 720 + 4,880 + 2,928 + 2,928 + 2,928 + 1,008 = 18,344
+operations/day, or 568,664 in a 31-day month. That is 56.9% of the included
+1,000,000 operations; ordinary successful delivery is materially lower.
+
+The Gemini claim caps intentionally provide partial host-outage coverage, not
+a cloud copy of all 55 spot-dates. Earliest recommendation dates become
+eligible first, future dates are tiered five minutes apart, and a stable
+spot/date offset rotates which current spots can reach the global four-call
+rolling-day cap first instead of preserving catalog order.
+
+Treat 700,000 projected month-end operations as an early warning and review the
+measured breakdown. Stop new narrative admission before the projection reaches
+900,000. Do not add retries, lower polling further, drain a DLQ, or admit
+another region/domain unless a new combined projection remains below the
+included allowance with this reserve. Per-domain Queues and runner processes
+isolate credentials and failures, not the account quota. If the projection
+cannot remain below the chosen admission stop, deploy
+`NARRATIVE_ENABLED=false`, boot out the runner LaunchAgent, prove its active
+lease drained and process stopped, then remove its HTTP consumer so empty pulls
+cease; deterministic Forecast remains available. Do not manually
 drain the DLQ as a quota workaround because that adds billed reads/deletes.
 
 At the observed complete-generation storage size of about 12.3 KB, the
 cadence-capped 616-generation/day envelope retains about 53 MB of row payload
 over seven days. A 50% reserve for indexes and SQLite overhead models about
-80 MB, roughly 16% of D1 Free's 500 MB database before core forecast data.
-Alert at 175 MB of narrative storage or 250 MB total D1 size and shorten the
+80 MB, roughly 1.6% of D1 Paid's 5 GB database before core forecast data.
+Alert at 500 MB of narrative storage or 4 GB total D1 size and shorten the
 horizon or reduce admission before either threshold grows. The cutoff-leading
 `narrative_revisions(published_at, local_date)` and
 `narrative_jobs(updated_at, local_date, status, deadline_at)` indexes keep the
@@ -763,6 +811,16 @@ rollback leaves D1 and R2 data intact once Queue quiescence is established.
 With `NARRATIVE_ENABLED=false`, the public read path still serves an exact
 published revision but reports every non-published ledger row unavailable; it
 never promises that stopped work is still being prepared.
+
+Narrative rollback has an additional out-of-band intake boundary. After the
+disabled deploy, boot out and use the runner guide's bounded fail-closed poll
+to gracefully drain the local runner **before**
+removing its HTTP pull consumer; otherwise the process continues polling and
+can publish callbacks while the feature flag is false. Prove the stopped
+heartbeat/dead PID/unloaded label, no leased or retrying primary work, and a
+fully drained delayed fallback Queue before activating a predecessor. Preserve
+available primary messages, the DLQ, fallback ledger, and additive migration
+0005 for recovery.
 
 If a later problem is found while the schema remains backward compatible, use
 Wrangler's version rollback:

@@ -553,6 +553,52 @@ describe("ForecastWorkbench", () => {
     ).toBe(true);
   });
 
+  it("keeps checking at low frequency until a delayed fallback publishes", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
+    const fallbackPublishesAt = Date.now() + 10 * 60_000;
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      Date.now() < fallbackPublishesAt
+        ? jsonResponse({
+            schemaVersion: 3,
+            status: "pending",
+            report: null,
+            message: "Analysis is being prepared.",
+            availableRevisions: 0
+          })
+        : jsonResponse({
+            schemaVersion: 3,
+            status: "published",
+            report: {
+              schemaVersion: 3,
+              spotId: "bolinas",
+              localDate: "2026-08-02",
+              revisionId: "revision.delayed-fallback",
+              headline: "Bolinas: delayed fallback is ready",
+              paragraphs: ["Setup paragraph.", "Plan paragraph.", "Confidence paragraph."],
+              updatedAt: "2026-08-02T12:10:00.000Z"
+            },
+            availableRevisions: 1
+          })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ForecastWorkbench spot={spot} initialForecast={fixtureForecast()} now={now} />);
+    expect(await screen.findByText("Analysis is being prepared.")).toBeTruthy();
+    expect(screen.queryByText("Analysis unavailable")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10 * 60_000 + 30_000);
+    });
+
+    expect(
+      await screen.findByRole("heading", { name: "Bolinas: delayed fallback is ready" })
+    ).toBeTruthy();
+    expect(screen.queryByText("Analysis unavailable")).toBeNull();
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(20);
+    expect(fetchMock.mock.calls.length).toBeLessThan(50);
+  });
+
   it("polls pending Analysis into the Worker's unavailable lifecycle", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
@@ -588,7 +634,7 @@ describe("ForecastWorkbench", () => {
     expect(requests).toBe(2);
   });
 
-  it("ends an always-pending Analysis as unavailable after exactly 20 requests", async () => {
+  it("backs off an always-pending Analysis and offers an explicit bounded refresh", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     window.history.replaceState({}, "", "/?spot=bolinas&tab=analysis");
     const fetchMock = vi.fn<typeof fetch>(async () =>
@@ -608,14 +654,34 @@ describe("ForecastWorkbench", () => {
       await vi.advanceTimersByTimeAsync(19 * 3_000);
     });
 
-    const unavailable = await screen.findByText("Analysis unavailable");
     expect(fetchMock).toHaveBeenCalledTimes(20);
-    expect(unavailable.closest('[role="status"]')?.getAttribute("aria-busy")).toBe("false");
-    expect(screen.queryByText("Analysis is being prepared.")).toBeNull();
+    expect(screen.getByText("Analysis is being prepared.")).toBeTruthy();
+    expect(screen.queryByText("Analysis unavailable")).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(29_000);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(20);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(21);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40 * 60_000);
+    });
+    const refresh = await screen.findByRole("button", { name: "Check again" });
+    expect(screen.getByText("Analysis is being prepared.")).toBeTruthy();
+    expect(screen.queryByText("Analysis unavailable")).toBeNull();
+    expect(refresh.closest('[role="status"]')?.getAttribute("aria-busy")).toBe("false");
+    const stoppedAt = fetchMock.mock.calls.length;
     await act(async () => {
       await vi.advanceTimersByTimeAsync(60_000);
     });
-    expect(fetchMock).toHaveBeenCalledTimes(20);
+    expect(fetchMock).toHaveBeenCalledTimes(stoppedAt);
+
+    fireEvent.click(refresh);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(stoppedAt + 1));
+    expect(await screen.findByText("Analysis is being prepared.")).toBeTruthy();
   });
 
   it("cancels pending Analysis polling when the panel is no longer visible", async () => {

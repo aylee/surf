@@ -33,6 +33,8 @@ describe("result callback client", () => {
       schemaVersion: 1,
       jobId: job.jobId,
       submissionId: "submission-1",
+      providerId: "omlx",
+      route: "primary",
       modelId: "local-model",
       output: { summary: "ok" }
     });

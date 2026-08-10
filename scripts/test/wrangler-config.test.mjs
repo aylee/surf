@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readWranglerConfig } from "../lib/cloudflare-commands.mjs";
+import { stageWranglerConfigSnapshot } from "../lib/wrangler-config-snapshot.mjs";
 import {
   wranglerEnvironmentFailures,
   wranglerStructureFailures
@@ -19,29 +21,62 @@ function renameInstance(config, name) {
   config.d1_databases[0].database_name = name;
   config.queues.producers[0].queue = `${name}-ingest`;
   config.queues.producers[1].queue = `${name}-narrative`;
+  config.queues.producers[2].queue = `${name}-narrative-fallback`;
   config.queues.consumers[0].queue = `${name}-ingest`;
   config.queues.consumers[0].dead_letter_queue = `${name}-ingest-dlq`;
+  config.queues.consumers[1].queue = `${name}-narrative-fallback`;
 }
 
 test("Wrangler instance config follows the subcommand arguments", () => {
-  const result = spawnSync(
-    process.execPath,
-    ["scripts/wrangler.mjs", "whoami", "--help"],
-    {
-      cwd: root,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        SURF_WRANGLER_CONFIG: "wrangler.jsonc",
-        WRANGLER_LOG_PATH: resolve(tmpdir(), `surf-wrangler-order-${process.pid}.log`)
+  const activationRoot = mkdtempSync(resolve(tmpdir(), "surf-wrangler-order-"));
+  try {
+    const sourcePath = resolve(activationRoot, "source/wrangler.jsonc");
+    const outputPath = resolve(activationRoot, "activation/wrangler.jsonc");
+    mkdirSync(resolve(activationRoot, "source"), { recursive: true });
+    mkdirSync(resolve(activationRoot, "activation"), { recursive: true });
+    writeFileSync(sourcePath, `${JSON.stringify(canonical, null, 2)}\n`, { mode: 0o600 });
+    const pinned = stageWranglerConfigSnapshot({ sourcePath, outputPath, releaseRoot: root });
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/wrangler.mjs", "whoami", "--help"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SURF_WRANGLER_CONFIG: pinned.path,
+          SURF_WRANGLER_CONFIG_SHA256: pinned.sha256,
+          WRANGLER_LOG_PATH: resolve(tmpdir(), `surf-wrangler-order-${process.pid}.log`)
+        }
       }
-    }
-  );
-  const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    );
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
 
-  assert.equal(result.status, 0, output);
-  assert.match(output, /wrangler whoami/);
-  assert.doesNotMatch(output, /Unknown argument/);
+    assert.equal(result.status, 0, output);
+    assert.match(output, /wrangler whoami/);
+    assert.doesNotMatch(output, /Unknown argument/);
+
+    appendFileSync(pinned.path, " ");
+    const drifted = spawnSync(
+      process.execPath,
+      ["scripts/wrangler.mjs", "deployments", "status", "--json"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SURF_WRANGLER_CONFIG: pinned.path,
+          SURF_WRANGLER_CONFIG_SHA256: pinned.sha256
+        }
+      }
+    );
+    const driftOutput = `${drifted.stdout ?? ""}${drifted.stderr ?? ""}`;
+    assert.notEqual(drifted.status, 0);
+    assert.match(driftOutput, /SHA-256 does not match activation/);
+    assert.doesNotMatch(driftOutput, /> pnpm|wrangler deployments/);
+  } finally {
+    rmSync(activationRoot, { recursive: true, force: true });
+  }
 });
 
 test("canonical Wrangler configuration satisfies the supported instance contract", () => {
@@ -149,7 +184,7 @@ test("instance validation protects the outbound narrative pull boundary", () => 
     "NARRATIVE_QUEUE must produce to surf-narrative.",
     "Queue consumer must read surf-ingest and dead-letter to surf-ingest-dlq.",
     "The narrative queue must use an out-of-band HTTP pull consumer, not a Worker consumer.",
-    "The tracked config must keep NARRATIVE_ENABLED=false until pull infrastructure exists.",
+    "The tracked config must keep NARRATIVE_ENABLED=false; activation belongs in the ignored instance overlay.",
     "NARRATIVE_RESULT_TOKEN must be a Wrangler secret, never a tracked Worker var."
   ]);
 });
@@ -202,6 +237,29 @@ test("instance validation preserves serialized ingest generations", () => {
 
   assert.deepEqual(wranglerStructureFailures(config, configPath), [
     "Ingest queue consumption must be serialized one message at a time."
+  ]);
+});
+
+test("instance validation preserves the at-most-once paid fallback topology", () => {
+  const config = structuredClone(canonical);
+  config.queues.producers[2].queue = "wrong-fallback";
+  config.queues.consumers[1].max_retries = 2;
+  config.queues.consumers[1].dead_letter_queue = "surf-narrative-fallback-dlq";
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "NARRATIVE_FALLBACK_QUEUE must produce to surf-narrative-fallback.",
+    "Narrative fallback consumption must be serialized with max_retries=0 and no DLQ; D1 owns paid-call idempotency."
+  ]);
+});
+
+test("tracked fallback defaults remain reviewable and bounded", () => {
+  const config = structuredClone(canonical);
+  config.vars.NARRATIVE_FALLBACK_MODEL = "gemini-expensive";
+  config.vars.NARRATIVE_FALLBACK_DAILY_CAP = "20";
+
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "NARRATIVE_FALLBACK_MODEL must remain gemini-3.6-flash in the tracked canonical config.",
+    "NARRATIVE_FALLBACK_DAILY_CAP must remain 4 in the tracked canonical config."
   ]);
 });
 

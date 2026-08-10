@@ -2722,6 +2722,30 @@ div.quietBriefLine {
   color: var(--ink);
 }
 
+.analysisRetryButton {
+  width: fit-content;
+  margin-top: 6px;
+  padding: 7px 11px;
+  border: 1px solid #ccd8d4;
+  border-radius: 10px;
+  background: #f7f9f6;
+  color: var(--ocean);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.analysisRetryButton:hover {
+  border-color: #a9c9bf;
+  background: #eef6f2;
+}
+
+.analysisRetryButton:focus-visible {
+  outline: 3px solid rgb(46 139 120 / 25%);
+  outline-offset: 2px;
+}
+
 @media (max-width: 680px) {
   .spotHeroSlim {
     padding: 16px;

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.alex.omlx-server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=__HOME_ABSOLUTE_PATH__</string>
+    <string>LANG=en_US.UTF-8</string>
+    <string>PATH=__OMLX_BIN_ABSOLUTE_DIRECTORY__:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>SURF_OMLX_RESTART_DELAY_SECONDS=15</string>
+    <string>/bin/sh</string>
+    <string>__OMLX_SUPERVISOR_ABSOLUTE_PATH__</string>
+    <string>__NODE_ABSOLUTE_PATH__</string>
+    <string>__ACTIVATION_VERIFIER_ABSOLUTE_PATH__</string>
+    <string>__ACTIVATION_RECORD_ABSOLUTE_PATH__</string>
+    <string>--</string>
+    <string>__OMLX_ABSOLUTE_PATH__</string>
+    <string>serve</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8000</string>
+    <string>--max-concurrent-requests</string>
+    <string>1</string>
+    <string>--log-level</string>
+    <string>warning</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__OMLX_DATA_ABSOLUTE_PATH__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ExitTimeOut</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIRECTORY_ABSOLUTE_PATH__/omlx.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIRECTORY_ABSOLUTE_PATH__/omlx.stderr.log</string>
+</dict>
+</plist>

@@ -10,6 +10,7 @@
   },
   "packageManager": "pnpm@11.7.0",
   "scripts": {
+    "analysis:bakeoff": "pnpm --filter @surf/narrative-runner bakeoff",
     "check": "node scripts/check-portability.mjs && pnpm check:wrangler-wrapper && pnpm -r --if-present check",
     "check:wrangler-wrapper": "pnpm wrangler -- --version",
     "test": "node --test scripts/test/*.test.mjs && pnpm -r --if-present test && uv run --project services/extractor --locked pytest",
@@ -26,6 +27,8 @@
     "deploy": "node scripts/cf-deploy.mjs deploy",
     "check:cloudflare": "node scripts/cf-deploy.mjs setup --dry-run",
     "wrangler": "node scripts/wrangler.mjs",
+    "wrangler:snapshot": "node scripts/stage-wrangler-config.mjs",
+    "narrative:stage-deploy-inputs": "node scripts/stage-narrative-deploy-inputs.mjs",
     "ops:status": "node scripts/ops-status.mjs",
     "smoke:local": "node scripts/smoke-local.mjs",
     "smoke:cloudflare": "pnpm --filter @surf/web smoke:cloudflare",

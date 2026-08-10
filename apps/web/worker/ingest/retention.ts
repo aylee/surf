@@ -4,6 +4,9 @@ import type { PersistenceResult } from "./types";
 export const FORECAST_HISTORY_RETENTION_DAYS = 400;
 export const OPERATIONAL_FORECAST_RETENTION_DAYS = 2;
 export const NARRATIVE_RETENTION_DAYS = 7;
+// The paid-fallback claim ledger is also the rolling 31-day budget authority.
+// Keep a small clock-skew cushion beyond the budget window before pruning it.
+export const NARRATIVE_FALLBACK_LEDGER_RETENTION_DAYS = 35;
 
 export async function pruneRetainedData(
   db: D1Database,
@@ -21,8 +24,18 @@ export async function pruneRetainedData(
   const narrativeCutoff = new Date(
     now.getTime() - NARRATIVE_RETENTION_DAYS * 24 * 60 * 60 * 1000
   ).toISOString();
+  const narrativeFallbackCutoff = new Date(
+    now.getTime() -
+      NARRATIVE_FALLBACK_LEDGER_RETENTION_DAYS * 24 * 60 * 60 * 1000
+  ).toISOString();
   const currentDate = now.toISOString().slice(0, 10);
   return runPendingStatements(db, [
+    {
+      label: "prune narrative_fallback_attempts",
+      statement: db
+        .prepare("delete from narrative_fallback_attempts where claimed_at < ?")
+        .bind(narrativeFallbackCutoff)
+    },
     {
       // Revisions own a foreign key to jobs, so this must remain before the
       // narrative_jobs deletion below.

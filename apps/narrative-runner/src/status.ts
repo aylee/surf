@@ -13,10 +13,12 @@ const RunnerStateSchema = z.enum([
 
 export const RunnerStatusSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     runnerId: z.string().min(1),
     pid: z.number().int().positive(),
     modelId: z.string().min(1),
+    releaseSha: z.string().regex(/^[0-9a-f]{40}$/),
+    runtimeFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
     state: RunnerStateSchema,
     startedAt: z.string().datetime({ offset: true }),
     updatedAt: z.string().datetime({ offset: true }),
@@ -77,16 +79,20 @@ export class StatusTracker {
   constructor(
     runnerId: string,
     modelId: string,
+    releaseSha: string,
+    runtimeFingerprint: string,
     private readonly store: StatusStore,
     now: () => Date = () => new Date()
   ) {
     const timestamp = now().toISOString();
     this.now = now;
     this.snapshot = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runnerId,
       pid: process.pid,
       modelId,
+      releaseSha,
+      runtimeFingerprint,
       state: "starting",
       startedAt: timestamp,
       updatedAt: timestamp,

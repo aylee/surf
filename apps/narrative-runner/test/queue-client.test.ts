@@ -20,6 +20,40 @@ function queueSettlement(body: string | undefined) {
   };
 }
 
+function queueMetadata(
+  queueName = "surf-narrative",
+  consumer: unknown = {
+    type: "http_pull",
+    dead_letter_queue: "surf-narrative-dlq",
+    settings: {
+      batch_size: 1,
+      max_retries: 0,
+      retry_delay: 30,
+      visibility_timeout_ms: 180_000
+    }
+  }
+) {
+  return {
+    success: true,
+    result: {
+      queue_id: "queue-test",
+      queue_name: queueName,
+      consumers_total_count: 1,
+      consumers: [consumer]
+    }
+  };
+}
+
+function withQueueMetadata(
+  handler: (input: string | URL | Request, init?: RequestInit) => Promise<Response>,
+  queueName = "surf-narrative"
+): typeof fetch {
+  return (async (input: string | URL | Request, init?: RequestInit) =>
+    init?.method === "GET"
+      ? Response.json(queueMetadata(queueName))
+      : handler(input, init)) as typeof fetch;
+}
+
 describe("Cloudflare Queue pull transport", () => {
   it.each(["json", "text", "bytes"] as const)(
     "decodes %s using CF-Content-Type",
@@ -87,6 +121,7 @@ describe("Cloudflare Queue pull transport", () => {
     const message = queueMessage(makeJob());
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
+      if (init?.method === "GET") return Response.json(queueMetadata());
       return Response.json(
         url.endsWith("/pull")
           ? {
@@ -115,26 +150,114 @@ describe("Cloudflare Queue pull transport", () => {
       [string, { headers: Record<string, string>; body: string }]
     >;
     expect(calls.map(([url]) => url)).toEqual([
+      "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test",
       "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test/messages/pull",
       "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test/messages/ack",
       "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test/messages/ack"
     ]);
-    expect(JSON.parse(calls[0]![1].body)).toEqual({
+    expect(calls[0]![1]).toMatchObject({
+      method: "GET",
+      headers: { Authorization: "Bearer queue-secret" }
+    });
+    expect(JSON.parse(calls[1]![1].body)).toEqual({
       visibility_timeout_ms: 180_000,
       batch_size: 3
     });
-    expect(JSON.parse(calls[1]![1].body)).toEqual({
+    expect(JSON.parse(calls[2]![1].body)).toEqual({
       acks: [{ lease_id: "lease-ack" }],
       retries: []
     });
-    expect(JSON.parse(calls[2]![1].body)).toEqual({
+    expect(JSON.parse(calls[3]![1].body)).toEqual({
       acks: [],
       retries: [{ lease_id: "lease-retry", delay_seconds: 45 }]
     });
-    expect(calls[0]![1].headers).toMatchObject({
+    expect(calls[1]![1].headers).toMatchObject({
       Authorization: "Bearer queue-secret",
       "Content-Type": "application/json"
     });
+  });
+
+  it("requires the Queue ID metadata to report the exact configured name", async () => {
+    const missing = new CloudflareQueueClient(
+      makeConfig().queue,
+      180_000,
+      30_000,
+      (async () => Response.json({ success: true, result: {} })) as typeof fetch
+    );
+    await expect(missing.preflight()).rejects.toMatchObject({
+      code: "queue_preflight_response_invalid",
+      disposition: "terminal"
+    });
+
+    const mismatch = new CloudflareQueueClient(
+      makeConfig().queue,
+      180_000,
+      30_000,
+      (async () => Response.json(queueMetadata("surf-ingest"))) as typeof fetch
+    );
+    await expect(mismatch.preflight()).rejects.toMatchObject({
+      code: "queue_identity_mismatch",
+      disposition: "terminal"
+    });
+  });
+
+  it("requires exactly one HTTP pull consumer with the configured DLQ and lease settings", async () => {
+    const cases: Array<{ metadata: unknown; code: string }> = [
+      {
+        metadata: {
+          ...queueMetadata(),
+          result: { ...queueMetadata().result, consumers_total_count: 0, consumers: [] }
+        },
+        code: "queue_consumer_topology_mismatch"
+      },
+      {
+        metadata: queueMetadata("surf-narrative", {
+          type: "worker",
+          dead_letter_queue: "surf-narrative-dlq",
+          settings: {}
+        }),
+        code: "queue_consumer_topology_mismatch"
+      },
+      {
+        metadata: queueMetadata("surf-narrative", {
+          type: "http_pull",
+          dead_letter_queue: "wrong-dlq",
+          settings: {
+            batch_size: 1,
+            max_retries: 0,
+            retry_delay: 30,
+            visibility_timeout_ms: 180_000
+          }
+        }),
+        code: "queue_consumer_settings_mismatch"
+      },
+      {
+        metadata: queueMetadata("surf-narrative", {
+          type: "http_pull",
+          dead_letter_queue: "surf-narrative-dlq",
+          settings: {
+            batch_size: 1,
+            max_retries: 1,
+            retry_delay: 60,
+            visibility_timeout_ms: 30_000
+          }
+        }),
+        code: "queue_consumer_settings_mismatch"
+      }
+    ];
+
+    for (const { metadata, code } of cases) {
+      const client = new CloudflareQueueClient(
+        makeConfig().queue,
+        180_000,
+        30_000,
+        (async () => Response.json(metadata)) as typeof fetch
+      );
+      await expect(client.preflight()).rejects.toMatchObject({
+        code,
+        disposition: "terminal"
+      });
+    }
   });
 
   it("never accepts an invalid free-capacity batch size", async () => {
@@ -156,10 +279,10 @@ describe("Cloudflare Queue pull transport", () => {
       makeConfig().queue,
       180_000,
       30_000,
-      (async () => Response.json({
+      withQueueMetadata(async () => Response.json({
         success: true,
         result: { messages: [message, message] }
-      })) as typeof fetch
+      }))
     );
     await expect(client.pull(1)).rejects.toMatchObject({
       code: "queue_pull_response_invalid",
@@ -172,9 +295,9 @@ describe("Cloudflare Queue pull transport", () => {
       makeConfig().queue,
       180_000,
       30_000,
-      (async () => new Response("{}", {
+      withQueueMetadata(async () => new Response("{}", {
         headers: { "Content-Length": "1000000" }
-      })) as typeof fetch
+      }))
     );
     await expect(declared.pull(1)).rejects.toMatchObject({
       code: "queue_api_response_invalid",
@@ -192,7 +315,7 @@ describe("Cloudflare Queue pull transport", () => {
       makeConfig().queue,
       180_000,
       30_000,
-      (async () => new Response(body)) as typeof fetch
+      withQueueMetadata(async () => new Response(body))
     );
     await expect(chunked.ack("lease-1")).rejects.toMatchObject({
       code: "queue_api_response_invalid",
@@ -210,7 +333,7 @@ describe("Cloudflare Queue pull transport", () => {
         makeConfig().queue,
         180_000,
         30_000,
-        (async () => Response.json({ success: true, result })) as typeof fetch
+        withQueueMetadata(async () => Response.json({ success: true, result }))
       );
       await expect(client.ack("lease-1")).rejects.toMatchObject({
         code: "queue_ack_response_invalid",
@@ -222,15 +345,30 @@ describe("Cloudflare Queue pull transport", () => {
   it.each([
     [401, "queue_api_auth", "terminal"],
     [403, "queue_api_auth", "terminal"],
-    [429, "queue_api_http_transient", "transient"],
-    [503, "queue_api_http_transient", "transient"],
-    [400, "queue_api_http_terminal", "terminal"]
-  ] as const)("classifies Queue HTTP %i as %s", async (status, code, disposition) => {
+    [408, "queue_preflight_http_transient", "transient"],
+    [429, "queue_preflight_http_transient", "transient"],
+    [503, "queue_preflight_http_transient", "transient"],
+    [400, "queue_preflight_http_terminal", "terminal"]
+  ] as const)("classifies Queue metadata HTTP %i as %s", async (status, code, disposition) => {
     const client = new CloudflareQueueClient(
       makeConfig().queue,
       180_000,
       30_000,
       (async () => new Response(null, { status })) as typeof fetch
+    );
+    await expect(client.preflight()).rejects.toMatchObject({ code, disposition });
+  });
+
+  it.each([
+    [429, "queue_api_http_transient", "transient"],
+    [503, "queue_api_http_transient", "transient"],
+    [400, "queue_api_http_terminal", "terminal"]
+  ] as const)("classifies Queue message HTTP %i as %s", async (status, code, disposition) => {
+    const client = new CloudflareQueueClient(
+      makeConfig().queue,
+      180_000,
+      30_000,
+      withQueueMetadata(async () => new Response(null, { status }))
     );
     await expect(client.pull(1)).rejects.toMatchObject({ code, disposition });
   });
@@ -246,7 +384,7 @@ describe("Cloudflare Queue pull transport", () => {
       makeConfig().queue,
       180_000,
       5,
-      stalled
+      withQueueMetadata(stalled)
     );
     await expect(bounded.pull(1)).rejects.toMatchObject({
       code: "queue_api_network",

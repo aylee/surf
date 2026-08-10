@@ -1,0 +1,47 @@
+{
+  "evaluationMode": "full",
+  "expectedBundleCount": 55,
+  "caseLimit": 55,
+  "outputDirectory": ".analysis-bakeoff",
+  "endpoints": {
+    "local": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "tokenEnv": "ANALYSIS_BAKEOFF_OMLX_API_TOKEN"
+    }
+  },
+  "generators": [
+    {
+      "id": "generator-a",
+      "endpoint": "local",
+      "modelId": "replace-with-first-id-from-v1-models"
+    },
+    {
+      "id": "generator-b",
+      "endpoint": "local",
+      "modelId": "replace-with-second-id-from-v1-models"
+    },
+    {
+      "id": "generator-c",
+      "endpoint": "local",
+      "modelId": "replace-with-third-id-from-v1-models"
+    }
+  ],
+  "judges": [
+    {
+      "id": "judge-a",
+      "endpoint": "local",
+      "modelId": "replace-with-judge-id-from-v1-models"
+    },
+    {
+      "id": "judge-b",
+      "endpoint": "local",
+      "modelId": "replace-with-second-judge-id-from-v1-models"
+    }
+  ],
+  "seeds": [17, 29, 43],
+  "judgeSeeds": [59],
+  "enableThinking": false,
+  "concurrency": 1,
+  "timeoutMs": 300000,
+  "responseMaxBytes": 524288
+}

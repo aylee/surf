@@ -10,8 +10,39 @@ import {
   markNarrativeJobEnqueued,
   markNarrativeJobEnqueueFailed
 } from "./repository";
+import { enqueueNarrativeFallbackWatchdog } from "./fallback";
+import {
+  NARRATIVE_FALLBACK_DEFAULT_DELAY_SECONDS,
+  NARRATIVE_FALLBACK_MAX_DELAY_SECONDS
+} from "./config";
 
 export const SURF_ANALYSIS_FUTURE_CADENCE_HOURS = 3 as const;
+const SURF_ANALYSIS_FALLBACK_FUTURE_TIER_SECONDS = 300;
+const SURF_ANALYSIS_FALLBACK_FAIRNESS_SPREAD_SECONDS = 120;
+
+export function surfAnalysisFallbackDelaySeconds(options: {
+  baseDelaySeconds: number;
+  spotId: string;
+  localDate: string;
+  futureDatePriority?: number;
+}): number {
+  let hash = 2_166_136_261;
+  for (const character of `${options.localDate}:${options.spotId}`) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16_777_619) >>> 0;
+  }
+  const fairnessOffset = hash % SURF_ANALYSIS_FALLBACK_FAIRNESS_SPREAD_SECONDS;
+  const futureDatePriority = Math.min(
+    Math.max(Math.trunc(options.futureDatePriority ?? 0), 0),
+    4
+  );
+  return Math.min(
+    NARRATIVE_FALLBACK_MAX_DELAY_SECONDS,
+    options.baseDelaySeconds +
+      futureDatePriority * SURF_ANALYSIS_FALLBACK_FUTURE_TIER_SECONDS +
+      fairnessOffset
+  );
+}
 
 function localHourForTime(value: string, timeZone: string): number {
   const hour = Number(
@@ -61,8 +92,11 @@ export function selectSurfAnalysisBundlesForSignal(options: {
 export async function enqueueSurfAnalysis(options: {
   db: D1Database;
   queue: Queue;
+  fallbackQueue: Queue;
   bundle: ForecastFactBundle;
   now?: Date;
+  fallbackDelaySeconds?: number;
+  fallbackFutureDatePriority?: number;
 }): Promise<{ status: "enqueued" | "duplicate"; jobId: string }> {
   const snapshot = await buildSurfAnalysisSnapshot(options.bundle);
   const job = await buildSurfNarrativeJob(snapshot);
@@ -76,6 +110,22 @@ export async function enqueueSurfAnalysis(options: {
   const leaseToken = claim.stored.enqueueLeaseToken;
   if (!leaseToken) throw new Error("Narrative enqueue claim has no lease token");
   try {
+    // The watchdog is sent first. A ledger row is never marked pending unless
+    // both the cloud fallback and local-primary deliveries were accepted.
+    await enqueueNarrativeFallbackWatchdog({
+      queue: options.fallbackQueue,
+      jobId: claim.stored.job.jobId,
+      submissionId: claim.stored.job.result.submissionId,
+      now: options.now,
+      delaySeconds: surfAnalysisFallbackDelaySeconds({
+        baseDelaySeconds:
+          options.fallbackDelaySeconds ?? NARRATIVE_FALLBACK_DEFAULT_DELAY_SECONDS,
+        spotId: options.bundle.input.spotId,
+        localDate: options.bundle.input.localDate,
+        futureDatePriority: options.fallbackFutureDatePriority
+      }),
+      trigger: "delayed_watchdog"
+    });
     await options.queue.send(claim.stored.job, { contentType: "json" });
     await markNarrativeJobEnqueued(
       options.db,
@@ -108,10 +158,19 @@ export type SurfAnalysisEnqueueOutcome =
 export async function enqueueSurfAnalysisBundles(options: {
   db: D1Database;
   queue: Queue;
+  fallbackQueue: Queue;
   bundles: ForecastFactBundle[];
   now?: Date;
+  fallbackDelaySeconds?: number;
 }): Promise<SurfAnalysisEnqueueOutcome[]> {
   const outcomes: SurfAnalysisEnqueueOutcome[] = [];
+  const recommendedDates = [
+    ...new Set(
+      options.bundles
+        .filter(({ input }) => input.recommendationWindowIds.length > 0)
+        .map(({ input }) => input.localDate)
+    )
+  ].sort();
   for (const bundle of options.bundles) {
     if (bundle.input.recommendationWindowIds.length === 0) {
       outcomes.push({
@@ -125,8 +184,11 @@ export async function enqueueSurfAnalysisBundles(options: {
       const result = await enqueueSurfAnalysis({
         db: options.db,
         queue: options.queue,
+        fallbackQueue: options.fallbackQueue,
         bundle,
-        now: options.now
+        now: options.now,
+        fallbackDelaySeconds: options.fallbackDelaySeconds,
+        fallbackFutureDatePriority: recommendedDates.indexOf(bundle.input.localDate)
       });
       outcomes.push({ localDate: bundle.input.localDate, ...result });
     } catch (error) {
@@ -139,9 +201,11 @@ export async function enqueueSurfAnalysisBundles(options: {
 export async function reconcileNarrativeEnqueues(options: {
   db: D1Database;
   queue: Queue;
+  fallbackQueue: Queue;
   now?: Date;
   limit?: number;
   pendingRedeliveryMs?: number;
+  fallbackDelaySeconds?: number;
 }): Promise<{ enqueued: number }> {
   const now = options.now ?? new Date();
   await expireNarrativeJobs(options.db, now);
@@ -157,6 +221,11 @@ export async function reconcileNarrativeEnqueues(options: {
     limit,
     pendingRedeliveryMs
   );
+  const candidateDatePriorities = new Map(
+    [...new Set(candidates.map(({ job }) => job.entity.localDate))]
+      .sort()
+      .map((localDate, index) => [localDate, index] as const)
+  );
   let enqueued = 0;
   for (const candidate of candidates) {
     const claim = await claimNarrativeJobForEnqueue({
@@ -167,6 +236,21 @@ export async function reconcileNarrativeEnqueues(options: {
     });
     if (!claim?.enqueueLeaseToken) continue;
     try {
+      await enqueueNarrativeFallbackWatchdog({
+        queue: options.fallbackQueue,
+        jobId: claim.job.jobId,
+        submissionId: claim.job.result.submissionId,
+        now,
+        delaySeconds: surfAnalysisFallbackDelaySeconds({
+          baseDelaySeconds:
+            options.fallbackDelaySeconds ?? NARRATIVE_FALLBACK_DEFAULT_DELAY_SECONDS,
+          spotId: claim.job.entity.id,
+          localDate: claim.job.entity.localDate,
+          futureDatePriority:
+            candidateDatePriorities.get(claim.job.entity.localDate) ?? 0
+        }),
+        trigger: "delayed_watchdog"
+      });
       await options.queue.send(claim.job, { contentType: "json" });
       await markNarrativeJobEnqueued(
         options.db,
