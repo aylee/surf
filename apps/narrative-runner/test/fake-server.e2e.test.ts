@@ -46,7 +46,7 @@ describe("domain-neutral runner fake-server e2e", () => {
     );
   });
 
-  it("pulls base64 jobs, uses JSON-schema chat completion, submits, and ACKs", async () => {
+  it("pulls live-shape JSON jobs, uses JSON-schema chat completion, submits, and ACKs", async () => {
     const jobs = [
       makeJob({
         domain: "surf",

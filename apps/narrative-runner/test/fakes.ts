@@ -81,9 +81,9 @@ export function queueMessage(
     timestamp_ms: Date.parse("2026-08-09T18:00:00.000Z"),
     metadata: { "CF-Content-Type": contentType },
     body:
-      contentType === "text"
-        ? serialized
-        : Buffer.from(serialized, "utf8").toString("base64")
+      contentType === "bytes"
+        ? Buffer.from(serialized, "utf8").toString("base64")
+        : serialized
   };
 }
 
