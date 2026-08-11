@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   CLOUDFLARE_COMMAND_TIMEOUT_MS,
   cloudflareApiErrorCodes,
   hasCloudflareApiErrorCode,
   resolveCloudflareCommandTimeout,
-  runPnpm
+  runPnpm,
+  runWrangler
 } from "../lib/cloudflare-commands.mjs";
 import {
   isSecretlessLocalWranglerInvocation,
@@ -47,6 +51,47 @@ test("shared pnpm boundary rejects invalid timeout configuration before spawning
       () => runPnpm(["--version"], { timeoutMs }),
       /positive integer in milliseconds/
     );
+  }
+});
+
+test("captured Wrangler JSON is stable under a non-CI parent without mutating it", () => {
+  const fakeBin = mkdtempSync(join(tmpdir(), "surf-fake-pnpm-"));
+  const fakePnpm = join(fakeBin, "pnpm");
+  writeFileSync(
+    fakePnpm,
+    `#!/usr/bin/env node
+if (process.env.CI !== "true") process.stdout.write("pnpm dependency status\\n");
+process.stdout.write(JSON.stringify({ ci: process.env.CI, args: process.argv.slice(2) }));
+`
+  );
+  chmodSync(fakePnpm, 0o755);
+
+  const originalPath = process.env.PATH;
+  const originalCi = process.env.CI;
+  process.env.PATH = `${fakeBin}:${originalPath ?? ""}`;
+  delete process.env.CI;
+
+  try {
+    const output = runWrangler(
+      ["versions", "view", "not-a-real-version", "--json"],
+      { capture: true, echo: false }
+    );
+    const parsed = JSON.parse(output);
+
+    assert.equal(parsed.ci, "true");
+    assert.deepEqual(parsed.args.slice(0, 5), [
+      "--filter",
+      "@surf/web",
+      "exec",
+      "wrangler",
+      "versions"
+    ]);
+    assert.equal(process.env.CI, undefined);
+  } finally {
+    process.env.PATH = originalPath;
+    if (originalCi === undefined) delete process.env.CI;
+    else process.env.CI = originalCi;
+    rmSync(fakeBin, { recursive: true, force: true });
   }
 });
 
