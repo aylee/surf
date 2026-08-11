@@ -16,7 +16,10 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
-import { renderLaunchAgents } from "../scripts/render-launch-agents.mjs";
+import {
+  renderLaunchAgents,
+  verifyLaunchActivation
+} from "../scripts/render-launch-agents.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -247,6 +250,12 @@ describe("LaunchAgent renderer", () => {
       release.render({ ...options, runnerExitTimeoutSeconds: 931 })
     ).rejects.toThrow(/existing LaunchAgent artifact differs/);
     await expect(release.verify(written[2]!)).resolves.toMatchObject({
+      status: "ok",
+      releaseSha: release.releaseSha
+    });
+    await expect(
+      verifyLaunchActivation(written[2]!, { requireInstalled: false })
+    ).resolves.toMatchObject({
       status: "ok",
       releaseSha: release.releaseSha
     });
