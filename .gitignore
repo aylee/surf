@@ -30,7 +30,8 @@ data/tmp/
 apps/narrative-runner/bakeoff.local.json
 
 # Local planning and agent session state are not part of the public product.
-/cc_state/
+# Match both the legacy directory and the machine-local symlink entry.
+/cc_state
 # Browser-automation scratch output from local UI verification.
 /.playwright-mcp/
 pr-b-*.png
