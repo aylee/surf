@@ -172,7 +172,7 @@ install -m 0600 apps/web/wrangler.jsonc "$config_source"
 # Edit only the private source: add instance resource IDs/destinations and keep
 # vars.NARRATIVE_ENABLED=false for initial setup.
 ${EDITOR:-vi} "$config_source"
-snapshot_json="$(pnpm wrangler:snapshot -- \
+snapshot_json="$(pnpm wrangler:snapshot \
   --source "$config_source" --output "$config_snapshot")"
 export SURF_WRANGLER_CONFIG="$(printf '%s' "$snapshot_json" | jq -er .path)"
 export SURF_WRANGLER_CONFIG_SHA256="$(printf '%s' "$snapshot_json" | jq -er .sha256)"
@@ -410,7 +410,7 @@ activation_id="$(date -u +%Y%m%dT%H%M%SZ)-update"
 config_source="/Users/alex/Services/surf/config/wrangler.source.jsonc"
 config_snapshot="/Users/alex/Services/surf/config/activations/$activation_id/wrangler.instance.jsonc"
 install -d -m 0700 "$(dirname "$config_snapshot")"
-snapshot_json="$(pnpm wrangler:snapshot -- \
+snapshot_json="$(pnpm wrangler:snapshot \
   --source "$config_source" --output "$config_snapshot")"
 export SURF_WRANGLER_CONFIG="$(printf '%s' "$snapshot_json" | jq -er .path)"
 export SURF_WRANGLER_CONFIG_SHA256="$(printf '%s' "$snapshot_json" | jq -er .sha256)"

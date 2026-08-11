@@ -63,8 +63,16 @@ describe("Cloudflare Queue pull transport", () => {
     }
   );
 
+  it("retains base64 compatibility for JSON pull messages", () => {
+    const job = makeJob();
+    expect(decodeNarrativeJob({
+      ...queueMessage(job, { contentType: "json" }),
+      body: Buffer.from(JSON.stringify(job), "utf8").toString("base64")
+    })).toEqual(job);
+  });
+
   it("rejects unsupported encodings and invalid base64 as terminal messages", () => {
-    const message = queueMessage(makeJob());
+    const message = queueMessage(makeJob(), { contentType: "bytes" });
     expect(() =>
       decodeNarrativeJob({
         ...message,
@@ -98,7 +106,7 @@ describe("Cloudflare Queue pull transport", () => {
   });
 
   it("rejects oversized encoded and text bodies before decoding or parsing", () => {
-    const message = queueMessage(makeJob());
+    const message = queueMessage(makeJob(), { contentType: "bytes" });
     expect(() =>
       decodeNarrativeJob({ ...message, body: "A".repeat(81_000) })
     ).toThrowError(expect.objectContaining({

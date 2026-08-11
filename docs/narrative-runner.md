@@ -375,9 +375,11 @@ inside the lease and job deadlines.
 | Queue pull 401/403 | No lease acquired | Persistently halt intake; operator fixes the Queue credential and restarts explicitly |
 | Queue pull network, 429, or 5xx | No lease acquired | Back off before the next pull |
 
-Cloudflare's HTTP pull API sends JSON and byte message bodies as RFC 4648
-base64 and identifies the encoding in `metadata["CF-Content-Type"]`. The
-runner decodes that field before validating the shared schema and 60,000-byte
+Cloudflare's HTTP pull API identifies the message type in
+`metadata["CF-Content-Type"]`. A production wire probe observed `json` bodies
+as plain serialized JSON, while `bytes` bodies use RFC 4648 base64. The runner
+accepts that live JSON shape, retains base64-JSON compatibility for older or
+alternate deliveries, and validates the decoded shared schema and 60,000-byte
 serialized-size limit. It settles messages with `lease_id`, never message ID.
 Successful pull, settlement, result, model-list, and completion response bodies
 are byte-bounded before JSON parsing. A pull returning more messages than the
@@ -572,7 +574,7 @@ set -euo pipefail
 test "$(stat -f '%Lp' "$config_source")" = "600"
 test "$(stat -f '%Lp' "$worker_secrets_source")" = "600"
 test "$(stat -f '%Lp' "$runner_env_path")" = "600"
-snapshot_json="$(pnpm --dir "$release_path" wrangler:snapshot -- \
+snapshot_json="$(pnpm --dir "$release_path" wrangler:snapshot \
   --source "$config_source" --output "$config_snapshot")"
 export SURF_WRANGLER_CONFIG="$(printf '%s' "$snapshot_json" | jq -er .path)"
 export SURF_WRANGLER_CONFIG_SHA256="$(printf '%s' "$snapshot_json" | jq -er .sha256)"
@@ -582,7 +584,7 @@ export SURF_NARRATIVE_RUNNER_ENV_FILE="$runner_env_path"
 pnpm --dir "$release_path" narrative:stage-deploy-inputs
 
 pnpm --dir "$release_path" --filter @surf/narrative-runner \
-  launch-agents:render -- \
+  launch-agents:render \
   --outputDir "$launch_agents_path" \
   --repositoryPath "$release_path" \
   --releaseSha "$release_sha" \
@@ -673,9 +675,9 @@ copies secrets. To prepare the persistent files without starting services:
 set -euo pipefail
 record="$launch_agents_path/activation-record.json"
 pnpm --dir "$release_path" --filter @surf/narrative-runner \
-  launch-agents:install -- "$record"
+  launch-agents:install "$record"
 pnpm --dir "$release_path" --filter @surf/narrative-runner \
-  launch-agents:verify-installed -- "$record"
+  launch-agents:verify-installed "$record"
 plutil -lint "$HOME/Library/LaunchAgents/ai.alex.narrative-runner.plist"
 plutil -lint "$HOME/Library/LaunchAgents/ai.alex.omlx-server.plist"
 ```
@@ -699,11 +701,11 @@ so network time counts rather than only sleeps:
 ```bash
 # Initial activation (no labels loaded).
 pnpm --dir "$release_path" --filter @surf/narrative-runner \
-  launch-agents:activate -- --record "$record"
+  launch-agents:activate --record "$record"
 
 # Release switch. The prior record is mandatory rollback/drain evidence.
 pnpm --dir "$release_path" --filter @surf/narrative-runner \
-  launch-agents:activate -- \
+  launch-agents:activate \
   --record "$record" \
   --prior-record "$prior_activation_record"
 ```
@@ -723,7 +725,7 @@ bootstrap:
 
 ```bash
 pnpm --dir "$prior_release_path" --filter @surf/narrative-runner \
-  launch-agents:rollback -- \
+  launch-agents:rollback \
   --record "$prior_activation_record" \
   --prior-record "$current_activation_record"
 ```

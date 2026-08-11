@@ -121,7 +121,21 @@ function parseJson(value: string): unknown {
   }
 }
 
-/** Decode exactly as Cloudflare's HTTP pull API documents. */
+function parsePulledJsonBody(value: string): {
+  encoding: "plain" | "base64";
+  value: unknown;
+} {
+  try {
+    return { encoding: "plain", value: JSON.parse(value) };
+  } catch {
+    return {
+      encoding: "base64",
+      value: parseJson(utf8(decodeBase64(value)))
+    };
+  }
+}
+
+/** Decode Cloudflare's observed JSON wire shape while retaining base64 compatibility. */
 export function decodeNarrativeJob(message: PulledQueueMessage): NarrativeJob {
   const contentType = message.metadata["CF-Content-Type"];
   if (typeof contentType !== "string") {
@@ -136,7 +150,13 @@ export function decodeNarrativeJob(message: PulledQueueMessage): NarrativeJob {
   }
 
   let json: unknown;
-  if (contentType === "json" || contentType === "bytes") {
+  if (contentType === "json") {
+    const decoded = parsePulledJsonBody(message.body);
+    if (decoded.encoding === "plain" && bodyBytes > NARRATIVE_JOB_MAX_BYTES) {
+      throw new RunnerFailure("queue_body_oversized", "terminal");
+    }
+    json = decoded.value;
+  } else if (contentType === "bytes") {
     json = parseJson(utf8(decodeBase64(message.body)));
   } else if (contentType === "text") {
     json = parseJson(message.body);
