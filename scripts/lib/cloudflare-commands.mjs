@@ -206,10 +206,24 @@ function wranglerPnpmArgs(args) {
   return ["--filter", "@surf/web", "exec", "wrangler", ...args, ...configArgs];
 }
 
+function stableWranglerCaptureOptions(options) {
+  if (options.capture !== true) return options;
+  // Captured Wrangler stdout is parsed by deployment guards. Keep pnpm's
+  // dependency/status chatter deterministic without changing the operator's
+  // shell or the environment inherited by non-captured commands.
+  return {
+    ...options,
+    env: {
+      ...options.env,
+      CI: "true"
+    }
+  };
+}
+
 export function runWrangler(args, options = {}) {
   const pnpmArgs = wranglerPnpmArgs(args);
   try {
-    return runPnpm(pnpmArgs, options);
+    return runPnpm(pnpmArgs, stableWranglerCaptureOptions(options));
   } finally {
     assertCloudflareCommandInputsUnchanged();
   }
@@ -218,7 +232,10 @@ export function runWrangler(args, options = {}) {
 export function probeWrangler(args, options = {}) {
   const pnpmArgs = wranglerPnpmArgs(args);
   try {
-    return invokePnpm(pnpmArgs, { ...options, capture: true });
+    return invokePnpm(
+      pnpmArgs,
+      stableWranglerCaptureOptions({ ...options, capture: true })
+    );
   } finally {
     assertCloudflareCommandInputsUnchanged();
   }
