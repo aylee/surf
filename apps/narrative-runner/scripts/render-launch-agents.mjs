@@ -50,18 +50,22 @@ async function gitValue(repositoryPath, args, label) {
   }
 }
 
-export async function validateImmutableRelease(repositoryPath, releaseSha) {
-  let renderedFrom;
+export async function validateImmutableRelease(
+  repositoryPath,
+  releaseSha,
+  { requireRendererOwnership = true } = {}
+) {
+  let renderedFrom = null;
   let requestedRepository;
   try {
-    [renderedFrom, requestedRepository] = await Promise.all([
-      realpath(rendererRepositoryRoot),
-      realpath(repositoryPath)
-    ]);
+    requestedRepository = await realpath(repositoryPath);
+    if (requireRendererOwnership) {
+      renderedFrom = await realpath(rendererRepositoryRoot);
+    }
   } catch {
     throw new Error("renderer and repositoryPath must resolve to readable release paths");
   }
-  if (renderedFrom !== requestedRepository) {
+  if (requireRendererOwnership && renderedFrom !== requestedRepository) {
     throw new Error(
       "LaunchAgent renderer must execute from the same release as repositoryPath"
     );
@@ -378,7 +382,12 @@ export async function verifyLaunchActivation(
   ) {
     throw new Error("activation record schema is invalid");
   }
-  await validateImmutableRelease(record.repositoryPath, record.releaseSha);
+  // A release switch verifies both the target and prior records from the
+  // target controller. Rendering remains owner-bound; record verification
+  // follows and hashes the release named by the record itself.
+  await validateImmutableRelease(record.repositoryPath, record.releaseSha, {
+    requireRendererOwnership: false
+  });
   const runnerEnvironment = readStrictDotenvFile(
     record.runnerEnvPath,
     "Narrative runner environment file"
