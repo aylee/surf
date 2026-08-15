@@ -42,6 +42,20 @@ const spotsResponse = {
   sourceNote: "DOM-test catalog."
 } satisfies SpotsResponse;
 
+const geographicSpotIds = [
+  "obsf-north",
+  "obsf-central",
+  "obsf-south",
+  "linda-mar",
+  "rodeo-beach",
+  "stinson",
+  "bolinas",
+  "steamer-lane",
+  "pleasure-point",
+  "cowells",
+  "jacks"
+] as const;
+
 function fixtureForecast(forecastSpot: ApiSpot = spot, now = new Date()): ForecastResponse {
   const fixture = buildFixtureForecast("bolinas", now);
   return ForecastResponseSchema.parse({
@@ -139,6 +153,31 @@ function installSuccessfulApi() {
   return fetchMock;
 }
 
+function installCatalogApi(
+  catalogSpots: ApiSpot[],
+  forecastOverrides: ReadonlyMap<string, ForecastResponse> = new Map()
+) {
+  const catalog = {
+    spots: catalogSpots,
+    sourceNote: "DOM-test geographic catalog."
+  } satisfies SpotsResponse;
+  const forecasts = new Map(
+    catalogSpots.map((catalogSpot) => [
+      catalogSpot.id,
+      forecastOverrides.get(catalogSpot.id) ?? fixtureForecast(catalogSpot)
+    ])
+  );
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>(async (input) => {
+    const path = requestPath(input);
+    if (path === "/api/spots") return jsonResponse(catalog);
+    const forecast = catalogSpots.find(
+      (catalogSpot) => path === `/api/forecast/${catalogSpot.id}`
+    );
+    if (forecast) return jsonResponse(forecasts.get(forecast.id));
+    return jsonResponse({ error: "not found" }, 404);
+  }));
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -160,6 +199,57 @@ describe("App", () => {
       "/api/spots",
       "/api/forecast/test-break"
     ]);
+  });
+
+  it("orders daily comparisons geographically and puts the best window last", async () => {
+    const expectedSpots = geographicSpotIds.map((spotId) => getSpotProfile(spotId));
+    const forecasts = new Map(expectedSpots.map((expectedSpot, index) => {
+      const forecast = fixtureForecast(expectedSpot);
+      return [
+        expectedSpot.id,
+        ForecastResponseSchema.parse({
+          ...forecast,
+          windows: forecast.windows.map((window) => ({
+            ...window,
+            score: index === expectedSpots.length - 1 ? 100 : 0
+          }))
+        })
+      ] as const;
+    }));
+    installCatalogApi([...expectedSpots].reverse(), forecasts);
+
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Compare spots" })).toBeTruthy();
+    expect(
+      [...container.querySelectorAll(".compareRow .spotNameCell > strong")].map(
+        (element) => element.textContent
+      )
+    ).toEqual(expectedSpots.map(({ name }) => name));
+    expect(screen.getByText(/Jack's has the best overall window around/)).toBeTruthy();
+    expect(
+      [...container.querySelectorAll(".compareHeader > span")].map(
+        (element) => element.textContent
+      )
+    ).toEqual(["Spot", "Size estimate", "Wind / surface", "Tide", "Best window", ""]);
+    expect(
+      [...container.querySelectorAll(".compareRow")[0]!.querySelectorAll("[data-label]")].map(
+        (element) => element.getAttribute("data-label")
+      )
+    ).toEqual(["Size estimate", "Wind / surface", "Tide", "Best window"]);
+  });
+
+  it("uses the geographic order in spot navigation", async () => {
+    const expectedSpots = geographicSpotIds.map((spotId) => getSpotProfile(spotId));
+    installCatalogApi([...expectedSpots].reverse());
+    window.history.replaceState({}, "", "/?spot=cowells");
+
+    const { container } = render(<App />);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Cowell's" })).toBeTruthy();
+    expect(
+      [...container.querySelectorAll(".spotLinks > a")].map((element) => element.textContent)
+    ).toEqual(expectedSpots.map(({ name }) => name.replace("Ocean Beach ", "OB ")));
   });
 
   it("does not promote an all-wind-unavailable forecast as the best overall window", async () => {
