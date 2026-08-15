@@ -83,6 +83,31 @@ const DELAYED_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const CATALOG_REFRESH_DELAY_NOTICE =
   "The latest update is delayed. Showing the last forecast we loaded.";
 
+// Keep presentation order separate from the reference catalog, whose order is
+// also used by ingest orchestration. This groups nearby breaks for browsing
+// from San Francisco through Marin, then Santa Cruz.
+const SPOT_DISPLAY_ORDER = [
+  "obsf-north",
+  "obsf-central",
+  "obsf-south",
+  "linda-mar",
+  "rodeo-beach",
+  "stinson",
+  "bolinas",
+  "steamer-lane",
+  "pleasure-point",
+  "cowells",
+  "jacks"
+] satisfies readonly SpotId[];
+const SPOT_DISPLAY_RANK = new Map(
+  SPOT_DISPLAY_ORDER.map((spotId, index) => [spotId, index])
+);
+
+function sortSpotsByDisplayOrder(left: ApiSpot, right: ApiSpot): number {
+  return (SPOT_DISPLAY_RANK.get(left.id) ?? Number.MAX_SAFE_INTEGER)
+    - (SPOT_DISPLAY_RANK.get(right.id) ?? Number.MAX_SAFE_INTEGER);
+}
+
 async function fetchJson<T>(path: string, signal: AbortSignal): Promise<T> {
   const response = await fetch(path, { headers: { Accept: "application/json" }, signal });
   if (!response.ok) throw new Error(`${path} returned ${response.status}`);
@@ -250,7 +275,7 @@ function forecastHref(spotId: SpotId): string {
   return `/?spot=${encodeURIComponent(spotId)}`;
 }
 
-function sortDailyRows(left: DailySpotRow, right: DailySpotRow): number {
+function sortDailyRowsByForecastQuality(left: DailySpotRow, right: DailySpotRow): number {
   if (!left.window && !right.window) return 0;
   if (!left.window) return 1;
   if (!right.window) return -1;
@@ -290,7 +315,9 @@ function windSnapshot(spot: ApiSpot, window: ScoredForecastWindow): string {
 }
 
 function regionalReport(rows: DailySpotRow[], dateKey: string | null): { title: string; body: string } {
-  const ready = rows.filter((row): row is DailySpotRow & { window: ScoredForecastWindow } => Boolean(row.window));
+  const ready = rows
+    .filter((row): row is DailySpotRow & { window: ScoredForecastWindow } => Boolean(row.window))
+    .sort(sortDailyRowsByForecastQuality);
   if (ready.length === 0 || !dateKey) {
     return {
       title: "No reliable regional call yet",
@@ -518,8 +545,7 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
           )
         : undefined;
       return { ...summary, selection, window: selection?.window };
-    })
-    .sort(sortDailyRows);
+    });
   const report = regionalReport(rows, reportDateKey);
   const hazards = dedupeHazardNotices(
     summaries.flatMap((summary) =>
@@ -550,10 +576,10 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
         <div className="compareList">
           <div className="compareHeader" aria-hidden="true">
             <span>Spot</span>
-            <span>Best window</span>
             <span>Size estimate</span>
             <span>Wind / surface</span>
             <span>Tide</span>
+            <span>Best window</span>
             <span />
           </div>
           {rows.map((row) => (
@@ -564,14 +590,14 @@ function DailyReport({ summaries, now }: { summaries: SpotSummary[]; now: Date }
               </span>
               {row.window ? (
                 <>
+                  <strong data-label="Size estimate">{surfHeightRange(row.window.waveHeightFt)}</strong>
+                  <span data-label="Wind / surface">{windSnapshot(row.spot, row.window)}</span>
+                  <span data-label="Tide">{formatNumber(row.window.tideFt, " ft", 1)} · {tideTrend(row.windows, row.window).toLowerCase()}</span>
                   <span data-label="Best window">{formatWindowSpan(
                     row.selection?.startAt ?? row.window.forecastAt,
                     row.spot.timezone,
                     row.selection?.endAt
                   )}</span>
-                  <strong data-label="Size estimate">{surfHeightRange(row.window.waveHeightFt)}</strong>
-                  <span data-label="Wind / surface">{windSnapshot(row.spot, row.window)}</span>
-                  <span data-label="Tide">{formatNumber(row.window.tideFt, " ft", 1)} · {tideTrend(row.windows, row.window).toLowerCase()}</span>
                 </>
               ) : (
                 <span className="noCallRow">
@@ -881,7 +907,7 @@ export function App() {
 
   const summaries = useMemo<SpotSummary[]>(
     () =>
-      state.spots.map((spot) => {
+      [...state.spots].sort(sortSpotsByDisplayOrder).map((spot) => {
         const forecast = state.forecasts[spot.id];
         return {
           spot,

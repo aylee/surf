@@ -365,7 +365,7 @@ strong {
 .compareHeader,
 .compareRow {
   display: grid;
-  grid-template-columns: minmax(160px, 1.2fr) 0.75fr 0.65fr minmax(190px, 1.25fr) 0.85fr 20px;
+  grid-template-columns: minmax(160px, 1.2fr) 0.65fr minmax(190px, 1.25fr) 0.85fr 0.75fr 20px;
   align-items: center;
   gap: 14px;
 }
@@ -2767,8 +2767,8 @@ div.quietBriefLine {
     margin-right: 0;
   }
 
-  .compareRow > [data-label="Best window"],
-  .compareRow > [data-label="Wind / surface"] {
+  .compareRow > [data-label="Size estimate"],
+  .compareRow > [data-label="Tide"] {
     grid-column: 1 / span 1;
   }
 
