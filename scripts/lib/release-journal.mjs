@@ -97,6 +97,13 @@ const JOURNAL_KEYS = Object.freeze([
 ]);
 
 const SUPERSEDED_BY_KEYS = Object.freeze(["releaseId", "targetGitSha"]);
+const BEFORE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
+  "failedConfigSha256",
+  "queueEvidence",
+  "queueTopologyFingerprint",
+  "schemaVersion",
+  "predecessorDeploymentCreatedOn"
+]);
 
 const PREDECESSOR_KEYS = Object.freeze([
   "releaseId",
@@ -176,6 +183,29 @@ function exactIsoTimestamp(value, label) {
   return value;
 }
 
+const ISO_UTC_NANOSECONDS_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
+
+function exactIsoTimestampNanoseconds(value, label) {
+  if (typeof value !== "string" || value.length > 64) {
+    throw new Error(`${label} must be an exact ISO timestamp`);
+  }
+  const match = value.match(ISO_UTC_NANOSECONDS_PATTERN);
+  if (!match) throw new Error(`${label} must be an exact ISO timestamp`);
+  const wholeSecond = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`;
+  const milliseconds = Date.parse(`${wholeSecond}.000Z`);
+  if (
+    !Number.isFinite(milliseconds) ||
+    new Date(milliseconds).toISOString() !== `${wholeSecond}.000Z`
+  ) {
+    throw new Error(`${label} must be an exact ISO timestamp`);
+  }
+  const fractionalNanoseconds = BigInt(
+    (match[7] ?? "").padEnd(9, "0") || "0"
+  );
+  return BigInt(milliseconds) * 1_000_000n + fractionalNanoseconds;
+}
+
 function notEarlier(candidate, previous, label) {
   exactIsoTimestamp(candidate, label);
   if (Date.parse(candidate) < Date.parse(previous)) {
@@ -227,16 +257,71 @@ function emptyPredecessor() {
   return Object.freeze(Object.fromEntries(PREDECESSOR_KEYS.map((key) => [key, null])));
 }
 
+function validateBeforeUploadAttestation(value) {
+  exactKeys(
+    value,
+    BEFORE_UPLOAD_ATTESTATION_KEYS,
+    "Before-upload replacement attestation"
+  );
+  if (value.schemaVersion !== 1) {
+    throw new Error("Before-upload replacement attestation schema is unsupported");
+  }
+  if (!SHA256_PATTERN.test(value.failedConfigSha256 ?? "")) {
+    throw new Error("Before-upload replacement attestation has an invalid config SHA-256");
+  }
+  if (!SHA256_PATTERN.test(value.queueTopologyFingerprint ?? "")) {
+    throw new Error(
+      "Before-upload replacement attestation has an invalid Queue-topology fingerprint"
+    );
+  }
+  const predecessorDeploymentCreatedOn = value.predecessorDeploymentCreatedOn;
+  exactIsoTimestampNanoseconds(
+    predecessorDeploymentCreatedOn,
+    "Predecessor deployment creation time"
+  );
+  const queueEvidence = validatedBeforeUploadQueueEvidence(
+    predecessorDeploymentCreatedOn,
+    value.queueEvidence
+  );
+  return Object.freeze({
+    schemaVersion: 1,
+    failedConfigSha256: value.failedConfigSha256,
+    queueTopologyFingerprint: value.queueTopologyFingerprint,
+    predecessorDeploymentCreatedOn,
+    queueEvidence
+  });
+}
+
 function validateSupersededBy(value) {
   if (value === null) return null;
-  exactKeys(value, SUPERSEDED_BY_KEYS, "Superseding release link");
+  const hasBeforeUploadAttestation = Object.hasOwn(
+    value,
+    "beforeUploadAttestation"
+  );
+  exactKeys(
+    value,
+    hasBeforeUploadAttestation
+      ? [...SUPERSEDED_BY_KEYS, "beforeUploadAttestation"]
+      : SUPERSEDED_BY_KEYS,
+    "Superseding release link"
+  );
   if (!RELEASE_ID_PATTERN.test(value.releaseId ?? "")) {
     throw new Error("Superseding release link has an invalid release ID");
   }
   if (!SHA_PATTERN.test(value.targetGitSha ?? "")) {
     throw new Error("Superseding release link has an invalid target Git SHA");
   }
-  return Object.freeze({ ...value });
+  return Object.freeze({
+    releaseId: value.releaseId,
+    targetGitSha: value.targetGitSha,
+    ...(hasBeforeUploadAttestation
+      ? {
+          beforeUploadAttestation: validateBeforeUploadAttestation(
+            value.beforeUploadAttestation
+          )
+        }
+      : {})
+  });
 }
 
 function validateReceipts(value) {
@@ -510,20 +595,42 @@ export function assertReleaseJournal(value) {
       "A replacement must name a different release and target Git SHA"
     );
   }
+  if (
+    supersededBy?.beforeUploadAttestation !== undefined &&
+    (value.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+      value.resumeFrom !== RELEASE_JOURNAL_STATES.VERIFIED)
+  ) {
+    throw new Error(
+      "Only a verified before-upload replacement may retain its attestation"
+    );
+  }
   nullablePattern(value.failureCode, FAILURE_CODE_PATTERN, "Release failure code");
   if (value.failureCode !== null && !ALLOWED_FAILURE_CODES.has(value.failureCode)) {
     throw new Error("Release journal contains an unknown failure code");
   }
   const receipts = validateReceipts(value.receipts);
+  const receiptFree = Object.values(receipts).every((entry) => entry === null);
+  const exactLivePredecessor =
+    predecessor.workerVersionId !== null &&
+    predecessor.deploymentId !== null;
+  const validReplacementBoundary =
+    (value.resumeFrom === RELEASE_JOURNAL_STATES.PLANNED &&
+      receiptFree &&
+      exactLivePredecessor &&
+      supersededBy?.beforeUploadAttestation === undefined) ||
+    (value.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED &&
+      value.failureCode === RELEASE_FAILURE_CODES.PREPARE_FAILED &&
+      receiptFree &&
+      exactLivePredecessor &&
+      predecessor.runnerActivationId !== null &&
+      supersededBy?.beforeUploadAttestation?.queueTopologyFingerprint ===
+        targetFingerprints.queueTopology);
   if (
     value.state === RELEASE_JOURNAL_STATES.REPLACED &&
-    (value.resumeFrom !== RELEASE_JOURNAL_STATES.PLANNED ||
-      Object.values(receipts).some((entry) => entry !== null) ||
-      predecessor.workerVersionId === null ||
-      predecessor.deploymentId === null)
+    !validReplacementBoundary
   ) {
     throw new Error(
-      "A pre-mutation replaced release must retain a receipt-free planned boundary and exact live predecessor"
+      "A replaced release must retain an allowed receipt-free boundary and exact live predecessor"
     );
   }
   if (!Number.isInteger(value.attempt) || value.attempt < 1) {
@@ -781,17 +888,177 @@ export function replacePreMutationReleaseJournal(
   );
 }
 
-export function predecessorForPreMutationReplacement(journal) {
+function validatedBeforeUploadQueueEvidence(createdBefore, evidence) {
+  const cutoffNanoseconds = exactIsoTimestampNanoseconds(
+    createdBefore,
+    "Predecessor deployment creation time"
+  );
+  exactKeys(evidence, ["expectedQueueNames", "queues"], "Before-upload Queue evidence");
+  if (
+    !Array.isArray(evidence.expectedQueueNames) ||
+    evidence.expectedQueueNames.length < 1 ||
+    evidence.expectedQueueNames.length > 256 ||
+    !Array.isArray(evidence.queues) ||
+    evidence.queues.length !== evidence.expectedQueueNames.length
+  ) {
+    throw new Error("Before-upload Queue evidence is incomplete");
+  }
+  const expected = [...evidence.expectedQueueNames];
+  if (
+    expected.some((name) => typeof name !== "string" || !SAFE_ID_PATTERN.test(name)) ||
+    new Set(expected).size !== expected.length
+  ) {
+    throw new Error("Before-upload expected Queue names are invalid");
+  }
+  expected.sort();
+  const queues = evidence.queues.map((queue) => {
+    exactKeys(queue, ["createdOn", "name"], "Before-upload Queue entry");
+    if (typeof queue.name !== "string" || !SAFE_ID_PATTERN.test(queue.name)) {
+      throw new Error("Before-upload Queue name is invalid");
+    }
+    const createdOnNanoseconds = exactIsoTimestampNanoseconds(
+      queue.createdOn,
+      "Before-upload Queue creation time"
+    );
+    if (createdOnNanoseconds >= cutoffNanoseconds) {
+      throw new Error(
+        "Before-upload Queue evidence does not predate the live predecessor deployment"
+      );
+    }
+    return Object.freeze({ name: queue.name, createdOn: queue.createdOn });
+  });
+  queues.sort((left, right) => left.name.localeCompare(right.name));
+  if (
+    new Set(queues.map((queue) => queue.name)).size !== queues.length ||
+    queues.some((queue, index) => queue.name !== expected[index])
+  ) {
+    throw new Error("Before-upload Queue evidence is missing a configured Queue");
+  }
+  return Object.freeze({
+    expectedQueueNames: Object.freeze(expected),
+    queues: Object.freeze(queues)
+  });
+}
+
+export function assertBeforeUploadReplacementEvidence(journal, evidence) {
+  const current = assertReleaseJournal(journal);
+  exactKeys(
+    evidence,
+    [
+      "backupArtifactAbsent",
+      "failedConfigSha256",
+      "failedQueueTopologyFingerprint",
+      "liveDeploymentId",
+      "liveDeploymentCreatedOn",
+      "liveRunnerActivationId",
+      "liveWorkerVersionId",
+      "queueEvidence",
+      "rollbackArtifactAbsent",
+      "uploadArtifactAbsent"
+    ],
+    "Before-upload replacement evidence"
+  );
+  if (
+    ![
+      RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
+      RELEASE_JOURNAL_STATES.REPLACED
+    ].includes(current.state) ||
+    current.resumeFrom !== RELEASE_JOURNAL_STATES.VERIFIED ||
+    current.failureCode !== RELEASE_FAILURE_CODES.PREPARE_FAILED ||
+    Object.values(current.receipts).some((value) => value !== null)
+  ) {
+    throw new Error(
+      "Before-upload replacement requires a receipt-free prepare failure from verified"
+    );
+  }
+  if (
+    evidence.liveWorkerVersionId !== current.predecessor.workerVersionId ||
+    evidence.liveDeploymentId !== current.predecessor.deploymentId ||
+    evidence.liveRunnerActivationId !== current.predecessor.runnerActivationId ||
+    current.predecessor.runnerActivationId === null
+  ) {
+    throw new Error(
+      "Before-upload replacement live predecessor differs from the failed release"
+    );
+  }
+  if (
+    evidence.uploadArtifactAbsent !== true ||
+    evidence.backupArtifactAbsent !== true ||
+    evidence.rollbackArtifactAbsent !== true
+  ) {
+    throw new Error(
+      "Before-upload replacement found an upload, backup, or rollback artifact"
+    );
+  }
+  if (!SHA256_PATTERN.test(evidence.failedConfigSha256 ?? "")) {
+    throw new Error("Before-upload replacement config SHA-256 is invalid");
+  }
+  if (
+    evidence.failedQueueTopologyFingerprint !==
+    current.targetFingerprints.queueTopology
+  ) {
+    throw new Error(
+      "Before-upload replacement Queue topology differs from the failed journal"
+    );
+  }
+  exactIsoTimestampNanoseconds(
+    evidence.liveDeploymentCreatedOn,
+    "Live predecessor deployment creation time"
+  );
+  const queueEvidence = validatedBeforeUploadQueueEvidence(
+    evidence.liveDeploymentCreatedOn,
+    evidence.queueEvidence
+  );
+  return Object.freeze({ ...evidence, queueEvidence });
+}
+
+export function replaceBeforeUploadReleaseJournal(
+  journal,
+  { releaseId, targetGitSha, evidence, at } = {}
+) {
+  const current = assertReleaseJournal(journal);
+  if (current.state !== RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE) {
+    throw new Error(
+      "Only a retryable release may be replaced before Worker upload"
+    );
+  }
+  const validatedEvidence = assertBeforeUploadReplacementEvidence(
+    current,
+    evidence
+  );
+  return revisedJournal(
+    current,
+    {
+      state: RELEASE_JOURNAL_STATES.REPLACED,
+      supersededBy: validateSupersededBy({
+        releaseId,
+        targetGitSha,
+        beforeUploadAttestation: {
+          schemaVersion: 1,
+          failedConfigSha256: validatedEvidence.failedConfigSha256,
+          queueTopologyFingerprint:
+            validatedEvidence.failedQueueTopologyFingerprint,
+          predecessorDeploymentCreatedOn:
+            validatedEvidence.liveDeploymentCreatedOn,
+          queueEvidence: validatedEvidence.queueEvidence
+        }
+      })
+    },
+    at
+  );
+}
+
+export function predecessorForReleaseReplacement(journal) {
   const replaced = assertReleaseJournal(journal);
   if (replaced.state !== RELEASE_JOURNAL_STATES.REPLACED) {
-    throw new Error("Pre-mutation replacement predecessor requires a replaced journal");
+    throw new Error("Release replacement predecessor requires a replaced journal");
   }
   if (
     replaced.predecessor.workerVersionId === null ||
     replaced.predecessor.deploymentId === null
   ) {
     throw new Error(
-      "Pre-mutation replacement requires an exact live Worker predecessor"
+      "Release replacement requires an exact live Worker predecessor"
     );
   }
   return Object.freeze({
@@ -803,22 +1070,24 @@ export function predecessorForPreMutationReplacement(journal) {
   });
 }
 
-export function assertPreMutationReleaseReplacement(
+export function assertReleaseReplacement(
   failedJournal,
   replacementJournal
 ) {
   const failed = assertReleaseJournal(failedJournal);
   const replacement = assertReleaseJournal(replacementJournal);
-  const expectedPredecessor = predecessorForPreMutationReplacement(failed);
+  const expectedPredecessor = predecessorForReleaseReplacement(failed);
   if (
     failed.state !== RELEASE_JOURNAL_STATES.REPLACED ||
     failed.supersededBy?.releaseId !== replacement.releaseId ||
     failed.supersededBy?.targetGitSha !== replacement.targetGitSha ||
+    (failed.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED &&
+      replacement.lane !== RELEASE_LANES.CONSERVATIVE_FULL) ||
     canonicalReleaseJson(replacement.predecessor) !==
       canonicalReleaseJson(expectedPredecessor)
   ) {
     throw new Error(
-      "Pre-mutation replacement does not exactly link its replaced release"
+      "Release replacement does not exactly link its replaced release"
     );
   }
   return Object.freeze({ failed, replacement });

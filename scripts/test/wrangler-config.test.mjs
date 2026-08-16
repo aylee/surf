@@ -239,16 +239,29 @@ test("observability validation requires the top-level enablement switch", () => 
   }
 });
 
-test("tracked config stays destination-neutral while ignored overlays may name destinations", () => {
+test("only the exact tracked config path applies template-only production guards", () => {
   const config = structuredClone(canonical);
+  config.vars.NARRATIVE_ENABLED = "true";
   config.observability.logs.destinations = ["surf-logfire-logs"];
   config.observability.traces.destinations = ["surf-logfire-traces"];
 
   assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "The tracked config must keep NARRATIVE_ENABLED=false; activation belongs in the ignored instance overlay.",
     "The tracked Wrangler config must remain destination-neutral; account-scoped telemetry destination names belong only in the ignored instance overlay."
   ]);
+
+  config.$schema = resolve(root, "apps/web", canonical.$schema);
+  config.main = resolve(root, "apps/web", canonical.main);
+  config.d1_databases[0].migrations_dir = resolve(
+    root,
+    "apps/web",
+    canonical.d1_databases[0].migrations_dir
+  );
   assert.deepEqual(
-    wranglerStructureFailures(config, resolve(root, "apps/web/wrangler.instance.jsonc")),
+    wranglerStructureFailures(
+      config,
+      resolve(root, ".release-state/attempts/release-1/wrangler.jsonc")
+    ),
     []
   );
 });

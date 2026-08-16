@@ -161,6 +161,33 @@ runner predecessor. Neither the old journal nor this link advances a production
 pointer. If interrupted between the terminal link and replacement-journal
 creation, rerun the same command; it remains pinned to the linked target.
 
+A distinct recovery applies when verification completed but preparation failed
+before Worker upload. It is intentionally not inferred from null receipts:
+Queue reconciliation is the first preparation operation and could have created
+a missing Queue before the failure was journaled. Request the guarded recovery
+explicitly:
+
+```bash
+pnpm release:prod --plan --replace-before-upload FAILED_RELEASE_ID
+pnpm release:prod --replace-before-upload FAILED_RELEASE_ID
+```
+
+The command accepts only a receipt-free `prepare_failed` journal whose resume
+boundary is `verified`. Before preview and again after confirmation, it proves
+the exact failed immutable checkout and its mode-`0600` attempt config, absence
+of Worker-upload and D1-backup artifacts, the unchanged live
+Worker/deployment/runner predecessor, and that every Queue configured by the
+failed attempt was created strictly before the exact predecessor deployment's
+Cloudflare-issued `created_on` time. The failed config's Queue-topology
+fingerprint must also match the original journal, so a modified attempt
+snapshot cannot narrow the proof. Missing, equal, newer, duplicate, or
+malformed Queue timestamps fail closed. The successor is forced through the
+conservative-full lane, and the old journal uses the same terminal hash-linked
+`replaced` transition without advancing a production pointer. That terminal
+link retains the bounded config, topology, deployment-time, and Queue
+attestation, so an interruption before successor-journal creation retries the
+immutable link instead of repeating a mutable attestation.
+
 There is no automatic production rollback after Worker activation. A Queue,
 schema, or protocol boundary may already have been crossed; follow the
 quiescence procedure in [Runtime operations](runtime-operations.md) before any

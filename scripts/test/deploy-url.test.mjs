@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  resolveActiveDeploymentEvidence,
   resolveActiveDeploymentId,
   resolveDeployedUrl,
   resolveDeployedVersionId,
@@ -13,6 +14,7 @@ const deploymentId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 function deploymentStatus(overrides = {}) {
   return JSON.stringify({
     id: deploymentId,
+    created_on: "2026-08-15T18:00:00.123456Z",
     strategy: "percentage",
     versions: [{ version_id: versionId, percentage: 100 }],
     ...overrides
@@ -101,6 +103,29 @@ test("staged upload parser rejects missing, ambiguous, and malformed IDs", () =>
 
 test("deployment status parser proves one exact version at 100 percent", () => {
   assert.equal(resolveActiveDeploymentId(deploymentStatus(), versionId), deploymentId);
+  assert.deepEqual(resolveActiveDeploymentEvidence(deploymentStatus(), versionId), {
+    deploymentId,
+    createdOn: "2026-08-15T18:00:00.123456Z"
+  });
+});
+
+test("deployment evidence requires an exact Cloudflare creation time", () => {
+  for (const created_on of [
+    undefined,
+    null,
+    "2026-08-15T18:00:00+00:00",
+    "2026-02-30T18:00:00.000000Z",
+    "2026-08-15T18:00:00.1234567890Z"
+  ]) {
+    assert.throws(
+      () =>
+        resolveActiveDeploymentEvidence(
+          deploymentStatus({ created_on }),
+          versionId
+        ),
+      /invalid Cloudflare creation time/
+    );
+  }
 });
 
 test("deployment status parser rejects malformed or non-object evidence", () => {

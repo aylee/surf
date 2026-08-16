@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   lstatSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -22,7 +23,8 @@ import {
   RELEASE_JOURNAL_STATES,
   RELEASE_LANE_STATE_PATHS,
   RELEASE_POINTER_KINDS,
-  assertPreMutationReleaseReplacement,
+  assertBeforeUploadReplacementEvidence,
+  assertReleaseReplacement,
   assertReleaseSupersession,
   assertReleaseJournal,
   assertReleasePointer,
@@ -31,7 +33,7 @@ import {
   createReleasePointer,
   createReleaseStateStore,
   fingerprintReleaseJournal,
-  predecessorForPreMutationReplacement,
+  predecessorForReleaseReplacement,
   recordReleaseJournalFailure,
   reconcileReleaseActivation,
   resolveTrustedActiveReleaseReceipt,
@@ -40,6 +42,11 @@ import {
   supersedeReleaseJournal,
   transitionReleaseJournal
 } from "../lib/release-journal.mjs";
+import {
+  assertBeforeUploadReplacementArtifactsAbsent,
+  commitBeforeUploadReplacement,
+  previewBeforeUploadReplacement
+} from "../lib/release-before-upload-replacement.mjs";
 
 const workerVersionId = "11111111-1111-4111-8111-111111111111";
 const deploymentId = "22222222-2222-4222-8222-222222222222";
@@ -79,6 +86,14 @@ function assetsClassification(targetFingerprints = fingerprints()) {
       ...targetFingerprints,
       workerAssets: fingerprintCanonicalReleaseValue("previous-assets")
     })
+  });
+}
+
+function conservativeClassification(targetFingerprints = fingerprints()) {
+  return classifyReleaseImpact({
+    changedPaths: ["pnpm-lock.yaml"],
+    targetFingerprints,
+    activeReceipt: null
   });
 }
 
@@ -500,7 +515,7 @@ test("a receipt-free planned failure can be terminally linked to a new target", 
     releaseId: "release-replacement-2",
     targetGitSha: replacementSha
   });
-  assert.deepEqual(predecessorForPreMutationReplacement(replaced), {
+  assert.deepEqual(predecessorForReleaseReplacement(replaced), {
     releaseId: replaced.releaseId,
     journalSha256: fingerprintReleaseJournal(replaced),
     workerVersionId: predecessor().workerVersionId,
@@ -513,7 +528,7 @@ test("a receipt-free planned failure can be terminally linked to a new target", 
         ...replaced,
         resumeFrom: RELEASE_JOURNAL_STATES.VERIFIED
       }),
-    /receipt-free planned boundary and exact live predecessor/
+    /allowed receipt-free boundary and exact live predecessor/
   );
 
   const targetFingerprints = fingerprints("replacement");
@@ -522,11 +537,11 @@ test("a receipt-free planned failure can be terminally linked to a new target", 
     targetGitSha: replaced.supersededBy.targetGitSha,
     classification: assetsClassification(targetFingerprints),
     targetFingerprints,
-    predecessor: predecessorForPreMutationReplacement(replaced),
+    predecessor: predecessorForReleaseReplacement(replaced),
     createdAt: "2026-08-15T22:00:03.000Z"
   });
   assert.doesNotThrow(() =>
-    assertPreMutationReleaseReplacement(replaced, replacement)
+    assertReleaseReplacement(replaced, replacement)
   );
 
   const verifiedFailure = recordReleaseJournalFailure(
@@ -577,13 +592,244 @@ test("a pre-mutation replacement is recoverable after its terminal link is store
     targetGitSha: replaced.supersededBy.targetGitSha,
     classification: assetsClassification(targetFingerprints),
     targetFingerprints,
-    predecessor: predecessorForPreMutationReplacement(replaced),
+    predecessor: predecessorForReleaseReplacement(replaced),
     createdAt: "2026-08-15T22:00:03.000Z"
   });
   const storedReplacement = store.writeJournal(replacement);
   assert.doesNotThrow(() =>
-    assertPreMutationReleaseReplacement(replaced, storedReplacement)
+    assertReleaseReplacement(replaced, storedReplacement)
   );
+});
+
+test("a verified prepare failure requires exact before-upload evidence", async () => {
+  const verified = transitionReleaseJournal(
+    initialJournal(),
+    RELEASE_JOURNAL_STATES.VERIFIED,
+    { at: "2026-08-15T22:00:01.000Z" }
+  );
+  const failed = recordReleaseJournalFailure(verified, {
+    code: RELEASE_FAILURE_CODES.PREPARE_FAILED,
+    at: "2026-08-15T22:00:02.000Z"
+  });
+  const queueEvidence = {
+    expectedQueueNames: ["surf-ingest", "surf-narrative"],
+    queues: [
+      {
+        name: "surf-ingest",
+        createdOn: "2026-08-10T04:58:17.532408Z"
+      },
+      {
+        name: "surf-narrative",
+        createdOn: "2026-08-10T15:18:13.808657Z"
+      }
+    ]
+  };
+  const evidence = {
+    liveWorkerVersionId: predecessor().workerVersionId,
+    liveDeploymentId: predecessor().deploymentId,
+    liveDeploymentCreatedOn: "2026-08-14T22:00:00.000000Z",
+    liveRunnerActivationId: predecessor().runnerActivationId,
+    failedConfigSha256: "9".repeat(64),
+    failedQueueTopologyFingerprint: failed.targetFingerprints.queueTopology,
+    uploadArtifactAbsent: true,
+    backupArtifactAbsent: true,
+    rollbackArtifactAbsent: true,
+    queueEvidence
+  };
+  assert.doesNotThrow(() =>
+    assertBeforeUploadReplacementEvidence(failed, evidence)
+  );
+
+  for (const patch of [
+    { liveWorkerVersionId: workerVersionId },
+    { liveDeploymentId: deploymentId },
+    { liveRunnerActivationId: "runner-other" }
+  ]) {
+    assert.throws(
+      () =>
+        assertBeforeUploadReplacementEvidence(failed, {
+          ...evidence,
+          ...patch
+        }),
+      /live predecessor differs/
+    );
+  }
+  for (const patch of [
+    { uploadArtifactAbsent: false },
+    { backupArtifactAbsent: false },
+    { rollbackArtifactAbsent: false }
+  ]) {
+    assert.throws(
+      () =>
+        assertBeforeUploadReplacementEvidence(failed, {
+          ...evidence,
+          ...patch
+        }),
+      /upload, backup, or rollback artifact/
+    );
+  }
+  assert.throws(
+    () =>
+      assertBeforeUploadReplacementEvidence(failed, {
+        ...evidence,
+        failedQueueTopologyFingerprint: "8".repeat(64)
+      }),
+    /Queue topology differs/
+  );
+  assert.throws(
+    () =>
+      assertBeforeUploadReplacementEvidence(failed, {
+        ...evidence,
+        queueEvidence: {
+          ...queueEvidence,
+          queues: queueEvidence.queues.slice(0, 1)
+        }
+      }),
+    /Queue evidence is incomplete/
+  );
+  assert.throws(
+    () =>
+      assertBeforeUploadReplacementEvidence(failed, {
+        ...evidence,
+        queueEvidence: {
+          ...queueEvidence,
+          queues: queueEvidence.queues.map((queue, index) =>
+            index === 0
+              ? { ...queue, createdOn: "2026-08-14T22:00:00.000001Z" }
+              : queue
+          )
+        }
+      }),
+    /does not predate/
+  );
+
+  let attestationCalls = 0;
+  const attest = async (source) => {
+    assert.equal(source.releaseId, failed.releaseId);
+    attestationCalls += 1;
+    return evidence;
+  };
+  assert.deepEqual(
+    await previewBeforeUploadReplacement(failed, attest),
+    assertBeforeUploadReplacementEvidence(failed, evidence)
+  );
+  assert.equal(attestationCalls, 1);
+  const committed = await commitBeforeUploadReplacement(failed, {
+    releaseId: "release-before-upload-2",
+    targetGitSha: "f".repeat(40),
+    at: "2026-08-15T22:00:03.000Z",
+    attest
+  });
+  const replaced = committed.journal;
+  assert.equal(attestationCalls, 2);
+  assert.equal(replaced.state, RELEASE_JOURNAL_STATES.REPLACED);
+  assert.equal(replaced.resumeFrom, RELEASE_JOURNAL_STATES.VERIFIED);
+  assert.equal(replaced.failureCode, RELEASE_FAILURE_CODES.PREPARE_FAILED);
+  assert.deepEqual(replaced.supersededBy, {
+    releaseId: "release-before-upload-2",
+    targetGitSha: "f".repeat(40),
+    beforeUploadAttestation: {
+      schemaVersion: 1,
+      failedConfigSha256: evidence.failedConfigSha256,
+      queueTopologyFingerprint: evidence.failedQueueTopologyFingerprint,
+      predecessorDeploymentCreatedOn: evidence.liveDeploymentCreatedOn,
+      queueEvidence
+    }
+  });
+  assert.throws(
+    () =>
+      assertReleaseJournal({
+        ...replaced,
+        supersededBy: {
+          releaseId: replaced.supersededBy.releaseId,
+          targetGitSha: replaced.supersededBy.targetGitSha
+        }
+      }),
+    /allowed receipt-free boundary/
+  );
+  assert.throws(
+    () =>
+      assertReleaseJournal({
+        ...replaced,
+        supersededBy: {
+          ...replaced.supersededBy,
+          beforeUploadAttestation: {
+            ...replaced.supersededBy.beforeUploadAttestation,
+            queueTopologyFingerprint: "7".repeat(64)
+          }
+        }
+      }),
+    /allowed receipt-free boundary/
+  );
+  assert.equal(
+    await previewBeforeUploadReplacement(replaced, attest),
+    null
+  );
+  const retry = await commitBeforeUploadReplacement(replaced, {
+    releaseId: replaced.supersededBy.releaseId,
+    targetGitSha: replaced.supersededBy.targetGitSha,
+    at: "2026-08-15T22:00:04.000Z",
+    attest
+  });
+  assert.deepEqual(retry.journal, replaced);
+  assert.equal(retry.evidence, null);
+  assert.equal(attestationCalls, 2);
+
+  const targetFingerprints = fingerprints("before-upload");
+  const replacement = createReleaseJournal({
+    releaseId: replaced.supersededBy.releaseId,
+    targetGitSha: replaced.supersededBy.targetGitSha,
+    classification: conservativeClassification(targetFingerprints),
+    targetFingerprints,
+    predecessor: predecessorForReleaseReplacement(replaced),
+    createdAt: "2026-08-15T22:00:04.000Z"
+  });
+  assert.doesNotThrow(() =>
+    assertReleaseReplacement(replaced, replacement)
+  );
+  assert.throws(
+    () =>
+      assertReleaseReplacement(replaced, {
+        ...replacement,
+        lane: "assets-only",
+        classification: assetsClassification(targetFingerprints)
+      }),
+    /does not exactly link/
+  );
+});
+
+test("before-upload artifact proof checks the exact upload, backup, and rollback paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "surf-before-upload-artifacts-"));
+  const attemptDirectory = join(root, "attempt");
+  const releaseId = "release-before-upload-failed";
+  mkdirSync(attemptDirectory);
+  try {
+    const options = { attemptDirectory, serviceRoot: root, releaseId };
+    assert.deepEqual(assertBeforeUploadReplacementArtifactsAbsent(options), {
+      uploadArtifactAbsent: true,
+      backupArtifactAbsent: true,
+      rollbackArtifactAbsent: true
+    });
+
+    for (const artifact of ["worker-upload.json", "d1-backup.json"]) {
+      const path = join(attemptDirectory, artifact);
+      writeFileSync(path, "{}\n", { mode: 0o600 });
+      assert.throws(
+        () => assertBeforeUploadReplacementArtifactsAbsent(options),
+        /must be absent before replacement/
+      );
+      rmSync(path);
+    }
+
+    const rollbackPath = join(root, "rollbacks", releaseId);
+    mkdirSync(rollbackPath, { recursive: true });
+    assert.throws(
+      () => assertBeforeUploadReplacementArtifactsAbsent(options),
+      /rollback artifact directory must be absent/
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("fix-forward appends an immutable supersession link to the failed journal", () => {

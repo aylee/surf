@@ -163,6 +163,17 @@ function nonTopologyWranglerConfig(config) {
   return value;
 }
 
+export function queueTopologyFingerprint(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error("Queue-topology fingerprint requires a Wrangler config object");
+  }
+  return fingerprintCanonicalReleaseValue({
+    name: config.name ?? null,
+    producers: config.queues?.producers ?? [],
+    consumers: config.queues?.consumers ?? []
+  });
+}
+
 export function privateFileHmacFingerprint({
   path,
   hmacKey,
@@ -215,11 +226,6 @@ export function computeReleaseFingerprints({
     throw new Error("Narrative protocol fingerprint must be an exact lowercase SHA-256");
   }
   const config = logicalWranglerConfig(wranglerSourcePath);
-  const queueTopology = {
-    name: config.name ?? null,
-    producers: config.queues?.producers ?? [],
-    consumers: config.queues?.consumers ?? []
-  };
   const triggerTopology = {
     name: config.name ?? null,
     triggers: config.triggers ?? {}
@@ -242,7 +248,7 @@ export function computeReleaseFingerprints({
     materialization: fingerprintMaterializationPaths(releaseRoot),
     migrations: fingerprintReleasePaths(releaseRoot, ["packages/db/migrations"]),
     seed: fingerprintReleasePaths(releaseRoot, ["packages/db/seeds"]),
-    queueTopology: fingerprintCanonicalReleaseValue(queueTopology),
+    queueTopology: queueTopologyFingerprint(config),
     triggerTopology: fingerprintCanonicalReleaseValue(triggerTopology),
     runnerArtifact,
     runnerRuntime,

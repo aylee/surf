@@ -6,7 +6,7 @@ import test from "node:test";
 import { createHash } from "node:crypto";
 import { createCloudflareCommandContext } from "../lib/cloudflare-command-context.mjs";
 
-function fixture(name) {
+function fixture(name, { productionOverlay = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), `surf-command-context-${name}-`));
   const releaseRoot = join(root, "release");
   const configDirectory = join(root, "config");
@@ -76,6 +76,11 @@ function fixture(name) {
   config.main = join(canonicalReleaseRoot, "apps/web/worker/index.ts");
   config.assets.directory = join(canonicalReleaseRoot, "apps/web/dist/client");
   config.d1_databases[0].migrations_dir = join(canonicalReleaseRoot, "packages/db/migrations");
+  if (productionOverlay) {
+    config.vars.NARRATIVE_ENABLED = "true";
+    config.observability.logs.destinations = [`${name}-logs`];
+    config.observability.traces.destinations = [`${name}-traces`];
+  }
   const configPath = join(configDirectory, "wrangler.jsonc");
   const contents = `${JSON.stringify(config)}\n`;
   writeFileSync(configPath, contents, { mode: 0o600 });
@@ -107,6 +112,35 @@ test("keeps two release command contexts isolated", () => {
   assert.equal(calls[1].args.at(-1), right.configPath);
   assert.equal(calls[0].args.includes(right.configPath), false);
   assert.equal(calls[1].args.includes(left.configPath), false);
+});
+
+test("Queue probes accept a production overlay snapshot named wrangler.jsonc", () => {
+  const instance = fixture("production-overlay-surf", {
+    productionOverlay: true
+  });
+  const calls = [];
+  const context = createCloudflareCommandContext({
+    ...instance,
+    environment: {},
+    spawn: (file, args, options) => {
+      calls.push({ file, args, options });
+      return { status: 0, stdout: "{}", stderr: "" };
+    },
+    logger: { info() {} }
+  });
+
+  const inspection = context.inspectQueues();
+
+  assert.equal(instance.configPath.endsWith("/wrangler.jsonc"), true);
+  assert.equal(context.readConfig().vars.NARRATIVE_ENABLED, "true");
+  assert.deepEqual(inspection.missing, []);
+  assert.equal(inspection.matches, true);
+  assert.equal(calls.length, inspection.expected.length);
+  assert.ok(
+    calls.every(({ args }) =>
+      args.some((argument) => argument === instance.configPath)
+    )
+  );
 });
 
 test("rechecks config and guard before spawning and after commands", () => {
@@ -267,7 +301,8 @@ function queueApiFixture(name, consumerOverrides = {}) {
   ];
   const queues = queueNames.map((queueName, index) => ({
     queue_name: queueName,
-    queue_id: String(index + 1).repeat(32)
+    queue_id: String(index + 1).repeat(32),
+    created_on: "2026-08-15T18:00:00.000000Z"
   }));
   const consumers = {
     ["1".repeat(32)]: [
@@ -320,6 +355,144 @@ function queueApiFetcher({ queues, consumers, requests = [] }) {
     return Response.json({ success: true, result: consumers[match[1]] ?? [] });
   };
 }
+
+test("Queue preexistence attestation returns exact bounded read-only evidence", async () => {
+  const name = "queue-preexistence-surf";
+  const instance = fixture(name);
+  const api = queueApiFixture(name);
+  const requests = [];
+  const token = "queue-attestation-token-that-is-never-returned";
+  const context = createCloudflareCommandContext({
+    ...instance,
+    environment: {
+      CLOUDFLARE_ACCOUNT_ID: "7".repeat(32),
+      CLOUDFLARE_API_TOKEN: token
+    },
+    fetcher: queueApiFetcher({ ...api, requests }),
+    spawn: () => {
+      throw new Error("Queue preexistence attestation must not spawn a command");
+    },
+    logger: { info() {} }
+  });
+
+  const result = await context.attestPreexistingQueues(
+    "2026-08-15T19:00:00.000Z"
+  );
+  assert.deepEqual(
+    result,
+    {
+      queues: api.queues.map((queue) => ({
+        name: queue.queue_name,
+        createdOn: queue.created_on
+      }))
+    }
+  );
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(Object.isFrozen(result.queues), true);
+  assert.ok(result.queues.every((queue) => Object.isFrozen(queue)));
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.method, "GET");
+  assert.equal(requests[0].options.body, undefined);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(token));
+  assert.doesNotMatch(JSON.stringify(result), /[0-9a-f]{32}/i);
+});
+
+test("Queue preexistence attestation rejects missing Queue identity and time", async () => {
+  const name = "queue-preexistence-missing-surf";
+  const instance = fixture(name);
+  const environment = {
+    CLOUDFLARE_ACCOUNT_ID: "6".repeat(32),
+    CLOUDFLARE_API_TOKEN: "t".repeat(32)
+  };
+  const createContext = (api) =>
+    createCloudflareCommandContext({
+      ...instance,
+      environment,
+      fetcher: queueApiFetcher(api),
+      spawn: () => {
+        throw new Error("Queue preexistence attestation must remain read-only");
+      },
+      logger: { info() {} }
+    });
+
+  const missingQueue = queueApiFixture(name);
+  missingQueue.queues.pop();
+  await assert.rejects(
+    createContext(missingQueue).attestPreexistingQueues(
+      "2026-08-15T19:00:00.000Z"
+    ),
+    /lacks a configured Queue/
+  );
+
+  const missingTimestamp = queueApiFixture(name);
+  delete missingTimestamp.queues[0].created_on;
+  await assert.rejects(
+    createContext(missingTimestamp).attestPreexistingQueues(
+      "2026-08-15T19:00:00.000Z"
+    ),
+    /created_on must be an exact ISO timestamp/
+  );
+
+  const duplicate = queueApiFixture(name);
+  duplicate.queues.push({ ...duplicate.queues[0] });
+  await assert.rejects(
+    createContext(duplicate).attestPreexistingQueues(
+      "2026-08-15T19:00:00.000Z"
+    ),
+    /duplicate name/
+  );
+});
+
+test("Queue preexistence attestation rejects malformed, equal, and newer times", async () => {
+  const name = "queue-preexistence-time-surf";
+  const instance = fixture(name);
+  const cutoff = "2026-08-15T19:00:00.000Z";
+  const createContext = (api, requests = []) =>
+    createCloudflareCommandContext({
+      ...instance,
+      environment: {
+        CLOUDFLARE_ACCOUNT_ID: "5".repeat(32),
+        CLOUDFLARE_API_TOKEN: "t".repeat(32)
+      },
+      fetcher: queueApiFetcher({ ...api, requests }),
+      spawn: () => {
+        throw new Error("Queue preexistence attestation must remain read-only");
+      },
+      logger: { info() {} }
+    });
+
+  for (const [createdOn, pattern] of [
+    ["not-a-timestamp", /created_on must be an exact ISO timestamp/],
+    ["2026-08-15T19:00:00.000000Z", /was not created before the release cutoff/],
+    ["2026-08-15T19:00:00.000001Z", /was not created before the release cutoff/]
+  ]) {
+    const api = queueApiFixture(name);
+    api.queues[0].created_on = createdOn;
+    await assert.rejects(
+      createContext(api).attestPreexistingQueues(cutoff),
+      pattern
+    );
+  }
+
+  const preciselyOlder = queueApiFixture(name);
+  for (const queue of preciselyOlder.queues) {
+    queue.created_on = "2026-08-15T19:00:00.000499Z";
+  }
+  await assert.doesNotReject(
+    createContext(preciselyOlder).attestPreexistingQueues(
+      "2026-08-15T19:00:00.000500Z"
+    )
+  );
+
+  const requests = [];
+  await assert.rejects(
+    createContext(queueApiFixture(name), requests).attestPreexistingQueues(
+      "2026-08-15 19:00:00Z"
+    ),
+    /cutoff must be an exact ISO timestamp/
+  );
+  assert.equal(requests.length, 0);
+});
 
 test("Queue consumer inspection attests every account Queue and configured setting", async () => {
   const name = "queue-consumer-surf";
