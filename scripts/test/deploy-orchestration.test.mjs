@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   deployExistingWorker,
+  prebuiltWorkerVersionUploadArgs,
   workerTriggerSyncArgs,
   workerVersionActivationArgs,
   workerVersionUploadArgs
@@ -60,6 +61,12 @@ function recordedSteps({ failAt } = {}) {
 test("staged Wrangler commands upload, activate one exact version, then sync triggers", () => {
   const versionId = "11111111-2222-4333-8444-555555555555";
   assert.deepEqual(workerVersionUploadArgs(), ["versions", "upload"]);
+  assert.deepEqual(prebuiltWorkerVersionUploadArgs("/release/dist/index.js"), [
+    "versions",
+    "upload",
+    "/release/dist/index.js",
+    "--no-bundle"
+  ]);
   assert.deepEqual(workerVersionActivationArgs(versionId), [
     "versions",
     "deploy",
@@ -70,6 +77,10 @@ test("staged Wrangler commands upload, activate one exact version, then sync tri
   assert.throws(
     () => workerVersionActivationArgs("latest"),
     /staged Worker version ID must be a UUID/
+  );
+  assert.throws(
+    () => prebuiltWorkerVersionUploadArgs("dist/index.js"),
+    /bundle path must be absolute/
   );
 });
 

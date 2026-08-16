@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   AmbiguousWorkerActivationError,
+  buildWorkerCandidate,
   createWorkerReleaseOperations,
   expectedWorkerBindingDescriptor,
   RELEASE_GENERATION_TIMEOUT_MS,
@@ -13,12 +25,41 @@ import {
   resolveWorkerSourceRevision,
   resolveTaggedWorkerVersion
 } from "../lib/release-worker.mjs";
+import { captureClientOutputIdentity } from "../lib/build-identity.mjs";
 import { SURF_WORKER_VERSION_HEADER } from "../lib/worker-version.mjs";
 
 const predecessor = "11111111-1111-4111-8111-111111111111";
 const target = "22222222-2222-4222-8222-222222222222";
 const deployment = "33333333-3333-4333-8333-333333333333";
 const predecessorDeployment = "44444444-4444-4444-8444-444444444444";
+
+function temporaryRoot(prefix) {
+  return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+}
+
+const workerBundleRoot = temporaryRoot("surf-release-worker-bundle-");
+const workerBundlePath = join(workerBundleRoot, "index.js");
+const workerBundleContents = "export default { fetch() { return new Response('ok'); } };\n";
+writeFileSync(workerBundlePath, workerBundleContents, { mode: 0o600 });
+const workerRuntimeDigest = createHash("sha256")
+  .update(workerBundleContents)
+  .digest("hex");
+
+function installClientOutput(releaseRoot, marker = "planned") {
+  const clientDirectory = join(releaseRoot, "apps/web/dist/client");
+  mkdirSync(join(clientDirectory, "assets"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(clientDirectory, "index.html"), `<p>${marker}</p>\n`, {
+    mode: 0o600
+  });
+  writeFileSync(join(clientDirectory, "assets/app.js"), `export default ${JSON.stringify(marker)};\n`, {
+    mode: 0o600
+  });
+  return clientDirectory;
+}
+
+const workerClientDirectory = installClientOutput(workerBundleRoot);
+const workerClientOutputIdentity = captureClientOutputIdentity(workerClientDirectory);
+test.after(() => rmSync(workerBundleRoot, { recursive: true, force: true }));
 
 const reconciliationSeedSql = `
 insert into spots (id, name, region, lat, lon, timezone, shore_normal_deg, config_json, active) values
@@ -94,7 +135,7 @@ function context(activeVersions, calls) {
     version_metadata: { binding: "CF_VERSION_METADATA" },
     vars: {
       SURF_SOURCE_REVISION: "a".repeat(40),
-      SURF_WORKER_RUNTIME_DIGEST: "c".repeat(64),
+      SURF_WORKER_RUNTIME_DIGEST: workerRuntimeDigest,
       SURF_CLIENT_BUILD_DIGEST: "b".repeat(64)
     },
     d1_databases: [
@@ -182,17 +223,23 @@ function operations(
   instance,
   fetcher = async () => {
     throw new Error("not used");
-  }
+  },
+  {
+    clientDirectory = workerClientDirectory,
+    clientOutputIdentity = workerClientOutputIdentity
+  } = {}
 ) {
   return createWorkerReleaseOperations({
     context: instance,
     workerSecretsFile: "/private/worker.json",
     customOrigin: "https://surf.example",
     workersDevOrigin: "https://surf.example.workers.dev",
-    clientDirectory: "/release/apps/web/dist/client",
+    clientDirectory,
     sourceRevision: "a".repeat(40),
     clientBuildDigest: "b".repeat(64),
-    workerRuntimeDigest: "c".repeat(64),
+    clientOutputIdentity,
+    workerBundlePath,
+    workerRuntimeDigest,
     narrativeProtocolFingerprint: "d".repeat(64),
     releaseTag: "release-1",
     fetcher
@@ -204,8 +251,352 @@ test("upload uses an inactive version and validates runtime metadata", () => {
   const ops = operations(context([], calls));
   assert.deepEqual(ops.upload(), { versionId: target });
   assert.ok(calls.some((call) => call.includes("--secrets-file")));
+  assert.ok(
+    calls.some(
+      (call) =>
+        call[0] === "wrangler" &&
+        call[1] === "versions" &&
+        call[2] === "upload" &&
+        call.includes(workerBundlePath) &&
+        call.includes("--no-bundle")
+    )
+  );
   assert.ok(calls.some((call) => call.includes("--tag") && call.includes("release-1")));
   assert.ok(calls.some((call) => call[2] === "view"));
+});
+
+test("upload rejects a prebuilt Worker bundle changed after planning", () => {
+  const changedRoot = temporaryRoot("surf-release-worker-changed-");
+  try {
+    const changedBundlePath = join(changedRoot, "index.js");
+    writeFileSync(changedBundlePath, workerBundleContents, { mode: 0o600 });
+    const calls = [];
+    const ops = createWorkerReleaseOperations({
+      context: context([], calls),
+      workerSecretsFile: "/private/worker.json",
+      customOrigin: "https://surf.example",
+      workersDevOrigin: "https://surf.example.workers.dev",
+      clientDirectory: workerClientDirectory,
+      sourceRevision: "a".repeat(40),
+      clientBuildDigest: "b".repeat(64),
+      clientOutputIdentity: workerClientOutputIdentity,
+      workerBundlePath: changedBundlePath,
+      workerRuntimeDigest,
+      narrativeProtocolFingerprint: "d".repeat(64),
+      releaseTag: "release-1"
+    });
+    writeFileSync(changedBundlePath, `${workerBundleContents}// changed\n`, {
+      mode: 0o600
+    });
+    assert.throws(
+      () => ops.upload(),
+      /differs from its planned runtime digest/
+    );
+    assert.equal(calls.length, 0);
+  } finally {
+    rmSync(changedRoot, { recursive: true, force: true });
+  }
+});
+
+test("upload rejects client output drift before making a Wrangler call", () => {
+  const fixtureRoot = temporaryRoot("surf-release-client-drift-");
+  try {
+    const clientDirectory = installClientOutput(fixtureRoot);
+    const clientOutputIdentity = captureClientOutputIdentity(clientDirectory);
+    const calls = [];
+    const ops = operations(context([], calls), undefined, {
+      clientDirectory,
+      clientOutputIdentity
+    });
+    writeFileSync(join(clientDirectory, "assets/app.js"), "export default 'changed';\n");
+    assert.throws(
+      () => ops.upload(),
+      /Client build output differs from its planned identity/
+    );
+    assert.equal(calls.length, 0);
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("upload detects client output drift during successful and failed Wrangler calls", () => {
+  for (const outcome of ["response", "failure"]) {
+    const fixtureRoot = temporaryRoot(`surf-release-client-${outcome}-drift-`);
+    try {
+      const clientDirectory = installClientOutput(fixtureRoot);
+      const clientOutputIdentity = captureClientOutputIdentity(clientDirectory);
+      const calls = [];
+      const instance = context([], calls);
+      const originalRunWrangler = instance.runWrangler;
+      instance.runWrangler = (args) => {
+        if (args[0] !== "versions" || args[1] !== "upload") {
+          return originalRunWrangler(args);
+        }
+        calls.push(["wrangler", ...args]);
+        writeFileSync(
+          join(clientDirectory, "assets/app.js"),
+          `export default ${JSON.stringify(outcome)};\n`
+        );
+        if (outcome === "failure") throw new Error("simulated upload failure");
+        return `Worker Version ID: ${target}\n`;
+      };
+      const ops = operations(instance, undefined, {
+        clientDirectory,
+        clientOutputIdentity
+      });
+      let failure;
+      try {
+        ops.upload();
+      } catch (error) {
+        failure = error;
+      }
+      assert.ok(failure instanceof Error);
+      if (outcome === "failure") {
+        assert.ok(failure instanceof AggregateError);
+        assert.match(
+          failure.message,
+          /upload failed while planned build outputs also changed/
+        );
+        assert.equal(failure.errors.length, 2);
+        assert.match(
+          failure.errors[1].message,
+          /Client build output differs from its planned identity/
+        );
+      } else {
+        assert.match(
+          failure.message,
+          /Client build output differs from its planned identity/
+        );
+      }
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0][2], "upload");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("candidate build accepts only Wrangler's exact single-module inventory", () => {
+  const fixtureRoot = temporaryRoot("surf-release-candidate-");
+  try {
+    const outputDirectory = join(fixtureRoot, "output");
+    installClientOutput(fixtureRoot);
+    const candidate = buildWorkerCandidate({
+      context: {
+        releaseRoot: fixtureRoot,
+        runPnpm() {},
+        runWrangler() {
+          writeFileSync(join(outputDirectory, "README.md"), "Wrangler output\n");
+          writeFileSync(join(outputDirectory, "index.js"), workerBundleContents);
+          writeFileSync(join(outputDirectory, "index.js.map"), "{}\n");
+        }
+      },
+      outputDirectory,
+      sourceRevision: "a".repeat(40),
+      clientBuildDigest: "b".repeat(64)
+    });
+    assert.equal(candidate.bundlePath, join(outputDirectory, "index.js"));
+    assert.equal(candidate.workerRuntimeDigest, workerRuntimeDigest);
+    assert.deepEqual(
+      candidate.clientOutputIdentity,
+      captureClientOutputIdentity(candidate.clientDirectory)
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("candidate build rejects extra and missing runtime output", () => {
+  for (const variation of ["extra", "missing"]) {
+    const fixtureRoot = temporaryRoot(`surf-release-candidate-${variation}-`);
+    try {
+      const outputDirectory = join(fixtureRoot, "output");
+      installClientOutput(fixtureRoot);
+      assert.throws(
+        () =>
+          buildWorkerCandidate({
+            context: {
+              releaseRoot: fixtureRoot,
+              runPnpm() {},
+              runWrangler() {
+                writeFileSync(join(outputDirectory, "README.md"), "Wrangler output\n");
+                writeFileSync(join(outputDirectory, "index.js"), workerBundleContents);
+                if (variation !== "missing") {
+                  writeFileSync(join(outputDirectory, "index.js.map"), "{}\n");
+                }
+                if (variation === "extra") {
+                  writeFileSync(join(outputDirectory, "chunk.js"), "export {};\n");
+                }
+              }
+            },
+            outputDirectory,
+            sourceRevision: "a".repeat(40),
+            clientBuildDigest: "b".repeat(64)
+          }),
+        /must contain exactly README\.md, index\.js, index\.js\.map/
+      );
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("candidate build rejects a symlinked runtime output file", () => {
+  const fixtureRoot = temporaryRoot("surf-release-candidate-link-");
+  try {
+    const outputDirectory = join(fixtureRoot, "output");
+    installClientOutput(fixtureRoot);
+    assert.throws(
+      () =>
+        buildWorkerCandidate({
+          context: {
+            releaseRoot: fixtureRoot,
+            runPnpm() {},
+            runWrangler() {
+              writeFileSync(join(outputDirectory, "README.md"), "Wrangler output\n");
+              writeFileSync(join(outputDirectory, "index.js"), workerBundleContents);
+              symlinkSync("README.md", join(outputDirectory, "index.js.map"));
+            }
+          },
+          outputDirectory,
+          sourceRevision: "a".repeat(40),
+          clientBuildDigest: "b".repeat(64)
+        }),
+      /index\.js\.map must be a regular non-symlink file/
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("candidate build rejects a symlinked output parent", () => {
+  const fixtureRoot = temporaryRoot("surf-release-candidate-parent-link-");
+  try {
+    installClientOutput(fixtureRoot);
+    mkdirSync(join(fixtureRoot, "canonical-output-parent"));
+    symlinkSync(
+      "canonical-output-parent",
+      join(fixtureRoot, "aliased-output-parent")
+    );
+    const outputDirectory = join(fixtureRoot, "aliased-output-parent/output");
+    assert.throws(
+      () =>
+        buildWorkerCandidate({
+          context: {
+            releaseRoot: fixtureRoot,
+            runPnpm() {},
+            runWrangler() {
+              writeFileSync(join(outputDirectory, "README.md"), "Wrangler output\n");
+              writeFileSync(join(outputDirectory, "index.js"), workerBundleContents);
+              writeFileSync(join(outputDirectory, "index.js.map"), "{}\n");
+            }
+          },
+          outputDirectory,
+          sourceRevision: "a".repeat(40),
+          clientBuildDigest: "b".repeat(64)
+        }),
+      /output path must be canonical and contain no symlinks/
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("Wrangler no-bundle dry-run preserves the exact planned runtime module", () => {
+  const fixtureRoot = temporaryRoot("surf-release-wrangler-upload-");
+  try {
+    const surfRoot = resolve(import.meta.dirname, "../..");
+    const assetsDirectory = join(fixtureRoot, "assets");
+    const outputDirectory = join(fixtureRoot, "output");
+    const fixtureBundlePath = join(fixtureRoot, "planned-index.js");
+    const configPath = join(fixtureRoot, "wrangler.jsonc");
+    mkdirSync(assetsDirectory, { mode: 0o700 });
+    mkdirSync(outputDirectory, { mode: 0o700 });
+    writeFileSync(join(assetsDirectory, "index.html"), "<!doctype html><p>surf</p>\n", {
+      mode: 0o600
+    });
+    writeFileSync(fixtureBundlePath, workerBundleContents, { mode: 0o600 });
+    writeFileSync(
+      configPath,
+      `${JSON.stringify(
+        {
+          name: "surf-release-upload-test",
+          main: fixtureBundlePath,
+          compatibility_date: "2026-07-08",
+          assets: {
+            directory: assetsDirectory,
+            binding: "ASSETS",
+            run_worker_first: ["/api/*"]
+          },
+          vars: { RELEASE_CONFIG_SENTINEL: "retained" }
+        },
+        null,
+        2
+      )}\n`,
+      { mode: 0o600 }
+    );
+
+    const result = spawnSync(
+      "pnpm",
+      [
+        "--filter",
+        "@surf/web",
+        "exec",
+        "wrangler",
+        "versions",
+        "upload",
+        fixtureBundlePath,
+        "--no-bundle",
+        "--dry-run",
+        "--outdir",
+        outputDirectory,
+        "--config",
+        configPath
+      ],
+      {
+        cwd: surfRoot,
+        encoding: "utf8",
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          CI: "true",
+          CLOUDFLARE_ACCOUNT_ID: "",
+          CLOUDFLARE_API_TOKEN: "",
+          WRANGLER_LOG_PATH: join(fixtureRoot, "wrangler.log"),
+          WRANGLER_SEND_METRICS: "false"
+        }
+      }
+    );
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+    assert.equal(result.error, undefined, output);
+    assert.equal(result.status, 0, output);
+    assert.match(output, /env\.ASSETS\s+Assets/);
+    assert.match(output, /env\.RELEASE_CONFIG_SENTINEL \("retained"\)/);
+    assert.deepEqual(readdirSync(outputDirectory).sort(), [
+      "README.md",
+      "assets",
+      "planned-index.js"
+    ]);
+    assert.deepEqual(readdirSync(join(outputDirectory, "assets")).sort(), [
+      "index.html"
+    ]);
+    assert.equal(
+      readFileSync(join(outputDirectory, "assets/index.html"), "utf8"),
+      "<!doctype html><p>surf</p>\n"
+    );
+    assert.equal(
+      createHash("sha256")
+        .update(readFileSync(join(outputDirectory, "planned-index.js")))
+        .digest("hex"),
+      workerRuntimeDigest
+    );
+    assert.deepEqual(
+      readFileSync(join(outputDirectory, "planned-index.js")),
+      readFileSync(fixtureBundlePath)
+    );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test("portable R2 bindings resolve to Wrangler's exact auto-provisioned name", () => {
@@ -544,7 +935,7 @@ test("trigger synchronization removes exact stale consumers before Wrangler reco
 });
 
 test("seed resumes a lost-after-commit execution by exact read-only reconciliation", () => {
-  const releaseRoot = mkdtempSync(join(tmpdir(), "surf-release-seed-"));
+  const releaseRoot = temporaryRoot("surf-release-seed-");
   try {
     const seedDirectory = join(releaseRoot, "packages/db/seeds");
     mkdirSync(seedDirectory, { recursive: true });

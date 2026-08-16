@@ -1,9 +1,9 @@
-import { mkdirSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  prebuiltWorkerVersionUploadArgs,
   workerTriggerSyncArgs,
-  workerVersionActivationArgs,
-  workerVersionUploadArgs
+  workerVersionActivationArgs
 } from "./deploy-orchestration.mjs";
 import {
   resolveActiveDeploymentId,
@@ -20,7 +20,11 @@ import { inspectRemoteForecastReadModels } from "./remote-ingest.mjs";
 import {
   smokeStaticAssetsAcrossOrigins
 } from "./static-assets-smoke.mjs";
-import { workerBundleDigest } from "./build-identity.mjs";
+import {
+  assertClientOutputIdentity,
+  captureClientOutputIdentity,
+  workerBundleDigest
+} from "./build-identity.mjs";
 import { createReleaseStorage } from "./release-storage.mjs";
 
 const HEALTH_IDENTITY_MAX_BYTES = 64 * 1024;
@@ -36,6 +40,36 @@ const REQUIRED_SECRET_BINDINGS = Object.freeze([
 // its bounded 1-minute affinity handoff and 10-minute publication proof.
 // Keep the controller finite while leaving a small process-start margin.
 export const RELEASE_GENERATION_TIMEOUT_MS = 75 * 60_000;
+const WORKER_CANDIDATE_INVENTORY = Object.freeze([
+  "README.md",
+  "index.js",
+  "index.js.map"
+]);
+
+function assertWorkerCandidateInventory(outputDirectory) {
+  if (realpathSync(outputDirectory) !== resolve(outputDirectory)) {
+    throw new Error("Worker candidate output path must be canonical and contain no symlinks");
+  }
+  const rootStat = lstatSync(outputDirectory);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error("Worker candidate output must be a non-symlink directory");
+  }
+  const actual = readdirSync(outputDirectory).sort();
+  if (
+    actual.length !== WORKER_CANDIDATE_INVENTORY.length ||
+    actual.some((name, index) => name !== WORKER_CANDIDATE_INVENTORY[index])
+  ) {
+    throw new Error(
+      `Worker candidate output must contain exactly ${WORKER_CANDIDATE_INVENTORY.join(", ")}`
+    );
+  }
+  for (const name of WORKER_CANDIDATE_INVENTORY) {
+    const stat = lstatSync(resolve(outputDirectory, name));
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`Worker candidate output ${name} must be a regular non-symlink file`);
+    }
+  }
+}
 
 function requiredString(value, label) {
   if (
@@ -374,6 +408,8 @@ export function createWorkerReleaseOperations({
   clientDirectory,
   sourceRevision,
   clientBuildDigest,
+  clientOutputIdentity,
+  workerBundlePath,
   workerRuntimeDigest,
   narrativeProtocolFingerprint,
   releaseTag,
@@ -389,6 +425,13 @@ export function createWorkerReleaseOperations({
   );
   const releaseStorage = createReleaseStorage({ commandContext: context });
   const expectedBindings = expectedWorkerBindingDescriptor(context.readConfig());
+  const assertPlannedBuildOutputsUnchanged = () => {
+    if (workerBundleDigest(workerBundlePath) !== workerRuntimeDigest) {
+      throw new Error("Prebuilt Worker bundle differs from its planned runtime digest");
+    }
+    assertClientOutputIdentity(clientDirectory, clientOutputIdentity);
+  };
+  assertPlannedBuildOutputsUnchanged();
   const inspectActive = () => inspectDeployment(context);
   const inspectVersion = (versionId) => {
     const output = context.runWrangler(
@@ -417,11 +460,13 @@ export function createWorkerReleaseOperations({
     return versionId === null ? null : Object.freeze({ versionId });
   };
   const upload = () => {
+    assertPlannedBuildOutputsUnchanged();
     let output;
+    let commandError = null;
     try {
       output = context.runWrangler(
         [
-          ...workerVersionUploadArgs(),
+          ...prebuiltWorkerVersionUploadArgs(workerBundlePath),
           "--tag",
           releaseTag,
           "--message",
@@ -432,8 +477,22 @@ export function createWorkerReleaseOperations({
         { capture: true, env: { CI: "true" } }
       );
     } catch (error) {
-      throw workerVersionUploadFailure(error);
+      commandError = workerVersionUploadFailure(error);
     }
+    let integrityError = null;
+    try {
+      assertPlannedBuildOutputsUnchanged();
+    } catch (error) {
+      integrityError = error;
+    }
+    if (commandError && integrityError) {
+      throw new AggregateError(
+        [commandError, integrityError],
+        "Worker upload failed while planned build outputs also changed"
+      );
+    }
+    if (integrityError) throw integrityError;
+    if (commandError) throw commandError;
     const versionId = resolveUploadedVersionId(output);
     inspectVersion(versionId);
     return Object.freeze({ versionId });
@@ -717,10 +776,13 @@ export function buildWorkerCandidate({
     ["deploy", "--dry-run", "--outdir", outputDirectory],
     { env: { CI: "true" } }
   );
+  assertWorkerCandidateInventory(outputDirectory);
   const bundlePath = resolve(outputDirectory, "index.js");
+  const clientDirectory = resolve(context.releaseRoot, "apps/web/dist/client");
   return Object.freeze({
     bundlePath,
     workerRuntimeDigest: workerBundleDigest(bundlePath),
-    clientDirectory: resolve(context.releaseRoot, "apps/web/dist/client")
+    clientDirectory,
+    clientOutputIdentity: captureClientOutputIdentity(clientDirectory)
   });
 }

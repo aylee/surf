@@ -44,6 +44,7 @@ import {
 } from "../lib/release-journal.mjs";
 import {
   assertBeforeUploadReplacementArtifactsAbsent,
+  attestNoTaggedWorkerUpload,
   commitBeforeUploadReplacement,
   previewBeforeUploadReplacement
 } from "../lib/release-before-upload-replacement.mjs";
@@ -528,7 +529,7 @@ test("a receipt-free planned failure can be terminally linked to a new target", 
         ...replaced,
         resumeFrom: RELEASE_JOURNAL_STATES.VERIFIED
       }),
-    /allowed receipt-free boundary and exact live predecessor/
+    /allowed replacement boundary and exact live predecessor/
   );
 
   const targetFingerprints = fingerprints("replacement");
@@ -634,6 +635,7 @@ test("a verified prepare failure requires exact before-upload evidence", async (
     uploadArtifactAbsent: true,
     backupArtifactAbsent: true,
     rollbackArtifactAbsent: true,
+    remoteUploadEvidence: null,
     queueEvidence
   };
   assert.doesNotThrow(() =>
@@ -745,7 +747,7 @@ test("a verified prepare failure requires exact before-upload evidence", async (
           targetGitSha: replaced.supersededBy.targetGitSha
         }
       }),
-    /allowed receipt-free boundary/
+    /allowed replacement boundary/
   );
   assert.throws(
     () =>
@@ -759,7 +761,7 @@ test("a verified prepare failure requires exact before-upload evidence", async (
           }
         }
       }),
-    /allowed receipt-free boundary/
+    /allowed replacement boundary/
   );
   assert.equal(
     await previewBeforeUploadReplacement(replaced, attest),
@@ -795,6 +797,269 @@ test("a verified prepare failure requires exact before-upload evidence", async (
         classification: assetsClassification(targetFingerprints)
       }),
     /does not exactly link/
+  );
+});
+
+test("a prepared upload failure requires an exact remote-upload absence attestation", async () => {
+  let prepared = transitionReleaseJournal(
+    fullJournal(),
+    RELEASE_JOURNAL_STATES.VERIFIED,
+    { at: "2026-08-15T23:00:01.000Z" }
+  );
+  prepared = transitionReleaseJournal(
+    prepared,
+    RELEASE_JOURNAL_STATES.PREPARED,
+    {
+      at: "2026-08-15T23:00:02.000Z",
+      receipts: preparedReceipts
+    }
+  );
+  const failed = recordReleaseJournalFailure(prepared, {
+    code: RELEASE_FAILURE_CODES.UPLOAD_FAILED,
+    at: "2026-08-15T23:00:03.000Z"
+  });
+  const remoteUploadEvidence = {
+    schemaVersion: 1,
+    workerName: "surf-prod",
+    releaseTag: failed.releaseId,
+    remoteVersionCount: 32,
+    remoteVersionInventorySha256: "6".repeat(64),
+    taggedUploadAbsent: true
+  };
+  const evidence = {
+    liveWorkerVersionId: predecessor().workerVersionId,
+    liveDeploymentId: predecessor().deploymentId,
+    liveDeploymentCreatedOn: "2026-08-14T22:00:00.000000Z",
+    liveRunnerActivationId: predecessor().runnerActivationId,
+    failedConfigSha256: preparedReceipts.wranglerConfigSha256,
+    failedQueueTopologyFingerprint: failed.targetFingerprints.queueTopology,
+    uploadArtifactAbsent: true,
+    backupArtifactAbsent: true,
+    rollbackArtifactAbsent: true,
+    remoteUploadEvidence,
+    queueEvidence: {
+      expectedQueueNames: ["surf-ingest"],
+      queues: [
+        {
+          name: "surf-ingest",
+          createdOn: "2026-08-10T04:58:17.532408Z"
+        }
+      ]
+    }
+  };
+
+  assert.doesNotThrow(() =>
+    assertBeforeUploadReplacementEvidence(failed, evidence)
+  );
+  assert.throws(
+    () =>
+      assertBeforeUploadReplacementEvidence(failed, {
+        ...evidence,
+        failedConfigSha256: "7".repeat(64)
+      }),
+    /config differs from the prepared receipt/
+  );
+  assert.throws(
+    () =>
+      assertBeforeUploadReplacementEvidence(failed, {
+        ...evidence,
+        remoteUploadEvidence: null
+      }),
+    /Remote Worker-upload replacement attestation/
+  );
+  assert.throws(
+    () =>
+      assertBeforeUploadReplacementEvidence(failed, {
+        ...evidence,
+        remoteUploadEvidence: {
+          ...remoteUploadEvidence,
+          releaseTag: "another-release"
+        }
+      }),
+    /does not name the failed release/
+  );
+
+  const committed = await commitBeforeUploadReplacement(failed, {
+    releaseId: "release-after-upload-failure",
+    targetGitSha: "f".repeat(40),
+    at: "2026-08-15T23:00:04.000Z",
+    attest: async () => evidence
+  });
+  assert.equal(committed.journal.state, RELEASE_JOURNAL_STATES.REPLACED);
+  assert.equal(committed.journal.resumeFrom, RELEASE_JOURNAL_STATES.PREPARED);
+  assert.equal(
+    committed.journal.supersededBy.beforeUploadAttestation.schemaVersion,
+    2
+  );
+  assert.deepEqual(
+    committed.journal.supersededBy.beforeUploadAttestation.remoteUploadEvidence,
+    remoteUploadEvidence
+  );
+  assert.throws(
+    () =>
+      assertReleaseJournal({
+        ...committed.journal,
+        supersededBy: {
+          ...committed.journal.supersededBy,
+          beforeUploadAttestation: {
+            ...committed.journal.supersededBy.beforeUploadAttestation,
+            remoteUploadEvidence: {
+              ...remoteUploadEvidence,
+              releaseTag: "another-release"
+            }
+          }
+        }
+      }),
+    /allowed replacement boundary/
+  );
+});
+
+test("remote upload absence inspects the complete paginated inventory", async () => {
+  const releaseTag = "release-upload-failed";
+  const version = {
+    id: "11111111-1111-4111-8111-111111111111",
+    number: 32,
+    metadata: { created_on: "2026-08-16T05:00:00.123456Z" },
+    annotations: { "workers/triggered_by": "upload" }
+  };
+  const payload = (items, resultInfo = {}) => ({
+    success: true,
+    result: { items },
+    result_info: {
+      page: 1,
+      per_page: 100,
+      count: items.length,
+      total_count: items.length,
+      ...resultInfo
+    }
+  });
+  const responseFor = (value) =>
+    new Response(JSON.stringify(value), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  let guardCalls = 0;
+  const attestation = await attestNoTaggedWorkerUpload({
+    accountId: "a".repeat(32),
+    apiToken: "token".repeat(8),
+    workerName: "surf-prod",
+    releaseTag,
+    guard: () => {
+      guardCalls += 1;
+    },
+    fetcher: async (url, options) => {
+      assert.equal(url.searchParams.get("page"), "1");
+      assert.equal(url.searchParams.get("per_page"), "100");
+      assert.equal(options.method, "GET");
+      return responseFor(payload([version]));
+    }
+  });
+  assert.equal(guardCalls, 2);
+  assert.deepEqual(
+    {
+      ...attestation,
+      remoteVersionInventorySha256: "<sha256>"
+    },
+    {
+      schemaVersion: 1,
+      workerName: "surf-prod",
+      releaseTag,
+      remoteVersionCount: 1,
+      remoteVersionInventorySha256: "<sha256>",
+      taggedUploadAbsent: true
+    }
+  );
+  assert.match(attestation.remoteVersionInventorySha256, /^[0-9a-f]{64}$/);
+
+  const versions = Array.from({ length: 101 }, (_unused, index) => ({
+    id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    number: index + 1,
+    metadata: { created_on: "2026-08-16T05:00:00.123456Z" },
+    annotations: { "workers/triggered_by": "upload" }
+  }));
+  let pageCalls = 0;
+  const paginated = await attestNoTaggedWorkerUpload({
+    accountId: "a".repeat(32),
+    apiToken: "token".repeat(8),
+    workerName: "surf-prod",
+    releaseTag,
+    fetcher: async (url) => {
+      const page = Number(url.searchParams.get("page"));
+      pageCalls += 1;
+      return responseFor(
+        payload(versions.slice((page - 1) * 100, page * 100), {
+          page,
+          total_count: versions.length
+        })
+      );
+    }
+  });
+  assert.equal(pageCalls, 2);
+  assert.equal(paginated.remoteVersionCount, versions.length);
+
+  await assert.rejects(
+    attestNoTaggedWorkerUpload({
+      accountId: "a".repeat(32),
+      apiToken: "token".repeat(8),
+      workerName: "surf-prod",
+      releaseTag,
+      fetcher: async (url) => {
+        const page = Number(url.searchParams.get("page"));
+        return responseFor(
+          payload(versions.slice((page - 1) * 100, page * 100), {
+            page,
+            total_count: page === 1 ? versions.length : versions.length + 1
+          })
+        );
+      }
+    }),
+    /inventory changed while reading/
+  );
+  await assert.rejects(
+    attestNoTaggedWorkerUpload({
+      accountId: "a".repeat(32),
+      apiToken: "token".repeat(8),
+      workerName: "surf-prod",
+      releaseTag,
+      fetcher: async (url) => {
+        const page = Number(url.searchParams.get("page"));
+        const items = page === 1 ? versions.slice(0, 100) : [versions[99]];
+        return responseFor(
+          payload(items, { page, total_count: versions.length })
+        );
+      }
+    }),
+    /Worker-version identity is invalid/
+  );
+
+  await assert.rejects(
+    attestNoTaggedWorkerUpload({
+      accountId: "a".repeat(32),
+      apiToken: "token".repeat(8),
+      workerName: "surf-prod",
+      releaseTag,
+      fetcher: async () =>
+        responseFor(
+          payload([
+            {
+              ...version,
+              annotations: { "workers/tag": releaseTag }
+            }
+          ])
+        )
+    }),
+    /tagged remote Worker upload/
+  );
+  await assert.rejects(
+    attestNoTaggedWorkerUpload({
+      accountId: "a".repeat(32),
+      apiToken: "token".repeat(8),
+      workerName: "surf-prod",
+      releaseTag,
+      fetcher: async () =>
+        responseFor(payload([version], { total_count: 2 }))
+    }),
+    /inventory is incomplete/
   );
 });
 

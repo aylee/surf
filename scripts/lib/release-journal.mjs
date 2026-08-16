@@ -104,6 +104,14 @@ const BEFORE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
   "schemaVersion",
   "predecessorDeploymentCreatedOn"
 ]);
+const REMOTE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
+  "releaseTag",
+  "remoteVersionCount",
+  "remoteVersionInventorySha256",
+  "schemaVersion",
+  "taggedUploadAbsent",
+  "workerName"
+]);
 
 const PREDECESSOR_KEYS = Object.freeze([
   "releaseId",
@@ -257,13 +265,40 @@ function emptyPredecessor() {
   return Object.freeze(Object.fromEntries(PREDECESSOR_KEYS.map((key) => [key, null])));
 }
 
-function validateBeforeUploadAttestation(value) {
+function validateRemoteUploadAttestation(value) {
   exactKeys(
     value,
-    BEFORE_UPLOAD_ATTESTATION_KEYS,
-    "Before-upload replacement attestation"
+    REMOTE_UPLOAD_ATTESTATION_KEYS,
+    "Remote Worker-upload replacement attestation"
   );
   if (value.schemaVersion !== 1) {
+    throw new Error("Remote Worker-upload replacement attestation schema is unsupported");
+  }
+  if (
+    typeof value.workerName !== "string" ||
+    !SAFE_ID_PATTERN.test(value.workerName) ||
+    !RELEASE_ID_PATTERN.test(value.releaseTag ?? "") ||
+    !Number.isInteger(value.remoteVersionCount) ||
+    value.remoteVersionCount < 0 ||
+    value.remoteVersionCount > 10_000 ||
+    !SHA256_PATTERN.test(value.remoteVersionInventorySha256 ?? "") ||
+    value.taggedUploadAbsent !== true
+  ) {
+    throw new Error("Remote Worker-upload replacement attestation is invalid");
+  }
+  return Object.freeze({ ...value });
+}
+
+function validateBeforeUploadAttestation(value) {
+  const schemaVersion = value?.schemaVersion;
+  exactKeys(
+    value,
+    schemaVersion === 2
+      ? [...BEFORE_UPLOAD_ATTESTATION_KEYS, "remoteUploadEvidence"]
+      : BEFORE_UPLOAD_ATTESTATION_KEYS,
+    "Before-upload replacement attestation"
+  );
+  if (![1, 2].includes(schemaVersion)) {
     throw new Error("Before-upload replacement attestation schema is unsupported");
   }
   if (!SHA256_PATTERN.test(value.failedConfigSha256 ?? "")) {
@@ -284,11 +319,18 @@ function validateBeforeUploadAttestation(value) {
     value.queueEvidence
   );
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion,
     failedConfigSha256: value.failedConfigSha256,
     queueTopologyFingerprint: value.queueTopologyFingerprint,
     predecessorDeploymentCreatedOn,
-    queueEvidence
+    queueEvidence,
+    ...(schemaVersion === 2
+      ? {
+          remoteUploadEvidence: validateRemoteUploadAttestation(
+            value.remoteUploadEvidence
+          )
+        }
+      : {})
   });
 }
 
@@ -359,6 +401,21 @@ function validateReceipts(value) {
 function emptyReceipts() {
   return Object.freeze(
     Object.fromEntries(RELEASE_RECEIPT_KEYS.map((key) => [key, null]))
+  );
+}
+
+const PREPARED_RECEIPT_KEYS = Object.freeze([
+  "profileSha256",
+  "operatorEnvironmentFingerprint",
+  "wranglerConfigSha256",
+  "workerSecretsFingerprint"
+]);
+
+function hasOnlyPreparedReceipts(receipts) {
+  return RELEASE_RECEIPT_KEYS.every((key) =>
+    PREPARED_RECEIPT_KEYS.includes(key)
+      ? receipts[key] !== null
+      : receipts[key] === null
   );
 }
 
@@ -583,7 +640,7 @@ export function assertReleaseJournal(value) {
     (supersededBy !== null)
   ) {
     throw new Error(
-      "Only a superseded or pre-mutation replaced release may contain a replacement link"
+      "Only a superseded or replaced release may contain a replacement link"
     );
   }
   if (
@@ -598,10 +655,13 @@ export function assertReleaseJournal(value) {
   if (
     supersededBy?.beforeUploadAttestation !== undefined &&
     (value.state !== RELEASE_JOURNAL_STATES.REPLACED ||
-      value.resumeFrom !== RELEASE_JOURNAL_STATES.VERIFIED)
+      ![
+        RELEASE_JOURNAL_STATES.VERIFIED,
+        RELEASE_JOURNAL_STATES.PREPARED
+      ].includes(value.resumeFrom))
   ) {
     throw new Error(
-      "Only a verified before-upload replacement may retain its attestation"
+      "Only a verified or prepared before-upload replacement may retain its attestation"
     );
   }
   nullablePattern(value.failureCode, FAILURE_CODE_PATTERN, "Release failure code");
@@ -623,14 +683,27 @@ export function assertReleaseJournal(value) {
       receiptFree &&
       exactLivePredecessor &&
       predecessor.runnerActivationId !== null &&
+      supersededBy?.beforeUploadAttestation?.schemaVersion === 1 &&
       supersededBy?.beforeUploadAttestation?.queueTopologyFingerprint ===
-        targetFingerprints.queueTopology);
+        targetFingerprints.queueTopology) ||
+    (value.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED &&
+      value.failureCode === RELEASE_FAILURE_CODES.UPLOAD_FAILED &&
+      hasOnlyPreparedReceipts(receipts) &&
+      exactLivePredecessor &&
+      predecessor.runnerActivationId !== null &&
+      supersededBy?.beforeUploadAttestation?.schemaVersion === 2 &&
+      supersededBy.beforeUploadAttestation.failedConfigSha256 ===
+        receipts.wranglerConfigSha256 &&
+      supersededBy.beforeUploadAttestation.queueTopologyFingerprint ===
+        targetFingerprints.queueTopology &&
+      supersededBy.beforeUploadAttestation.remoteUploadEvidence.releaseTag ===
+        value.releaseId);
   if (
     value.state === RELEASE_JOURNAL_STATES.REPLACED &&
     !validReplacementBoundary
   ) {
     throw new Error(
-      "A replaced release must retain an allowed receipt-free boundary and exact live predecessor"
+      "A replaced release must retain an allowed replacement boundary and exact live predecessor"
     );
   }
   if (!Number.isInteger(value.attempt) || value.attempt < 1) {
@@ -953,22 +1026,29 @@ export function assertBeforeUploadReplacementEvidence(journal, evidence) {
       "liveRunnerActivationId",
       "liveWorkerVersionId",
       "queueEvidence",
+      "remoteUploadEvidence",
       "rollbackArtifactAbsent",
       "uploadArtifactAbsent"
     ],
     "Before-upload replacement evidence"
   );
+  const verifiedPrepareFailure =
+    current.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED &&
+    current.failureCode === RELEASE_FAILURE_CODES.PREPARE_FAILED &&
+    Object.values(current.receipts).every((value) => value === null);
+  const preparedUploadFailure =
+    current.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED &&
+    current.failureCode === RELEASE_FAILURE_CODES.UPLOAD_FAILED &&
+    hasOnlyPreparedReceipts(current.receipts);
   if (
     ![
       RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
       RELEASE_JOURNAL_STATES.REPLACED
     ].includes(current.state) ||
-    current.resumeFrom !== RELEASE_JOURNAL_STATES.VERIFIED ||
-    current.failureCode !== RELEASE_FAILURE_CODES.PREPARE_FAILED ||
-    Object.values(current.receipts).some((value) => value !== null)
+    (!verifiedPrepareFailure && !preparedUploadFailure)
   ) {
     throw new Error(
-      "Before-upload replacement requires a receipt-free prepare failure from verified"
+      "Before-upload replacement requires an exact verified prepare failure or prepared upload failure"
     );
   }
   if (
@@ -994,6 +1074,14 @@ export function assertBeforeUploadReplacementEvidence(journal, evidence) {
     throw new Error("Before-upload replacement config SHA-256 is invalid");
   }
   if (
+    preparedUploadFailure &&
+    evidence.failedConfigSha256 !== current.receipts.wranglerConfigSha256
+  ) {
+    throw new Error(
+      "Before-upload replacement config differs from the prepared receipt"
+    );
+  }
+  if (
     evidence.failedQueueTopologyFingerprint !==
     current.targetFingerprints.queueTopology
   ) {
@@ -1009,7 +1097,26 @@ export function assertBeforeUploadReplacementEvidence(journal, evidence) {
     evidence.liveDeploymentCreatedOn,
     evidence.queueEvidence
   );
-  return Object.freeze({ ...evidence, queueEvidence });
+  let remoteUploadEvidence = null;
+  if (preparedUploadFailure) {
+    remoteUploadEvidence = validateRemoteUploadAttestation(
+      evidence.remoteUploadEvidence
+    );
+    if (remoteUploadEvidence.releaseTag !== current.releaseId) {
+      throw new Error(
+        "Remote Worker-upload attestation does not name the failed release"
+      );
+    }
+  } else if (evidence.remoteUploadEvidence !== null) {
+    throw new Error(
+      "Verified prepare failures must not claim a remote Worker-upload attestation"
+    );
+  }
+  return Object.freeze({
+    ...evidence,
+    queueEvidence,
+    remoteUploadEvidence
+  });
 }
 
 export function replaceBeforeUploadReleaseJournal(
@@ -1034,13 +1141,20 @@ export function replaceBeforeUploadReleaseJournal(
         releaseId,
         targetGitSha,
         beforeUploadAttestation: {
-          schemaVersion: 1,
+          schemaVersion:
+            current.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED ? 2 : 1,
           failedConfigSha256: validatedEvidence.failedConfigSha256,
           queueTopologyFingerprint:
             validatedEvidence.failedQueueTopologyFingerprint,
           predecessorDeploymentCreatedOn:
             validatedEvidence.liveDeploymentCreatedOn,
-          queueEvidence: validatedEvidence.queueEvidence
+          queueEvidence: validatedEvidence.queueEvidence,
+          ...(current.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED
+            ? {
+                remoteUploadEvidence:
+                  validatedEvidence.remoteUploadEvidence
+              }
+            : {})
         }
       })
     },
@@ -1081,7 +1195,10 @@ export function assertReleaseReplacement(
     failed.state !== RELEASE_JOURNAL_STATES.REPLACED ||
     failed.supersededBy?.releaseId !== replacement.releaseId ||
     failed.supersededBy?.targetGitSha !== replacement.targetGitSha ||
-    (failed.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED &&
+    ([
+      RELEASE_JOURNAL_STATES.VERIFIED,
+      RELEASE_JOURNAL_STATES.PREPARED
+    ].includes(failed.resumeFrom) &&
       replacement.lane !== RELEASE_LANES.CONSERVATIVE_FULL) ||
     canonicalReleaseJson(replacement.predecessor) !==
       canonicalReleaseJson(expectedPredecessor)
