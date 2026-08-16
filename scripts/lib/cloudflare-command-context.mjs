@@ -18,6 +18,18 @@ const QUEUE_INSPECTION_MAX_QUEUES = 256;
 const QUEUE_TOPOLOGY_OPERATION_TIMEOUT_MS = 30_000;
 const ACCOUNT_ID_PATTERN = /^[0-9a-f]{32}$/i;
 const RESOURCE_ID_PATTERN = /^[0-9a-f]{32}$/i;
+const SAFE_CAPTURED_FAILURE_DIAGNOSTICS = Object.freeze([
+  Object.freeze({
+    message:
+      "remote ingest cron-safety wait ended before the required settle boundary; mutation did not begin",
+    code: "cron_wait_ended_early"
+  }),
+  Object.freeze({
+    message:
+      "remote ingest cron-safety wait did not reach a safe verification window; mutation did not begin",
+    code: "cron_wait_not_safe"
+  })
+]);
 
 function commandTimeout(options = {}) {
   if (options.timeoutPolicy === "unbounded") {
@@ -42,6 +54,21 @@ function apiErrorCodes(output) {
     codes.add(Number(match[1]));
   }
   return [...codes];
+}
+
+function safeCapturedFailureDiagnosticCode(output) {
+  const codesByExactErrorLine = new Map(
+    SAFE_CAPTURED_FAILURE_DIAGNOSTICS.map(({ message, code }) => [
+      `Error: ${message}`,
+      code
+    ])
+  );
+  const errorLines = String(output)
+    .split(/\r\n|\r|\n/)
+    .filter((line) => line.startsWith("Error: "));
+  return errorLines.length === 1
+    ? (codesByExactErrorLine.get(errorLines[0]) ?? null)
+    : null;
 }
 
 const ISO_UTC_TIMESTAMP_PATTERN =
@@ -336,13 +363,24 @@ export function createCloudflareCommandContext({
     }
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
     if (result.status !== 0) {
+      const diagnosticCode = capture
+        ? safeCapturedFailureDiagnosticCode(output)
+        : null;
       const error = new Error(
-        `pnpm ${args.join(" ")} exited with status ${result.status ?? "unknown"}`
+        `pnpm ${args.join(" ")} exited with status ${result.status ?? "unknown"}${
+          diagnosticCode === null ? "" : `; diagnostic=${diagnosticCode}`
+        }`
       );
       Object.defineProperty(error, "cloudflareApiErrorCodes", {
         value: apiErrorCodes(output),
         enumerable: false
       });
+      if (diagnosticCode !== null) {
+        Object.defineProperty(error, "releaseCommandDiagnosticCode", {
+          value: diagnosticCode,
+          enumerable: false
+        });
+      }
       throw error;
     }
     if (capture && options.echo === true && output) process.stdout.write(output);

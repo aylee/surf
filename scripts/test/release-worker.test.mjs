@@ -1339,6 +1339,40 @@ test("generation reconciliation proves an existing target lineage without enqueu
   assert.equal(calls.length, 0);
 });
 
+test("generation reconciliation treats an intervening cron lineage as target-absent", async () => {
+  const calls = [];
+  const notBefore = "2026-08-15T20:00:00.000Z";
+  const fetcher = async (input) => {
+    const url = new URL(String(input));
+    const headers = { [SURF_WORKER_VERSION_HEADER]: target };
+    if (url.pathname === "/api/spots") {
+      return Response.json(
+        { spots: [{ id: "obsf-north", timezone: "America/Los_Angeles" }] },
+        { headers }
+      );
+    }
+    if (url.pathname === "/api/forecast-readiness") {
+      return Response.json(
+        {
+          forecastReadModels: ["3h", "1h"].map((interval) => ({
+            spotId: "obsf-north",
+            interval,
+            generationId: `sha256:${"b".repeat(64)}:ingest:scheduled-ingest`,
+            ingestId: "scheduled-ingest",
+            generatedAt: "2026-08-15T20:17:00.000Z",
+            materializedAt: "2026-08-15T20:18:00.000Z"
+          }))
+        },
+        { headers }
+      );
+    }
+    throw new Error(`unexpected request ${url.pathname}`);
+  };
+  const ops = operations(context([], calls), fetcher);
+  assert.equal(await ops.inspectGeneration(target, notBefore), null);
+  assert.equal(calls.length, 0);
+});
+
 test("health identity reads a bounded JSON stream", async () => {
   const response = new Response('{"status":"ok"}', {
     headers: { "content-type": "application/json; charset=utf-8" }

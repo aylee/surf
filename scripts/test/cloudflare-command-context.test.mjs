@@ -191,6 +191,142 @@ test("captured command failures expose only structured API codes", () => {
   assert.deepEqual(Object.keys(caught), []);
 });
 
+test("captured command failures map exact safe cron-wait diagnostics", () => {
+  const cases = [
+    [
+      "remote ingest cron-safety wait ended before the required settle boundary; mutation did not begin",
+      "cron_wait_ended_early",
+      "stdout"
+    ],
+    [
+      "remote ingest cron-safety wait did not reach a safe verification window; mutation did not begin",
+      "cron_wait_not_safe",
+      "stderr"
+    ]
+  ];
+
+  for (const [diagnostic, code, stream] of cases) {
+    const instance = fixture(`safe-diagnostic-${code}`);
+    const context = createCloudflareCommandContext({
+      ...instance,
+      environment: {},
+      spawn: () => ({
+        status: 1,
+        stdout: stream === "stdout" ? `Error: ${diagnostic}\n` : "",
+        stderr: stream === "stderr" ? `Error: ${diagnostic}\n` : ""
+      }),
+      logger: { info() {} }
+    });
+
+    let caught;
+    try {
+      context.runPnpm(["ingest:remote"], { capture: true });
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.equal(caught.releaseCommandDiagnosticCode, code);
+    assert.equal(
+      caught.message,
+      `pnpm ingest:remote exited with status 1; diagnostic=${code}`
+    );
+    assert.deepEqual(Object.keys(caught), []);
+  }
+});
+
+test("captured command failures suppress unknown output", () => {
+  const instance = fixture("unknown-diagnostic-surf");
+  const unknownOutput =
+    "private provider detail: remote ingest failed outside the safe allowlist";
+  const context = createCloudflareCommandContext({
+    ...instance,
+    environment: {},
+    spawn: () => ({ status: 1, stdout: unknownOutput, stderr: "" }),
+    logger: { info() {} }
+  });
+
+  let caught;
+  try {
+    context.runPnpm(["ingest:remote"], { capture: true });
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.equal(caught.releaseCommandDiagnosticCode, undefined);
+  assert.equal(caught.message, "pnpm ingest:remote exited with status 1");
+  assert.doesNotMatch(caught.message, /private provider detail|safe allowlist/);
+  assert.deepEqual(Object.keys(caught), []);
+});
+
+test("captured command diagnostics reject embedded and ambiguous messages", () => {
+  const endedEarly =
+    "remote ingest cron-safety wait ended before the required settle boundary; mutation did not begin";
+  const notSafe =
+    "remote ingest cron-safety wait did not reach a safe verification window; mutation did not begin";
+  const cases = [
+    `prefix Error: ${endedEarly}`,
+    `Error: ${endedEarly} suffix`,
+    `unrelated output embedded ${endedEarly} inside a longer line`,
+    `Error: ${endedEarly}\nError: ${endedEarly}`,
+    `Error: ${endedEarly}\r\nError: ${notSafe}`,
+    `Error: ${endedEarly}\nError: unrelated adjacent failure`
+  ];
+
+  for (const [index, output] of cases.entries()) {
+    const instance = fixture(`rejected-diagnostic-${index}`);
+    const context = createCloudflareCommandContext({
+      ...instance,
+      environment: {},
+      spawn: () => ({ status: 1, stdout: output, stderr: "" }),
+      logger: { info() {} }
+    });
+
+    let caught;
+    try {
+      context.runPnpm(["ingest:remote"], { capture: true });
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.equal(caught.releaseCommandDiagnosticCode, undefined);
+    assert.equal(caught.message, "pnpm ingest:remote exited with status 1");
+    assert.doesNotMatch(caught.message, /cron-safety|settle boundary/);
+    assert.deepEqual(Object.keys(caught), []);
+  }
+});
+
+test("safe captured diagnostics never expose adjacent secret output", () => {
+  const instance = fixture("secret-diagnostic-surf");
+  const secret = "super-secret-ingest-token-value";
+  const diagnostic =
+    "remote ingest cron-safety wait ended before the required settle boundary; mutation did not begin";
+  const context = createCloudflareCommandContext({
+    ...instance,
+    environment: {},
+    spawn: () => ({
+      status: 1,
+      stdout: `${secret}\nError: ${diagnostic}\n`,
+      stderr: `adjacent-${secret}`
+    }),
+    logger: { info() {} }
+  });
+
+  let caught;
+  try {
+    context.runPnpm(["ingest:remote"], { capture: true });
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.equal(caught.releaseCommandDiagnosticCode, "cron_wait_ended_early");
+  assert.equal(
+    caught.message,
+    "pnpm ingest:remote exited with status 1; diagnostic=cron_wait_ended_early"
+  );
+  assert.doesNotMatch(caught.message, /super-secret|ingest-token-value/);
+  assert.deepEqual(Object.keys(caught), []);
+});
+
 test("cron trigger inspection proves exact remote topology without mutation", async () => {
   const instance = fixture("cron-inspection-surf");
   const requests = [];
