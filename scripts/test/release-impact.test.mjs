@@ -11,7 +11,8 @@ import {
   fingerprintCanonicalReleaseValue,
   fingerprintReleaseFiles,
   forceConservativeReleaseClassification,
-  isNarrowUiReleasePath
+  isNarrowUiReleasePath,
+  sameReleaseFingerprintSet
 } from "../lib/release-impact.mjs";
 
 const workerVersionId = "11111111-1111-4111-8111-111111111111";
@@ -36,6 +37,33 @@ function trustedReceipt(activeFingerprints = fingerprints()) {
     fingerprints: activeFingerprints
   });
 }
+
+test("release fingerprint equality is semantic and validates both complete sets", () => {
+  const left = fingerprints();
+  const right = Object.fromEntries(Object.entries(left).reverse());
+  assert.equal(sameReleaseFingerprintSet(left, right), true);
+  assert.equal(
+    sameReleaseFingerprintSet(left, {
+      ...right,
+      workerRuntime: fingerprintCanonicalReleaseValue("different-runtime")
+    }),
+    false
+  );
+
+  const { releaseTooling: _missing, ...missing } = right;
+  assert.throws(
+    () => sameReleaseFingerprintSet(left, missing),
+    /Right release fingerprints must contain exactly/
+  );
+  assert.throws(
+    () => sameReleaseFingerprintSet({ ...left, unexpected: "a".repeat(64) }, right),
+    /Left release fingerprints must contain exactly/
+  );
+  assert.throws(
+    () => sameReleaseFingerprintSet(left, { ...right, workerRuntime: "A".repeat(64) }),
+    /Right release fingerprints\.workerRuntime must be an exact lowercase SHA-256/
+  );
+});
 
 test("release file fingerprints are order-independent and boundary-safe", () => {
   const left = fingerprintReleaseFiles([

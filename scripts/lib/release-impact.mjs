@@ -267,6 +267,20 @@ export function assertReleaseFingerprintSet(value, label = "Release fingerprints
   return Object.freeze({ ...value });
 }
 
+export function sameReleaseFingerprintSet(left, right) {
+  const normalizedLeft = assertReleaseFingerprintSet(
+    left,
+    "Left release fingerprints"
+  );
+  const normalizedRight = assertReleaseFingerprintSet(
+    right,
+    "Right release fingerprints"
+  );
+  return RELEASE_FINGERPRINT_KEYS.every(
+    (key) => normalizedLeft[key] === normalizedRight[key]
+  );
+}
+
 /** @returns {Readonly<ReleaseImpactVector>} */
 export function releaseImpactForLane(lane) {
   if (lane === RELEASE_LANES.ASSETS_ONLY) {
