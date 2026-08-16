@@ -29,6 +29,11 @@ import {
 } from "../lib/release-worker.mjs";
 import { captureClientOutputIdentity } from "../lib/build-identity.mjs";
 import { workerCandidateBuildArgs } from "../lib/deploy-orchestration.mjs";
+import {
+  formatRemoteIngestReleaseReceipt,
+  REMOTE_INGEST_RECEIPT_MODE_ENV,
+  REMOTE_INGEST_RECEIPT_MODE_V1
+} from "../lib/remote-ingest.mjs";
 import { SURF_WORKER_VERSION_HEADER } from "../lib/worker-version.mjs";
 
 const predecessor = "11111111-1111-4111-8111-111111111111";
@@ -195,7 +200,22 @@ function context(activeVersions, calls) {
     },
     runPnpm(args, options) {
       calls.push(["pnpm", ...args, options]);
-      return JSON.stringify({ ingestId: target });
+      return args[0] === "ingest:remote"
+        ? [
+            "$ pnpm --filter @surf/web ingest:remote",
+            "$ node scripts/ingest-once.mjs --remote",
+            JSON.stringify({ event: "remote_ingest_cron_deferral" }),
+            formatRemoteIngestReleaseReceipt(
+              {
+                status: "published",
+                ingestId: target,
+                workerVersion: target
+              },
+              target
+            ),
+            ""
+          ].join("\n")
+        : "";
     },
     runWrangler(args) {
       calls.push(["wrangler", ...args]);
@@ -1301,6 +1321,48 @@ test("remote generation has a finite ceiling covering cron deferral", () => {
   assert.equal(options.timeoutMs, RELEASE_GENERATION_TIMEOUT_MS);
   assert.ok(RELEASE_GENERATION_TIMEOUT_MS > 70 * 60_000);
   assert.ok(RELEASE_GENERATION_TIMEOUT_MS < 90 * 60_000);
+  assert.equal(
+    options.env[REMOTE_INGEST_RECEIPT_MODE_ENV],
+    REMOTE_INGEST_RECEIPT_MODE_V1
+  );
+});
+
+test("remote generation rejects unframed or conflicting success output without leaking it", () => {
+  const secret = "private-generation-output-never-report";
+  const cases = [
+    `$ pnpm ingest:remote\n${JSON.stringify({ ingestId: target })}\n${secret}`,
+    [
+      formatRemoteIngestReleaseReceipt(
+        { status: "published", ingestId: target, workerVersion: target },
+        target
+      ),
+      formatRemoteIngestReleaseReceipt(
+        { status: "published", ingestId: target, workerVersion: target },
+        target
+      ),
+      secret
+    ].join("\r\n")
+  ];
+
+  for (const output of cases) {
+    const calls = [];
+    const instance = context([], calls);
+    instance.runPnpm = (args, options) => {
+      calls.push(["pnpm", ...args, options]);
+      return output;
+    };
+    let caught;
+    try {
+      operations(instance).generate(target, "ingest-token");
+    } catch (error) {
+      caught = error;
+    }
+    assert.equal(
+      caught?.message,
+      "Remote generation command did not return one valid framed receipt"
+    );
+    assert.doesNotMatch(caught.message, /private-generation-output|never-report/);
+  }
 });
 
 test("generation reconciliation proves an existing target lineage without enqueueing", async () => {

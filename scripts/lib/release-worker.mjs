@@ -17,7 +17,12 @@ import {
 import { waitForWorkerVersion } from "./worker-version.mjs";
 import { workerVersionUploadFailure } from "./worker-release-errors.mjs";
 import { smokeForecastInstance } from "./smoke-instance.mjs";
-import { inspectRemoteForecastReadModels } from "./remote-ingest.mjs";
+import {
+  inspectRemoteForecastReadModels,
+  parseRemoteIngestReleaseReceipt,
+  REMOTE_INGEST_RECEIPT_MODE_ENV,
+  REMOTE_INGEST_RECEIPT_MODE_V1
+} from "./remote-ingest.mjs";
 import {
   smokeStaticAssetsAcrossOrigins
 } from "./static-assets-smoke.mjs";
@@ -886,22 +891,15 @@ export function createWorkerReleaseOperations({
             SURF_BASE_URL: customOrigin,
             SURF_INGEST_TOKEN: ingestToken,
             SURF_EXPECTED_WORKER_VERSION: versionId,
-            SURF_EXPECTED_WORKER_NAME: context.workerName
+            SURF_EXPECTED_WORKER_NAME: context.workerName,
+            [REMOTE_INGEST_RECEIPT_MODE_ENV]: REMOTE_INGEST_RECEIPT_MODE_V1
           }
         });
       } finally {
         context.assertUnchanged();
       }
-      let parsed;
-      try {
-        parsed = JSON.parse(output);
-      } catch {
-        throw new Error("Remote generation command did not return one JSON receipt");
-      }
-      if (typeof parsed.ingestId !== "string" || parsed.ingestId.length === 0) {
-        throw new Error("Remote generation receipt is missing ingestId");
-      }
-      return Object.freeze({ generationId: parsed.ingestId });
+      const receipt = parseRemoteIngestReleaseReceipt(output, versionId);
+      return Object.freeze({ generationId: receipt.ingestId });
     }
   });
 }

@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   enqueueAndWaitForRemoteIngest as enqueueAndWaitForRemoteIngestImplementation,
-  inspectRemoteForecastReadModels
+  formatRemoteIngestReleaseReceipt,
+  inspectRemoteForecastReadModels,
+  parseRemoteIngestReleaseReceipt,
+  REMOTE_INGEST_RECEIPT_MARKER
 } from "../lib/remote-ingest.mjs";
 import {
   CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
@@ -218,6 +221,125 @@ async function successfulVersionedDeployAt(startedAt) {
   });
   return { result, clock, delays, requests, infoEvents };
 }
+
+function releaseReceiptPayload(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    status: "published",
+    ingestId: workerVersion,
+    workerVersion,
+    ...overrides
+  };
+}
+
+function releaseReceiptFrame(overrides = {}) {
+  return `${REMOTE_INGEST_RECEIPT_MARKER}${JSON.stringify(
+    releaseReceiptPayload(overrides)
+  )}`;
+}
+
+test("release receipt framing survives realistic pnpm and cron output", () => {
+  const result = {
+    status: "published",
+    ingestId: workerVersion,
+    workerVersion,
+    attempts: 8,
+    spots: 11,
+    forecastReadModels: 22
+  };
+  const frame = formatRemoteIngestReleaseReceipt(result, workerVersion);
+  assert.equal(frame, releaseReceiptFrame());
+
+  for (const newline of ["\n", "\r\n"]) {
+    const output = [
+      "$ pnpm --filter @surf/web ingest:remote",
+      "$ node scripts/ingest-once.mjs --remote",
+      JSON.stringify({
+        event: "remote_ingest_cron_deferral",
+        resumeAt: "2026-08-16T20:27:00.000Z"
+      }),
+      frame,
+      ""
+    ].join(newline);
+    assert.deepEqual(
+      parseRemoteIngestReleaseReceipt(output, workerVersion),
+      releaseReceiptPayload()
+    );
+  }
+});
+
+test("release receipt parsing fails closed without leaking captured output", () => {
+  const secret = "private-ingest-token-never-report-this";
+  const valid = releaseReceiptFrame();
+  const mismatchedVersion = "52a07dbe-35f5-4d9c-9ffc-241d159022a8";
+  const cases = [
+    ["missing", `$ pnpm ingest:remote\n${secret}\n`],
+    ["malformed", `${REMOTE_INGEST_RECEIPT_MARKER}{not-json}\n${secret}`],
+    ["duplicate", `${valid}\n${valid}`],
+    [
+      "conflicting",
+      `${valid}\n${releaseReceiptFrame({ workerVersion: mismatchedVersion })}`
+    ],
+    ["embedded", `prefix ${valid}`],
+    [
+      "extra key",
+      `${REMOTE_INGEST_RECEIPT_MARKER}${JSON.stringify({
+        ...releaseReceiptPayload(),
+        detail: secret
+      })}`
+    ],
+    ["wrong schema", releaseReceiptFrame({ schemaVersion: 2 })],
+    ["wrong status", releaseReceiptFrame({ status: "pending" })],
+    ["wrong ingest", releaseReceiptFrame({ ingestId: mismatchedVersion })],
+    ["wrong Worker", releaseReceiptFrame({ workerVersion: mismatchedVersion })],
+    [
+      "noncompact",
+      `${REMOTE_INGEST_RECEIPT_MARKER}${JSON.stringify(
+        releaseReceiptPayload(),
+        null,
+        2
+      )}`
+    ],
+    ["marker in noise", `${valid}\nnoise ${REMOTE_INGEST_RECEIPT_MARKER}`]
+  ];
+
+  for (const [name, output] of cases) {
+    let caught;
+    try {
+      parseRemoteIngestReleaseReceipt(output, workerVersion);
+    } catch (error) {
+      caught = error;
+    }
+    assert.equal(
+      caught?.message,
+      "Remote generation command did not return one valid framed receipt",
+      name
+    );
+    assert.doesNotMatch(caught.message, /private-ingest-token|never-report/);
+  }
+});
+
+test("release receipt formatting requires exact published target identity", () => {
+  for (const result of [
+    null,
+    { status: "pending", ingestId: workerVersion, workerVersion },
+    {
+      status: "published",
+      ingestId: "52a07dbe-35f5-4d9c-9ffc-241d159022a8",
+      workerVersion
+    },
+    {
+      status: "published",
+      ingestId: workerVersion,
+      workerVersion: "52a07dbe-35f5-4d9c-9ffc-241d159022a8"
+    }
+  ]) {
+    assert.throws(
+      () => formatRemoteIngestReleaseReceipt(result, workerVersion),
+      /^Error: Remote generation command did not return one valid framed receipt$/
+    );
+  }
+});
 
 test("versioned deploys defer before handoff when exact verification would overlap :17", async (t) => {
   const cases = [

@@ -15,6 +15,11 @@ export const REMOTE_INGEST_POLL_INTERVAL_MS = 5_000;
 export const REMOTE_INGEST_TIMEOUT_MS = 10 * 60_000;
 export const REMOTE_INGEST_REQUEST_TIMEOUT_MS = 30_000;
 export const REMOTE_INGEST_HANDOFF_TIMEOUT_MS = 60_000;
+export const REMOTE_INGEST_RECEIPT_MODE_ENV =
+  "SURF_REMOTE_INGEST_RECEIPT_MODE";
+export const REMOTE_INGEST_RECEIPT_MODE_V1 = "release-v1";
+export const REMOTE_INGEST_RECEIPT_MARKER =
+  "@@SURF_REMOTE_INGEST_RECEIPT_V1@@";
 
 const HOUR_MS = 60 * 60_000;
 const SCHEDULED_INGEST_SETTLE_MS = 10 * 60_000;
@@ -26,6 +31,9 @@ const REMOTE_INGEST_HANDOFF_MAX_PROBES = 60;
 const REMOTE_INGEST_HANDOFF_BACKOFF_MS = [1_000, 2_000];
 const REMOTE_INGEST_PROBE_BACKOFF_MS = 1_000;
 const CRON_SAFE_DEFERRAL_MAX_SLEEP_ATTEMPTS = 3;
+const REMOTE_INGEST_RECEIPT_MAX_CHARS = 1_024;
+const REMOTE_INGEST_RECEIPT_ERROR =
+  "Remote generation command did not return one valid framed receipt";
 const REMOTE_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
 const REMOTE_ERROR_MAX_BYTES = 16 * 1024;
 const REMOTE_MAX_SPOTS = 64;
@@ -212,6 +220,81 @@ function exactObjectKeys(value, expectedKeys) {
     actualKeys.length === sortedExpectedKeys.length &&
     actualKeys.every((key, index) => key === sortedExpectedKeys[index])
   );
+}
+
+function validatedReleaseReceipt(payload, expectedWorkerVersion) {
+  if (
+    !isWorkerVersionId(expectedWorkerVersion) ||
+    !exactObjectKeys(payload, [
+      "schemaVersion",
+      "status",
+      "ingestId",
+      "workerVersion"
+    ]) ||
+    payload.schemaVersion !== 1 ||
+    payload.status !== "published" ||
+    payload.ingestId !== expectedWorkerVersion ||
+    payload.workerVersion !== expectedWorkerVersion
+  ) {
+    throw new Error(REMOTE_INGEST_RECEIPT_ERROR);
+  }
+  return Object.freeze({ ...payload });
+}
+
+export function formatRemoteIngestReleaseReceipt(
+  result,
+  expectedWorkerVersion
+) {
+  const receipt = validatedReleaseReceipt(
+    {
+      schemaVersion: 1,
+      status: result?.status,
+      ingestId: result?.ingestId,
+      workerVersion: result?.workerVersion
+    },
+    expectedWorkerVersion
+  );
+  return `${REMOTE_INGEST_RECEIPT_MARKER}${JSON.stringify(receipt)}`;
+}
+
+export function parseRemoteIngestReleaseReceipt(
+  output,
+  expectedWorkerVersion
+) {
+  if (typeof output !== "string") {
+    throw new Error(REMOTE_INGEST_RECEIPT_ERROR);
+  }
+
+  let markerCount = 0;
+  let frameLine = null;
+  for (const line of output.split(/\r?\n/)) {
+    let offset = 0;
+    while (true) {
+      const markerIndex = line.indexOf(REMOTE_INGEST_RECEIPT_MARKER, offset);
+      if (markerIndex === -1) break;
+      markerCount += 1;
+      offset = markerIndex + REMOTE_INGEST_RECEIPT_MARKER.length;
+    }
+    if (line.startsWith(REMOTE_INGEST_RECEIPT_MARKER)) frameLine = line;
+  }
+  if (markerCount !== 1 || frameLine === null) {
+    throw new Error(REMOTE_INGEST_RECEIPT_ERROR);
+  }
+
+  const encoded = frameLine.slice(REMOTE_INGEST_RECEIPT_MARKER.length);
+  if (encoded.length === 0 || encoded.length > REMOTE_INGEST_RECEIPT_MAX_CHARS) {
+    throw new Error(REMOTE_INGEST_RECEIPT_ERROR);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(encoded);
+  } catch {
+    throw new Error(REMOTE_INGEST_RECEIPT_ERROR);
+  }
+  if (encoded !== JSON.stringify(payload)) {
+    throw new Error(REMOTE_INGEST_RECEIPT_ERROR);
+  }
+  return validatedReleaseReceipt(payload, expectedWorkerVersion);
 }
 
 function isJsonContentType(value) {
