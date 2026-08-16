@@ -25,6 +25,7 @@ const REMOTE_INGEST_HANDOFF_MAX_SESSIONS = 60;
 const REMOTE_INGEST_HANDOFF_MAX_PROBES = 60;
 const REMOTE_INGEST_HANDOFF_BACKOFF_MS = [1_000, 2_000];
 const REMOTE_INGEST_PROBE_BACKOFF_MS = 1_000;
+const CRON_SAFE_DEFERRAL_MAX_SLEEP_ATTEMPTS = 3;
 const REMOTE_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
 const REMOTE_ERROR_MAX_BYTES = 16 * 1024;
 const REMOTE_MAX_SPOTS = 64;
@@ -96,25 +97,42 @@ async function waitForCronSafeDeployWindow(options) {
       handoffTimeoutMs
     })
   );
-  await sleep(delayMs);
-  const resumedAtMs = now();
-  if (!Number.isFinite(resumedAtMs) || resumedAtMs < resumeAtMs) {
-    throw new Error(
-      "remote ingest cron-safety wait ended before the required settle boundary; mutation did not begin"
-    );
-  }
-  if (
-    cronSafeDeployDeferralMs(
-      resumedAtMs,
-      verificationTimeoutMs,
-      handoffTimeoutMs
-    ) !== 0
+  let previousAtMs = observedAtMs;
+  for (
+    let attempt = 1;
+    attempt <= CRON_SAFE_DEFERRAL_MAX_SLEEP_ATTEMPTS;
+    attempt += 1
   ) {
-    throw new Error(
-      "remote ingest cron-safety wait did not reach a safe verification window; mutation did not begin"
-    );
+    await sleep(resumeAtMs - previousAtMs);
+    const resumedAtMs = now();
+    if (!Number.isFinite(resumedAtMs)) {
+      throw new Error(
+        "remote ingest cron-safety clock became invalid during deferral; mutation did not begin"
+      );
+    }
+    if (resumedAtMs <= previousAtMs) {
+      throw new Error(
+        "remote ingest cron-safety clock did not advance during deferral; mutation did not begin"
+      );
+    }
+    previousAtMs = resumedAtMs;
+    if (resumedAtMs < resumeAtMs) continue;
+    if (
+      cronSafeDeployDeferralMs(
+        resumedAtMs,
+        verificationTimeoutMs,
+        handoffTimeoutMs
+      ) !== 0
+    ) {
+      throw new Error(
+        "remote ingest cron-safety wait did not reach a safe verification window; mutation did not begin"
+      );
+    }
+    return resumedAtMs;
   }
-  return resumedAtMs;
+  throw new Error(
+    "remote ingest cron-safety wait ended before the required settle boundary; mutation did not begin"
+  );
 }
 
 function assertCronSafeAuthenticatedMutationWindow(now, verificationTimeoutMs) {
@@ -1033,6 +1051,7 @@ export async function inspectRemoteForecastReadModels(options) {
     ingestId,
     requestedAt,
     forecastGeneratedAt = requestedAt,
+    inspectionMode = "strict",
     fetcher = globalThis.fetch,
     expectedVersionId,
     expectedWorkerName,
@@ -1052,6 +1071,9 @@ export async function inspectRemoteForecastReadModels(options) {
   }
   if (!(requestTimeoutMs > 0)) {
     throw new Error("remote ingest request timeout must be positive");
+  }
+  if (!["strict", "pre-enqueue"].includes(inspectionMode)) {
+    throw new Error("remote ingest inspection mode is invalid");
   }
 
   const spotIds =
@@ -1078,6 +1100,17 @@ export async function inspectRemoteForecastReadModels(options) {
     requestTimeoutMs
   );
   if (state.status === "superseded") {
+    if (inspectionMode === "pre-enqueue") {
+      // Before the authenticated PATCH, a newer cron lineage proves only that
+      // this target is absent. The caller may enqueue a fresh target lineage.
+      // Post-enqueue polling uses waitForRemoteForecastReadModels and keeps
+      // supersession terminal so mixed-lineage publication cannot pass.
+      return Object.freeze({
+        status: "target-absent",
+        ingestId,
+        reason: "newer-non-target-lineage"
+      });
+    }
     throw new Error(
       `queued ingest ${ingestId} was superseded before release reconciliation; target=${state.spotId}:${state.interval}`
     );

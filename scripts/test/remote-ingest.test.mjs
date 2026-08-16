@@ -261,8 +261,49 @@ test("versioned deploys defer before handoff when exact verification would overl
   }
 });
 
-test("cron safety fails closed before networking when the wait ends early", async () => {
+test("cron safety retries a one-millisecond early wake before networking", async () => {
   let clock = Date.parse("2026-08-04T06:13:19.808Z");
+  const resumeAt = Date.parse("2026-08-04T06:27:00.000Z");
+  const delays = [];
+  let networkRequests = 0;
+  const result = await enqueueAndWaitForRemoteIngest({
+    baseUrl,
+    token: "secret-token",
+    expectedVersionId: workerVersion,
+    expectedWorkerName: workerName,
+    now: () => clock,
+    sleep: async (delayMs) => {
+      assert.equal(networkRequests, 0);
+      delays.push(delayMs);
+      clock += delays.length === 1 ? delayMs - 1 : delayMs;
+    },
+    logger: silentLogger,
+    fetcher: async (input, init = {}) => {
+      assert.ok(clock >= resumeAt, "networking must wait for the absolute settle boundary");
+      networkRequests += 1;
+      const url = new URL(String(input));
+      const headers = new Headers(init.headers);
+      if (url.pathname === "/api/spots") return versionedJson({ spots: [spot] });
+      if (url.pathname === "/api/ingest/once" && init.method === "PATCH") {
+        return headers.has("Authorization")
+          ? acceptedDeployResponse()
+          : versionedUnauthorized();
+      }
+      if (url.pathname === "/api/forecast-readiness") {
+        return versionedReadinessResponse();
+      }
+      return new Response("unexpected request", { status: 500 });
+    }
+  });
+  assert.equal(result.status, "published");
+  assert.deepEqual(delays, [820_192, 1]);
+  assert.equal(clock, resumeAt);
+  assert.ok(networkRequests > 0);
+});
+
+test("cron safety bounds repeated early wakes before networking", async () => {
+  let clock = Date.parse("2026-08-04T06:13:19.808Z");
+  const delays = [];
   let networkRequests = 0;
   await assert.rejects(
     enqueueAndWaitForRemoteIngest({
@@ -272,7 +313,8 @@ test("cron safety fails closed before networking when the wait ends early", asyn
       expectedWorkerName: workerName,
       now: () => clock,
       sleep: async (delayMs) => {
-        clock += delayMs - 1;
+        delays.push(delayMs);
+        clock += delays.length === 1 ? delayMs - 3 : 1;
       },
       logger: silentLogger,
       fetcher: async () => {
@@ -282,7 +324,42 @@ test("cron safety fails closed before networking when the wait ends early", asyn
     }),
     /cron-safety wait ended before the required settle boundary; mutation did not begin/
   );
+  assert.deepEqual(delays, [820_192, 3, 2]);
   assert.equal(networkRequests, 0);
+});
+
+test("cron safety rejects invalid or nonadvancing clocks after a deferred sleep", async (t) => {
+  const startedAt = Date.parse("2026-08-04T06:13:19.808Z");
+  for (const [name, resumedAt, expectedError] of [
+    ["nonadvancing", startedAt, /clock did not advance during deferral/],
+    ["invalid", Number.NaN, /clock became invalid during deferral/]
+  ]) {
+    await t.test(name, async () => {
+      let clockReads = 0;
+      let sleeps = 0;
+      let networkRequests = 0;
+      await assert.rejects(
+        enqueueAndWaitForRemoteIngest({
+          baseUrl,
+          token: "secret-token",
+          expectedVersionId: workerVersion,
+          expectedWorkerName: workerName,
+          now: () => (clockReads++ === 0 ? startedAt : resumedAt),
+          sleep: async () => {
+            sleeps += 1;
+          },
+          logger: silentLogger,
+          fetcher: async () => {
+            networkRequests += 1;
+            return new Response("unexpected request", { status: 500 });
+          }
+        }),
+        expectedError
+      );
+      assert.equal(sleeps, 1);
+      assert.equal(networkRequests, 0);
+    });
+  }
 });
 
 test("cron safety fails closed before networking when the wait overshoots into the next protected window", async () => {
@@ -534,6 +611,43 @@ test("release reconciliation inspects an existing ingest lineage without enqueue
     ingestId,
     pending: ["test-break:3h", "test-break:1h"]
   });
+});
+
+test("pre-enqueue reconciliation reports a newer non-target lineage as target-absent", async () => {
+  const newerGeneratedAt = "2026-08-03T01:17:00.000Z";
+  const fetcher = async () =>
+    readinessResponse(
+      readinessRows([spot], {
+        rowIngestId: "scheduled-ingest-after-release",
+        generatedAt: newerGeneratedAt,
+        materializedAt: "2026-08-03T01:18:00.000Z"
+      })
+    );
+
+  const result = await inspectRemoteForecastReadModels({
+    baseUrl,
+    ingestId,
+    requestedAt,
+    inspectionMode: "pre-enqueue",
+    spotIds: [spot.id],
+    fetcher
+  });
+  assert.deepEqual(result, {
+    status: "target-absent",
+    ingestId,
+    reason: "newer-non-target-lineage"
+  });
+
+  await assert.rejects(
+    inspectRemoteForecastReadModels({
+      baseUrl,
+      ingestId,
+      requestedAt,
+      spotIds: [spot.id],
+      fetcher
+    }),
+    /was superseded before release reconciliation/
+  );
 });
 
 test("remote ingest polling is bounded and names unpublished read models", async () => {

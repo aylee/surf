@@ -786,13 +786,16 @@ export function createWorkerReleaseOperations({
         ingestId: versionId,
         requestedAt: notBefore,
         forecastGeneratedAt: notBefore,
+        inspectionMode: "pre-enqueue",
         expectedVersionId: versionId,
         expectedWorkerName: context.workerName,
         fetcher
       });
-      return result.status === "published"
-        ? Object.freeze({ generationId: versionId })
-        : null;
+      if (result.status === "published") {
+        return Object.freeze({ generationId: versionId });
+      }
+      if (["pending", "target-absent"].includes(result.status)) return null;
+      throw new Error("Release generation inspection returned an invalid result");
     } finally {
       context.assertUnchanged();
     }
