@@ -841,6 +841,21 @@ async function revalidateD1BackupReceipt(fs, receipt) {
   return evidence;
 }
 
+export async function attestD1BackupReceiptArtifact(
+  receipt,
+  { fileSystem = nodeFs } = {}
+) {
+  const validated = validateD1BackupReceipt(receipt);
+  const evidence = await revalidateD1BackupReceipt(fileSystem, validated);
+  return Object.freeze({
+    databaseName: validated.databaseName,
+    bookmark: validated.bookmark,
+    exportPath: validated.exportPath,
+    exportBytes: evidence.bytes,
+    exportSha256: evidence.sha256
+  });
+}
+
 function exactLandedReceipt(evidence) {
   return validateD1BackupReceipt({
     schemaVersion: RELEASE_D1_BACKUP_RECEIPT_SCHEMA_VERSION,

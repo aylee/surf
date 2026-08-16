@@ -16,6 +16,7 @@ test("parses the supported owner interface without downgrade switches", () => {
     replacePreMutation: null,
     replaceBeforeUpload: null,
     replaceInactiveUpload: null,
+    replaceRunnerFailure: null,
     forceFull: false
   });
   assert.deepEqual(
@@ -29,6 +30,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       replacePreMutation: null,
       replaceBeforeUpload: null,
       replaceInactiveUpload: null,
+      replaceRunnerFailure: null,
       forceFull: false
     }
   );
@@ -60,6 +62,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       replacePreMutation: "failed-release",
       replaceBeforeUpload: null,
       replaceInactiveUpload: null,
+      replaceRunnerFailure: null,
       forceFull: false
     }
   );
@@ -88,6 +91,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       replacePreMutation: null,
       replaceBeforeUpload: "failed-before-upload",
       replaceInactiveUpload: null,
+      replaceRunnerFailure: null,
       forceFull: false
     }
   );
@@ -116,6 +120,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       replacePreMutation: null,
       replaceBeforeUpload: null,
       replaceInactiveUpload: "failed-inactive-upload",
+      replaceRunnerFailure: null,
       forceFull: false
     }
   );
@@ -126,6 +131,35 @@ test("parses the supported owner interface without downgrade switches", () => {
         "one",
         "--replace-inactive-upload",
         "two"
+      ]),
+    /mutually exclusive/
+  );
+  assert.deepEqual(
+    parseReleaseProdArguments([
+      "--plan",
+      "--replace-runner-failure",
+      "failed-runner-release"
+    ]),
+    {
+      plan: true,
+      yes: false,
+      sha: null,
+      resume: null,
+      fixForward: null,
+      replacePreMutation: null,
+      replaceBeforeUpload: null,
+      replaceInactiveUpload: null,
+      replaceRunnerFailure: "failed-runner-release",
+      forceFull: false
+    }
+  );
+  assert.throws(
+    () =>
+      parseReleaseProdArguments([
+        "--replace-runner-failure",
+        "runner-failure",
+        "--replace-inactive-upload",
+        "upload-failure"
       ]),
     /mutually exclusive/
   );

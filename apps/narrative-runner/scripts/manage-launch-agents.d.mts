@@ -1,5 +1,4 @@
-export type RunnerDrainReceipt = Readonly<{
-  schemaVersion: 1;
+type RunnerDrainReceiptFields = Readonly<{
   priorActivationId: string | null;
   priorReleaseSha: string;
   priorPid: number;
@@ -11,6 +10,11 @@ export type RunnerDrainReceipt = Readonly<{
   runnerLabelUnloaded: true;
   maxWaitMs: number;
 }>;
+
+export type RunnerDrainReceipt =
+  | (RunnerDrainReceiptFields & Readonly<{ schemaVersion: 1 }>)
+  | (RunnerDrainReceiptFields &
+      Readonly<{ schemaVersion: 2; heartbeatPid: number }>);
 
 export function activateLaunchAgents(
   options: {
@@ -33,7 +37,19 @@ export function canRecoverHaltedRunner(options: {
   targetRecord: Record<string, unknown>;
   heartbeat: Record<string, unknown>;
   labelUnloaded: boolean;
-  priorPid: number;
-  pidAlive: boolean;
+  drainIntent: Record<string, unknown>;
+  priorPidAlive: boolean;
+  heartbeatPidAlive: boolean;
+  nowMs: number;
+}): boolean;
+
+export function canRecoverStoppedChildRunner(options: {
+  priorRecord: Record<string, unknown>;
+  targetRecord: Record<string, unknown>;
+  heartbeat: Record<string, unknown>;
+  labelUnloaded: boolean;
+  drainIntent: Record<string, unknown>;
+  priorPidAlive: boolean;
+  heartbeatPidAlive: boolean;
   nowMs: number;
 }): boolean;
