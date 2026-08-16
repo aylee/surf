@@ -51,6 +51,31 @@ test("file fingerprints are order-independent and reject traversal", () => {
   }
 });
 
+test("source fingerprints ignore installed dependency links but reject source links", () => {
+  const root = mkdtempSync(join(tmpdir(), "surf-fingerprint-links-"));
+  try {
+    const packageRoot = join(root, "packages/contracts");
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(join(packageRoot, "index.ts"), "export const value = 1;\n");
+    const expected = fingerprintReleasePaths(root, ["packages/contracts"]);
+
+    mkdirSync(join(packageRoot, "node_modules"));
+    symlinkSync(root, join(packageRoot, "node_modules/typescript"));
+    assert.equal(
+      fingerprintReleasePaths(root, ["packages/contracts"]),
+      expected
+    );
+
+    symlinkSync(join(packageRoot, "index.ts"), join(packageRoot, "alias.ts"));
+    assert.throws(
+      () => fingerprintReleasePaths(root, ["packages/contracts"]),
+      /must not be a symlink/
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("config and digest snapshots reject symlink and oversized inputs", () => {
   const root = mkdtempSync(join(tmpdir(), "surf-config-snapshot-"));
   try {
