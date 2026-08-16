@@ -15,6 +15,10 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const PRODUCTION_ASSET_PATH_PATTERN = /^\/assets\/[A-Za-z0-9._/-]+$/;
 const STATIC_REFERENCE_PATH_PATTERN = /^\/[A-Za-z0-9._/-]+$/;
 const MAX_RETURNED_IDENTIFIER_LENGTH = 512;
+const CLOUDFLARE_WEB_ANALYTICS_MARKER =
+  'src="https://static.cloudflareinsights.com/beacon.min.js/';
+const CLOUDFLARE_WEB_ANALYTICS_SCRIPT_PATTERN =
+  /^<script type="module" src="https:\/\/static\.cloudflareinsights\.com\/beacon\.min\.js\/v([a-f0-9]{45})" integrity="sha512-([A-Za-z0-9+/]{86}==)" data-cf-beacon='([^'\r\n]{1,512})' crossorigin="anonymous"><\/script>$/;
 const JAVASCRIPT_CONTENT_TYPES = new Set([
   "application/javascript",
   "application/x-javascript",
@@ -860,6 +864,75 @@ function exactBuildManifest(bytes, sourceRevision, clientBuildDigest) {
   }
 }
 
+function literalOccurrenceCount(value, marker) {
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = value.indexOf(marker, offset);
+    if (index === -1) return count;
+    count += 1;
+    offset = index + marker.length;
+  }
+}
+
+function isCanonicalCloudflareWebAnalyticsScript(script) {
+  const match = CLOUDFLARE_WEB_ANALYTICS_SCRIPT_PATTERN.exec(script);
+  if (!match) return false;
+  const [, , encodedIntegrity, encodedConfiguration] = match;
+  const integrityBytes = Buffer.from(encodedIntegrity, "base64");
+  if (
+    integrityBytes.byteLength !== 64 ||
+    integrityBytes.toString("base64") !== encodedIntegrity
+  ) {
+    return false;
+  }
+  let configuration;
+  try {
+    configuration = JSON.parse(encodedConfiguration);
+  } catch {
+    return false;
+  }
+  if (
+    !configuration ||
+    typeof configuration !== "object" ||
+    Array.isArray(configuration) ||
+    Object.keys(configuration).join("\0") !== "version\0token\0r" ||
+    JSON.stringify(configuration) !== encodedConfiguration ||
+    typeof configuration.version !== "string" ||
+    !/^\d{4}\.\d{1,2}\.\d{1,3}$/.test(configuration.version) ||
+    typeof configuration.token !== "string" ||
+    !/^[a-f0-9]{32}$/.test(configuration.token) ||
+    configuration.r !== 1
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function remoteClientIndexMatchesExpected(remoteBytes, localBytes) {
+  if (remoteBytes.equals(localBytes)) return true;
+  const local = boundedUtf8(localBytes, "local client index");
+  const remote = boundedUtf8(remoteBytes, "remote client index");
+  if (
+    literalOccurrenceCount(local, CLOUDFLARE_WEB_ANALYTICS_MARKER) !== 0 ||
+    literalOccurrenceCount(remote, CLOUDFLARE_WEB_ANALYTICS_MARKER) !== 1
+  ) {
+    return false;
+  }
+  const closingBodyIndex = local.indexOf("</body>");
+  if (
+    closingBodyIndex === -1 ||
+    local.indexOf("</body>", closingBodyIndex + 1) !== -1
+  ) {
+    return false;
+  }
+  const prefix = local.slice(0, closingBodyIndex);
+  const suffix = `\n${local.slice(closingBodyIndex)}`;
+  if (!remote.startsWith(prefix) || !remote.endsWith(suffix)) return false;
+  const script = remote.slice(prefix.length, remote.length - suffix.length);
+  return isCanonicalCloudflareWebAnalyticsScript(script);
+}
+
 function assertOptions(options) {
   if (
     typeof options.fetcher !== "function" ||
@@ -1012,7 +1085,7 @@ export async function smokeStaticAssets(
     });
     assertWithinOverallDeadline();
     const localIndexSha256 = sha256(localIndex);
-    if (sha256(remoteIndex.bytes) !== localIndexSha256) {
+    if (!remoteClientIndexMatchesExpected(remoteIndex.bytes, localIndex)) {
       throw new Error("remote client index does not match the expected build");
     }
 
