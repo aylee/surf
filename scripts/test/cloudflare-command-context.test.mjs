@@ -308,9 +308,11 @@ function queueApiFixture(name, consumerOverrides = {}) {
     ["1".repeat(32)]: [
       {
         consumer_id: "a".repeat(32),
+        created_on: "2026-07-08T05:13:15.070235Z",
         type: "worker",
         script: name,
-        environment_name: "",
+        queue_id: "1".repeat(32),
+        queue_name: `${name}-ingest`,
         dead_letter_queue: `${name}-ingest-dlq`,
         settings: {
           batch_size: 1,
@@ -324,8 +326,11 @@ function queueApiFixture(name, consumerOverrides = {}) {
     ["5".repeat(32)]: [
       {
         consumer_id: "b".repeat(32),
+        created_on: "2026-08-10T23:43:22.880980Z",
         type: "worker",
         script_name: name,
+        queue_id: "5".repeat(32),
+        queue_name: `${name}-narrative-fallback`,
         settings: {
           batch_size: 1,
           max_retries: 0,
@@ -554,6 +559,32 @@ test("Queue consumer inspection attests every account Queue and configured setti
       }
     ]
   );
+});
+
+test("Queue consumer inspection rejects mismatched returned Queue identity", async () => {
+  const name = "queue-consumer-identity-surf";
+  const instance = fixture(name);
+  for (const [field, value] of [
+    ["queue_id", "2".repeat(32)],
+    ["queue_name", `${name}-ingest-dlq`]
+  ]) {
+    const api = queueApiFixture(name);
+    api.consumers["1".repeat(32)][0][field] = value;
+    const context = createCloudflareCommandContext({
+      ...instance,
+      environment: {
+        CLOUDFLARE_ACCOUNT_ID: "6".repeat(32),
+        CLOUDFLARE_API_TOKEN: "t".repeat(32)
+      },
+      fetcher: queueApiFetcher(api),
+      logger: { info() {} }
+    });
+
+    await assert.rejects(
+      context.inspectQueueConsumers(),
+      /returned an invalid Worker consumer/
+    );
+  }
 });
 
 test("Queue consumer inspection reports setting and exact environment drift", async () => {
