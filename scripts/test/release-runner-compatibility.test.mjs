@@ -34,6 +34,7 @@ const RUNNER_WRAPPER_PID = 4101;
 const OMLX_PID = 4102;
 const RUNNER_HEARTBEAT_PID = 4103;
 const PROCESS_STARTED_AT = "Sat Aug 15 19:00:00 2026";
+const SEMANTIC_RUNTIME_FINGERPRINT = "4".repeat(64);
 
 function sha256(contents) {
   return createHash("sha256").update(contents).digest("hex");
@@ -109,7 +110,7 @@ function status(overrides = {}) {
     activationId: ACTIVATION_ID,
     runnerArtifactSha256: ARTIFACT,
     sourceRevision: SOURCE_REVISION,
-    runtimeFingerprint: environmentFingerprint(),
+    runtimeFingerprint: SEMANTIC_RUNTIME_FINGERPRINT,
     acceptedProtocolFingerprints: [PROTOCOL],
     state: "idle",
     startedAt: "2026-08-15T19:00:00.000Z",
@@ -124,6 +125,41 @@ function status(overrides = {}) {
     lastErrorCode: null,
     ...overrides
   };
+}
+
+function liveCheck(statusFile, overrides = {}) {
+  const config = {
+    runnerId: "runner-test",
+    activationId: ACTIVATION_ID,
+    artifactSha256: ARTIFACT,
+    sourceRevision: SOURCE_REVISION,
+    acceptedProtocolFingerprints: [PROTOCOL],
+    runtimeFingerprint: SEMANTIC_RUNTIME_FINGERPRINT,
+    modelId: "model-test",
+    queueName: "surf-narrative",
+    queueDeadLetterName: "surf-narrative-dlq",
+    omlxThinkingEnabled: false,
+    concurrency: 1,
+    visibilityTimeoutMs: 900_000,
+    queueTimeoutMs: 30_000,
+    targetIds: ["surf.analysis.v5"],
+    statusFile,
+    ...overrides.config
+  };
+  return `${JSON.stringify({
+    command: "check",
+    config,
+    queue: {
+      ready: true,
+      code: null,
+      queueName: config.queueName,
+      consumerType: "http_pull",
+      deadLetterQueueName: config.queueDeadLetterName,
+      ...overrides.queue
+    },
+    omlx: { ready: true, code: null, ...overrides.omlx },
+    ...overrides.root
+  })}\n`;
 }
 
 function plist(recordPath, { records = [recordPath], command = "run" } = {}) {
@@ -262,7 +298,7 @@ function verificationDependencies(value, overrides = {}) {
       command: async (file, args) => {
         if (file === value.record.executables.node.path) {
           calls.push({ type: "health-check", file, args });
-          return { status: 0, stdout: "" };
+          return { status: 0, stdout: liveCheck(value.statusPath) };
         }
         if (file === "/bin/ps") {
           const pid = Number(args.at(-1));
@@ -300,7 +336,7 @@ test("trusted-id verification returns a bounded secret-free v4 compatibility rec
     runnerArtifactSha256: ARTIFACT,
     sourceRevision: SOURCE_REVISION,
     acceptedProtocolFingerprints: [PROTOCOL],
-    runtimeFingerprint: environmentFingerprint(),
+    runtimeFingerprint: SEMANTIC_RUNTIME_FINGERPRINT,
     resultTargetId: "surf.analysis.v5",
     bindingHmacs: {
       queue: receipt.bindingHmacs.queue,
@@ -319,6 +355,7 @@ test("trusted-id verification returns a bounded secret-free v4 compatibility rec
   assert.equal(serialized.includes(STATUS_HMAC_KEY), false);
   assert.equal(serialized.includes("https://surf.example"), false);
   assert.equal(serialized.includes("surf-narrative-dlq"), false);
+  assert.notEqual(SEMANTIC_RUNTIME_FINGERPRINT, environmentFingerprint());
   assert.deepEqual(calls[0], {
     type: "verify",
     recordPath: value.recordPath,
@@ -643,7 +680,7 @@ test("installed and loaded plist identity is exact and process-bound", async (t)
   });
 });
 
-test("fresh healthy status v3 must exactly match record identity", async (t) => {
+test("fresh healthy status v3 must match record and live semantic identity", async (t) => {
   const cases = [
     ["stale", { updatedAt: "2026-08-15T19:59:00.000Z" }, { maxStatusAgeMs: 1_000 }, /stale/],
     ["future", { updatedAt: "2026-08-15T20:01:00.000Z" }, {}, /future-dated/],
@@ -696,6 +733,103 @@ test("live Queue and model preflight is required after heartbeat attestation", a
     }),
     /live Queue and model preflight failed/
   );
+});
+
+test("pinned live check output must prove one exact semantic runner identity", async (t) => {
+  await t.test("semantic fingerprint mismatch", async () => {
+    const value = await fixture();
+    const base = verificationDependencies(value);
+    const command = base.dependencies.command;
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(verificationOptions(value), {
+        ...base.dependencies,
+        command: async (file, args, options) =>
+          file === value.record.executables.node.path
+            ? {
+                status: 0,
+                stdout: liveCheck(value.statusPath, {
+                  config: { runtimeFingerprint: "8".repeat(64) }
+                })
+              }
+            : command(file, args, options)
+      }),
+      /semantic identity differs/
+    );
+  });
+
+  for (const [name, makeStdout, message] of [
+    ["empty", () => "", /output is ambiguous/],
+    ["malformed", () => "{not-json}\n", /must contain valid JSON/],
+    [
+      "ambiguous",
+      (value) => `${liveCheck(value.statusPath)}${liveCheck(value.statusPath)}`,
+      /output is ambiguous/
+    ],
+    ["oversized", () => "x".repeat(64 * 1024 + 1), /output is invalid/]
+  ]) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      const base = verificationDependencies(value);
+      const command = base.dependencies.command;
+      await assert.rejects(
+        verifyActiveRunnerCompatibility(verificationOptions(value), {
+          ...base.dependencies,
+          command: async (file, args, options) =>
+            file === value.record.executables.node.path
+              ? { status: 0, stdout: makeStdout(value) }
+              : command(file, args, options)
+        }),
+        message
+      );
+    });
+  }
+
+  for (const [name, config, message] of [
+    ["runnerId mismatch", { runnerId: "other-runner" }, /semantic identity differs/],
+    [
+      "status-file mismatch",
+      { statusFile: "/different/status.json" },
+      /status file differs/
+    ]
+  ]) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      const base = verificationDependencies(value);
+      const command = base.dependencies.command;
+      await assert.rejects(
+        verifyActiveRunnerCompatibility(verificationOptions(value), {
+          ...base.dependencies,
+          command: async (file, args, options) =>
+            file === value.record.executables.node.path
+              ? {
+                  status: 0,
+                  stdout: liveCheck(value.statusPath, { config })
+                }
+              : command(file, args, options)
+        }),
+        message
+      );
+    });
+  }
+
+  await t.test("post-check status drift", async () => {
+    const value = await fixture();
+    const base = verificationDependencies(value);
+    const command = base.dependencies.command;
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(verificationOptions(value), {
+        ...base.dependencies,
+        command: async (file, args, options) => {
+          if (file === value.record.executables.node.path) {
+            await value.writeStatus({ runtimeFingerprint: "8".repeat(64) });
+            return { status: 0, stdout: liveCheck(value.statusPath) };
+          }
+          return command(file, args, options);
+        }
+      }),
+      /semantic identity differs/
+    );
+  });
 });
 
 test("account, Queue, DLQ, result target, callback, and result token must match exactly", async (t) => {
