@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { NARRATIVE_PROTOCOL_FINGERPRINT } from "@surf/narrative-contracts";
 import { loadRunnerConfig, redactedConfigSummary } from "../src/config";
 
 function validEnv(): NodeJS.ProcessEnv {
   return {
     NARRATIVE_RUNNER_ID: "macbook-runner",
+    NARRATIVE_RUNNER_ACTIVATION_ID: `${"a".repeat(40)}-r1`,
+    NARRATIVE_RUNNER_ARTIFACT_SHA256: "c".repeat(64),
     NARRATIVE_RUNNER_RELEASE_SHA: "a".repeat(40),
     NARRATIVE_RUNNER_STATUS_HMAC_KEY: "h".repeat(64),
     NARRATIVE_RUNNER_CF_API_BASE_URL: "https://api.cloudflare.com/client/v4",
@@ -37,7 +40,10 @@ describe("runner runtime configuration", () => {
     const summary = redactedConfigSummary(config);
     expect(summary).toMatchObject({
       runnerId: "macbook-runner",
-      releaseSha: "a".repeat(40),
+      activationId: `${"a".repeat(40)}-r1`,
+      artifactSha256: "c".repeat(64),
+      sourceRevision: "a".repeat(40),
+      acceptedProtocolFingerprints: [NARRATIVE_PROTOCOL_FINGERPRINT],
       runtimeFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
       modelId: "local-model",
       queueName: "surf-narrative",
@@ -75,6 +81,26 @@ describe("runner runtime configuration", () => {
       /must equal the immutable expected release SHA/
     );
     expect(() => load(mismatch, "")).toThrow(/expected release argument/);
+  });
+
+  it("binds status identity to the activation artifact while preserving source-mode defaults", () => {
+    const production = load();
+    expect(production.activationId).toBe(`${"a".repeat(40)}-r1`);
+    expect(production.artifactSha256).toBe("c".repeat(64));
+
+    const sourceMode = validEnv();
+    delete sourceMode.NARRATIVE_RUNNER_ACTIVATION_ID;
+    delete sourceMode.NARRATIVE_RUNNER_ARTIFACT_SHA256;
+    const local = load(sourceMode);
+    expect(local.activationId).toBe(`development-${"a".repeat(40)}`);
+    expect(local.artifactSha256).toMatch(/^[0-9a-f]{64}$/);
+
+    const paddedActivation = validEnv();
+    paddedActivation.NARRATIVE_RUNNER_ACTIVATION_ID = " activation-r1";
+    expect(() => load(paddedActivation)).toThrow(/surrounding whitespace/);
+    const paddedArtifact = validEnv();
+    paddedArtifact.NARRATIVE_RUNNER_ARTIFACT_SHA256 = `${"c".repeat(64)} `;
+    expect(() => load(paddedArtifact)).toThrow(/surrounding whitespace/);
   });
 
   it("requires an explicit expected Queue name for the ID-to-name preflight", () => {

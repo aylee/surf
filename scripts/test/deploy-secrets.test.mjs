@@ -49,7 +49,7 @@ function enabledConfig(queue = "surf-narrative") {
 }
 
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "surf-deploy-secrets-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "surf-deploy-secrets-")));
   const worker = join(root, "worker.env");
   const runner = join(root, "runner.env");
   const workerSnapshot = join(tmpdir(), `surf-worker-secrets-${basename(root)}.json`);
@@ -168,7 +168,7 @@ test("enabled deploys refuse Worker snapshot or runner environment drift", () =>
   assert.throws(runnerResolved.assertUnchanged, /deploy input changed/);
 });
 
-test("enabled deploys bind the Worker checkout to the runner release SHA", () => {
+test("legacy setup retains Worker/runner SHA equality", () => {
   const mismatch = fixture();
   writeFileSync(
     mismatch.runner,
@@ -182,7 +182,7 @@ test("enabled deploys bind the Worker checkout to the runner release SHA", () =>
         environment: deployEnvironment(mismatch),
         root: mismatch.root
       }),
-    /must match the exact Worker deploy checkout HEAD/
+    /Legacy setup requires/
   );
 
   const branch = fixture();

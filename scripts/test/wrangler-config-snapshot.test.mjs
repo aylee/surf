@@ -73,6 +73,65 @@ test("stages one release-bound private Wrangler snapshot and verifies its hash",
   }
 });
 
+test("pins exact release identity into the private snapshot", () => {
+  const candidate = fixture();
+  try {
+    const staged = stageWranglerConfigSnapshot({
+      ...candidate,
+      releaseIdentity: {
+        sourceRevision: "1".repeat(40),
+        workerRuntimeDigest: "2".repeat(64),
+        clientBuildDigest: "3".repeat(64)
+      }
+    });
+    assert.equal(staged.config.vars.SURF_SOURCE_REVISION, "1".repeat(40));
+    assert.equal(
+      staged.config.vars.SURF_WORKER_RUNTIME_DIGEST,
+      "2".repeat(64)
+    );
+    assert.equal(staged.config.vars.SURF_CLIENT_BUILD_DIGEST, "3".repeat(64));
+  } finally {
+    rmSync(candidate.root, { recursive: true, force: true });
+  }
+});
+
+test("repins a trusted private source from a prior immutable release layout", () => {
+  const candidate = fixture();
+  try {
+    const source = parse(readFileSync(candidate.sourcePath, "utf8"));
+    const prior = "/srv/surf/releases/" + "a".repeat(40);
+    source.$schema = `${prior}/apps/web/node_modules/wrangler/config-schema.json`;
+    source.main = `${prior}/apps/web/worker/index.ts`;
+    source.assets.directory = `${prior}/apps/web/dist/client`;
+    source.d1_databases[0].migrations_dir = `${prior}/packages/db/migrations`;
+    writeFileSync(candidate.sourcePath, `${JSON.stringify(source)}\n`, { mode: 0o600 });
+    const staged = stageWranglerConfigSnapshot(candidate);
+    assert.equal(staged.config.main.endsWith("/apps/web/worker/index.ts"), true);
+  } finally {
+    rmSync(candidate.root, { recursive: true, force: true });
+  }
+});
+
+test("rejects incomplete release identity before writing", () => {
+  const candidate = fixture();
+  try {
+    assert.throws(
+      () =>
+        stageWranglerConfigSnapshot({
+          ...candidate,
+          releaseIdentity: {
+            sourceRevision: "1".repeat(40),
+            clientBuildDigest: "3".repeat(64)
+          }
+        }),
+      /must contain exactly/
+    );
+    assert.throws(() => readFileSync(candidate.outputPath), /ENOENT/);
+  } finally {
+    rmSync(candidate.root, { recursive: true, force: true });
+  }
+});
+
 test("rejects permissive, symlinked, in-release, and reused snapshot inputs", () => {
   const permissive = fixture();
   try {

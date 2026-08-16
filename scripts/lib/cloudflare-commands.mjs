@@ -29,6 +29,8 @@ export let activeWranglerConfigPath = initialWranglerPath
   : wranglerConfigPath;
 let useActiveConfigArgument = Boolean(initialWranglerPath);
 let pinnedWranglerConfigSha256 = null;
+const pinnedWranglerConfigEvidence = [];
+let bootstrapIdentityRepinned = false;
 let cloudflareCommandGuard = null;
 
 export function setCloudflareCommandGuard(guard) {
@@ -63,9 +65,44 @@ export function pinActiveWranglerConfigForDeploy(
   activeWranglerConfigPath = pinned.path;
   useActiveConfigArgument = true;
   pinnedWranglerConfigSha256 = pinned.sha256;
+  pinnedWranglerConfigEvidence.push(
+    Object.freeze({ path: pinned.path, sha256: pinned.sha256 })
+  );
   console.log(
     JSON.stringify({
       status: "wrangler-config-pinned",
+      path: pinned.path,
+      sha256: pinned.sha256,
+      workerName: pinned.config.name
+    })
+  );
+  return pinned;
+}
+
+export function repinActiveWranglerConfigForBootstrap({ path, sha256 }) {
+  if (!pinnedWranglerConfigSha256) {
+    throw new Error(
+      "Bootstrap identity cannot replace an unpinned Wrangler configuration"
+    );
+  }
+  if (bootstrapIdentityRepinned) {
+    throw new Error("Bootstrap Wrangler release identity is already pinned");
+  }
+  const pinned = verifyWranglerConfigSnapshot({
+    path,
+    releaseRoot: repoRoot,
+    expectedSha256: sha256
+  });
+  activeWranglerConfigPath = pinned.path;
+  useActiveConfigArgument = true;
+  pinnedWranglerConfigSha256 = pinned.sha256;
+  pinnedWranglerConfigEvidence.push(
+    Object.freeze({ path: pinned.path, sha256: pinned.sha256 })
+  );
+  bootstrapIdentityRepinned = true;
+  console.log(
+    JSON.stringify({
+      status: "bootstrap-wrangler-identity-pinned",
       path: pinned.path,
       sha256: pinned.sha256,
       workerName: pinned.config.name
@@ -82,12 +119,13 @@ export function selectTrackedWranglerConfigForSecretlessDryRun() {
 }
 
 function assertPinnedWranglerConfigUnchanged() {
-  if (!pinnedWranglerConfigSha256) return;
-  verifyWranglerConfigSnapshot({
-    path: activeWranglerConfigPath,
-    releaseRoot: repoRoot,
-    expectedSha256: pinnedWranglerConfigSha256
-  });
+  for (const evidence of pinnedWranglerConfigEvidence) {
+    verifyWranglerConfigSnapshot({
+      path: evidence.path,
+      releaseRoot: repoRoot,
+      expectedSha256: evidence.sha256
+    });
+  }
 }
 
 function displayCommand(args) {

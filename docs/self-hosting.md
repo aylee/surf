@@ -134,25 +134,34 @@ ensures the named Queues exist without calling Cloudflare from the Worker.
 pnpm setup:cloudflare
 ```
 
+This is a bootstrap-only command for an instance that does not yet have a
+Worker and all required bindings. Do not use it to update or adopt an existing
+production instance; after the first healthy deployment, configure the
+production profile and use `pnpm release:prod` for every managed release.
+
 The first-install command checks authentication, ensures the named Queues,
-builds and validates the Worker, deploys while Wrangler provisions D1/R2,
-applies additive D1 migrations, upserts the reference seed, and runs a
-structure-only API smoke against the deployed URL. Provisioning and seed steps
-are idempotent.
+requires a clean Git worktree, builds and validates the Worker twice, deploys
+while Wrangler provisions D1/R2, applies additive D1 migrations, upserts the
+reference seed, and runs a structure-only API smoke against the deployed URL.
+The two builds prove that pinning the final release identity did not alter the
+Worker runtime digest. Provisioning and seed steps are idempotent.
 
 The setup command runs automatic provisioning in non-interactive mode so
 instance IDs stay in Cloudflare rather than being written into the tracked
 configuration. The config-hygiene check rejects owner-specific IDs. Initial
 setup is fail-closed unless `NARRATIVE_ENABLED=false`; finish storage and the
 out-of-band runner/HTTP-pull-consumer activation, then enable Analysis only
-through the staged update-deploy path. A first setup cannot use the update
-deploy's inactive-version capability gate because
+through the component-aware release path. A first setup cannot use the managed
+release's inactive-version capability gate because
 neither the Worker nor all bindings exist yet. Confirm Workers Paid first. It
 then deploys once before D1 can be migrated, so a plan/config rejection or
 migration failure can leave partially created resources or a temporarily
-uninitialized Worker. Read the reported error, fix it, and rerun the same
-command; do not delete resources to retry. If automatic provisioning is
-unavailable for an account, use
+uninitialized Worker. If the Worker was created, do not rerun bootstrap:
+preserve the printed identity snapshot receipt, configure the production
+profile, and use `pnpm release:prod` to adopt and fix forward. If the failure
+happened before the Worker was created, fix the reported error and rerun the
+bootstrap command. Do not delete resources to retry. If automatic provisioning
+is unavailable for an account, use
 [Cloudflare's manual resource setup](https://developers.cloudflare.com/workers/wrangler/configuration/#bindings)
 and a private external instance source plus activation snapshot rather than
 guessing IDs or committing account-specific values.
@@ -183,11 +192,16 @@ Add the D1 `database_id` and the instance-scoped R2 `bucket_name` only to the
 private source. `wrangler:snapshot` writes a mode-`0600`, non-symlink,
 single-activation file outside the checkout, pins every code/assets/migrations
 path to the exact checkout, and fails if that output path already contains
-different bytes. The setup/deploy helpers require its absolute path and exact
-SHA-256, and recheck both before every Wrangler command. Preserve the snapshot,
-hash, and release as one rollback unit. Use the documented `pnpm wrangler --
-...` wrapper for one-off commands so the same pinned configuration is applied
-to secrets and diagnostics too.
+different bytes. The bootstrap helper and one-off Wrangler wrapper require its
+absolute path and exact SHA-256, and recheck both before every Wrangler
+command. During `setup:cloudflare`, the helper writes a second durable
+mode-`0600` snapshot beside this input. Its filename and contents bind the
+nonzero exact Git source revision plus the canonical client and Worker runtime
+digests; the helper repins that snapshot before the first Queue, D1, or Worker
+mutation and prints its path/hash receipt. Preserve both snapshots, both hashes,
+and the source revision as one bootstrap evidence unit. Use the documented
+`pnpm wrangler -- ...` wrapper for one-off commands so the same pinned
+configuration is applied to secrets and diagnostics too.
 
 Keep the active config's `name` override-addressable: it must start with a
 lowercase letter and contain only lowercase letters, digits, and hyphens (for
@@ -212,32 +226,31 @@ Enter a long random value at the hidden prompt. When invoking the endpoint from
 your shell, provide the same value through the ignored environment variable
 `SURF_INGEST_TOKEN`; never paste it into a script or GitHub issue.
 
-Keep that variable available for later `pnpm deploy` runs. An update deploy
-requires `SURF_BASE_URL` and first reconciles configured Queues, because
-Wrangler prechecks them before it will upload a version. It then stages the
-exact target as an inactive Worker version. Cloudflare must accept the
-configured 2,000 ms CPU guard and the version-detail readback must match before
-the command mutates D1. An unsupported-plan or CPU-capability rejection can
-therefore leave newly created Queues, but never a D1 migration/seed from that
-deploy attempt. The command then
-prepares storage, rechecks that the original predecessor remains solely active,
-activates only the target at 100%, synchronizes triggers, proves the exact
-version is callable and ordinary routing has converged, then performs one
-unpinned authenticated PATCH with a Worker-enforced version precondition. Any
-newly migrated forecast read-model tables are populated before unpinned,
-exact-version strict smoke testing and a final 100% control-plane check.
-`versions upload` can emit a public preview URL; deployment never substitutes
-it for the configured production origin.
+Keep that variable in the private operator-environment file referenced by the
+[production profile](production-releases.md#one-time-profile). `pnpm
+release:prod` classifies the exact target before asking for confirmation. A
+proven assets-only release stages and activates the exact Worker without
+touching Queues, D1, triggers, ingest, or the runner. A conservative full
+release stages the target and requires Cloudflare to accept and read back the
+configured 2,000 ms CPU guard. It then performs only the component work selected
+by the attested impact vector: Queue reconciliation for Queue topology, a D1
+rollback pair plus storage work for migration/seed changes, runner verification
+or activation when Analysis compatibility is affected, trigger synchronization
+for trigger topology, and generation publication for materialization or catalog
+changes. Every lane rechecks the predecessor, activates only the target at
+100%, and performs exact-version smoke and final control-plane checks. `versions upload`
+can emit a public preview URL; release verification never substitutes it for a
+configured production origin.
 
 ### 5. Optional local-oMLX Analysis rollout
 
 The tracked configuration deliberately sets `NARRATIVE_ENABLED=false`. The
-authorized `pnpm setup:cloudflare` and `pnpm deploy` workflows call
-`ensureQueues()`, which inspects and idempotently provisions every configured
-Queue plus the matching narrative DLQ. Do not run an unconditional second
-`queues create` after those workflows. If an operator intentionally bypasses
-project setup, use the read-before-create manual alternative in
-[the runner guide](narrative-runner.md).
+bootstrap-only `pnpm setup:cloudflare` command and conservative `pnpm
+release:prod` lane call `ensureQueues()`, which inspects and idempotently
+provisions every configured Queue plus the matching narrative DLQ. Do not run
+an unconditional second `queues create` after those workflows. If an operator
+intentionally bypasses project setup, use the read-before-create manual
+alternative in [the runner guide](narrative-runner.md).
 
 After the disabled deployment is healthy:
 
@@ -245,24 +258,24 @@ After the disabled deployment is healthy:
 2. Add the narrative Queue's HTTP pull consumer and DLQ with the exact command
    in the runner guide. Do not add a Worker consumer to the local-primary
    Queue; the tracked Worker consumer belongs only to the fallback Queue.
-3. Create the external mode-0600 Wrangler source, Worker-secret source, and
-   runner environment described in the runner guide. Put
-   one password-manager-generated result token in both named result-token
-   fields and keep the Queue API token separate. Stage the Wrangler source into
-   a new absolute activation snapshot/hash, set a new
-   `SURF_WORKER_SECRETS_SNAPSHOT` path, and run
-   `narrative:stage-deploy-inputs`. Export only paths, the Wrangler SHA-256, and
-   no secret values. The staged deploy verifies the shared token, HMAC-pins the
-   effective secret inputs, and uploads only the Worker-secret activation
-   snapshot with the exact version; do not run a separate secret side-deploy.
+3. Create the external mode-`0600` Wrangler source, Worker-secret source,
+   runner-environment source, and operator environment described by the
+   production profile. Put one password-manager-generated result token in both
+   named result-token fields and keep the Queue API token separate. Do not
+   pre-stage a release-specific Wrangler or Worker-secret snapshot; `pnpm
+   release:prod` owns those snapshots, HMAC-pins their inputs, and supplies the
+   exact Worker-secret snapshot to the inactive Worker upload.
 4. Create a detached, clean release worktree at the exact merged SHA, run the
    frozen install there, and render both LaunchAgents by executing the renderer
-   from that release path. The activation record must reference the same
-   external runner environment, Wrangler snapshot/hash, and Worker-secret
-   snapshot validated by the deploy boundary. Install and activate only through
-   the runner guide's supported controller, which atomically installs attested
+   from that release path. The initial activation record owns the runner
+   bundle/manifest, runner environment and status path, accepted protocols,
+   model/executables, and rendered/installed plist identities. It must not
+   contain a Wrangler or Worker-secret snapshot. Install and activate only
+   through the runner guide's supported controller, which installs attested
    copies under `~/Library/LaunchAgents` so login/reboot reloads them. Never run
-   a production LaunchAgent from the developer checkout.
+   a production LaunchAgent from the developer checkout. Subsequent compatible
+   runner changes are activated by `pnpm release:prod`; an unchanged compatible
+   runner remains running.
 5. Preflight oMLX and run the runner's config/status checks through the
    immutable release's activation-record verifier as shown in the runner guide.
    It excludes ambient overrides and supplies the recorded release SHA to the
@@ -283,10 +296,12 @@ After the disabled deployment is healthy:
    or retrying messages. Consumer-list output is not a backlog proof. If either
    legacy gate is nonzero, leave v5 disabled and drain with the compatible
    predecessor; never let a v5-only runner ACK an old target.
-6. In the ignored instance config, change only `vars.NARRATIVE_ENABLED` to
-   `true`, then deploy through the normal version/readiness path **from the
-   same clean detached release worktree**. The deploy refuses a branch, dirty
-   tree, or `NARRATIVE_RUNNER_RELEASE_SHA` different from checkout `HEAD`.
+6. In the private Wrangler source, change only `vars.NARRATIVE_ENABLED` to
+   `true`, then deploy through `pnpm release:prod`. The command creates the
+   clean detached Worker release itself. The runner retains its own immutable
+   source revision; activation requires the exact narrative protocol and
+   Queue/callback/result-token binding proof rather than matching Worker and
+   runner Git SHAs.
 7. Trigger one fresh authorized ingest so the deployed Worker emits an
    `analysis-signal` and a real narrative job. Run `once` (or start `run run`),
    then require the selected `/brief` response to become `published` and
@@ -326,9 +341,10 @@ pnpm smoke:cloudflare
 ```
 
 The first `pnpm setup:cloudflare` remains structure-only and needs this manual
-population step. Subsequent `pnpm deploy` runs perform the same authenticated
-Queue ingest and bounded read-model publication check automatically before
-their strict smoke; rerunning these commands is a safe explicit verification.
+population step. Later releases perform the authenticated Queue ingest and
+bounded read-model publication check only when materialization or catalog/seed
+inputs changed. Proven assets-only and unrelated component releases omit that
+stateful work.
 
 `pnpm ingest:remote` returns after every configured spot's 1-hour and 3-hour
 read models expose the exact ingest ID acknowledged by the Worker, report a
@@ -402,37 +418,41 @@ requirement:
 }
 ```
 
-Stage the reconciled source to a new absolute external activation path, export
-the returned exact path/hash, then verify and deploy:
+Put the reconciled source and required secret/environment sources in the
+mode-`0600` production profile, then preview and release:
 
 ```bash
-activation_id="$(date -u +%Y%m%dT%H%M%SZ)-update"
-config_source="/Users/alex/Services/surf/config/wrangler.source.jsonc"
-config_snapshot="/Users/alex/Services/surf/config/activations/$activation_id/wrangler.instance.jsonc"
-install -d -m 0700 "$(dirname "$config_snapshot")"
-snapshot_json="$(pnpm wrangler:snapshot \
-  --source "$config_source" --output "$config_snapshot")"
-export SURF_WRANGLER_CONFIG="$(printf '%s' "$snapshot_json" | jq -er .path)"
-export SURF_WRANGLER_CONFIG_SHA256="$(printf '%s' "$snapshot_json" | jq -er .sha256)"
-pnpm verify
-export SURF_INGEST_TOKEN=<matching-secret-in-your-shell>
-pnpm deploy
+export SURF_PRODUCTION_PROFILE=/absolute/path/to/production-profile.json
+pnpm release:prod -- --plan
+pnpm release:prod
 ```
 
-All operational `pnpm wrangler -- ...` and `pnpm ops:status` calls require both
-exports, including canonical-name instances. Stage a new private snapshot from
-the tracked config when no instance overlay is needed; the mutable tracked file
-is never the active operational input. The exact local, secretless wrapper
-check `pnpm wrangler -- --version` is the only command that may omit the pair.
-An enabled Analysis v5 deploy must instead run from the exact clean detached
-release and activation input sequence in the narrative-runner section below;
-a mutable developer checkout is deliberately rejected.
+The preview performs exact target-owned read-only preparation: it fetches
+`origin/main`, creates or reuses the detached checkout, installs from the
+frozen lockfile, runs `pnpm verify`, builds all component identities, and
+inspects the live Worker/deployment plus trusted release/runner evidence before
+printing the proven lane and mutations. It writes no production journal and
+makes no Cloudflare, D1, Queue, secret, trigger, or LaunchAgent mutation.
 
-The deploy command reconciles Queues, stages and validates the target, applies
-migrations, activates the target, synchronizes triggers, refreshes the
-materialized forecast generation, and then runs the strict remote smoke.
-Wrangler requires Queues before staging, but a rejected CPU guard stops before
-D1; there is no Workers Free fallback. Because Wrangler can activate before a
+The release command creates and pins the release-specific config and secret
+snapshots internally. If no trusted active receipt exists, the first managed
+release takes the conservative full lane, records the live Worker/deployment as
+its external predecessor, and discovers the installed runner through its exact
+plist. Adoption does not require matching Worker and runner Git SHAs or adding
+Wrangler/Worker-secret artifacts to activation record v4. Direct operational
+`pnpm wrangler -- ...` and legacy
+`pnpm ops:status` calls still require the exact external snapshot path/hash
+pair recorded by the release journal. The exact local, secretless wrapper check
+`pnpm wrangler -- --version` is the only command that may omit that pair.
+
+The release command always stages and validates the inactive target, rechecks
+the predecessor, activates the exact target, and runs strict remote smoke. It
+reconciles Queues and triggers, backs up or mutates D1, activates the runner,
+and refreshes materialized forecasts only when their attested component
+fingerprints require that work; missing trust evidence selects every guarded
+step. Wrangler requires referenced Queues before staging, but a rejected CPU
+guard stops before D1; there is no Workers Free fallback. Because Wrangler can
+activate before a
 later observability patch fails, a nonzero activation command is reconciled
 against exact control-plane state before the workflow proceeds. Once Wrangler
 activates the version, any settings, trigger, readiness, publication, or smoke

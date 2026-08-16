@@ -91,6 +91,9 @@ export function heartbeatMatchesConfig(
   heartbeat: RunnerStatus | null,
   config: {
     runnerId: string;
+    activationId: string;
+    artifactSha256: string;
+    acceptedProtocolFingerprints: readonly string[];
     releaseSha: string;
     runtimeFingerprint: string;
     omlx: { modelId: string };
@@ -100,7 +103,15 @@ export function heartbeatMatchesConfig(
     heartbeat &&
       heartbeat.runnerId === config.runnerId &&
       heartbeat.modelId === config.omlx.modelId &&
-      heartbeat.releaseSha === config.releaseSha &&
+      heartbeat.activationId === config.activationId &&
+      heartbeat.runnerArtifactSha256 === config.artifactSha256 &&
+      heartbeat.sourceRevision === config.releaseSha &&
+      heartbeat.acceptedProtocolFingerprints.length ===
+        config.acceptedProtocolFingerprints.length &&
+      heartbeat.acceptedProtocolFingerprints.every(
+        (fingerprint, index) =>
+          fingerprint === config.acceptedProtocolFingerprints[index]
+      ) &&
       heartbeat.runtimeFingerprint === config.runtimeFingerprint
   );
 }

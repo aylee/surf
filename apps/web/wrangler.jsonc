@@ -43,6 +43,11 @@
     "ENVIRONMENT": "production",
     "SURF_REGION": "norcal",
     "SURF_USER_AGENT": "surf-self-hosted/1.0 (+https://github.com/aylee/surf)",
+    // Release tooling replaces these zero identities in the immutable private
+    // production snapshot after hashing the exact candidate artifacts.
+    "SURF_SOURCE_REVISION": "0000000000000000000000000000000000000000",
+    "SURF_WORKER_RUNTIME_DIGEST": "0000000000000000000000000000000000000000000000000000000000000000",
+    "SURF_CLIENT_BUILD_DIGEST": "0000000000000000000000000000000000000000000000000000000000000000",
     // Dormant v2 Agent rollback compatibility; Analysis v5 uses the separate
     // narrative Queue and local pull runner below.
     "FORECAST_BRIEF_ENABLED": "false",

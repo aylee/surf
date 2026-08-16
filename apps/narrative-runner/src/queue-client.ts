@@ -214,6 +214,7 @@ export class CloudflareQueueClient implements QueueClient {
     try {
       response = await this.fetcher(this.queueUrl, {
         method: "GET",
+        redirect: "error",
         headers: { Authorization: `Bearer ${this.config.apiToken}` },
         signal: AbortSignal.timeout(this.requestTimeoutMs)
       });
@@ -280,6 +281,7 @@ export class CloudflareQueueClient implements QueueClient {
     try {
       response = await this.fetcher(`${this.messagesUrl}/${path}`, {
         method: "POST",
+        redirect: "error",
         headers: {
           Authorization: `Bearer ${this.config.apiToken}`,
           "Content-Type": "application/json"

@@ -3,16 +3,14 @@ export type LaunchAgentRenderOptions = {
   repositoryPath: string;
   releaseSha: string;
   runnerEnvPath: string;
+  runnerArtifactPath: string;
+  runnerArtifactManifestPath?: string;
   launchAgentsDir?: string;
   runnerExitTimeoutSeconds: number | string;
-  pnpmPath: string;
   nodeBinPath: string;
   omlxPath: string;
   omlxDataPath: string;
   modelArtifactPath: string;
-  wranglerConfigPath: string;
-  wranglerConfigSha256: string;
-  workerSecretsPath: string;
   logDir: string;
   environment?: NodeJS.ProcessEnv;
 };
@@ -28,11 +26,19 @@ export function validateImmutableRelease(
 
 export function verifyLaunchActivation(
   recordPath: string,
-  options?: { requireInstalled?: boolean }
+  options?: { requireInstalled?: boolean; allowLegacyV3?: boolean }
 ): Promise<{
   status: "ok";
+  schemaVersion: 3 | 4;
+  transitionOnly: boolean;
+  activationId?: string;
   releaseSha: string;
   modelId: string;
-  wranglerConfigSha256: string;
+  runnerArtifactSha256?: string;
+  acceptedProtocols: Array<{
+    family: string;
+    version: number;
+    fingerprint: string;
+  }>;
   modelArtifactSha256: string;
 }>;

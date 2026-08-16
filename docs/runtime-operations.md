@@ -1,7 +1,9 @@
 # Runtime operations
 
-This runbook is instance-neutral. Run commands from the repository root. The
-Every operational `pnpm wrangler -- ...` call requires and hash-verifies the
+This runbook is instance-neutral. Run commands from the repository root.
+Routine production releases use the one-command workflow in
+[Production releases](production-releases.md). Every direct operational `pnpm
+wrangler -- ...` call requires and hash-verifies the
 absolute external `SURF_WRANGLER_CONFIG` activation snapshot and its
 `SURF_WRANGLER_CONFIG_SHA256` described in the self-hosting guide, including
 remote D1 and rollback commands. The sole exception is the exact local,
@@ -104,7 +106,7 @@ automation never changes account usage models, subscriptions, or billing. An
 existing version's `resources.script_runtime.usage_model = standard` is not
 proof of current account entitlement: a Worker on a Free account can still
 report that version metadata while rejecting a new custom CPU limit. For an
-existing Worker, `pnpm deploy` first idempotently reconciles configured Queues
+existing Worker, a conservative `pnpm release:prod` first idempotently reconciles configured Queues
 because Wrangler refuses `versions upload` when any referenced Queue is
 missing. It then stages the exact target. Acceptance by that upload API is the
 capability proof and gates every D1 migration/seed; Cloudflare error `100328`
@@ -117,7 +119,7 @@ bindings exist.
 
 Before deploying a CPU-limit change, record the active Worker version and a D1
 Time Travel bookmark. Run `pnpm check:cloudflare`, then deploy through the
-supported `pnpm deploy` path. That path uploads an inactive version, parses
+supported `pnpm release:prod` path. That path uploads an inactive version, parses
 Wrangler's exact `Worker Version ID`, and verifies the staged version reports
 the configured runtime guard before preparing D1. Queue reconciliation happens
 first because it is a Wrangler upload precondition. It activates only that ID
@@ -217,32 +219,33 @@ substitute a remote D1 command for this procedure.
 
 ## Post-merge routine
 
-Use the supported path in this order after a merge. Set `SURF_BASE_URL` to the
-bare HTTPS origin being checked; `SURF_WRANGLER_CONFIG` and
-`SURF_WRANGLER_CONFIG_SHA256` must select the preserved external activation
-snapshot. `ops:status` is strictly read-only and verifies that same snapshot
-before any health or Wrangler probe.
+The production profile owns the origins and private source paths. The release
+command fetches exact `origin/main`, creates a detached checkout, runs the full
+verification gate, previews the inferred mutations, asks once, and journals
+the result.
 
 ```bash
-pnpm verify
-pnpm deploy
-pnpm ops:status
-pnpm smoke:cloudflare
+pnpm release:prod -- --plan
+pnpm release:prod
+pnpm release:status
 ```
 
 Expected results:
 
-- `pnpm verify` completes the fresh-D1, test, build, and secretless bundle
-  gates before production changes.
-- `pnpm deploy` reconciles configured Queues, stages and verifies one inactive
-  target version, then prepares D1, rechecks the predecessor, activates only
-  the target, synchronizes triggers, publishes one complete generation, and
-  finishes its strict smoke. A staging or runtime-proof failure happens before
-  D1 mutation, although Queue creation may already have occurred. After Worker
-  activation, recover a failed settings patch, trigger, readiness, or
-  publication check by fixing forward; rollback still requires explicit Queue
+- `pnpm release:prod -- --plan` is read-only and fails closed to a conservative
+  lane until built identities exist.
+- `pnpm release:prod` runs `pnpm verify` and the deterministic identity builds
+  before confirmation. Proven assets-only changes skip D1, Queues, triggers,
+  ingest, and runner activation. The conservative lane derives a component
+  vector from the trusted active receipt: storage backup/mutation, Queue and
+  trigger reconciliation, runner activation, and generation run only when
+  their corresponding fingerprints changed. Unknown or untrusted inputs still
+  select the complete guarded sequence. After Worker activation, recover by
+  exact resume or a linked fix forward; rollback still requires explicit Queue
   quiescence and payload-compatibility proof.
-- `pnpm ops:status` prints four compact `PASS` rows: HTTPS health and the exact
+- `pnpm release:status` reads the private journal and distinct `active` and
+  `lastComplete` pointers without contacting Cloudflare.
+- The optional legacy `pnpm ops:status` prints four compact `PASS` rows: HTTPS health and the exact
   serving Worker version; one active deployment at 100%; one ingest consumer
   with batch/concurrency `1/1` and the configured DLQ; and one ready read-model
   row for each active spot/interval pair (`22/22` for the current 11-spot
@@ -387,7 +390,7 @@ Historical bootstrap note (retired): the one production Worker deployed before
 PATCH existed had a one-recovery exception. Its invocation shape was:
 
 ```bash
-SURF_LEGACY_PATCHLESS_WORKER_VERSION=<immutable-legacy-version-uuid> pnpm deploy
+SURF_LEGACY_PATCHLESS_WORKER_VERSION=<immutable-legacy-version-uuid> node scripts/cf-deploy.mjs deploy
 ```
 
 That exception was consumed during PR #20 and must not be set for current or
@@ -729,19 +732,18 @@ generated artifact checks, TypeScript and Python tests, production build, and
 a secretless Wrangler dry-run. It leaves the normal local development database
 untouched.
 
-For additive changes, back up D1 and export the required
-`SURF_INGEST_TOKEN`, set `SURF_BASE_URL` to the bare HTTPS production origin,
-then use the supported `pnpm deploy` path. Deployment first proves the
-predecessor is one version at 100% and reconciles configured Queues. Wrangler
-prechecks those Queues before `versions upload`, so Queue creation is the one
-allowed mutation before account capability is proven. Deployment then stages
-the exact target, parses Wrangler's `Worker Version ID`, and reads that inactive
-version back to require Standard plus `limits.cpu_ms = 2000`. Only then does it
-apply D1 migrations/seed. Immediately before activation it proves the original
-predecessor remains the sole 100% version, refusing to overwrite a concurrent
-deployment. It activates the target ID at 100% with `wrangler versions deploy`,
-synchronizes workers.dev, cron, and Queue-consumer triggers, proves the version
-is reachable with an exact override, and then requires
+Use the supported `pnpm release:prod` path for additive changes. The planner
+requires `SURF_INGEST_TOKEN` only when the inferred release will publish a new
+generation. It creates a Time Travel bookmark and SQL export only before a
+migration or seed change; reconciles Queues and triggers only for their
+topology impacts; and activates the runner only when its artifact changes.
+Unknown inputs deliberately select all of those guarded operations. Deployment
+stages the exact target, parses Wrangler's `Worker Version ID`, and reads that
+inactive version back to require Standard plus `limits.cpu_ms = 2000`.
+Immediately before activation it proves the original predecessor remains the
+sole 100% version, refusing to overwrite a concurrent deployment. It activates
+the target ID at 100% with `wrangler versions deploy`, proves the version is
+reachable with an exact override, and then requires
 three consecutive cache-busted, unpinned version-matched health responses
 before requiring the active deployment JSON to contain exactly that one version
 at 100%. It samples bounded fresh affinity sessions; a session freezes one key

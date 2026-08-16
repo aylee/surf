@@ -2,10 +2,17 @@ import {
   responseWorkerVersion,
   workerVersionRequestHeaders
 } from "./worker-version.mjs";
+import {
+  readBoundedResponseJson,
+  readBoundedResponseText
+} from "./bounded-http-response.mjs";
 
 export const SMOKE_REQUEST_TIMEOUT_MS = 15_000;
 export const SMOKE_TIMEOUT_MS = 2 * 60_000;
 export const SMOKE_ROUND_RETRY_INTERVAL_MS = 1_000;
+const SMOKE_JSON_MAX_BYTES = 4 * 1024 * 1024;
+const SMOKE_ERROR_MAX_BYTES = 16 * 1024;
+const SMOKE_MAX_SPOTS = 64;
 
 class WorkerVersionSkewError extends Error {
   constructor(path, actualVersionId, expectedVersionId) {
@@ -142,10 +149,16 @@ async function getJson(
       );
       if (!response.ok) {
         throw new Error(
-          `${label} ${path} failed: ${response.status} ${await response.text()}`
+          `${label} ${path} failed: ${response.status} ${await readBoundedResponseText(response, { maxBytes: SMOKE_ERROR_MAX_BYTES, label: `${label} ${path}` })}`
         );
       }
-      return { payload: await response.json(), workerVersion };
+      return {
+        payload: await readBoundedResponseJson(response, {
+          maxBytes: SMOKE_JSON_MAX_BYTES,
+          label: `${label} ${path}`
+        }),
+        workerVersion
+      };
     }
   );
 }
@@ -188,7 +201,10 @@ async function getForecastReadModel(
     async (response) => {
       await requireWorkerVersion(response, path, expectedVersionId);
       if (response.status === 503 && !requireForecastData) {
-        const body = await response.json().catch(() => null);
+        const body = await readBoundedResponseJson(response, {
+          maxBytes: SMOKE_JSON_MAX_BYTES,
+          label: `${label} ${path}`
+        }).catch(() => null);
         if (isRetryableForecastUnavailable(body, spot.id, interval)) {
           return { status: "pending", forecast: null };
         }
@@ -198,10 +214,16 @@ async function getForecastReadModel(
       }
       if (!response.ok) {
         throw new Error(
-          `${label} ${path} failed: ${response.status} ${await response.text()}`
+          `${label} ${path} failed: ${response.status} ${await readBoundedResponseText(response, { maxBytes: SMOKE_ERROR_MAX_BYTES, label: `${label} ${path}` })}`
         );
       }
-      return { status: "ready", forecast: await response.json() };
+      return {
+        status: "ready",
+        forecast: await readBoundedResponseJson(response, {
+          maxBytes: SMOKE_JSON_MAX_BYTES,
+          label: `${label} ${path}`
+        })
+      };
     }
   );
 }
@@ -275,7 +297,11 @@ async function smokeForecastRound(
   );
   const spots = spotsResponse.payload;
 
-  if (!Array.isArray(spots.spots) || spots.spots.length === 0) {
+  if (
+    !Array.isArray(spots.spots) ||
+    spots.spots.length === 0 ||
+    spots.spots.length > SMOKE_MAX_SPOTS
+  ) {
     throw new Error(`Expected at least one configured spot, got: ${JSON.stringify(spots)}`);
   }
 

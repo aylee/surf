@@ -5,6 +5,8 @@ Use the shortest document that answers the question.
 ## Operate your own instance
 
 - [Self-hosting](self-hosting.md) — clone, configure, deploy, and verify.
+- [Production releases](production-releases.md) — preview, release, resume,
+  fix forward, and inspect durable production state.
 - [Runtime operations](runtime-operations.md) — ingest, health checks, backup,
   update, retention, and rollback.
 - [Local narrative runner](narrative-runner.md) — oMLX pull-consumer setup,

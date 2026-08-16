@@ -4,6 +4,7 @@ import type {
   NarrativeJob,
   NarrativeResultResponse
 } from "@surf/narrative-contracts";
+import { NARRATIVE_PROTOCOL_FINGERPRINT } from "@surf/narrative-contracts";
 import type { RunnerConfig } from "../src/config";
 import { MemoryLogger } from "../src/logger";
 import type { OmlxClient, OmlxGeneration } from "../src/omlx-client";
@@ -219,6 +220,9 @@ type ConfigOverrides = Partial<Omit<RunnerConfig, "queue" | "omlx" | "targets">>
 export function makeConfig(overrides: ConfigOverrides = {}): RunnerConfig {
   const base: RunnerConfig = {
     runnerId: "runner-test",
+    activationId: `${"a".repeat(40)}-r1`,
+    artifactSha256: "c".repeat(64),
+    acceptedProtocolFingerprints: [NARRATIVE_PROTOCOL_FINGERPRINT],
     releaseSha: "a".repeat(40),
     runtimeFingerprint: "b".repeat(64),
     queue: {
@@ -291,10 +295,15 @@ export function makeRunnerHarness(options: {
   const clock = options.clock ?? new TestClock();
   const store = new MemoryStatusStore();
   const status = new StatusTracker(
-    config.runnerId,
-    config.omlx.modelId,
-    config.releaseSha,
-    config.runtimeFingerprint,
+    {
+      runnerId: config.runnerId,
+      modelId: config.omlx.modelId,
+      activationId: config.activationId,
+      runnerArtifactSha256: config.artifactSha256,
+      sourceRevision: config.releaseSha,
+      runtimeFingerprint: config.runtimeFingerprint,
+      acceptedProtocolFingerprints: config.acceptedProtocolFingerprints
+    },
     store,
     clock.now
   );

@@ -1,4 +1,7 @@
-import { lstatSync, readFileSync } from "node:fs";
+import { lstatSync } from "node:fs";
+import { readVerifiedFileSnapshot } from "./verified-file-snapshot.mjs";
+
+const MAX_ENVIRONMENT_FILE_BYTES = 1024 * 1024;
 
 export function assertMode0600RegularFile(path, label) {
   let metadata;
@@ -49,14 +52,13 @@ export function parseStrictDotenv(contents, label = "Environment file") {
 }
 
 export function readStrictDotenvFile(path, label = "Environment file") {
-  assertMode0600RegularFile(path, label);
-  let contents;
-  try {
-    contents = readFileSync(path, "utf8");
-  } catch {
-    throw new Error(`${label} could not be read.`);
-  }
-  return parseStrictDotenv(contents, label);
+  const snapshot = readVerifiedFileSnapshot(path, {
+    label,
+    maximumBytes: MAX_ENVIRONMENT_FILE_BYTES,
+    requireMode0600: true,
+    requireCanonical: true
+  });
+  return parseStrictDotenv(snapshot.contents.toString("utf8"), label);
 }
 
 export function assertSupportedRunnerEnvironment(values) {

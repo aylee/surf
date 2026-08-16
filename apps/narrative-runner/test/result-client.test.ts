@@ -25,6 +25,7 @@ describe("result callback client", () => {
     });
     const [url, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://result.example/api/internal/narratives/results");
+    expect(init.redirect).toBe("error");
     expect(init.headers).toMatchObject({
       Authorization: "Bearer secret",
       "Content-Type": "application/json"

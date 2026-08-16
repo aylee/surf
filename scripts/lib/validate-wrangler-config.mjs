@@ -139,11 +139,20 @@ export function wranglerStructureFailures(config, configPath) {
     (entry) => entry.name === "FORECAST_BRIEF_AGENT"
   );
   if (
+    briefBindings.length !== 1 ||
     briefBinding.length !== 1 ||
     briefBinding[0]?.class_name !== "ForecastBriefAgent"
   ) {
     failures.push(
       "FORECAST_BRIEF_AGENT must bind exactly once to ForecastBriefAgent."
+    );
+  }
+  if (
+    briefBinding.length === 1 &&
+    Object.keys(briefBinding[0]).sort().join(",") !== "class_name,name"
+  ) {
+    failures.push(
+      "FORECAST_BRIEF_AGENT must be a local binding with exactly name and class_name; script_name and environment are not allowed."
     );
   }
   const briefExport = config?.exports?.ForecastBriefAgent;
