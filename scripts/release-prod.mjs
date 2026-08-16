@@ -16,7 +16,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import {
   boundedReleasePreview,
@@ -35,6 +35,7 @@ import {
   RELEASE_POINTER_KINDS,
   assertBeforeUploadReplacementEvidence,
   assertInactiveUploadReplacementEvidence,
+  assertRunnerFailureReplacementTargetFingerprints,
   assertReleaseJournal,
   assertReleaseReplacement,
   assertReleaseSupersession,
@@ -116,6 +117,10 @@ import {
   commitInactiveUploadReplacement,
   previewInactiveUploadReplacement
 } from "./lib/release-inactive-upload-replacement.mjs";
+import {
+  establishRunnerFailureReplacement
+} from "./lib/release-runner-failure-replacement.mjs";
+import { createRunnerFailureRecoveryAttestor } from "./lib/release-runner-failure-attestation.mjs";
 
 const INTERNAL_ENV = "SURF_RELEASE_EXECUTION_ROOT";
 const TARGET_ENV = "SURF_RELEASE_TARGET_SHA";
@@ -412,6 +417,52 @@ function journalTargetForInactiveUploadReplacementRetry(profile, releaseId) {
   return failed.supersededBy.targetGitSha;
 }
 
+function isRunnerFailureReplacementBoundary(journal) {
+  const requiredReceiptKeys = new Set([
+    "profileSha256",
+    "operatorEnvironmentFingerprint",
+    "wranglerConfigSha256",
+    "workerSecretsFingerprint",
+    "workerVersionId",
+    "d1Bookmark",
+    "d1ExportSha256"
+  ]);
+  const exactRunnerFailure =
+    journal.lane === RELEASE_LANES.CONSERVATIVE_FULL &&
+    journal.resumeFrom === RELEASE_JOURNAL_STATES.DATA_PREPARED &&
+    journal.failureCode === RELEASE_FAILURE_CODES.RUNNER_FAILED &&
+    Object.entries(journal.receipts).every(([key, value]) =>
+      requiredReceiptKeys.has(key) ? value !== null : value === null
+    ) &&
+    journal.predecessor.workerVersionId !== null &&
+    journal.predecessor.deploymentId !== null &&
+    journal.predecessor.runnerActivationId !== null;
+  return (
+    exactRunnerFailure &&
+    (journal.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+      journal.supersededBy?.runnerFailureAttestation !== undefined)
+  );
+}
+
+function journalTargetForRunnerFailureReplacementRetry(profile, releaseId) {
+  const failed = recoveryJournal(profile, releaseId);
+  if (
+    failed.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE &&
+    isRunnerFailureReplacementBoundary(failed)
+  ) {
+    return null;
+  }
+  if (
+    failed.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+    !isRunnerFailureReplacementBoundary(failed)
+  ) {
+    throw new Error(
+      "Runner-failure replacement requires an exact data-prepared runner failure or its linked journal"
+    );
+  }
+  return failed.supersededBy.targetGitSha;
+}
+
 function runnerCompatibilityRequired(impact) {
   return (
     impact.workerRuntime ||
@@ -430,7 +481,7 @@ function generationRequired(impact) {
 
 function mutationsForClassification(
   classification,
-  { analysisEnabled = true } = {}
+  { analysisEnabled = true, restoreLegacyRunner = false } = {}
 ) {
   if (classification.lane === RELEASE_LANES.ASSETS_ONLY) {
     return [
@@ -443,6 +494,11 @@ function mutationsForClassification(
   }
   const impact = classification.impact;
   const mutations = ["stage private release config and Worker-secret snapshots"];
+  if (restoreLegacyRunner) {
+    mutations.unshift(
+      "restore and re-attest the exact installed legacy v3 runner"
+    );
+  }
   if (impact.queueTopology) {
     mutations.push("reconcile configured Queue names");
   }
@@ -504,12 +560,19 @@ async function outerMain(options) {
           options.replaceInactiveUpload
         )
       : null;
+    const linkedRunnerFailureReplacementSha = options.replaceRunnerFailure
+      ? journalTargetForRunnerFailureReplacementRetry(
+          profile,
+          options.replaceRunnerFailure
+        )
+      : null;
     fetchTarget(profile.repositoryPath);
     const linkedTargetSha =
       linkedFixForwardSha ??
       linkedPreMutationReplacementSha ??
       linkedBeforeUploadReplacementSha ??
-      linkedInactiveUploadReplacementSha;
+      linkedInactiveUploadReplacementSha ??
+      linkedRunnerFailureReplacementSha;
     if (linkedTargetSha !== null) {
       if (options.sha !== null && options.sha !== linkedTargetSha) {
         throw new Error(
@@ -819,7 +882,8 @@ async function internalMain(options) {
     options.fixForward ??
     options.replacePreMutation ??
     options.replaceBeforeUpload ??
-    options.replaceInactiveUpload;
+    options.replaceInactiveUpload ??
+    options.replaceRunnerFailure;
   for (const journalBatch of store.scanJournalBatches()) {
     for (const journal of journalBatch) {
       if (journal.state === RELEASE_JOURNAL_STATES.SUPERSEDED) {
@@ -843,12 +907,18 @@ async function internalMain(options) {
           journal.supersededBy.inactiveUploadAttestation !== undefined;
         const beforeUpload =
           journal.supersededBy.beforeUploadAttestation !== undefined;
-        const selectedReplacementId = inactiveUpload
+        const runnerFailure =
+          journal.supersededBy.runnerFailureAttestation !== undefined;
+        const selectedReplacementId = runnerFailure
+          ? options.replaceRunnerFailure
+          : inactiveUpload
           ? options.replaceInactiveUpload
           : beforeUpload
             ? options.replaceBeforeUpload
             : options.replacePreMutation;
-        const recoveryOption = inactiveUpload
+        const recoveryOption = runnerFailure
+          ? "--replace-runner-failure"
+          : inactiveUpload
           ? "--replace-inactive-upload"
           : beforeUpload
             ? "--replace-before-upload"
@@ -1432,6 +1502,12 @@ async function internalMain(options) {
         }
       });
     };
+    const attestRunnerFailureReplacement =
+      createRunnerFailureRecoveryAttestor({
+        profile,
+        environment,
+        store
+      });
     const liveVersionDetail = finalProbeContext.runWrangler(
       ["versions", "view", livePredecessorVersionId, "--json"],
       { capture: true, echo: false }
@@ -1511,7 +1587,11 @@ async function internalMain(options) {
         RELEASE_CLASSIFICATION_REASON_CODES.FIX_FORWARD_REQUIRED
       );
     }
-    if (options.replaceBeforeUpload || options.replaceInactiveUpload) {
+    if (
+      options.replaceBeforeUpload ||
+      options.replaceInactiveUpload ||
+      options.replaceRunnerFailure
+    ) {
       classification = forceConservativeReleaseClassification(classification);
     }
     let managedJournal = resumeJournal;
@@ -1519,6 +1599,7 @@ async function internalMain(options) {
     let preMutationReplacementSource = null;
     let beforeUploadReplacementSource = null;
     let inactiveUploadReplacementSource = null;
+    let runnerFailureReplacementSource = null;
     let predecessor;
     if (options.resume) {
       classification = managedJournal.classification;
@@ -1684,6 +1765,47 @@ async function internalMain(options) {
         failed.state === RELEASE_JOURNAL_STATES.REPLACED
           ? predecessorForReleaseReplacement(failed)
           : failed.predecessor;
+    } else if (options.replaceRunnerFailure) {
+      const failed = store.readJournal(options.replaceRunnerFailure);
+      if (
+        !failed ||
+        ![
+          RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
+          RELEASE_JOURNAL_STATES.REPLACED
+        ].includes(failed.state) ||
+        !isRunnerFailureReplacementBoundary(failed)
+      ) {
+        throw new Error(
+          "Runner-failure replacement must name an exact data-prepared runner failure or its linked journal"
+        );
+      }
+      if (
+        activePointer?.releaseId === failed.releaseId ||
+        lastCompletePointer?.releaseId === failed.releaseId
+      ) {
+        throw new Error(
+          "Runner-failure replacement cannot target an active or last-complete release"
+        );
+      }
+      if (failed.targetGitSha === targetGitSha) {
+        throw new Error(
+          "Runner-failure replacement requires a new target SHA; the failed SHA cannot repair its release tool"
+        );
+      }
+      if (
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED &&
+        failed.supersededBy.targetGitSha !== targetGitSha
+      ) {
+        throw new Error(
+          "Linked runner-failure replacement target differs from its immutable journal"
+        );
+      }
+      runnerFailureReplacementSource = failed;
+      assertRunnerFailureReplacementTargetFingerprints(failed, fingerprints);
+      predecessor =
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED
+          ? predecessorForReleaseReplacement(failed)
+          : failed.predecessor;
     } else if (activeJournal) {
       predecessor = predecessorFromJournal(activeJournal, activePointer.journalSha256);
     } else {
@@ -1756,6 +1878,7 @@ async function internalMain(options) {
       preMutationReplacementSource?.supersededBy?.releaseId ??
       beforeUploadReplacementSource?.supersededBy?.releaseId ??
       inactiveUploadReplacementSource?.supersededBy?.releaseId ??
+      runnerFailureReplacementSource?.supersededBy?.releaseId ??
       releaseIdFor(targetGitSha);
     const analysisEnabled =
       finalProbeContext.readConfig().vars?.NARRATIVE_ENABLED === "true";
@@ -1768,7 +1891,10 @@ async function internalMain(options) {
       mismatchKeys: classification.mismatchKeys,
       predecessorWorkerVersionId: livePredecessorVersionId,
       mutations: mutationsForClassification(classification, {
-        analysisEnabled
+        analysisEnabled,
+        restoreLegacyRunner:
+          runnerFailureReplacementSource?.state ===
+          RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE
       })
     });
     if (options.plan) {
@@ -1876,6 +2002,34 @@ async function internalMain(options) {
       }
       predecessor = predecessorForReleaseReplacement(
         inactiveUploadReplacementSource
+      );
+    }
+
+    if (runnerFailureReplacementSource) {
+      const established = await establishRunnerFailureReplacement(
+        runnerFailureReplacementSource,
+        {
+          releaseId,
+          targetGitSha,
+          at: new Date().toISOString(),
+          attest: attestRunnerFailureReplacement,
+          persistReplaced: (journal) => store.writeJournal(journal),
+          createSuccessor: ({ predecessor: replacementPredecessor }) =>
+            createReleaseJournal({
+              releaseId,
+              targetGitSha,
+              classification,
+              targetFingerprints: fingerprints,
+              predecessor: replacementPredecessor,
+              createdAt: new Date().toISOString()
+            }),
+          persistSuccessor: (journal) => store.writeJournal(journal)
+        }
+      );
+      runnerFailureReplacementSource = established.replaced;
+      managedJournal = established.successor;
+      predecessor = predecessorForReleaseReplacement(
+        runnerFailureReplacementSource
       );
     }
 

@@ -227,6 +227,46 @@ process stops after writing that terminal link, rerunning the same command is
 pinned to the linked SHA and uses the immutable attestation instead of reading
 mutable recovery evidence again.
 
+A runner failure after the Worker upload and D1 checkpoint has its own narrow
+new-SHA recovery. It is not an alias for `--resume`, because the failed
+checkout owns the broken release controller:
+
+```bash
+pnpm release:prod --plan --replace-runner-failure FAILED_RELEASE_ID
+pnpm release:prod --replace-runner-failure FAILED_RELEASE_ID
+```
+
+This command accepts only a conservative-full `runner_failed` journal whose
+resume boundary is exactly `data-prepared`, with the four preparation receipts,
+one inactive Worker receipt, and the complete D1 bookmark/export pair. No
+runner-drain, runner-activation, deployment, or generation receipt may exist.
+The replacement target must be a distinct freshly fetched `origin/main` SHA.
+Every target fingerprint except `runnerArtifact` and `releaseTooling` must
+remain byte-identical to the failed release, and at least one of those two
+repair fingerprints must change. The successor is always forced through the
+conservative-full lane.
+
+After confirmation, the controller proves the sole active Worker/deployment is
+still the original predecessor; the failed Worker is the exact tagged inactive
+version; Queue identities predate that predecessor; and the mode-`0600`
+Worker-upload and D1-backup receipts match the journal and full SQL export. The
+actual command first
+uses the existing bounded rollback controller on the installed legacy v3
+activation itself. That controller restores the exact recorded LaunchAgents
+when necessary and returns only after their pinned `check` and `status`
+commands pass. The release controller repeats that health proof and rehashes
+the full D1 export immediately before writing the terminal link. `--plan`
+remains mutation-free and reports this restoration as a planned mutation.
+
+The terminal replacement link retains only bounded IDs, hashes, sizes, and
+canonical control-plane evidence—never secret values or artifact paths. The
+successor is an ordinary conservative-full release: it drains the now-live v3
+runner through the standard dual-PID v2 transition, with no recovery-only
+runner protocol or resume authority. If interrupted after the terminal link,
+rerunning the same replacement command stays pinned to its linked SHA and
+creates the exact successor without repeating the recovery mutation. Once the
+successor journal exists, normal `--resume` semantics apply.
+
 There is no automatic production rollback after Worker activation. A Queue,
 schema, or protocol boundary may already have been crossed; follow the
 quiescence procedure in [Runtime operations](runtime-operations.md) before any

@@ -11,6 +11,7 @@ export function parseReleaseProdArguments(argv) {
     replacePreMutation: null,
     replaceBeforeUpload: null,
     replaceInactiveUpload: null,
+    replaceRunnerFailure: null,
     forceFull: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -25,7 +26,8 @@ export function parseReleaseProdArguments(argv) {
         "--fix-forward",
         "--replace-pre-mutation",
         "--replace-before-upload",
-        "--replace-inactive-upload"
+        "--replace-inactive-upload",
+        "--replace-runner-failure"
       ].includes(argument)
     ) {
       const value = argv[index + 1];
@@ -45,6 +47,9 @@ export function parseReleaseProdArguments(argv) {
       if (argument === "--replace-inactive-upload") {
         options.replaceInactiveUpload = value;
       }
+      if (argument === "--replace-runner-failure") {
+        options.replaceRunnerFailure = value;
+      }
     } else {
       throw new Error(`Unknown release option: ${argument}`);
     }
@@ -57,7 +62,8 @@ export function parseReleaseProdArguments(argv) {
     ["--fix-forward", options.fixForward],
     ["--replace-pre-mutation", options.replacePreMutation],
     ["--replace-before-upload", options.replaceBeforeUpload],
-    ["--replace-inactive-upload", options.replaceInactiveUpload]
+    ["--replace-inactive-upload", options.replaceInactiveUpload],
+    ["--replace-runner-failure", options.replaceRunnerFailure]
   ]) {
     if (value !== null && !RELEASE_ID_PATTERN.test(value)) {
       throw new Error(`${name} requires a valid release ID`);
@@ -69,7 +75,8 @@ export function parseReleaseProdArguments(argv) {
       options.fixForward,
       options.replacePreMutation,
       options.replaceBeforeUpload,
-      options.replaceInactiveUpload
+      options.replaceInactiveUpload,
+      options.replaceRunnerFailure
     ].filter(Boolean).length > 1
   ) {
     throw new Error(

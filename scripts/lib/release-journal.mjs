@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   RELEASE_IMPACT_SCHEMA_VERSION,
+  RELEASE_FINGERPRINT_KEYS,
   RELEASE_LANES,
   assertReleaseClassification,
   assertReleaseFingerprintSet,
@@ -136,6 +137,22 @@ const INACTIVE_REMOTE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
   "sourceRevision",
   "workerName",
   "workerRuntimeDigest"
+]);
+const RUNNER_FAILURE_ATTESTATION_KEYS = Object.freeze([
+  "d1BackupReceiptSha256",
+  "d1ExportBytes",
+  "d1ExportSha256",
+  "failedConfigSha256",
+  "failedJournalSha256",
+  "predecessorDeploymentCreatedOn",
+  "priorRunnerActivationId",
+  "priorRunnerRecordSha256",
+  "priorRunnerReleaseSha",
+  "queueEvidence",
+  "queueTopologyFingerprint",
+  "remoteUploadEvidence",
+  "schemaVersion",
+  "workerUploadReceiptSha256"
 ]);
 
 const PREDECESSOR_KEYS = Object.freeze([
@@ -440,6 +457,56 @@ function validateInactiveUploadAttestation(value) {
   });
 }
 
+function validateRunnerFailureAttestation(value) {
+  exactKeys(
+    value,
+    RUNNER_FAILURE_ATTESTATION_KEYS,
+    "Runner-failure replacement attestation"
+  );
+  if (value.schemaVersion !== 1) {
+    throw new Error(
+      "Runner-failure replacement attestation schema is unsupported"
+    );
+  }
+  for (const [field, label] of [
+    [value.failedJournalSha256, "failed journal"],
+    [value.failedConfigSha256, "failed config"],
+    [value.workerUploadReceiptSha256, "Worker upload receipt"],
+    [value.d1BackupReceiptSha256, "D1 backup receipt"],
+    [value.d1ExportSha256, "D1 export"],
+    [value.priorRunnerRecordSha256, "prior runner record"],
+    [value.queueTopologyFingerprint, "Queue topology"]
+  ]) {
+    if (!SHA256_PATTERN.test(field ?? "")) {
+      throw new Error(
+        `Runner-failure replacement attestation has an invalid ${label} SHA-256`
+      );
+    }
+  }
+  if (
+    !SAFE_ID_PATTERN.test(value.priorRunnerActivationId ?? "") ||
+    !SHA_PATTERN.test(value.priorRunnerReleaseSha ?? "") ||
+    !Number.isSafeInteger(value.d1ExportBytes) ||
+    value.d1ExportBytes < 1
+  ) {
+    throw new Error("Runner-failure replacement attestation is invalid");
+  }
+  exactIsoTimestampNanoseconds(
+    value.predecessorDeploymentCreatedOn,
+    "Predecessor deployment creation time"
+  );
+  return Object.freeze({
+    ...value,
+    queueEvidence: validatedBeforeUploadQueueEvidence(
+      value.predecessorDeploymentCreatedOn,
+      value.queueEvidence
+    ),
+    remoteUploadEvidence: validateInactiveRemoteUploadAttestation(
+      value.remoteUploadEvidence
+    )
+  });
+}
+
 function validateSupersededBy(value) {
   if (value === null) return null;
   const hasBeforeUploadAttestation = Object.hasOwn(
@@ -450,9 +517,19 @@ function validateSupersededBy(value) {
     value,
     "inactiveUploadAttestation"
   );
-  if (hasBeforeUploadAttestation && hasInactiveUploadAttestation) {
+  const hasRunnerFailureAttestation = Object.hasOwn(
+    value,
+    "runnerFailureAttestation"
+  );
+  if (
+    [
+      hasBeforeUploadAttestation,
+      hasInactiveUploadAttestation,
+      hasRunnerFailureAttestation
+    ].filter(Boolean).length > 1
+  ) {
     throw new Error(
-      "A replacement link cannot contain two upload attestations"
+      "A replacement link cannot contain multiple recovery attestations"
     );
   }
   exactKeys(
@@ -461,6 +538,8 @@ function validateSupersededBy(value) {
       ? [...SUPERSEDED_BY_KEYS, "beforeUploadAttestation"]
       : hasInactiveUploadAttestation
         ? [...SUPERSEDED_BY_KEYS, "inactiveUploadAttestation"]
+        : hasRunnerFailureAttestation
+          ? [...SUPERSEDED_BY_KEYS, "runnerFailureAttestation"]
       : SUPERSEDED_BY_KEYS,
     "Superseding release link"
   );
@@ -484,6 +563,13 @@ function validateSupersededBy(value) {
       ? {
           inactiveUploadAttestation: validateInactiveUploadAttestation(
             value.inactiveUploadAttestation
+          )
+        }
+      : {}),
+    ...(hasRunnerFailureAttestation
+      ? {
+          runnerFailureAttestation: validateRunnerFailureAttestation(
+            value.runnerFailureAttestation
           )
         }
       : {})
@@ -540,6 +626,18 @@ function hasOnlyPreparedReceipts(receipts) {
     PREPARED_RECEIPT_KEYS.includes(key)
       ? receipts[key] !== null
       : receipts[key] === null
+  );
+}
+
+function hasExactRunnerFailureReceipts(receipts) {
+  const required = new Set([
+    ...PREPARED_RECEIPT_KEYS,
+    "workerVersionId",
+    "d1Bookmark",
+    "d1ExportSha256"
+  ]);
+  return RELEASE_RECEIPT_KEYS.every((key) =>
+    required.has(key) ? receipts[key] !== null : receipts[key] === null
   );
 }
 
@@ -798,6 +896,17 @@ export function assertReleaseJournal(value) {
       "Only a prepared inactive-upload replacement may retain its attestation"
     );
   }
+  if (
+    supersededBy?.runnerFailureAttestation !== undefined &&
+    (value.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+      value.lane !== RELEASE_LANES.CONSERVATIVE_FULL ||
+      value.resumeFrom !== RELEASE_JOURNAL_STATES.DATA_PREPARED ||
+      value.failureCode !== RELEASE_FAILURE_CODES.RUNNER_FAILED)
+  ) {
+    throw new Error(
+      "Only an exact data-prepared runner failure may retain its replacement attestation"
+    );
+  }
   nullablePattern(value.failureCode, FAILURE_CODE_PATTERN, "Release failure code");
   if (value.failureCode !== null && !ALLOWED_FAILURE_CODES.has(value.failureCode)) {
     throw new Error("Release journal contains an unknown failure code");
@@ -847,9 +956,40 @@ export function assertReleaseJournal(value) {
             targetFingerprints.workerAssets &&
           supersededBy.inactiveUploadAttestation.remoteUploadEvidence
             .inactiveWorkerVersionId !== predecessor.workerVersionId)));
+  const runnerFailureAttestation = supersededBy?.runnerFailureAttestation;
+  const validRunnerFailureReplacementBoundary =
+    value.resumeFrom === RELEASE_JOURNAL_STATES.DATA_PREPARED &&
+    value.failureCode === RELEASE_FAILURE_CODES.RUNNER_FAILED &&
+    value.lane === RELEASE_LANES.CONSERVATIVE_FULL &&
+    hasExactRunnerFailureReceipts(receipts) &&
+    exactLivePredecessor &&
+    predecessor.runnerActivationId !== null &&
+    runnerFailureAttestation?.schemaVersion === 1 &&
+    runnerFailureAttestation.failedJournalSha256 ===
+      value.previousJournalSha256 &&
+    runnerFailureAttestation.failedConfigSha256 ===
+      receipts.wranglerConfigSha256 &&
+    runnerFailureAttestation.queueTopologyFingerprint ===
+      targetFingerprints.queueTopology &&
+    runnerFailureAttestation.remoteUploadEvidence.releaseTag ===
+      value.releaseId &&
+    runnerFailureAttestation.remoteUploadEvidence.sourceRevision ===
+      value.targetGitSha &&
+    runnerFailureAttestation.remoteUploadEvidence.workerRuntimeDigest ===
+      targetFingerprints.workerRuntime &&
+    runnerFailureAttestation.remoteUploadEvidence.clientBuildDigest ===
+      targetFingerprints.workerAssets &&
+    runnerFailureAttestation.remoteUploadEvidence.inactiveWorkerVersionId ===
+      receipts.workerVersionId &&
+    runnerFailureAttestation.remoteUploadEvidence.inactiveWorkerVersionId !==
+      predecessor.workerVersionId &&
+    runnerFailureAttestation.d1ExportSha256 === receipts.d1ExportSha256 &&
+    runnerFailureAttestation.priorRunnerActivationId ===
+      predecessor.runnerActivationId;
   if (
     value.state === RELEASE_JOURNAL_STATES.REPLACED &&
-    !validReplacementBoundary
+    !validReplacementBoundary &&
+    !validRunnerFailureReplacementBoundary
   ) {
     throw new Error(
       "A replaced release must retain an allowed replacement boundary and exact live predecessor"
@@ -1458,6 +1598,126 @@ export function replaceInactiveUploadReleaseJournal(
   );
 }
 
+export function assertRunnerFailureReplacementEvidence(journal, evidence) {
+  const current = assertReleaseJournal(journal);
+  exactKeys(
+    evidence,
+    [
+      ...RUNNER_FAILURE_ATTESTATION_KEYS.filter(
+        (key) => key !== "schemaVersion"
+      ),
+      "liveDeploymentId",
+      "liveWorkerVersionId"
+    ],
+    "Runner-failure replacement evidence"
+  );
+  if (
+    current.state !== RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE ||
+    current.lane !== RELEASE_LANES.CONSERVATIVE_FULL ||
+    current.resumeFrom !== RELEASE_JOURNAL_STATES.DATA_PREPARED ||
+    current.failureCode !== RELEASE_FAILURE_CODES.RUNNER_FAILED ||
+    !hasExactRunnerFailureReceipts(current.receipts)
+  ) {
+    throw new Error(
+      "Runner-failure replacement requires an exact data-prepared runner failure"
+    );
+  }
+  if (
+    evidence.liveWorkerVersionId !== current.predecessor.workerVersionId ||
+    evidence.liveDeploymentId !== current.predecessor.deploymentId ||
+    current.predecessor.runnerActivationId === null
+  ) {
+    throw new Error(
+      "Runner-failure replacement live predecessor differs from the failed release"
+    );
+  }
+  const attestation = validateRunnerFailureAttestation({
+    schemaVersion: 1,
+    ...Object.fromEntries(
+      RUNNER_FAILURE_ATTESTATION_KEYS.filter(
+        (key) => key !== "schemaVersion"
+      ).map((key) => [key, evidence[key]])
+    )
+  });
+  if (
+    attestation.failedJournalSha256 !== fingerprintReleaseJournal(current) ||
+    attestation.failedConfigSha256 !== current.receipts.wranglerConfigSha256 ||
+    attestation.queueTopologyFingerprint !==
+      current.targetFingerprints.queueTopology ||
+    attestation.remoteUploadEvidence.releaseTag !== current.releaseId ||
+    attestation.remoteUploadEvidence.sourceRevision !== current.targetGitSha ||
+    attestation.remoteUploadEvidence.workerRuntimeDigest !==
+      current.targetFingerprints.workerRuntime ||
+    attestation.remoteUploadEvidence.clientBuildDigest !==
+      current.targetFingerprints.workerAssets ||
+    attestation.remoteUploadEvidence.inactiveWorkerVersionId !==
+      current.receipts.workerVersionId ||
+    attestation.remoteUploadEvidence.inactiveWorkerVersionId ===
+      current.predecessor.workerVersionId ||
+    attestation.d1ExportSha256 !== current.receipts.d1ExportSha256 ||
+    attestation.priorRunnerActivationId !==
+      current.predecessor.runnerActivationId
+  ) {
+    throw new Error(
+      "Runner-failure replacement evidence differs from the failed release"
+    );
+  }
+  const predecessorCreated = exactIsoTimestampNanoseconds(
+    attestation.predecessorDeploymentCreatedOn,
+    "Predecessor deployment creation time"
+  );
+  if (
+    exactIsoTimestampNanoseconds(
+      attestation.remoteUploadEvidence.inactiveWorkerCreatedOn,
+      "Inactive Worker version creation time"
+    ) <= predecessorCreated
+  ) {
+    throw new Error(
+      "Runner-failure replacement inactive Worker does not postdate the live predecessor"
+    );
+  }
+  return Object.freeze({
+    ...evidence,
+    queueEvidence: attestation.queueEvidence,
+    remoteUploadEvidence: attestation.remoteUploadEvidence
+  });
+}
+
+export function replaceRunnerFailureReleaseJournal(
+  journal,
+  { releaseId, targetGitSha, evidence, at } = {}
+) {
+  const current = assertReleaseJournal(journal);
+  if (current.state !== RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE) {
+    throw new Error(
+      "Only a retryable release may replace a data-prepared runner failure"
+    );
+  }
+  const validatedEvidence = assertRunnerFailureReplacementEvidence(
+    current,
+    evidence
+  );
+  return revisedJournal(
+    current,
+    {
+      state: RELEASE_JOURNAL_STATES.REPLACED,
+      supersededBy: validateSupersededBy({
+        releaseId,
+        targetGitSha,
+        runnerFailureAttestation: {
+          schemaVersion: 1,
+          ...Object.fromEntries(
+            RUNNER_FAILURE_ATTESTATION_KEYS.filter(
+              (key) => key !== "schemaVersion"
+            ).map((key) => [key, validatedEvidence[key]])
+          )
+        }
+      })
+    },
+    at
+  );
+}
+
 export function predecessorForReleaseReplacement(journal) {
   const replaced = assertReleaseJournal(journal);
   if (replaced.state !== RELEASE_JOURNAL_STATES.REPLACED) {
@@ -1480,6 +1740,56 @@ export function predecessorForReleaseReplacement(journal) {
   });
 }
 
+export function assertRunnerFailureReplacementTargetFingerprints(
+  failedJournal,
+  targetFingerprints
+) {
+  const failed = assertReleaseJournal(failedJournal);
+  if (!isRunnerFailureReplacementJournal(failed)) {
+    throw new Error(
+      "Runner-failure target comparison requires its exact failed or linked journal"
+    );
+  }
+  const target = assertReleaseFingerprintSet(
+    targetFingerprints,
+    "Runner-failure replacement target fingerprints"
+  );
+  const drift = RELEASE_FINGERPRINT_KEYS.filter(
+    (key) =>
+      !["runnerArtifact", "releaseTooling"].includes(key) &&
+      failed.targetFingerprints[key] !== target[key]
+  );
+  if (drift.length > 0) {
+    throw new Error(
+      `Runner-failure replacement changes forbidden fingerprints: ${drift.join(
+        ", "
+      )}`
+    );
+  }
+  if (
+    ["runnerArtifact", "releaseTooling"].every(
+      (key) => failed.targetFingerprints[key] === target[key]
+    )
+  ) {
+    throw new Error(
+      "Runner-failure replacement must change runnerArtifact or releaseTooling"
+    );
+  }
+  return target;
+}
+
+function isRunnerFailureReplacementJournal(journal) {
+  return (
+    journal.lane === RELEASE_LANES.CONSERVATIVE_FULL &&
+    journal.resumeFrom === RELEASE_JOURNAL_STATES.DATA_PREPARED &&
+    journal.failureCode === RELEASE_FAILURE_CODES.RUNNER_FAILED &&
+    [
+      RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
+      RELEASE_JOURNAL_STATES.REPLACED
+    ].includes(journal.state)
+  );
+}
+
 export function assertReleaseReplacement(
   failedJournal,
   replacementJournal
@@ -1487,13 +1797,22 @@ export function assertReleaseReplacement(
   const failed = assertReleaseJournal(failedJournal);
   const replacement = assertReleaseJournal(replacementJournal);
   const expectedPredecessor = predecessorForReleaseReplacement(failed);
+  const runnerFailureReplacement =
+    failed.supersededBy?.runnerFailureAttestation !== undefined;
+  if (runnerFailureReplacement) {
+    assertRunnerFailureReplacementTargetFingerprints(
+      failed,
+      replacement.targetFingerprints
+    );
+  }
   if (
     failed.state !== RELEASE_JOURNAL_STATES.REPLACED ||
     failed.supersededBy?.releaseId !== replacement.releaseId ||
     failed.supersededBy?.targetGitSha !== replacement.targetGitSha ||
     ([
       RELEASE_JOURNAL_STATES.VERIFIED,
-      RELEASE_JOURNAL_STATES.PREPARED
+      RELEASE_JOURNAL_STATES.PREPARED,
+      RELEASE_JOURNAL_STATES.DATA_PREPARED
     ].includes(failed.resumeFrom) &&
       replacement.lane !== RELEASE_LANES.CONSERVATIVE_FULL) ||
     canonicalReleaseJson(replacement.predecessor) !==

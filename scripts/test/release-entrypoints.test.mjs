@@ -25,10 +25,12 @@ import {
   createReleaseJournal,
   createReleasePointer,
   createReleaseStateStore,
+  fingerprintReleaseJournal,
   recordReleaseJournalFailure,
   replaceBeforeUploadReleaseJournal,
   replaceInactiveUploadReleaseJournal,
   replacePreMutationReleaseJournal,
+  replaceRunnerFailureReleaseJournal,
   supersedeReleaseJournal,
   transitionReleaseJournal
 } from "../lib/release-journal.mjs";
@@ -359,6 +361,97 @@ function inactiveUploadEvidence(failed) {
     }
   };
 }
+
+function dataPreparedRunnerFailure(
+  store,
+  targetGitSha,
+  releaseId = "release-runner-failure"
+) {
+  const targetFingerprints = fingerprints();
+  const classification = classifyReleaseImpact({
+    changedPaths: ["package.json"],
+    targetFingerprints,
+    activeReceipt: null
+  });
+  let journal = createReleaseJournal({
+    releaseId,
+    targetGitSha,
+    classification,
+    targetFingerprints,
+    predecessor: {
+      releaseId: null,
+      journalSha256: null,
+      workerVersionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      deploymentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      runnerActivationId: "runner-prior"
+    },
+    createdAt: "2026-08-15T01:00:00.000Z"
+  });
+  store.writeJournal(journal);
+  journal = transitionReleaseJournal(journal, RELEASE_JOURNAL_STATES.VERIFIED, {
+    at: "2026-08-15T01:00:01.000Z"
+  });
+  store.writeJournal(journal);
+  journal = transitionReleaseJournal(journal, RELEASE_JOURNAL_STATES.PREPARED, {
+    at: "2026-08-15T01:00:02.000Z",
+    receipts: {
+      profileSha256: "1".repeat(64),
+      operatorEnvironmentFingerprint: "4".repeat(64),
+      wranglerConfigSha256: "2".repeat(64),
+      workerSecretsFingerprint: "3".repeat(64)
+    }
+  });
+  store.writeJournal(journal);
+  journal = transitionReleaseJournal(
+    journal,
+    RELEASE_JOURNAL_STATES.WORKER_UPLOADED,
+    {
+      at: "2026-08-15T01:00:03.000Z",
+      receipts: {
+        workerVersionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+      }
+    }
+  );
+  store.writeJournal(journal);
+  journal = transitionReleaseJournal(
+    journal,
+    RELEASE_JOURNAL_STATES.DATA_PREPARED,
+    {
+      at: "2026-08-15T01:00:04.000Z",
+      receipts: {
+        d1Bookmark: "bookmark-runner-failure-0001",
+        d1ExportSha256: "5".repeat(64)
+      }
+    }
+  );
+  store.writeJournal(journal);
+  journal = recordReleaseJournalFailure(journal, {
+    code: RELEASE_FAILURE_CODES.RUNNER_FAILED,
+    at: "2026-08-15T01:00:05.000Z"
+  });
+  return store.writeJournal(journal);
+}
+
+function runnerFailureEvidence(failed) {
+  return {
+    failedJournalSha256: fingerprintReleaseJournal(failed),
+    failedConfigSha256: failed.receipts.wranglerConfigSha256,
+    workerUploadReceiptSha256: "6".repeat(64),
+    d1BackupReceiptSha256: "7".repeat(64),
+    d1ExportBytes: 1024,
+    d1ExportSha256: failed.receipts.d1ExportSha256,
+    priorRunnerActivationId: "runner-prior",
+    priorRunnerRecordSha256: "a".repeat(64),
+    priorRunnerReleaseSha: "c".repeat(40),
+    liveWorkerVersionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    liveDeploymentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    predecessorDeploymentCreatedOn: "2026-08-14T23:00:00.000000Z",
+    queueTopologyFingerprint: failed.targetFingerprints.queueTopology,
+    queueEvidence: beforeUploadEvidence().queueEvidence,
+    remoteUploadEvidence: inactiveUploadEvidence(failed).remoteUploadEvidence
+  };
+}
+
 
 function fileTree(root) {
   const result = [];
@@ -912,6 +1005,49 @@ test("a linked inactive-upload replacement retry stays pinned without re-attesta
   );
   assert.equal(store.readJournal(replaced.supersededBy.releaseId), null);
 });
+
+test("a linked runner-failure replacement retry stays pinned without re-attestation", (t) => {
+  const { profile, profilePath, targetGitSha } = fixture(t);
+  const store = createReleaseStateStore({ rootDir: profile.stateDirectory });
+  const failed = dataPreparedRunnerFailure(store, "a".repeat(40));
+  const replaced = replaceRunnerFailureReleaseJournal(failed, {
+    releaseId: "release-linked-runner-failure",
+    targetGitSha,
+    evidence: runnerFailureEvidence(failed),
+    at: "2026-08-15T01:00:06.000Z"
+  });
+  store.writeJournal(replaced);
+
+  writeFileSync(join(profile.repositoryPath, "README.md"), "newer main\n");
+  runGit(profile.repositoryPath, ["add", "README.md"]);
+  runGit(profile.repositoryPath, ["commit", "-qm", "advance main"]);
+  runGit(profile.repositoryPath, ["push", "-q", "origin", "main"]);
+  assert.notEqual(runGit(profile.repositoryPath, ["rev-parse", "HEAD"]), targetGitSha);
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(surfRoot, "scripts/release-prod.mjs"),
+      "--plan",
+      "--replace-runner-failure",
+      failed.releaseId
+    ],
+    {
+      cwd: surfRoot,
+      encoding: "utf8",
+      env: { ...process.env, SURF_PRODUCTION_PROFILE: profilePath }
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+  assert.equal(
+    store.readJournal(failed.releaseId).state,
+    RELEASE_JOURNAL_STATES.REPLACED
+  );
+  assert.equal(store.readJournal(replaced.supersededBy.releaseId), null);
+});
+
 
 test("ambient internal-execution variables cannot bypass the outer release gate", () => {
   const result = spawnSync(
