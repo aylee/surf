@@ -681,7 +681,8 @@ async function configuredSpotIds(
   fetcher,
   expectedVersionId,
   expectedWorkerName,
-  requestTimeoutMs
+  requestTimeoutMs,
+  versionOverride = false
 ) {
   return requestWithTimeout(
     fetcher,
@@ -690,7 +691,7 @@ async function configuredSpotIds(
       headers: workerVersionRequestHeaders({
         expectedVersionId,
         expectedWorkerName,
-        override: false,
+        override: versionOverride,
         headers: { Accept: "application/json" }
       })
     },
@@ -1067,7 +1068,8 @@ async function inspectForecastReadinessSnapshot(
   fetcher,
   expectedVersionId,
   expectedWorkerName,
-  requestTimeoutMs
+  requestTimeoutMs,
+  versionOverride = false
 ) {
   const path = "/api/forecast-readiness";
   try {
@@ -1078,7 +1080,7 @@ async function inspectForecastReadinessSnapshot(
         headers: workerVersionRequestHeaders({
           expectedVersionId,
           expectedWorkerName,
-          override: false,
+          override: versionOverride,
           headers: { Accept: "application/json" }
         }),
         cache: "no-store"
@@ -1090,6 +1092,11 @@ async function inspectForecastReadinessSnapshot(
           responseWorkerVersion(response) !== expectedVersionId
         ) {
           await cancelBody(response);
+          if (versionOverride) {
+            throw new Error(
+              "forecast readiness exact-version response did not match the expected Worker"
+            );
+          }
           return { status: "pending", pending: targets };
         }
 
@@ -1158,6 +1165,11 @@ export async function inspectRemoteForecastReadModels(options) {
   if (!["strict", "pre-enqueue"].includes(inspectionMode)) {
     throw new Error("remote ingest inspection mode is invalid");
   }
+  // Reconciliation before a possible enqueue is read-only. Address the exact
+  // target so brief ordinary-route lag cannot fail or misclassify an existing
+  // target lineage. The authenticated handoff and all post-enqueue publication
+  // checks continue to exercise ordinary routing.
+  const versionOverride = inspectionMode === "pre-enqueue";
 
   const spotIds =
     configuredSpotIdsOption ??
@@ -1166,7 +1178,8 @@ export async function inspectRemoteForecastReadModels(options) {
       fetcher,
       expectedVersionId,
       expectedWorkerName,
-      requestTimeoutMs
+      requestTimeoutMs,
+      versionOverride
     ));
   const targets = spotIds.flatMap((spotId) =>
     FORECAST_INTERVALS.map((interval) => ({ spotId, interval }))
@@ -1180,7 +1193,8 @@ export async function inspectRemoteForecastReadModels(options) {
     fetcher,
     expectedVersionId,
     expectedWorkerName,
-    requestTimeoutMs
+    requestTimeoutMs,
+    versionOverride
   );
   if (state.status === "superseded") {
     if (inspectionMode === "pre-enqueue") {

@@ -735,6 +735,148 @@ test("release reconciliation inspects an existing ingest lineage without enqueue
   });
 });
 
+test("pre-enqueue reconciliation reads the exact target when ordinary routing still serves its predecessor", async () => {
+  const expectedOverride = `${workerName}="${workerVersion}"`;
+  const requests = [];
+  const result = await inspectRemoteForecastReadModels({
+    baseUrl,
+    ingestId: workerVersion,
+    requestedAt,
+    inspectionMode: "pre-enqueue",
+    expectedVersionId: workerVersion,
+    expectedWorkerName: workerName,
+    fetcher: async (input, init = {}) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init.headers);
+      const versionOverride = headers.get(
+        CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER
+      );
+      requests.push({
+        path: url.pathname,
+        versionOverride,
+        expectedVersion: headers.get(SURF_EXPECTED_WORKER_VERSION_HEADER),
+        versionAffinityKey: headers.get(workerVersionKeyHeader)
+      });
+      const responseVersion =
+        versionOverride === expectedOverride
+          ? workerVersion
+          : staleWorkerVersion;
+      if (url.pathname === "/api/spots") {
+        return Response.json(
+          { spots: [spot] },
+          { headers: { [SURF_WORKER_VERSION_HEADER]: responseVersion } }
+        );
+      }
+      if (url.pathname === "/api/forecast-readiness") {
+        return readinessResponse(
+          readinessRows([spot], { rowIngestId: workerVersion }),
+          { responseVersion }
+        );
+      }
+      throw new Error(`unexpected reconciliation request ${url.pathname}`);
+    }
+  });
+
+  assert.equal(result.status, "published");
+  assert.deepEqual(requests, [
+    {
+      path: "/api/spots",
+      versionOverride: expectedOverride,
+      expectedVersion: null,
+      versionAffinityKey: null
+    },
+    {
+      path: "/api/forecast-readiness",
+      versionOverride: expectedOverride,
+      expectedVersion: null,
+      versionAffinityKey: null
+    }
+  ]);
+});
+
+test("pre-enqueue reconciliation rejects version drift between the target catalog and readiness", async () => {
+  const requests = [];
+  await assert.rejects(
+    inspectRemoteForecastReadModels({
+      baseUrl,
+      ingestId: workerVersion,
+      requestedAt,
+      inspectionMode: "pre-enqueue",
+      expectedVersionId: workerVersion,
+      expectedWorkerName: workerName,
+      fetcher: async (input, init = {}) => {
+        const url = new URL(String(input));
+        requests.push({
+          path: url.pathname,
+          versionOverride: new Headers(init.headers).get(
+            CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER
+          )
+        });
+        if (url.pathname === "/api/spots") {
+          return versionedJson({ spots: [spot] });
+        }
+        if (url.pathname === "/api/forecast-readiness") {
+          return readinessResponse(
+            readinessRows([spot], { rowIngestId: workerVersion }),
+            { responseVersion: staleWorkerVersion }
+          );
+        }
+        throw new Error(`unexpected reconciliation request ${url.pathname}`);
+      }
+    }),
+    /^Error: forecast readiness exact-version response did not match the expected Worker$/
+  );
+
+  assert.deepEqual(requests, [
+    {
+      path: "/api/spots",
+      versionOverride: `${workerName}="${workerVersion}"`
+    },
+    {
+      path: "/api/forecast-readiness",
+      versionOverride: `${workerName}="${workerVersion}"`
+    }
+  ]);
+  assert.equal(
+    requests.some(({ path }) => path === "/api/ingest/once"),
+    false
+  );
+});
+
+test("strict reconciliation keeps catalog and readiness on ordinary routing", async () => {
+  const requests = [];
+  const result = await inspectRemoteForecastReadModels({
+    baseUrl,
+    ingestId: workerVersion,
+    requestedAt,
+    expectedVersionId: workerVersion,
+    expectedWorkerName: workerName,
+    fetcher: async (input, init = {}) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init.headers);
+      requests.push({
+        path: url.pathname,
+        versionOverride: headers.get(
+          CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER
+        )
+      });
+      if (url.pathname === "/api/spots") {
+        return versionedJson({ spots: [spot] });
+      }
+      if (url.pathname === "/api/forecast-readiness") {
+        return versionedReadinessResponse();
+      }
+      throw new Error(`unexpected reconciliation request ${url.pathname}`);
+    }
+  });
+
+  assert.equal(result.status, "published");
+  assert.deepEqual(requests, [
+    { path: "/api/spots", versionOverride: null },
+    { path: "/api/forecast-readiness", versionOverride: null }
+  ]);
+});
+
 test("pre-enqueue reconciliation reports a newer non-target lineage as target-absent", async () => {
   const newerGeneratedAt = "2026-08-03T01:17:00.000Z";
   const fetcher = async () =>
