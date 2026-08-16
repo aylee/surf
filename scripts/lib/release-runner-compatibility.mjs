@@ -618,18 +618,24 @@ function parseLoadedJob(stdout, expectedPath, label) {
   }
   const lines = stdout.split(/\r?\n/);
   const paths = lines
-    .map((line) => line.match(/^\s*path = (.+)$/)?.[1])
+    .map((line) => {
+      const match = line.match(/^([ \t]*)path = (.+)$/);
+      return match ? { indentation: match[1], value: match[2] } : undefined;
+    })
     .filter((value) => value !== undefined);
+  if (paths.length !== 1 || paths[0].value !== expectedPath) {
+    throw new Error(`${label} is not loaded from the exact recorded persistent plist`);
+  }
+  const rootIndentation = paths[0].indentation;
   const states = lines
-    .map((line) => line.match(/^\s*state = (.+)$/)?.[1])
-    .filter((value) => value !== undefined);
+    .map((line) => line.match(/^([ \t]*)state = (.+)$/))
+    .filter((match) => match?.[1] === rootIndentation)
+    .map((match) => match[2]);
   const pids = lines
-    .map((line) => line.match(/^\s*pid = ([0-9]+)$/)?.[1])
-    .filter((value) => value !== undefined)
-    .map(Number);
+    .map((line) => line.match(/^([ \t]*)pid = ([0-9]+)$/))
+    .filter((match) => match?.[1] === rootIndentation)
+    .map((match) => Number(match[2]));
   if (
-    paths.length !== 1 ||
-    paths[0] !== expectedPath ||
     states.length !== 1 ||
     states[0] !== "running" ||
     pids.length !== 1 ||
