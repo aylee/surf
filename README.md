@@ -73,6 +73,9 @@ and binds resources in its own account.
 
 Follow the [self-hosting guide](docs/self-hosting.md) for authentication,
 provisioning, migrations, secrets, first ingest, and deployment verification.
+Instance owners should then use the single
+[component-aware production release workflow](docs/production-releases.md)
+instead of invoking Wrangler directly.
 
 ## How forecasts work
 

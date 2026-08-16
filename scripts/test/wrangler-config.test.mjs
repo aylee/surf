@@ -173,6 +173,29 @@ test("instance validation keeps the legacy Agent dormant and protects its secret
   ]);
 });
 
+test("instance validation permits only the exact local Durable Object binding", () => {
+  for (const unexpected of [
+    { script_name: "different-worker" },
+    { environment: "production" },
+    { future_capability: true }
+  ]) {
+    const config = structuredClone(canonical);
+    Object.assign(config.durable_objects.bindings[0], unexpected);
+    assert.deepEqual(wranglerStructureFailures(config, configPath), [
+      "FORECAST_BRIEF_AGENT must be a local binding with exactly name and class_name; script_name and environment are not allowed."
+    ]);
+  }
+
+  const config = structuredClone(canonical);
+  config.durable_objects.bindings.push({
+    name: "UNEXPECTED_AGENT",
+    class_name: "ForecastBriefAgent"
+  });
+  assert.deepEqual(wranglerStructureFailures(config, configPath), [
+    "FORECAST_BRIEF_AGENT must bind exactly once to ForecastBriefAgent."
+  ]);
+});
+
 test("instance validation protects the outbound narrative pull boundary", () => {
   const config = structuredClone(canonical);
   config.queues.producers[1].queue = "wrong-narrative";

@@ -2,7 +2,10 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   assertNarrativeJobSize,
+  canonicalNarrativeProtocolDefinition,
   NARRATIVE_JOB_MAX_BYTES,
+  NARRATIVE_PROTOCOL_DESCRIPTOR,
+  NARRATIVE_PROTOCOL_FINGERPRINT,
   NarrativeFallbackWatchdogSchema,
   NarrativeGeneratedResultSubmissionSchema,
   NarrativeJobSchema,
@@ -144,5 +147,22 @@ describe("NarrativeJob", () => {
         preclaimRetryCount: 2
       })
     ).toThrow();
+  });
+});
+
+describe("Narrative protocol identity", () => {
+  it("matches the canonical wire and semantic definition", () => {
+    const calculated = createHash("sha256")
+      .update(canonicalNarrativeProtocolDefinition())
+      .digest("hex");
+
+    expect(calculated).toBe(NARRATIVE_PROTOCOL_FINGERPRINT);
+    expect(NARRATIVE_PROTOCOL_DESCRIPTOR.fingerprint).toBe(calculated);
+  });
+
+  it("keeps the reviewed v1 compatibility fingerprint golden", () => {
+    expect(NARRATIVE_PROTOCOL_FINGERPRINT).toBe(
+      "3956bce39909ae82fd1e81591698f1ecc7c28d6b05f9a2a53e99f5a80218f041"
+    );
   });
 });

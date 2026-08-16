@@ -180,10 +180,15 @@ describe("domain-neutral runner fake-server e2e", () => {
     });
     const clock = new TestClock();
     const status = new StatusTracker(
-      config.runnerId,
-      config.omlx.modelId,
-      config.releaseSha,
-      config.runtimeFingerprint,
+      {
+        runnerId: config.runnerId,
+        modelId: config.omlx.modelId,
+        activationId: config.activationId,
+        runnerArtifactSha256: config.artifactSha256,
+        sourceRevision: config.releaseSha,
+        runtimeFingerprint: config.runtimeFingerprint,
+        acceptedProtocolFingerprints: config.acceptedProtocolFingerprints
+      },
       new MemoryStatusStore(),
       clock.now
     );

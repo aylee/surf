@@ -155,13 +155,22 @@ describe("Cloudflare Queue pull transport", () => {
     await client.retry("lease-retry", 45);
 
     const calls = fetcher.mock.calls as unknown as Array<
-      [string, { headers: Record<string, string>; body: string }]
+      [
+        string,
+        RequestInit & { headers: Record<string, string>; body: string }
+      ]
     >;
     expect(calls.map(([url]) => url)).toEqual([
       "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test",
       "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test/messages/pull",
       "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test/messages/ack",
       "https://api.cloudflare.com/client/v4/accounts/account-test/queues/queue-test/messages/ack"
+    ]);
+    expect(calls.map(([, init]) => init.redirect)).toEqual([
+      "error",
+      "error",
+      "error",
+      "error"
     ]);
     expect(calls[0]![1]).toMatchObject({
       method: "GET",

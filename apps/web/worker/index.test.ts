@@ -334,6 +334,9 @@ describe("worker api", () => {
       request,
       {
         ...env(),
+        SURF_SOURCE_REVISION: "1".repeat(40),
+        SURF_WORKER_RUNTIME_DIGEST: "2".repeat(64),
+        SURF_CLIENT_BUILD_DIGEST: "3".repeat(64),
         CF_VERSION_METADATA: {
           id: "worker-version-test-id",
           tag: "",
@@ -345,7 +348,15 @@ describe("worker api", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(response.headers.get("X-Surf-Worker-Version")).toBe("worker-version-test-id");
-    expect(await response.json()).toMatchObject({ status: "ok", service: "surf" });
+    expect(await response.json()).toMatchObject({
+      status: "ok",
+      service: "surf",
+      sourceRevision: "1".repeat(40),
+      workerRuntimeDigest: "2".repeat(64),
+      clientBuildDigest: "3".repeat(64),
+      narrativeProtocolFingerprint:
+        "3956bce39909ae82fd1e81591698f1ecc7c28d6b05f9a2a53e99f5a80218f041"
+    });
   });
 
   it("returns every configured reference spot", async () => {

@@ -7,6 +7,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "bakeoff": "node --import tsx --env-file-if-exists=.env src/bakeoff-cli.ts",
+    "build": "node scripts/build-runner.mjs",
     "launch-agents:render": "node scripts/render-launch-agents.mjs",
     "launch-agents:verify": "node scripts/render-launch-agents.mjs --verifyRecord",
     "launch-agents:install": "node scripts/install-launch-agents.mjs --installRecord",
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "26.1.2",
+    "esbuild": "0.28.1",
     "tsx": "4.23.5",
     "typescript": "7.0.2",
     "vitest": "4.1.10"

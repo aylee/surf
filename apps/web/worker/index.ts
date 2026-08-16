@@ -6,6 +6,7 @@ import {
 } from "@surf/forecast-core";
 import { ForecastIntervalSchema, SpotIdSchema, SpotsResponseSchema } from "@surf/contracts";
 import {
+  NARRATIVE_PROTOCOL_FINGERPRINT,
   NARRATIVE_RESULT_MAX_BYTES,
   NarrativeFallbackWatchdogSchema,
   NarrativeResultResponseSchema,
@@ -68,6 +69,9 @@ export type Env = Omit<
   | "NARRATIVE_QUEUE"
   | "NARRATIVE_FALLBACK_QUEUE"
   | "NARRATIVE_RESULT_TOKEN"
+  | "SURF_SOURCE_REVISION"
+  | "SURF_WORKER_RUNTIME_DIGEST"
+  | "SURF_CLIENT_BUILD_DIGEST"
   | "NARRATIVE_FALLBACK_MODEL"
   | "NARRATIVE_FALLBACK_DELAY_SECONDS"
   | "NARRATIVE_FALLBACK_DAILY_CAP"
@@ -87,6 +91,9 @@ export type Env = Omit<
   NARRATIVE_QUEUE?: Queue;
   NARRATIVE_FALLBACK_QUEUE?: Queue;
   NARRATIVE_RESULT_TOKEN?: string;
+  SURF_SOURCE_REVISION?: string;
+  SURF_WORKER_RUNTIME_DIGEST?: string;
+  SURF_CLIENT_BUILD_DIGEST?: string;
   NARRATIVE_FALLBACK_MODEL?: string;
   NARRATIVE_FALLBACK_DELAY_SECONDS?: string;
   NARRATIVE_FALLBACK_DAILY_CAP?: string;
@@ -144,6 +151,10 @@ app.get("/api/health", (c) =>
     service: "surf",
     environment: c.env.ENVIRONMENT,
     region: c.env.SURF_REGION,
+    sourceRevision: c.env.SURF_SOURCE_REVISION ?? null,
+    workerRuntimeDigest: c.env.SURF_WORKER_RUNTIME_DIGEST ?? null,
+    clientBuildDigest: c.env.SURF_CLIENT_BUILD_DIGEST ?? null,
+    narrativeProtocolFingerprint: NARRATIVE_PROTOCOL_FINGERPRINT,
     generatedAt: new Date().toISOString()
   })
 );

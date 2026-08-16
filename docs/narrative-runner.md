@@ -58,9 +58,10 @@ that consumer out of band.
 The following steps mutate remote Cloudflare state. Do not run them from an
 agent session without explicit operator authorization, a current D1 backup or
 Time Travel bookmark, the exact instance Queue names, and the rollback command
-recorded first. The authorized `pnpm setup:cloudflare` and `pnpm deploy`
-workflows already call `ensureQueues()`: they inspect every Queue named by the
-active instance config and create only missing resources, including
+recorded first. The bootstrap-only `pnpm setup:cloudflare` command and the
+conservative `pnpm release:prod` lane already call `ensureQueues()`: they
+inspect every Queue named by the active instance config and create only missing
+resources, including
 `surf-narrative`, `surf-narrative-dlq`, and `surf-narrative-fallback` for the
 canonical instance. Do not
 duplicate those create calls in the normal operator path.
@@ -234,30 +235,29 @@ SURF_NARRATIVE_RESULT_TOKEN=<stored-only-in-this-ignored-file>
 ```
 
 For an enabled deployment, create a private Worker-secret source outside every
-checkout from `apps/web/.worker-secrets.example`, set mode `0600`, and point
-`SURF_WORKER_SECRETS_FILE` at it. Set
-`SURF_WORKER_SECRETS_SNAPSHOT` to a new absolute `.json` path inside the
-versioned external activation directory; the staging command creates it
-exclusively and deploy passes only that snapshot to Wrangler. Point
-`SURF_NARRATIVE_RUNNER_ENV_FILE` at a mode-0600, non-symlink dotenv runner
-environment outside every release worktree; a JSON runner file is rejected
-because the strict service guard loads dotenv syntax. Duplicate/malformed
-assignments and unquoted `#` values are rejected so deployment and the service
-guard see exactly the same value; quote a legitimate value containing `#`. Generate one random
-result token in a password manager and paste it into
-`NARRATIVE_RESULT_TOKEN` in the Worker file and
-`SURF_NARRATIVE_RESULT_TOKEN` in the runner file; do not place it in a command
-argument, stdout, clipboard log, or shell history. The staged deploy validates
-the two values with a timing-safe comparison, verifies both files are
-non-symlink mode-0600 files, requires the current Surf target to use that exact
-token environment and the production `SURF_BASE_URL` callback path, matches
-the runner's Queue and DLQ names to the active Wrangler instance, confirms the
-Queue token is distinct, creates an HMAC receipt without logging secret bytes,
-and passes the private activation snapshot to `wrangler versions upload
---secrets-file`. It rechecks that snapshot and the runner environment before
-every Wrangler command. This attaches
-both `NARRATIVE_RESULT_TOKEN` and `GEMINI_API_KEY` to the exact staged version
-without a separate `wrangler secret put` deployment.
+checkout from `apps/web/.worker-secrets.example` and a separate mode-`0600`,
+non-symlink dotenv runner-environment source. Reference both sources from the
+[production profile](production-releases.md#one-time-profile); do not create or
+export release-specific snapshot paths yourself. `pnpm release:prod` creates
+and pins the Worker-secret snapshot used by `wrangler versions upload
+--secrets-file`, and separately creates a release-bound runner environment only
+when runner activation is required. A JSON runner file is rejected because the
+strict service guard loads dotenv syntax. Duplicate/malformed assignments and
+unquoted `#` values are rejected so release planning and the service guard see
+exactly the same value; quote a legitimate value containing `#`.
+
+Generate one random result token in a password manager and paste it into
+`NARRATIVE_RESULT_TOKEN` in the Worker source and
+`SURF_NARRATIVE_RESULT_TOKEN` in the runner source; do not place it in a
+command argument, stdout, clipboard log, or shell history. The release command
+validates the two values with a timing-safe comparison, verifies both sources
+are non-symlink mode-`0600` files, requires the runner to use the production
+callback path, matches its Queue and DLQ names to the active Wrangler instance,
+confirms the Queue token is distinct, and creates HMAC receipts without logging
+secret bytes. The Worker snapshot and Wrangler snapshot remain Worker-release
+artifacts. Activation record v4 owns only the runner bundle and manifest,
+accepted protocols, runner environment and status identity, model/executables,
+and rendered/installed plist attestations.
 
 The heartbeat stores the exact release SHA and an HMAC of the effective Queue,
 model, target URLs, operational settings, and credential values—not the
@@ -266,11 +266,12 @@ external file and refuses to call an old-release or old-secret daemon healthy.
 Use a distinct high-entropy HMAC key, rotate/version the external env file with
 every credential change, and boot out/bootstrap the service; editing a loaded
 environment file in place never updates the daemon.
-An enabled Worker deploy must run from that same clean detached worktree; the
-deploy boundary derives checkout `HEAD`, rejects a branch or dirty tree, and
-requires it to equal `NARRATIVE_RUNNER_RELEASE_SHA`. This prevents a Worker
-contract from SHA A being activated with a runner binary/environment from SHA
-B.
+The runner source revision and Worker source revision are independent. The
+runner heartbeat and activation record identify the runner's own immutable
+bundle; Worker deployment proves compatibility with the explicit narrative
+protocol fingerprint plus exact Queue, DLQ, callback, result target, and
+result-token bindings. A breaking protocol still requires an expand/migrate/
+contract rollout—it is never inferred from Git proximity.
 
 The Queue token belongs only in `NARRATIVE_RUNNER_CF_API_TOKEN`. Do not put a
 token in the JSON target map, tracked plist, shell history, issue, test fixture,
@@ -544,10 +545,6 @@ release_path="/Users/alex/Services/surf/releases/${release_sha}"
 activation_id="${release_sha}-r1"
 launch_agents_path="/Users/alex/Services/surf/launch-agents/${activation_id}"
 runner_env_path="/Users/alex/Services/surf/secrets/${activation_id}.env"
-config_source="/Users/alex/Services/surf/config/wrangler.source.jsonc"
-config_snapshot="$launch_agents_path/wrangler.instance.jsonc"
-worker_secrets_source="/Users/alex/Services/surf/secrets/worker-secrets.source.env"
-worker_secrets_snapshot="$launch_agents_path/worker-secrets.json"
 model_id="REPLACE_WITH_ACCEPTED_EXACT_OMLX_MODEL_ID"
 model_artifact_path="$(realpath "/Users/alex/.omlx/models/${model_id}")"
 
@@ -563,80 +560,65 @@ test -z "$(git -C "$release_path" status --porcelain --untracked-files=all)"
 install -d -m 0700 "$launch_agents_path"
 ```
 
-Before rendering, stage the private Wrangler source and Worker-secret source
-into this activation directory. The staging commands emit paths, hashes, and
-HMAC fingerprints only—never secret bytes. Pass the exact same files to the
-renderer and later deploy; both paths are reverified before each Wrangler
-command:
+Build the deterministic runner artifact, then render a v4 activation from that
+bundle and the runner-owned environment. Wrangler and Worker-secret artifacts
+are deliberately absent from the runner record:
 
 ```bash
 set -euo pipefail
-test "$(stat -f '%Lp' "$config_source")" = "600"
-test "$(stat -f '%Lp' "$worker_secrets_source")" = "600"
 test "$(stat -f '%Lp' "$runner_env_path")" = "600"
-snapshot_json="$(pnpm --dir "$release_path" wrangler:snapshot \
-  --source "$config_source" --output "$config_snapshot")"
-export SURF_WRANGLER_CONFIG="$(printf '%s' "$snapshot_json" | jq -er .path)"
-export SURF_WRANGLER_CONFIG_SHA256="$(printf '%s' "$snapshot_json" | jq -er .sha256)"
-export SURF_WORKER_SECRETS_FILE="$worker_secrets_source"
-export SURF_WORKER_SECRETS_SNAPSHOT="$worker_secrets_snapshot"
-export SURF_NARRATIVE_RUNNER_ENV_FILE="$runner_env_path"
-pnpm --dir "$release_path" narrative:stage-deploy-inputs
+pnpm --dir "$release_path" --filter @surf/narrative-runner build
 
 pnpm --dir "$release_path" --filter @surf/narrative-runner \
   launch-agents:render \
   --outputDir "$launch_agents_path" \
   --repositoryPath "$release_path" \
   --releaseSha "$release_sha" \
-  --runnerEnvPath "$SURF_NARRATIVE_RUNNER_ENV_FILE" \
+  --runnerEnvPath "$runner_env_path" \
   --launchAgentsDir "$HOME/Library/LaunchAgents" \
   --runnerExitTimeoutSeconds 930 \
-  --pnpmPath "$(realpath "$(command -v pnpm)")" \
+  --runnerArtifactPath "$release_path/apps/narrative-runner/dist/narrative-runner.mjs" \
+  --runnerArtifactManifestPath "$release_path/apps/narrative-runner/dist/narrative-runner.manifest.json" \
   --nodeBinPath "$(dirname "$(realpath "$(command -v node)")")" \
   --omlxPath "$(realpath "$(command -v omlx)")" \
   --omlxDataPath "/Users/alex/.omlx" \
   --modelArtifactPath "$model_artifact_path" \
-  --wranglerConfigPath "$SURF_WRANGLER_CONFIG" \
-  --wranglerConfigSha256 "$SURF_WRANGLER_CONFIG_SHA256" \
-  --workerSecretsPath "$SURF_WORKER_SECRETS_SNAPSHOT" \
   --logDir "/Users/alex/Services/surf/logs"
 plutil -lint "$launch_agents_path/ai.alex.narrative-runner.plist"
 plutil -lint "$launch_agents_path/ai.alex.omlx-server.plist"
 ```
 
 The renderer creates the private log directory, writes the plist files mode
-`0600`, writes a secret-safe activation record with canonical executable,
-supervisor, plist, exact Wrangler snapshot, and exact model-artifact tree
-SHA-256 digests; HMAC fingerprints of the effective runner environment and
-Worker-secret snapshot; and the exact model ID. It fails on
+`0600`, writes a secret-safe activation record with canonical runner bundle,
+bundle manifest, accepted protocol descriptors, executable, supervisor, plist,
+environment, and exact model-artifact tree SHA-256 attestations. It fails on
 unresolved placeholders. It must itself execute from `repositoryPath`, proves
 that path is the clean detached `releaseSha`, and requires the output, logs,
-runner environment, Wrangler/Worker snapshots, and absolute heartbeat path to
+runner environment, and absolute heartbeat path to
 remain outside the release.
 Existing activation artifacts are accepted only when byte-identical; a secret
 rotation or tool change gets a new `activation_id`, never an in-place rewrite.
-`PNPM_ABSOLUTE_PATH`
-must be the canonical realpath of the Corepack/pnpm executable in
-the intended Node 24 environment. Also run `command -v node` and set
+Run `command -v node` and set
 `NODE_BIN_ABSOLUTE_DIRECTORY` to that executable's containing directory. This
 explicit non-secret `PATH` is required because Corepack/NVM pnpm shims commonly
 use `/usr/bin/env node`, while launchd starts with a minimal environment. A
 version-manager or Homebrew alias can retarget during an upgrade, so the
 renderer rejects final-component symlinks. Its `--verifyRecord` mode recomputes
-every executable/plist/config hash, the full selected model-tree hash,
-Worker-secret and environment HMACs, release checkout, and model ID; it fails
-before bootstrap if anything drifted. Preserve the activation record, exact
-Wrangler and Worker-secret snapshots, exact selected model directory, the
-exact IDs returned by `/v1/models`, and the prior activation directory as one
+the runner bundle/manifest, every executable/plist hash, environment
+fingerprint, full selected model-tree hash, release checkout, and model ID; it
+fails before bootstrap if anything drifted. Preserve the activation record,
+runner environment, exact selected model directory, the exact IDs returned by
+`/v1/models`, and the prior activation directory as one
 rollback unit. Retain accepted model artifacts by exact activation rather than
 letting model-cache cleanup silently remove a rollback target.
 
 The runner plist invokes the release-pinned verification wrapper; the plist
 itself remains secret-free. It starts Node through `/usr/bin/env -i` with only
 the recorded home and pinned executable path, so launchd-global variables
-cannot affect the verifier before it sanitizes the runner child. The wrapper verifies the installed plist copies,
-release, executables, model tree, Wrangler snapshot, Worker-secret fingerprint,
-and exact runner-environment fingerprint on every automatic launch. It then
+cannot affect the verifier before it sanitizes the runner child. The wrapper
+verifies the installed plist copies, immutable runner source and bundle,
+executables, model tree, accepted protocols, status path, and exact
+runner-environment fingerprint on every automatic launch. It then
 starts the runner with an environment reconstructed from the attested mode-0600
 file, excluding ambient variables that could otherwise override the file.
 Keep that file mode `0600`, keep the log

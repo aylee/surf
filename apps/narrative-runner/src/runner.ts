@@ -703,51 +703,59 @@ export class NarrativeRunner {
   }
 
   async run(signal?: AbortSignal): Promise<void> {
-    await this.updateStatus({ state: "starting", inFlight: 0 });
-    this.dependencies.logger.event("narrative_runner_started", {
-      runnerId: this.config.runnerId,
-      concurrency: this.config.concurrency,
-      modelId: this.config.omlx.modelId
-    });
-
-    let emptyPullCount = 0;
-    while (!signal?.aborted) {
-      try {
-        const result = await this.poll();
-        if (this.inFlight.size > 0 && this.availableCapacity() === 0) {
-          emptyPullCount = 0;
-          await this.waitForProgressOrHeartbeat(signal);
-        } else if (result.pulled === 0) {
-          emptyPullCount += 1;
-          await this.dependencies.sleep(this.idleDelayMs(emptyPullCount), signal);
-        } else {
-          emptyPullCount = 0;
-        }
-      } catch (error) {
-        const failure = runnerFailure(error, "runner_poll_failed", "transient");
-        if (failure.disposition === "terminal" && this.intakeHalted()) {
+    try {
+      await this.updateStatus({ state: "starting", inFlight: 0 });
+      this.dependencies.logger.event("narrative_runner_started", {
+        runnerId: this.config.runnerId,
+        concurrency: this.config.concurrency,
+        modelId: this.config.omlx.modelId
+      });
+      let emptyPullCount = 0;
+      while (!signal?.aborted) {
+        try {
+          const result = await this.poll();
+          if (this.inFlight.size > 0 && this.availableCapacity() === 0) {
+            emptyPullCount = 0;
+            await this.waitForProgressOrHeartbeat(signal);
+          } else if (result.pulled === 0) {
+            emptyPullCount += 1;
+            await this.dependencies.sleep(this.idleDelayMs(emptyPullCount), signal);
+          } else {
+            emptyPullCount = 0;
+          }
+        } catch (error) {
+          if (signal?.aborted) break;
+          const failure = runnerFailure(error, "runner_poll_failed", "transient");
+          if (failure.disposition === "terminal" && this.intakeHalted()) {
+            await this.updateStatus({
+              state: "halted",
+              lastErrorCode: this.intakeHaltedCode
+            });
+            await this.dependencies.sleep(this.config.heartbeatIntervalMs, signal);
+            continue;
+          }
+          if (failure.disposition === "terminal") throw failure;
           await this.updateStatus({
-            state: "halted",
-            lastErrorCode: this.intakeHaltedCode
+            state: "backing_off",
+            lastErrorCode: this.intakeBlockedCode ?? failure.code
           });
-          await this.dependencies.sleep(this.config.heartbeatIntervalMs, signal);
-          continue;
+          this.dependencies.logger.event("narrative_poll_backoff", { code: failure.code });
+          await this.dependencies.sleep(this.config.modelBackoffMs, signal);
         }
-        if (failure.disposition === "terminal") throw failure;
-        await this.updateStatus({
-          state: "backing_off",
-          lastErrorCode: this.intakeBlockedCode ?? failure.code
+      }
+    } finally {
+      try {
+        await this.drain();
+      } finally {
+        // Shutdown evidence is part of the activation safety boundary. Even a
+        // cancelled sleep or failed drain must attempt the final durable
+        // stopped heartbeat before the process exits.
+        await this.updateStatus({ state: "stopped", inFlight: 0 });
+        this.dependencies.logger.event("narrative_runner_stopped", {
+          runnerId: this.config.runnerId
         });
-        this.dependencies.logger.event("narrative_poll_backoff", { code: failure.code });
-        await this.dependencies.sleep(this.config.modelBackoffMs, signal);
       }
     }
-
-    await this.drain();
-    await this.updateStatus({ state: "stopped", inFlight: 0 });
-    this.dependencies.logger.event("narrative_runner_stopped", {
-      runnerId: this.config.runnerId
-    });
   }
 }
 
@@ -759,10 +767,15 @@ export function createNarrativeRunner(
   const status =
     overrides.status ??
     new StatusTracker(
-      config.runnerId,
-      config.omlx.modelId,
-      config.releaseSha,
-      config.runtimeFingerprint,
+      {
+        runnerId: config.runnerId,
+        modelId: config.omlx.modelId,
+        activationId: config.activationId,
+        runnerArtifactSha256: config.artifactSha256,
+        sourceRevision: config.releaseSha,
+        runtimeFingerprint: config.runtimeFingerprint,
+        acceptedProtocolFingerprints: config.acceptedProtocolFingerprints
+      },
       new FileStatusStore(config.statusFile),
       now
     );

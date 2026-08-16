@@ -35,6 +35,8 @@ function sanitizedEnvironment(values, record) {
   for (const [name, value] of Object.entries(values)) {
     environment[name] = value;
   }
+  environment.NARRATIVE_RUNNER_ACTIVATION_ID = record.activationId;
+  environment.NARRATIVE_RUNNER_ARTIFACT_SHA256 = record.runnerArtifact.sha256;
   return environment;
 }
 
@@ -49,26 +51,23 @@ export async function runVerifiedRunner(argv, dependencies = {}) {
     throw new Error("activation record changed during launch verification");
   }
   const record = JSON.parse(recordAfterVerification);
+  if (record.schemaVersion !== 4) {
+    throw new Error("verified runner launches require an activation record v4 artifact");
+  }
   const runnerEnvironment = readStrictDotenvFile(
-    record.runnerEnvPath,
+    record.runtime.environmentPath,
     "Narrative runner environment file"
   );
   const child = spawnChild(
-    record.executables.pnpm.path,
+    record.executables.node.path,
     [
-      "--dir",
-      record.repositoryPath,
-      "--filter",
-      "@surf/narrative-runner",
-      "exec",
-      "tsx",
-      "src/cli.ts",
+      record.runnerArtifact.path,
       command,
       "--expected-release-sha",
-      record.releaseSha
+      record.source.revision
     ],
     {
-      cwd: record.repositoryPath,
+      cwd: record.source.repositoryPath,
       env: sanitizedEnvironment(runnerEnvironment, record),
       stdio: "inherit"
     }

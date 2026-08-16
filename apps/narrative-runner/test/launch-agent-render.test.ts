@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   chmod,
   copyFile,
@@ -12,10 +12,11 @@ import {
   writeFile
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { NARRATIVE_PROTOCOL_DESCRIPTOR } from "@surf/narrative-contracts";
 import {
   renderLaunchAgents,
   verifyLaunchActivation
@@ -23,40 +24,69 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+function sha256(contents: string | Buffer): string {
+  return createHash("sha256").update(contents).digest("hex");
+}
+
 async function detachedRelease(root: string, name = "release") {
   const repositoryPath = join(root, name);
   const currentPackageRoot = fileURLToPath(new URL("../", import.meta.url));
-  await mkdir(join(repositoryPath, "apps/narrative-runner/scripts"), { recursive: true });
-  await mkdir(join(repositoryPath, "apps/narrative-runner/examples"), { recursive: true });
-  await mkdir(join(repositoryPath, "scripts/lib"), { recursive: true });
-  await copyFile(
-    join(currentPackageRoot, "scripts/render-launch-agents.mjs"),
-    join(repositoryPath, "apps/narrative-runner/scripts/render-launch-agents.mjs")
-  );
-  await copyFile(
-    join(currentPackageRoot, "scripts/supervise-omlx.sh"),
-    join(repositoryPath, "apps/narrative-runner/scripts/supervise-omlx.sh")
-  );
-  await copyFile(
-    join(currentPackageRoot, "scripts/run-verified-runner.mjs"),
-    join(repositoryPath, "apps/narrative-runner/scripts/run-verified-runner.mjs")
-  );
-  await copyFile(
-    join(currentPackageRoot, "scripts/install-launch-agents.mjs"),
-    join(repositoryPath, "apps/narrative-runner/scripts/install-launch-agents.mjs")
-  );
+  for (const directory of [
+    "apps/narrative-runner/scripts",
+    "apps/narrative-runner/examples",
+    "apps/narrative-runner/dist",
+    "scripts/lib"
+  ]) {
+    await mkdir(join(repositoryPath, directory), { recursive: true });
+  }
+  for (const file of [
+    "scripts/render-launch-agents.mjs",
+    "scripts/supervise-omlx.sh",
+    "scripts/run-verified-runner.mjs",
+    "scripts/install-launch-agents.mjs",
+    "examples/ai.alex.narrative-runner.plist.example",
+    "examples/ai.alex.omlx-server.plist.example"
+  ]) {
+    await copyFile(
+      join(currentPackageRoot, file),
+      join(repositoryPath, "apps/narrative-runner", file)
+    );
+  }
   await copyFile(
     join(currentPackageRoot, "../../scripts/lib/strict-env-file.mjs"),
     join(repositoryPath, "scripts/lib/strict-env-file.mjs")
   );
   await copyFile(
-    join(currentPackageRoot, "examples/ai.alex.narrative-runner.plist.example"),
-    join(repositoryPath, "apps/narrative-runner/examples/ai.alex.narrative-runner.plist.example")
+    join(currentPackageRoot, "../../scripts/lib/verified-file-snapshot.mjs"),
+    join(repositoryPath, "scripts/lib/verified-file-snapshot.mjs")
   );
-  await copyFile(
-    join(currentPackageRoot, "examples/ai.alex.omlx-server.plist.example"),
-    join(repositoryPath, "apps/narrative-runner/examples/ai.alex.omlx-server.plist.example")
+  const runnerArtifactPath = join(
+    repositoryPath,
+    "apps/narrative-runner/dist/narrative-runner.mjs"
   );
+  const artifactContents = "export const bundledRunner = true;\n";
+  await writeFile(runnerArtifactPath, artifactContents, { mode: 0o500 });
+  const runnerArtifactManifestPath = join(
+    repositoryPath,
+    "apps/narrative-runner/dist/narrative-runner.manifest.json"
+  );
+  await writeFile(
+    runnerArtifactManifestPath,
+    `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        artifact: {
+          sha256: sha256(artifactContents),
+          bytes: Buffer.byteLength(artifactContents)
+        },
+        acceptedProtocols: [NARRATIVE_PROTOCOL_DESCRIPTOR]
+      },
+      null,
+      2
+    )}\n`,
+    { mode: 0o400 }
+  );
+  await writeFile(join(repositoryPath, ".gitignore"), "dist/\n");
   await execFileAsync("git", ["init", "-q", repositoryPath]);
   await execFileAsync("git", ["-C", repositoryPath, "add", "."]);
   await execFileAsync("git", [
@@ -70,35 +100,54 @@ async function detachedRelease(root: string, name = "release") {
     "-qm",
     "release"
   ]);
-  const { stdout } = await execFileAsync("git", ["-C", repositoryPath, "rev-parse", "HEAD"], {
-    encoding: "utf8"
-  });
+  const { stdout } = await execFileAsync(
+    "git",
+    ["-C", repositoryPath, "rev-parse", "HEAD"],
+    { encoding: "utf8" }
+  );
   const releaseSha = stdout.trim();
-  await execFileAsync("git", ["-C", repositoryPath, "checkout", "--detach", "-q", releaseSha]);
+  await execFileAsync("git", [
+    "-C",
+    repositoryPath,
+    "checkout",
+    "--detach",
+    "-q",
+    releaseSha
+  ]);
   const releaseModule = await import(
-    `${pathToFileURL(join(repositoryPath, "apps/narrative-runner/scripts/render-launch-agents.mjs")).href}?sha=${releaseSha}`
+    `${pathToFileURL(
+      join(repositoryPath, "apps/narrative-runner/scripts/render-launch-agents.mjs")
+    ).href}?sha=${releaseSha}`
   );
   const installerModule = await import(
-    `${pathToFileURL(join(repositoryPath, "apps/narrative-runner/scripts/install-launch-agents.mjs")).href}?sha=${releaseSha}`
+    `${pathToFileURL(
+      join(repositoryPath, "apps/narrative-runner/scripts/install-launch-agents.mjs")
+    ).href}?sha=${releaseSha}`
   );
   return {
     repositoryPath,
     releaseSha,
+    runnerArtifactPath,
+    runnerArtifactManifestPath,
     render: releaseModule.renderLaunchAgents as typeof renderLaunchAgents,
-    verify: (recordPath: string) =>
-      releaseModule.verifyLaunchActivation(recordPath, { requireInstalled: false }) as Promise<{
-        status: "ok";
-        releaseSha: string;
-      }>,
-    verifyInstalled: (recordPath: string) =>
-      releaseModule.verifyLaunchActivation(recordPath, { requireInstalled: true }) as Promise<{
-        status: "ok";
-        releaseSha: string;
-      }>,
+    verify: releaseModule.verifyLaunchActivation as typeof verifyLaunchActivation,
     install: installerModule.installLaunchAgents as (
       recordPath: string,
-      options: { environment: NodeJS.ProcessEnv; allowReplace?: boolean }
-    ) => Promise<{ status: "ok"; releaseSha: string }>
+      options: {
+        environment: NodeJS.ProcessEnv;
+        allowReplace?: boolean;
+        allowLegacyV3?: boolean;
+        priorRecordPath?: string | null;
+      },
+      overrides?: { afterInstall?: (name: string) => Promise<void> | void }
+    ) => Promise<Record<string, unknown>>,
+    inspect: installerModule.inspectInstalledLaunchAgents as (
+      records: { targetRecordPath: string; priorRecordPath: string },
+      options: { environment: NodeJS.ProcessEnv }
+    ) => Promise<{
+      status: "ok";
+      launchAgents: { narrativeRunner: "prior" | "target"; omlxServer: "prior" | "target" };
+    }>
   };
 }
 
@@ -114,37 +163,8 @@ function runnerEnvironment(releaseSha: string, statusFile: string): string {
   ].join("\n");
 }
 
-async function pinnedDeployInputs(root: string) {
-  const wranglerConfigPath = join(root, "deploy/wrangler.instance.jsonc");
-  const workerSecretsPath = join(root, "deploy/worker-secrets.json");
-  await mkdir(join(root, "deploy"), { recursive: true });
-  const wranglerContents = '{"name":"surf"}\n';
-  await writeFile(wranglerConfigPath, wranglerContents, { mode: 0o600 });
-  await writeFile(
-    workerSecretsPath,
-    `${JSON.stringify({
-      GEMINI_API_KEY: "g".repeat(32),
-      NARRATIVE_RESULT_TOKEN: "r".repeat(64)
-    })}\n`,
-    { mode: 0o600 }
-  );
-  return {
-    wranglerConfigPath: await realpath(wranglerConfigPath),
-    wranglerConfigSha256: createHash("sha256")
-      .update(wranglerContents)
-      .digest("hex"),
-    workerSecretsPath: await realpath(workerSecretsPath)
-  };
-}
-
-const deployInputPlaceholders = {
-  wranglerConfigPath: "/Users/test/activations/wrangler.instance.jsonc",
-  wranglerConfigSha256: "a".repeat(64),
-  workerSecretsPath: "/Users/test/activations/worker-secrets.json"
-};
-
-async function pinnedModel(root: string, name = "omlx-data") {
-  const omlxDataPath = join(root, name);
+async function pinnedModel(root: string) {
+  const omlxDataPath = join(root, "omlx-data");
   const modelArtifactPath = join(omlxDataPath, "models/local-model");
   await mkdir(modelArtifactPath, { recursive: true });
   await writeFile(join(modelArtifactPath, "config.json"), '{"model":"local-model"}\n');
@@ -152,527 +172,425 @@ async function pinnedModel(root: string, name = "omlx-data") {
   return { omlxDataPath, modelArtifactPath };
 }
 
-async function pinnedTools(root: string, name = "tools") {
-  const bin = join(root, name, "bin");
+async function pinnedTools(root: string) {
+  const bin = join(root, "tools/bin");
   await mkdir(bin, { recursive: true });
-  for (const tool of ["node", "pnpm", "omlx"]) {
+  for (const tool of ["node", "omlx", "pnpm"]) {
     await writeFile(join(bin, tool), `#!/bin/sh\necho ${tool}\n`, { mode: 0o755 });
   }
   return {
     nodeBinPath: bin,
-    pnpmPath: join(bin, "pnpm"),
-    omlxPath: join(bin, "omlx")
+    omlxPath: join(bin, "omlx"),
+    pnpmPath: join(bin, "pnpm")
   };
 }
 
-describe("LaunchAgent renderer", () => {
-  it("renders secret-free, mode-0600 local service files", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-"));
-    const outputDir = join(root, "agents");
-    const logDir = join(root, "logs");
-    const runnerEnvPath = join(root, "narrative-runner.env");
-    const launchAgentsDir = join(root, "home/Library/LaunchAgents");
-    const release = await detachedRelease(root);
-    const tools = await pinnedTools(root);
-    const model = await pinnedModel(root);
-    const deployInputs = await pinnedDeployInputs(root);
-    await writeFile(runnerEnvPath, runnerEnvironment(release.releaseSha, join(root, "state/status.json")), {
-      mode: 0o600
-    });
-    const options = {
+async function fixture(root: string) {
+  root = await realpath(root);
+  const release = await detachedRelease(root);
+  const tools = await pinnedTools(root);
+  const model = await pinnedModel(root);
+  const runnerEnvPath = join(root, "runner.env");
+  const statusFile = join(root, "state/status.json");
+  await writeFile(
+    runnerEnvPath,
+    runnerEnvironment(release.releaseSha, statusFile),
+    { mode: 0o600 }
+  );
+  const outputDir = join(root, "activation-r1");
+  const launchAgentsDir = join(root, "home/Library/LaunchAgents");
+  return {
+    release,
+    tools,
+    model,
+    runnerEnvPath,
+    statusFile,
+    outputDir,
+    launchAgentsDir,
+    options: {
       outputDir,
       repositoryPath: release.repositoryPath,
       releaseSha: release.releaseSha,
       runnerEnvPath,
+      runnerArtifactPath: release.runnerArtifactPath,
+      runnerArtifactManifestPath: release.runnerArtifactManifestPath,
       launchAgentsDir,
       runnerExitTimeoutSeconds: 930,
-      ...tools,
+      nodeBinPath: tools.nodeBinPath,
+      omlxPath: tools.omlxPath,
       ...model,
-      ...deployInputs,
-      logDir,
-      environment: {
-        HOME: join(root, "home"),
-        SURF_NARRATIVE_RUNNER_ENV_FILE: runnerEnvPath
-      }
-    };
-    const written = await release.render(options);
+      logDir: join(root, "logs"),
+      environment: { HOME: join(root, "home") }
+    }
+  };
+}
+
+describe("LaunchAgent activation records", () => {
+  it("renders and verifies a runner-owned v4 activation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-v4-"));
+    const value = await fixture(root);
+    const written = await value.release.render(value.options);
+    const record = JSON.parse(await readFile(written[2]!, "utf8"));
 
     expect(written).toHaveLength(3);
-    for (const path of written) {
-      const contents = await readFile(path, "utf8");
-      expect(contents).not.toMatch(/__[A-Z_]+__/);
-      expect(contents).not.toMatch(/api[-_ ]?key|bearer|token/i);
-      expect((await stat(path)).mode & 0o777).toBe(0o600);
-    }
-    expect((await stat(logDir)).mode & 0o777).toBe(0o700);
-    expect(await readFile(written[0]!, "utf8")).toMatch(
-      /<key>ExitTimeOut<\/key>\s*<integer>930<\/integer>/
-    );
-    expect(await readFile(written[0]!, "utf8")).toContain(
-      `<string>${written[2]}</string>\n    <string>--command</string>\n    <string>run</string>`
-    );
-    expect(await readFile(written[1]!, "utf8")).toContain(
-      `<string>${written[2]}</string>\n    <string>--</string>`
-    );
-    expect(await readFile(written[1]!, "utf8")).toMatch(
-      /<key>ExitTimeOut<\/key>\s*<integer>60<\/integer>/
-    );
-    expect(JSON.parse(await readFile(written[2]!, "utf8"))).toMatchObject({
-      schemaVersion: 3,
-      releaseSha: release.releaseSha,
-      modelId: "local-model",
-      wranglerConfig: {
-        path: deployInputs.wranglerConfigPath,
-        sha256: deployInputs.wranglerConfigSha256
+    expect(record).toMatchObject({
+      schemaVersion: 4,
+      activationId: "activation-r1",
+      source: {
+        revision: value.release.releaseSha,
+        repositoryPath: value.release.repositoryPath
       },
-      workerSecrets: {
-        path: deployInputs.workerSecretsPath,
-        fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/)
-      },
-      modelArtifact: {
-        path: expect.stringMatching(/\/omlx-data\/models\/local-model$/),
+      runnerArtifact: {
+        path: value.release.runnerArtifactPath,
         sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
-        fileCount: 2
+        bytes: expect.any(Number),
+        manifest: {
+          path: value.release.runnerArtifactManifestPath,
+          sha256: expect.stringMatching(/^[0-9a-f]{64}$/)
+        }
+      },
+      acceptedProtocols: [
+        expect.objectContaining({
+          family: "surf.narrative",
+          version: 1,
+          fingerprint: NARRATIVE_PROTOCOL_DESCRIPTOR.fingerprint
+        })
+      ],
+      runtime: {
+        environmentPath: value.runnerEnvPath,
+        environmentFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+        statusFile: value.statusFile
+      },
+      model: {
+        id: "local-model",
+        artifact: { sha256: expect.stringMatching(/^[0-9a-f]{64}$/), fileCount: 2 }
       },
       executables: {
-        node: { path: expect.stringMatching(/\/tools\/bin\/node$/), sha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
-        pnpm: { path: expect.stringMatching(/\/tools\/bin\/pnpm$/), sha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
-        omlx: { path: expect.stringMatching(/\/tools\/bin\/omlx$/), sha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
-        runnerGuard: { path: expect.stringMatching(/\/run-verified-runner\.mjs$/), sha256: expect.stringMatching(/^[0-9a-f]{64}$/) }
-      },
-      launchAgents: {
-        narrativeRunner: { path: expect.stringMatching(/\/Library\/LaunchAgents\/ai\.alex\.narrative-runner\.plist$/) },
-        omlxServer: { path: expect.stringMatching(/\/Library\/LaunchAgents\/ai\.alex\.omlx-server\.plist$/) }
+        node: { sha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
+        omlx: { sha256: expect.stringMatching(/^[0-9a-f]{64}$/) },
+        runnerGuard: { sha256: expect.stringMatching(/^[0-9a-f]{64}$/) }
       }
     });
-    await expect(release.render(options)).resolves.toEqual(written);
+    expect(record).not.toHaveProperty("wranglerConfig");
+    expect(record).not.toHaveProperty("workerSecrets");
+    expect(record.executables).not.toHaveProperty("pnpm");
+    for (const path of written) {
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
+      expect(await readFile(path, "utf8")).not.toMatch(/__[A-Z_]+__/);
+    }
     await expect(
-      release.render({ ...options, runnerExitTimeoutSeconds: 931 })
-    ).rejects.toThrow(/existing LaunchAgent artifact differs/);
-    await expect(release.verify(written[2]!)).resolves.toMatchObject({
-      status: "ok",
-      releaseSha: release.releaseSha
-    });
-    await expect(
-      verifyLaunchActivation(written[2]!, { requireInstalled: false })
+      value.release.verify(written[2]!, { requireInstalled: false })
     ).resolves.toMatchObject({
       status: "ok",
-      releaseSha: release.releaseSha
+      schemaVersion: 4,
+      activationId: "activation-r1",
+      releaseSha: value.release.releaseSha,
+      runnerArtifactSha256: record.runnerArtifact.sha256
     });
     await expect(
-      release.install(written[2]!, { environment: options.environment })
-    ).resolves.toMatchObject({ status: "ok", releaseSha: release.releaseSha });
-    await expect(release.verifyInstalled(written[2]!)).resolves.toMatchObject({
-      status: "ok",
-      releaseSha: release.releaseSha
-    });
-    for (const name of ["ai.alex.narrative-runner.plist", "ai.alex.omlx-server.plist"]) {
-      expect((await stat(join(launchAgentsDir, name))).mode & 0o777).toBe(0o600);
+      value.release.install(written[2]!, {
+        environment: value.options.environment
+      })
+    ).resolves.toMatchObject({ status: "ok", activationId: "activation-r1" });
+    await expect(
+      value.release.verify(written[2]!, { requireInstalled: true })
+    ).resolves.toMatchObject({ status: "ok" });
+  });
+
+  it.each([
+    ["omlxServer", { omlxServer: "target", narrativeRunner: "prior" }],
+    ["narrativeRunner", { omlxServer: "target", narrativeRunner: "target" }]
+  ] as const)(
+    "resumes exact replacement after a crash following the %s plist rename",
+    async (failedAfter, expectedState) => {
+      const root = await mkdtemp(join(tmpdir(), `surf-launch-install-${failedAfter}-`));
+      const value = await fixture(root);
+      const prior = await value.release.render({
+        ...value.options,
+        outputDir: join(dirname(value.outputDir), "activation-r0")
+      });
+      const target = await value.release.render(value.options);
+      await value.release.install(prior[2]!, {
+        environment: value.options.environment
+      });
+
+      await expect(
+        value.release.install(
+          target[2]!,
+          {
+            environment: value.options.environment,
+            allowReplace: true,
+            priorRecordPath: prior[2]!
+          },
+          {
+            afterInstall(name) {
+              if (name === failedAfter) throw new Error(`injected crash after ${name}`);
+            }
+          }
+        )
+      ).rejects.toThrow(`injected crash after ${failedAfter}`);
+      await expect(
+        value.release.inspect(
+          { targetRecordPath: target[2]!, priorRecordPath: prior[2]! },
+          { environment: value.options.environment }
+        )
+      ).resolves.toMatchObject({ launchAgents: expectedState });
+
+      await expect(
+        value.release.install(target[2]!, {
+          environment: value.options.environment,
+          allowReplace: true,
+          priorRecordPath: prior[2]!
+        })
+      ).resolves.toMatchObject({ status: "ok", activationId: "activation-r1" });
+      await expect(
+        value.release.verify(target[2]!, { requireInstalled: true })
+      ).resolves.toMatchObject({ status: "ok", activationId: "activation-r1" });
     }
+  );
+
+  it("refuses to inspect or replace persistent plist bytes owned by neither record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-install-unknown-"));
+    const value = await fixture(root);
+    const prior = await value.release.render({
+      ...value.options,
+      outputDir: join(dirname(value.outputDir), "activation-r0")
+    });
+    const target = await value.release.render(value.options);
+    await value.release.install(prior[2]!, {
+      environment: value.options.environment
+    });
     await writeFile(
-      join(launchAgentsDir, "ai.alex.narrative-runner.plist"),
+      join(value.launchAgentsDir, "ai.alex.omlx-server.plist"),
+      "unknown plist bytes\n",
+      { mode: 0o600 }
+    );
+
+    await expect(
+      value.release.inspect(
+        { targetRecordPath: target[2]!, priorRecordPath: prior[2]! },
+        { environment: value.options.environment }
+      )
+    ).rejects.toThrow(/match neither the verified prior nor target/);
+    await expect(
+      value.release.install(target[2]!, {
+        environment: value.options.environment,
+        allowReplace: true,
+        priorRecordPath: prior[2]!
+      })
+    ).rejects.toThrow(/not owned by the verified prior or target/);
+  });
+
+  it("fails closed on runner, runtime, model, tool, and installed-plist drift", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-drift-"));
+    const value = await fixture(root);
+    const written = await value.release.render(value.options);
+    await value.release.install(written[2]!, { environment: value.options.environment });
+
+    await chmod(value.release.runnerArtifactPath, 0o700);
+    await writeFile(value.release.runnerArtifactPath, "mutated\n", { mode: 0o500 });
+    await expect(
+      value.release.verify(written[2]!, { requireInstalled: false })
+    ).rejects.toThrow(/runner artifact SHA-256 differs/);
+    await writeFile(value.release.runnerArtifactPath, "export const bundledRunner = true;\n", {
+      mode: 0o500
+    });
+    await chmod(value.release.runnerArtifactPath, 0o500);
+
+    await writeFile(
+      value.runnerEnvPath,
+      `${await readFile(value.runnerEnvPath, "utf8")}NARRATIVE_RUNNER_POLL_INTERVAL_MS=6000\n`,
+      { mode: 0o600 }
+    );
+    await expect(
+      value.release.verify(written[2]!, { requireInstalled: false })
+    ).rejects.toThrow(/runner environment differs/);
+    await writeFile(
+      value.runnerEnvPath,
+      runnerEnvironment(value.release.releaseSha, value.statusFile),
+      { mode: 0o600 }
+    );
+
+    await writeFile(join(value.model.modelArtifactPath, "weights.bin"), "mutated\n");
+    await expect(
+      value.release.verify(written[2]!, { requireInstalled: false })
+    ).rejects.toThrow(/model artifact differs/);
+    await writeFile(join(value.model.modelArtifactPath, "weights.bin"), "weight-bytes\n");
+
+    await writeFile(join(value.tools.nodeBinPath, "node"), "#!/bin/sh\necho changed\n", {
+      mode: 0o755
+    });
+    await expect(
+      value.release.verify(written[2]!, { requireInstalled: false })
+    ).rejects.toThrow(/node SHA-256 differs/);
+    await writeFile(join(value.tools.nodeBinPath, "node"), "#!/bin/sh\necho node\n", {
+      mode: 0o755
+    });
+
+    await writeFile(
+      join(value.launchAgentsDir, "ai.alex.narrative-runner.plist"),
       "drifted\n",
       { mode: 0o600 }
     );
-    await expect(release.verifyInstalled(written[2]!)).rejects.toThrow(
-      /installed narrativeRunner SHA-256 differs/
-    );
     await expect(
-      release.install(written[2]!, { environment: options.environment })
-    ).rejects.toThrow(/use the bounded activation controller/);
-    await release.install(written[2]!, {
-      environment: options.environment,
-      allowReplace: true
-    });
-    await chmod(
-      join(launchAgentsDir, "ai.alex.narrative-runner.plist"),
-      0o644
-    );
-    await expect(release.verifyInstalled(written[2]!)).rejects.toThrow(
-      /installed narrativeRunner must remain/
-    );
-    await chmod(
-      join(launchAgentsDir, "ai.alex.narrative-runner.plist"),
-      0o600
-    );
-    const workerSecretsContents = await readFile(
-      deployInputs.workerSecretsPath,
-      "utf8"
-    );
+      value.release.verify(written[2]!, { requireInstalled: true })
+    ).rejects.toThrow(/installed narrativeRunner SHA-256 differs/);
+  });
+
+  it("keeps source, identity, paths, lease timeout, and executables immutable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-boundaries-"));
+    const value = await fixture(root);
+    await expect(
+      value.release.render({ ...value.options, runnerExitTimeoutSeconds: 929 })
+    ).rejects.toThrow(/must be at least 930/);
+    await expect(
+      value.release.render({ ...value.options, outputDir: join(root, "bad activation") })
+    ).rejects.toThrow(/stable activation identifier/);
+    await expect(
+      renderLaunchAgents(value.options)
+    ).rejects.toThrow(/renderer must execute from the same release/);
+
+    const envInside = join(value.release.repositoryPath, "runner.env");
     await writeFile(
-      deployInputs.workerSecretsPath,
+      join(value.release.repositoryPath, ".git/info/exclude"),
+      "runner.env\napps/narrative-runner/dist/runner-alias.mjs\n"
+    );
+    await writeFile(envInside, runnerEnvironment(value.release.releaseSha, value.statusFile), {
+      mode: 0o600
+    });
+    await expect(
+      value.release.render({
+        ...value.options,
+        runnerEnvPath: envInside,
+        outputDir: join(root, "activation-env-inside")
+      })
+    ).rejects.toThrow(/runnerEnvPath must be outside/);
+
+    const artifactAlias = join(
+      value.release.repositoryPath,
+      "apps/narrative-runner/dist/runner-alias.mjs"
+    );
+    await symlink(value.release.runnerArtifactPath, artifactAlias);
+    await expect(
+      value.release.render({
+        ...value.options,
+        outputDir: join(root, "activation-artifact-alias"),
+        runnerArtifactPath: artifactAlias
+      })
+    ).rejects.toThrow(/runnerArtifactPath must be a canonical non-symlink file/);
+
+    const omlxAlias = join(root, "omlx-current");
+    await symlink(value.tools.omlxPath, omlxAlias);
+    await expect(
+      value.release.render({
+        ...value.options,
+        outputDir: join(root, "activation-alias"),
+        omlxPath: omlxAlias
+      })
+    ).rejects.toThrow(/omlxPath must be the canonical realpath/);
+
+    await execFileAsync("git", [
+      "-C",
+      value.release.repositoryPath,
+      "switch",
+      "-c",
+      "mutable"
+    ]);
+    await expect(value.release.render(value.options)).rejects.toThrow(/detached release/);
+  });
+
+  it("accepts v3 records only behind the explicit rollback-transition gate", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-v3-"));
+    const value = await fixture(root);
+    const written = await value.release.render(value.options);
+    const v4 = JSON.parse(await readFile(written[2]!, "utf8"));
+    const wranglerConfigPath = join(root, "legacy/wrangler.jsonc");
+    const workerSecretsPath = join(root, "legacy/worker-secrets.json");
+    await mkdir(dirname(wranglerConfigPath), { recursive: true });
+    const wranglerContents = '{"name":"surf"}\n';
+    await writeFile(wranglerConfigPath, wranglerContents, { mode: 0o600 });
+    await writeFile(
+      workerSecretsPath,
       `${JSON.stringify({
-        GEMINI_API_KEY: "x".repeat(32),
+        GEMINI_API_KEY: "g".repeat(32),
         NARRATIVE_RESULT_TOKEN: "r".repeat(64)
       })}\n`,
       { mode: 0o600 }
     );
-    await expect(release.verify(written[2]!)).rejects.toThrow(
-      /worker secrets differ/
+    const environmentValues = Object.fromEntries(
+      (await readFile(value.runnerEnvPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => line.split(/=(.*)/s).slice(0, 2))
     );
-    await writeFile(deployInputs.workerSecretsPath, workerSecretsContents, {
-      mode: 0o600
-    });
-    const wranglerContents = await readFile(deployInputs.wranglerConfigPath, "utf8");
-    await writeFile(deployInputs.wranglerConfigPath, `${wranglerContents} `, {
-      mode: 0o600
-    });
-    await expect(release.verify(written[2]!)).rejects.toThrow(
-      /wranglerConfigPath SHA-256 differs/
-    );
-    await writeFile(deployInputs.wranglerConfigPath, wranglerContents, {
-      mode: 0o600
-    });
-    await writeFile(join(model.modelArtifactPath, "weights.bin"), "mutated\n");
-    await expect(release.verify(written[2]!)).rejects.toThrow(
-      /model artifact differs/
-    );
-    await writeFile(join(model.modelArtifactPath, "weights.bin"), "weight-bytes\n");
-    await writeFile(tools.pnpmPath, "#!/bin/sh\necho changed\n", { mode: 0o755 });
-    await expect(release.verify(written[2]!)).rejects.toThrow(
-      /pnpm SHA-256 differs/
-    );
-  });
-
-  it("XML-escapes operational paths and emits valid macOS plists", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-escaped-"));
-    const runnerEnvPath = join(root, "A&B-runner.env");
-    const release = await detachedRelease(root, "A&B-surf");
-    const tools = await pinnedTools(root, "A&B-tools");
-    const model = await pinnedModel(root, "A&B-omlx");
-    const deployInputs = await pinnedDeployInputs(root);
-    await writeFile(runnerEnvPath, runnerEnvironment(release.releaseSha, join(root, "state/status.json")), {
-      mode: 0o600
-    });
-    const written = await release.render({
-      outputDir: join(root, "agents"),
-      repositoryPath: release.repositoryPath,
-      releaseSha: release.releaseSha,
-      runnerEnvPath,
-      runnerExitTimeoutSeconds: 930,
-      ...tools,
-      ...model,
-      ...deployInputs,
-      logDir: join(root, "A&B-logs"),
-      environment: {
-        SURF_NARRATIVE_RUNNER_ENV_FILE: runnerEnvPath
+    const environmentFingerprint = createHmac(
+      "sha256",
+      environmentValues.NARRATIVE_RUNNER_STATUS_HMAC_KEY
+    )
+      .update("surf-runner-env-v1")
+      .update("\u0000")
+      .update(
+        JSON.stringify(
+          Object.fromEntries(
+            Object.entries(environmentValues).sort(([left], [right]) =>
+              left.localeCompare(right)
+            )
+          )
+        )
+      )
+      .digest("hex");
+    const legacyPath = join(root, "legacy/activation-record.json");
+    const legacy = {
+      schemaVersion: 3,
+      releaseSha: value.release.releaseSha,
+      repositoryPath: value.release.repositoryPath,
+      runnerEnvPath: value.runnerEnvPath,
+      statusFile: value.statusFile,
+      modelId: "local-model",
+      runnerEnvironmentFingerprint: environmentFingerprint,
+      wranglerConfig: { path: await realpath(wranglerConfigPath), sha256: sha256(wranglerContents) },
+      workerSecrets: {
+        path: await realpath(workerSecretsPath),
+        fingerprint: createHmac(
+          "sha256",
+          environmentValues.NARRATIVE_RUNNER_STATUS_HMAC_KEY
+        )
+          .update("surf-worker-secrets-v1")
+          .update("\u0000")
+          .update(
+            JSON.stringify({
+              GEMINI_API_KEY: "g".repeat(32),
+              NARRATIVE_RESULT_TOKEN: "r".repeat(64)
+            })
+          )
+          .digest("hex")
+      },
+      modelArtifact: v4.model.artifact,
+      renderedLaunchAgents: v4.renderedLaunchAgents,
+      launchAgents: v4.launchAgents,
+      executables: {
+        ...v4.executables,
+        pnpm: {
+          path: await realpath(value.tools.pnpmPath),
+          sha256: sha256(await readFile(value.tools.pnpmPath))
+        }
       }
+    };
+    await writeFile(legacyPath, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(
+      value.release.verify(legacyPath, { requireInstalled: false })
+    ).rejects.toThrow(/only for explicit rollback transition/);
+    await expect(
+      value.release.verify(legacyPath, {
+        requireInstalled: false,
+        allowLegacyV3: true
+      })
+    ).resolves.toMatchObject({
+      status: "ok",
+      schemaVersion: 3,
+      transitionOnly: true,
+      acceptedProtocols: []
     });
-
-    for (const path of written.slice(0, 2)) {
-      const contents = await readFile(path, "utf8");
-      expect(contents).toContain("A&amp;B");
-      expect(contents).not.toContain("A&B");
-      if (process.platform === "darwin") {
-        await expect(
-          execFileAsync("/usr/bin/plutil", ["-lint", path])
-        ).resolves.toBeDefined();
-      }
-    }
-  });
-
-
-  it("rejects relative operational paths", async () => {
-    await expect(
-      renderLaunchAgents({
-        outputDir: "agents",
-        repositoryPath: "/opt/surf",
-        releaseSha: "a".repeat(40),
-        runnerEnvPath: "/Users/test/.config/surf/narrative-runner.env",
-        runnerExitTimeoutSeconds: 930,
-        pnpmPath: "/opt/homebrew/bin/pnpm",
-        nodeBinPath: "/opt/homebrew/bin",
-        omlxPath: "/opt/homebrew/bin/omlx",
-        omlxDataPath: "/Users/test/.omlx",
-        modelArtifactPath: "/Users/test/.omlx/models/local-model",
-        ...deployInputPlaceholders,
-        logDir: "/tmp/logs",
-        environment: {
-          SURF_NARRATIVE_RUNNER_ENV_FILE: "/Users/test/.config/surf/narrative-runner.env"
-        }
-      })
-    ).rejects.toThrow(/outputDir must be an absolute path/);
-  });
-
-  it("rejects a service environment path different from deploy validation", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-env-mismatch-"));
-    await expect(
-      renderLaunchAgents({
-        outputDir: join(root, "agents"),
-        repositoryPath: "/opt/surf",
-        releaseSha: "a".repeat(40),
-        runnerEnvPath: "/Users/test/.config/surf/service.env",
-        runnerExitTimeoutSeconds: 930,
-        pnpmPath: "/opt/homebrew/bin/pnpm",
-        nodeBinPath: "/opt/homebrew/bin",
-        omlxPath: "/opt/homebrew/bin/omlx",
-        omlxDataPath: "/Users/test/.omlx",
-        modelArtifactPath: "/Users/test/.omlx/models/local-model",
-        ...deployInputPlaceholders,
-        logDir: join(root, "logs"),
-        environment: {
-          SURF_NARRATIVE_RUNNER_ENV_FILE: "/Users/test/.config/surf/validated.env"
-        }
-      })
-    ).rejects.toThrow(/must exactly match SURF_NARRATIVE_RUNNER_ENV_FILE/);
-  });
-
-  it("rejects an unbounded or too-short runner exit timeout", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-exit-timeout-"));
-    await expect(
-      renderLaunchAgents({
-        outputDir: join(root, "agents"),
-        repositoryPath: "/opt/surf",
-        releaseSha: "a".repeat(40),
-        runnerEnvPath: "/Users/test/.config/surf/runner.env",
-        runnerExitTimeoutSeconds: 0,
-        pnpmPath: "/opt/homebrew/bin/pnpm",
-        nodeBinPath: "/opt/homebrew/bin",
-        omlxPath: "/opt/homebrew/bin/omlx",
-        omlxDataPath: "/Users/test/.omlx",
-        modelArtifactPath: "/Users/test/.omlx/models/local-model",
-        ...deployInputPlaceholders,
-        logDir: join(root, "logs"),
-        environment: {
-          SURF_NARRATIVE_RUNNER_ENV_FILE: "/Users/test/.config/surf/runner.env"
-        }
-      })
-    ).rejects.toThrow(/runnerExitTimeoutSeconds must be an integer from 30/);
-  });
-
-  it("derives the minimum exit timeout from the validated runner lease", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-lease-timeout-"));
-    const runnerEnvPath = join(root, "runner.env");
-    const release = await detachedRelease(root);
-    const tools = await pinnedTools(root);
-    const model = await pinnedModel(root);
-    const deployInputs = await pinnedDeployInputs(root);
-    await writeFile(runnerEnvPath, runnerEnvironment(release.releaseSha, join(root, "state/status.json")), {
-      mode: 0o600
-    });
-    const base = {
-      outputDir: join(root, "agents"),
-      repositoryPath: release.repositoryPath,
-      releaseSha: release.releaseSha,
-      runnerEnvPath,
-      ...tools,
-      ...model,
-      ...deployInputs,
-      logDir: join(root, "logs"),
-      environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: runnerEnvPath }
-    };
-    await expect(
-      release.render({ ...base, runnerExitTimeoutSeconds: 929 })
-    ).rejects.toThrow(/must be at least 930/);
-    await expect(
-      release.render({
-        ...base,
-        outputDir: join(root, "agents-930"),
-        runnerExitTimeoutSeconds: 930
-      })
-    ).resolves.toHaveLength(3);
-  });
-
-  it("requires the exact strict deploy-validated runner environment before rendering", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-strict-env-"));
-    const release = await detachedRelease(root);
-    const tools = await pinnedTools(root);
-    const runnerEnvPath = join(root, "runner.env");
-    const base = {
-      outputDir: join(root, "agents"),
-      repositoryPath: release.repositoryPath,
-      releaseSha: release.releaseSha,
-      runnerEnvPath,
-      runnerExitTimeoutSeconds: 930,
-      ...tools,
-      omlxDataPath: "/Users/test/.omlx",
-      modelArtifactPath: "/Users/test/.omlx/models/local-model",
-      ...deployInputPlaceholders,
-      logDir: join(root, "logs"),
-      environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: runnerEnvPath }
-    };
-
-    await writeFile(
-      runnerEnvPath,
-      runnerEnvironment(release.releaseSha, join(root, "state/status.json")),
-      { mode: 0o600 }
-    );
-    await chmod(runnerEnvPath, 0o640);
-    await expect(release.render(base)).rejects.toThrow(/mode 0600/);
-
-    await chmod(runnerEnvPath, 0o600);
-    const runnerEnvAlias = join(root, "runner-current.env");
-    await symlink(runnerEnvPath, runnerEnvAlias);
-    await expect(
-      release.render({
-        ...base,
-        runnerEnvPath: runnerEnvAlias,
-        environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: runnerEnvAlias }
-      })
-    ).rejects.toThrow(/non-symlink regular file/);
-
-    await writeFile(
-      runnerEnvPath,
-      `${runnerEnvironment(release.releaseSha, join(root, "state/status.json"))}NARRATIVE_RUNNER_RELEASE_SHA=${release.releaseSha}\n`,
-      { mode: 0o600 }
-    );
-    await expect(release.render(base)).rejects.toThrow(
-      /duplicate NARRATIVE_RUNNER_RELEASE_SHA/
-    );
-
-    await writeFile(
-      runnerEnvPath,
-      `${runnerEnvironment(release.releaseSha, join(root, "state/status.json"))}BROKEN VALUE\n`,
-      { mode: 0o600 }
-    );
-    await expect(release.render(base)).rejects.toThrow(/line 7 is malformed/);
-
-  });
-
-  it("keeps environment, state, logs, and rendered artifacts outside the immutable release", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-containment-"));
-    const release = await detachedRelease(root);
-    const externalEnv = join(root, "external/runner.env");
-    await mkdir(join(root, "external"), { recursive: true });
-    await writeFile(
-      externalEnv,
-      runnerEnvironment(release.releaseSha, join(root, "state/status.json")),
-      { mode: 0o600 }
-    );
-    const base = {
-      outputDir: join(root, "agents"),
-      repositoryPath: release.repositoryPath,
-      releaseSha: release.releaseSha,
-      runnerEnvPath: externalEnv,
-      runnerExitTimeoutSeconds: 930,
-      pnpmPath: "/opt/homebrew/bin/pnpm",
-      nodeBinPath: "/opt/homebrew/bin",
-      omlxPath: "/opt/homebrew/bin/omlx",
-      omlxDataPath: "/Users/test/.omlx",
-      modelArtifactPath: "/Users/test/.omlx/models/local-model",
-      ...deployInputPlaceholders,
-      logDir: join(root, "logs"),
-      environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: externalEnv }
-    };
-
-    await expect(
-      release.render({ ...base, outputDir: join(release.repositoryPath, "agents") })
-    ).rejects.toThrow(/outputDir must be outside/);
-    await expect(
-      release.render({ ...base, logDir: join(release.repositoryPath, "logs") })
-    ).rejects.toThrow(/logDir must be outside/);
-
-    const stateInsideEnv = join(root, "external/state-inside.env");
-    await writeFile(
-      stateInsideEnv,
-      runnerEnvironment(release.releaseSha, join(release.repositoryPath, "status.json")),
-      { mode: 0o600 }
-    );
-    await expect(
-      release.render({
-        ...base,
-        runnerEnvPath: stateInsideEnv,
-        environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: stateInsideEnv }
-      })
-    ).rejects.toThrow(/statusFile must be outside/);
-
-    const envInside = join(release.repositoryPath, "ignored-runner.env");
-    await writeFile(join(release.repositoryPath, ".git/info/exclude"), "ignored-runner.env\n");
-    await writeFile(
-      envInside,
-      runnerEnvironment(release.releaseSha, join(root, "state/status.json")),
-      { mode: 0o600 }
-    );
-    await expect(
-      release.render({
-        ...base,
-        runnerEnvPath: envInside,
-        environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: envInside }
-      })
-    ).rejects.toThrow(/runnerEnvPath must be outside/);
-  });
-
-  it("rejects mutable executable aliases instead of pinning them into rollback plists", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-alias-"));
-    const release = await detachedRelease(root);
-    const tools = await pinnedTools(root);
-    const runnerEnvPath = join(root, "runner.env");
-    await writeFile(
-      runnerEnvPath,
-      runnerEnvironment(release.releaseSha, join(root, "state/status.json")),
-      { mode: 0o600 }
-    );
-    const omlxAlias = join(root, "omlx-current");
-    await symlink(tools.omlxPath, omlxAlias);
-    await expect(
-      release.render({
-        outputDir: join(root, "agents"),
-        repositoryPath: release.repositoryPath,
-        releaseSha: release.releaseSha,
-        runnerEnvPath,
-        runnerExitTimeoutSeconds: 930,
-        pnpmPath: tools.pnpmPath,
-        nodeBinPath: tools.nodeBinPath,
-        omlxPath: omlxAlias,
-        omlxDataPath: "/Users/test/.omlx",
-        modelArtifactPath: "/Users/test/.omlx/models/local-model",
-        ...deployInputPlaceholders,
-        logDir: join(root, "logs"),
-        environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: runnerEnvPath }
-      })
-    ).rejects.toThrow(/omlxPath must be the canonical realpath/);
-  });
-
-  it("rejects a branch checkout, wrong SHA, or dirty release worktree", async () => {
-    const root = await mkdtemp(join(tmpdir(), "surf-launchagents-release-boundary-"));
-    const release = await detachedRelease(root);
-    const runnerEnvPath = join(root, "runner.env");
-    await writeFile(runnerEnvPath, runnerEnvironment(release.releaseSha, join(root, "state/status.json")), {
-      mode: 0o600
-    });
-    const base = {
-      outputDir: join(root, "agents"),
-      repositoryPath: release.repositoryPath,
-      releaseSha: release.releaseSha,
-      runnerEnvPath,
-      runnerExitTimeoutSeconds: 930,
-      pnpmPath: "/opt/homebrew/bin/pnpm",
-      nodeBinPath: "/opt/homebrew/bin",
-      omlxPath: "/opt/homebrew/bin/omlx",
-      omlxDataPath: "/Users/test/.omlx",
-      modelArtifactPath: "/Users/test/.omlx/models/local-model",
-      ...deployInputPlaceholders,
-      logDir: join(root, "logs"),
-      environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: runnerEnvPath }
-    };
-
-    await expect(renderLaunchAgents(base)).rejects.toThrow(
-      /renderer must execute from the same release/
-    );
-
-    await expect(
-      release.render({ ...base, releaseSha: "f".repeat(40) })
-    ).rejects.toThrow(/runnerEnvPath NARRATIVE_RUNNER_RELEASE_SHA must equal releaseSha/);
-    const wrongShaEnv = join(root, "wrong-sha.env");
-    await writeFile(
-      wrongShaEnv,
-      runnerEnvironment("f".repeat(40), join(root, "state/status.json")),
-      { mode: 0o600 }
-    );
-    await expect(
-      release.render({
-        ...base,
-        releaseSha: "f".repeat(40),
-        runnerEnvPath: wrongShaEnv,
-        environment: { SURF_NARRATIVE_RUNNER_ENV_FILE: wrongShaEnv }
-      })
-    ).rejects.toThrow(/HEAD must exactly match releaseSha/);
-
-    await execFileAsync("git", ["-C", release.repositoryPath, "switch", "-c", "mutable-branch"]);
-    await expect(release.render(base)).rejects.toThrow(/must be a detached release worktree/);
-
-    await execFileAsync("git", ["-C", release.repositoryPath, "checkout", "--detach", "-q", release.releaseSha]);
-    await writeFile(join(release.repositoryPath, "untracked.txt"), "dirty\n");
-    await expect(release.render(base)).rejects.toThrow(/release worktree must be clean/);
   });
 });

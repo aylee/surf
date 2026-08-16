@@ -113,6 +113,7 @@ export class MappedResultClient implements ResultClient {
     try {
       response = await this.fetcher(target.url, {
         method: "POST",
+        redirect: "error",
         headers: {
           Authorization: `Bearer ${target.token}`,
           "Content-Type": "application/json",

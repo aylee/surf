@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "repositoryPath": "/absolute/path/to/code/surf",
+  "serviceRoot": "/absolute/path/to/Services/surf",
+  "releasesDirectory": "/absolute/path/to/Services/surf/releases",
+  "stateDirectory": "/absolute/path/to/Services/surf/release-state",
+  "wranglerSourcePath": "/absolute/path/to/Services/surf/config/wrangler.production.jsonc",
+  "workerSecretsSourcePath": "/absolute/path/to/Services/surf/secrets/worker.source.env",
+  "runnerEnvironmentPath": "/absolute/path/to/Services/surf/secrets/runner.source.env",
+  "operatorEnvironmentPath": "/absolute/path/to/Services/surf/secrets/operator.env",
+  "customOrigin": "https://surf.example.com",
+  "workersDevOrigin": "https://surf-example.workers.dev"
+}

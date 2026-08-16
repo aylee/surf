@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 
 import {
+  activeWranglerConfigPath,
   assertActiveWranglerConfig,
+  cloudflareApiErrorCodes,
   ensureQueues,
   pinActiveWranglerConfigForDeploy,
+  probeWrangler,
+  repinActiveWranglerConfigForBootstrap,
   runPnpm,
   runWrangler,
   selectTrackedWranglerConfigForSecretlessDryRun,
@@ -35,14 +39,150 @@ import {
   assertNarrativeSetupDisabled,
   resolveNarrativeDeploySecrets
 } from "./lib/deploy-secrets.mjs";
+import { lstatSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+import { readProductionProfile } from "./lib/release-profile.mjs";
+import {
+  assertBootstrapWorkerDigest,
+  assertDeployedBootstrapReleaseIdentity,
+  resolveExactBootstrapSourceIdentity,
+  stageExactBootstrapWranglerConfig
+} from "./lib/bootstrap-release-identity.mjs";
 import { repoRoot } from "./lib/root-env.mjs";
 
 const mode = process.argv[2];
 const dryRun = process.argv.includes("--dry-run");
+const bootstrapNewInstance = process.argv.includes("--bootstrap-new-instance");
 let workerSecretsFile = null;
+let bootstrapSourceIdentity = null;
 
 if (mode !== "setup" && mode !== "deploy") {
-  throw new Error("Usage: node scripts/cf-deploy.mjs <setup|deploy> [--dry-run]");
+  throw new Error(
+    "Usage: node scripts/cf-deploy.mjs <setup|deploy> [--dry-run] [--bootstrap-new-instance]"
+  );
+}
+if (mode === "deploy") {
+  throw new Error(
+    "The legacy direct deploy entry point is retired; use pnpm release:prod so production mutations are classified and journaled."
+  );
+}
+const unknownArguments = process.argv.slice(3).filter(
+  (argument) => !new Set(["--dry-run", "--bootstrap-new-instance"]).has(argument)
+);
+if (unknownArguments.length > 0) {
+  throw new Error(`Unknown setup argument: ${unknownArguments.join(", ")}`);
+}
+if (!dryRun && !bootstrapNewInstance) {
+  throw new Error(
+    "Cloudflare setup is a bootstrap-only first-install operation and requires explicit new-instance intent. Use pnpm setup:cloudflare for a new instance, or pnpm release:prod for established production."
+  );
+}
+
+const productionProfilePath =
+  process.env.SURF_PRODUCTION_PROFILE?.trim() ||
+  resolve(homedir(), "Services/surf/production-profile.json");
+const defaultReleaseStatePath = resolve(
+  homedir(),
+  "Services/surf/release-state"
+);
+const workerAbsentApiCodes = new Set([10007, 10090]);
+let pinnedBootstrapProfileEvidence = null;
+
+function optionalPathMetadata(path, label) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error(`Could not inspect ${label}; refusing bootstrap`, {
+      cause: error
+    });
+  }
+}
+
+function assertManagedReleaseStateAbsent() {
+  const explicitProfile = Boolean(
+    process.env.SURF_PRODUCTION_PROFILE?.trim()
+  );
+  const profileMetadata = optionalPathMetadata(
+    productionProfilePath,
+    "the production profile"
+  );
+  let statePath = defaultReleaseStatePath;
+  let profileSha256 = null;
+  if (profileMetadata) {
+    let profile;
+    try {
+      ({ profile, sha256: profileSha256 } = readProductionProfile(
+        productionProfilePath
+      ));
+    } catch (error) {
+      throw new Error(
+        "Could not prove managed production release state is absent because the production profile is unsafe or unreadable; use pnpm release:prod for established production.",
+        { cause: error }
+      );
+    }
+    statePath = profile.stateDirectory;
+  } else if (explicitProfile) {
+    throw new Error(
+      "Could not prove managed production release state is absent because SURF_PRODUCTION_PROFILE does not name an existing profile; refusing bootstrap."
+    );
+  }
+
+  const profileEvidence = JSON.stringify({
+    profilePath: productionProfilePath,
+    profileSha256,
+    statePath
+  });
+  if (pinnedBootstrapProfileEvidence === null) {
+    pinnedBootstrapProfileEvidence = profileEvidence;
+  } else if (pinnedBootstrapProfileEvidence !== profileEvidence) {
+    throw new Error(
+      "Production profile identity changed during bootstrap; refusing further remote operations."
+    );
+  }
+
+  if (optionalPathMetadata(statePath, "managed production release state")) {
+    throw new Error(
+      `Managed production release state already exists at ${statePath}; setup:cloudflare is bootstrap-only. Use pnpm release:prod.`
+    );
+  }
+}
+
+function assertBootstrapWorkerAbsent(workerName, checkpoint) {
+  const inspection = probeWrangler(
+    ["deployments", "status", "--name", workerName, "--json"],
+    { timeoutMs: 60_000 }
+  );
+  const output = `${inspection.stdout ?? ""}${inspection.stderr ?? ""}`;
+  if (inspection.status === 0) {
+    throw new Error(
+      `Worker '${workerName}' already has deployment state; setup:cloudflare is bootstrap-only. Use pnpm release:prod.`
+    );
+  }
+  const apiCodes = cloudflareApiErrorCodes(output);
+  if (
+    apiCodes.length === 1 &&
+    workerAbsentApiCodes.has(apiCodes[0])
+  ) {
+    console.log(
+      JSON.stringify({
+        status: "bootstrap-worker-absence-proved",
+        checkpoint,
+        workerName,
+        cloudflareApiCode: apiCodes[0]
+      })
+    );
+    return;
+  }
+  if (output.includes(`The Worker ${workerName} has no deployments.`)) {
+    throw new Error(
+      `Worker '${workerName}' already exists without versioned deployment state; setup:cloudflare will not adopt it. Use pnpm release:prod.`
+    );
+  }
+  throw new Error(
+    `Could not prove Worker '${workerName}' is absent from Cloudflare at ${checkpoint}; refusing bootstrap before any remote mutation. Inspect it read-only, then use pnpm release:prod for established production.`
+  );
 }
 
 const legacyPatchlessVersionId =
@@ -224,6 +364,23 @@ function inspectWorkerRuntime(expectedVersionId, { requireCpuLimit, checkpoint }
   return runtime;
 }
 
+function inspectBootstrapReleaseIdentity(expectedVersionId, identity) {
+  const versionOutput = runWrangler(
+    ["versions", "view", expectedVersionId, "--json"],
+    { capture: true, echo: false }
+  );
+  const receipt = assertDeployedBootstrapReleaseIdentity(versionOutput, {
+    versionId: expectedVersionId,
+    sourceRevision: identity.sourceRevision,
+    workerRuntimeDigest: identity.workerRuntimeDigest,
+    clientBuildDigest: identity.clientBuildDigest
+  });
+  console.log(
+    JSON.stringify({ status: "bootstrap-release-identity-live", ...receipt })
+  );
+  return receipt;
+}
+
 function assertExistingDeploymentState() {
   const deploymentOutput = runWrangler(
     ["deployments", "status", "--json"],
@@ -290,11 +447,9 @@ if (dryRun) {
 }
 assertNarrativeSetupDisabled(mode, activeWranglerConfig);
 const expectedWorkerName = activeWranglerConfig.name;
-buildAndValidate(
-  dryRun ? secretlessDryRunEnvironment(expectedWorkerName) : undefined
-);
 
 if (dryRun) {
+  buildAndValidate(secretlessDryRunEnvironment(expectedWorkerName));
   console.log("Cloudflare dry run passed. No remote resources were changed.");
   process.exit(0);
 }
@@ -306,11 +461,15 @@ const narrativeDeployInputs = resolveNarrativeDeploySecrets({
 });
 if (narrativeDeployInputs) {
   workerSecretsFile = narrativeDeployInputs.workerSecretsFile;
-  setCloudflareCommandGuard(narrativeDeployInputs.assertUnchanged);
   console.log(
     JSON.stringify({ status: "narrative-deploy-inputs-pinned", ...narrativeDeployInputs.receipt })
   );
 }
+setCloudflareCommandGuard(() => {
+  narrativeDeployInputs?.assertUnchanged();
+  bootstrapSourceIdentity?.assertUnchanged();
+  assertManagedReleaseStateAbsent();
+});
 
 if (mode === "deploy" && !process.env.SURF_INGEST_TOKEN?.trim()) {
   throw new Error(
@@ -325,31 +484,81 @@ if (mode === "deploy" && !updateDeploymentUrl) {
   );
 }
 
+assertManagedReleaseStateAbsent();
 runWrangler(["whoami"]);
+assertBootstrapWorkerAbsent(expectedWorkerName, "pre-build");
+bootstrapSourceIdentity = resolveExactBootstrapSourceIdentity(repoRoot);
+const bootstrapBuildEnvironment = {
+  SURF_RELEASE_SHA: bootstrapSourceIdentity.sourceRevision,
+  SURF_CLIENT_BUILD_DIGEST: bootstrapSourceIdentity.clientBuildDigest
+};
+buildAndValidate(bootstrapBuildEnvironment);
+const bootstrapConfig = stageExactBootstrapWranglerConfig({
+  sourcePath: activeWranglerConfigPath,
+  releaseRoot: repoRoot,
+  sourceRevision: bootstrapSourceIdentity.sourceRevision,
+  clientBuildDigest: bootstrapSourceIdentity.clientBuildDigest,
+  workerBundlePath: resolve(repoRoot, "dist/wrangler-dry-run/index.js")
+});
+if (bootstrapConfig.config.name !== expectedWorkerName) {
+  throw new Error("Bootstrap release identity changed the Worker name");
+}
+repinActiveWranglerConfigForBootstrap({
+  path: bootstrapConfig.path,
+  sha256: bootstrapConfig.sha256
+});
+buildAndValidate(bootstrapBuildEnvironment);
+assertBootstrapWorkerDigest(
+  resolve(repoRoot, "dist/wrangler-dry-run/index.js"),
+  bootstrapConfig.workerRuntimeDigest
+);
+console.log(
+  JSON.stringify({
+    status: "bootstrap-release-identity-ready",
+    sourceRevision: bootstrapConfig.sourceRevision,
+    clientBuildDigest: bootstrapConfig.clientBuildDigest,
+    workerRuntimeDigest: bootstrapConfig.workerRuntimeDigest,
+    wranglerConfigPath: bootstrapConfig.path,
+    wranglerConfigSha256: bootstrapConfig.sha256
+  })
+);
+assertManagedReleaseStateAbsent();
+assertBootstrapWorkerAbsent(expectedWorkerName, "pre-mutation");
 
 let output;
 if (mode === "setup") {
   ensureQueues();
+  assertBootstrapWorkerAbsent(expectedWorkerName, "pre-worker-upload");
   output = deployWorker();
-  inspectWorkerRuntime(resolveDeployedVersionId(output), {
-    requireCpuLimit: true,
-    checkpoint: "post-upload"
-  });
+  let setupVersionId;
+  try {
+    setupVersionId = resolveDeployedVersionId(output);
+    inspectWorkerRuntime(setupVersionId, {
+      requireCpuLimit: true,
+      checkpoint: "post-upload"
+    });
+    inspectBootstrapReleaseIdentity(setupVersionId, bootstrapConfig);
+    assertDeploymentActive(setupVersionId, "bootstrap-pre-storage");
+  } catch (error) {
+    throw new Error(
+      "The bootstrap Worker now exists, but its exact runtime/release identity could not be proved. Do not rerun bootstrap: preserve the printed identity snapshot receipt, configure the production profile, and use pnpm release:prod to inspect and fix forward.",
+      { cause: error }
+    );
+  }
   try {
     migrateAndSeed();
   } catch (error) {
     throw new Error(
-      "The Worker and storage bindings were provisioned, but D1 initialization failed. Fix the reported error and rerun pnpm setup:cloudflare.",
+      "The Worker and storage bindings were provisioned, but D1 initialization failed. Do not rerun bootstrap: configure the production profile and use pnpm release:prod to adopt and fix forward the existing Worker.",
       { cause: error }
     );
   }
   const setupUrl = deployedUrl(output);
   if (!setupUrl) {
     throw new Error(
-      "Setup completed, but its production URL could not be inferred. Set SURF_BASE_URL and rerun pnpm setup:cloudflare so the required smoke test can finish."
+      "The bootstrap Worker exists, but its production URL could not be inferred. Configure the production profile and use pnpm release:prod to adopt and verify it; setup:cloudflare will not overwrite it."
     );
   }
-  const setupVersionId = resolveDeployedVersionId(output);
   const rollout = await waitUntilServing(
     setupUrl,
     setupVersionId,

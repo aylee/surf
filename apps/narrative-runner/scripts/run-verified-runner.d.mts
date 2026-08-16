@@ -5,7 +5,7 @@ export function runVerifiedRunner(
   dependencies?: {
     verify?: (
       recordPath: string,
-      options: { requireInstalled: true }
+      options: { requireInstalled: true; allowLegacyV3?: false }
     ) => Promise<unknown>;
     spawn?: (
       command: string,

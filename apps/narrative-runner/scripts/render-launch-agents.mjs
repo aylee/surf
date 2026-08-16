@@ -351,25 +351,82 @@ async function verifyRecordedFile(
   }
 }
 
-export async function verifyLaunchActivation(
-  recordPath,
-  { requireInstalled = true } = {}
-) {
-  let metadata;
-  let record;
-  try {
-    metadata = await lstat(recordPath);
-    record = JSON.parse(await readFile(recordPath, "utf8"));
-  } catch {
-    throw new Error("activation record must be readable JSON");
+function protocolDescriptor(value, label = "accepted protocol") {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value.family !== "surf.narrative" ||
+    !Number.isInteger(value.version) ||
+    value.version < 1 ||
+    !/^[0-9a-f]{64}$/.test(value.fingerprint ?? "")
+  ) {
+    throw new Error(`${label} is invalid`);
   }
-  if (metadata.isSymbolicLink() || !metadata.isFile() || (metadata.mode & 0o777) !== 0o600) {
-    throw new Error("activation record must be a non-symlink mode-0600 regular file");
+  return value;
+}
+
+async function readRunnerArtifactManifest(path) {
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    throw new Error("runner artifact manifest must be readable JSON");
   }
   if (
-    !record ||
-    typeof record !== "object" ||
-    record.schemaVersion !== 3 ||
+    manifest?.schemaVersion !== 1 ||
+    !/^[0-9a-f]{64}$/.test(manifest.artifact?.sha256 ?? "") ||
+    !Number.isInteger(manifest.artifact?.bytes) ||
+    manifest.artifact.bytes < 1 ||
+    !Array.isArray(manifest.acceptedProtocols) ||
+    manifest.acceptedProtocols.length < 1
+  ) {
+    throw new Error("runner artifact manifest schema is invalid");
+  }
+  for (const value of manifest.acceptedProtocols) protocolDescriptor(value);
+  return manifest;
+}
+
+async function verifyCommonArtifacts(record, requireInstalled) {
+  for (const name of ["node", "omlx", "omlxSupervisor"]) {
+    await verifyRecordedFile(record.executables?.[name], name, true);
+  }
+  await verifyRecordedFile(record.executables?.runnerGuard, "runnerGuard", false);
+  for (const name of ["narrativeRunner", "omlxServer"]) {
+    await verifyRecordedFile(
+      record.renderedLaunchAgents?.[name],
+      `rendered ${name}`,
+      false,
+      true
+    );
+    if (requireInstalled) {
+      await verifyRecordedFile(
+        record.launchAgents?.[name],
+        `installed ${name}`,
+        false,
+        true
+      );
+    }
+  }
+}
+
+async function verifyModelArtifact(record) {
+  const modelRecord = record.schemaVersion === 4 ? record.model?.artifact : record.modelArtifact;
+  const currentModelArtifact = await directoryArtifact(
+    modelRecord?.path,
+    "modelArtifactPath"
+  );
+  if (
+    currentModelArtifact.sha256 !== modelRecord?.sha256 ||
+    currentModelArtifact.fileCount !== modelRecord?.fileCount ||
+    currentModelArtifact.totalBytes !== modelRecord?.totalBytes
+  ) {
+    throw new Error("model artifact differs from activation record");
+  }
+  return currentModelArtifact;
+}
+
+async function verifyLegacyV3Activation(record, requireInstalled) {
+  if (
     typeof record.releaseSha !== "string" ||
     typeof record.repositoryPath !== "string" ||
     typeof record.runnerEnvPath !== "string" ||
@@ -380,11 +437,8 @@ export async function verifyLaunchActivation(
     typeof record.workerSecrets?.path !== "string" ||
     !/^[0-9a-f]{64}$/.test(record.workerSecrets?.fingerprint ?? "")
   ) {
-    throw new Error("activation record schema is invalid");
+    throw new Error("legacy v3 activation record schema is invalid");
   }
-  // A release switch verifies both the target and prior records from the
-  // target controller. Rendering remains owner-bound; record verification
-  // follows and hashes the release named by the record itself.
   await validateImmutableRelease(record.repositoryPath, record.releaseSha, {
     requireRendererOwnership: false
   });
@@ -410,43 +464,122 @@ export async function verifyLaunchActivation(
   if (currentWorkerSecrets.fingerprint !== record.workerSecrets.fingerprint) {
     throw new Error("worker secrets differ from activation record");
   }
-
-  for (const name of ["node", "pnpm", "omlx", "omlxSupervisor"]) {
-    await verifyRecordedFile(record.executables?.[name], name, true);
-  }
-  await verifyRecordedFile(record.executables?.runnerGuard, "runnerGuard", false);
-  for (const name of ["narrativeRunner", "omlxServer"]) {
-    await verifyRecordedFile(
-      record.renderedLaunchAgents?.[name],
-      `rendered ${name}`,
-      false,
-      true
-    );
-    if (requireInstalled) {
-      await verifyRecordedFile(
-        record.launchAgents?.[name],
-        `installed ${name}`,
-        false,
-        true
-      );
-    }
-  }
-  const currentModelArtifact = await directoryArtifact(
-    record.modelArtifact?.path,
-    "modelArtifactPath"
-  );
-  if (
-    currentModelArtifact.sha256 !== record.modelArtifact?.sha256 ||
-    currentModelArtifact.fileCount !== record.modelArtifact?.fileCount ||
-    currentModelArtifact.totalBytes !== record.modelArtifact?.totalBytes
-  ) {
-    throw new Error("model artifact differs from activation record");
-  }
+  await verifyRecordedFile(record.executables?.pnpm, "pnpm", true);
+  await verifyCommonArtifacts(record, requireInstalled);
+  const currentModelArtifact = await verifyModelArtifact(record);
   return {
     status: "ok",
+    schemaVersion: 3,
+    transitionOnly: true,
     releaseSha: record.releaseSha,
     modelId: record.modelId,
     wranglerConfigSha256: record.wranglerConfig.sha256,
+    modelArtifactSha256: currentModelArtifact.sha256,
+    acceptedProtocols: []
+  };
+}
+
+export async function verifyLaunchActivation(
+  recordPath,
+  { requireInstalled = true, allowLegacyV3 = false } = {}
+) {
+  let metadata;
+  let record;
+  try {
+    metadata = await lstat(recordPath);
+    record = JSON.parse(await readFile(recordPath, "utf8"));
+  } catch {
+    throw new Error("activation record must be readable JSON");
+  }
+  if (metadata.isSymbolicLink() || !metadata.isFile() || (metadata.mode & 0o777) !== 0o600) {
+    throw new Error("activation record must be a non-symlink mode-0600 regular file");
+  }
+  if (!record || typeof record !== "object") throw new Error("activation record schema is invalid");
+  if (record.schemaVersion === 3) {
+    if (!allowLegacyV3) {
+      throw new Error("legacy v3 activation records are accepted only for explicit rollback transition");
+    }
+    return verifyLegacyV3Activation(record, requireInstalled);
+  }
+  if (
+    record.schemaVersion !== 4 ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(record.activationId ?? "") ||
+    !/^[0-9a-f]{40}$/.test(record.source?.revision ?? "") ||
+    typeof record.source?.repositoryPath !== "string" ||
+    typeof record.runtime?.environmentPath !== "string" ||
+    !/^[0-9a-f]{64}$/.test(record.runtime?.environmentFingerprint ?? "") ||
+    typeof record.runtime?.statusFile !== "string" ||
+    typeof record.model?.id !== "string" ||
+    !Array.isArray(record.acceptedProtocols) ||
+    record.acceptedProtocols.length < 1 ||
+    typeof record.runnerArtifact?.manifest?.path !== "string"
+  ) {
+    throw new Error("activation record v4 schema is invalid");
+  }
+  for (const value of record.acceptedProtocols) protocolDescriptor(value);
+  const canonicalRecordPath = await realpath(recordPath);
+  if (resolve(recordPath) !== canonicalRecordPath) {
+    throw new Error("activation record must be addressed by its canonical realpath");
+  }
+  if (basename(dirname(canonicalRecordPath)) !== record.activationId) {
+    throw new Error("activationId must equal the immutable activation directory name");
+  }
+  await validateImmutableRelease(record.source.repositoryPath, record.source.revision, {
+    requireRendererOwnership: false
+  });
+  const runnerEnvironment = readStrictDotenvFile(
+    record.runtime.environmentPath,
+    "Narrative runner environment file"
+  );
+  if (runnerEnvironment.NARRATIVE_RUNNER_RELEASE_SHA !== record.source.revision) {
+    throw new Error("runner environment source revision differs from activation record");
+  }
+  if (runnerEnvironment.NARRATIVE_RUNNER_OMLX_MODEL !== record.model.id) {
+    throw new Error("runner environment model ID differs from activation record");
+  }
+  if (
+    runnerEnvironment.NARRATIVE_RUNNER_ACTIVATION_ID !== undefined ||
+    runnerEnvironment.NARRATIVE_RUNNER_ARTIFACT_SHA256 !== undefined
+  ) {
+    throw new Error("runner activation identity is record-owned, not an environment-file setting");
+  }
+  if (runnerEnvironmentFingerprint(runnerEnvironment) !== record.runtime.environmentFingerprint) {
+    throw new Error("runner environment differs from activation record");
+  }
+  await verifyRecordedFile(record.runnerArtifact, "runner artifact", false);
+  await verifyRecordedFile(record.runnerArtifact.manifest, "runner artifact manifest", false);
+  const artifactMetadata = await lstat(record.runnerArtifact.path);
+  if (artifactMetadata.size !== record.runnerArtifact.bytes) {
+    throw new Error("runner artifact byte size differs from activation record");
+  }
+  const manifest = await readRunnerArtifactManifest(record.runnerArtifact.manifest.path);
+  if (
+    manifest.artifact.sha256 !== record.runnerArtifact.sha256 ||
+    manifest.artifact.bytes !== record.runnerArtifact.bytes ||
+    JSON.stringify(manifest.acceptedProtocols) !== JSON.stringify(record.acceptedProtocols)
+  ) {
+    throw new Error("runner artifact manifest differs from activation record");
+  }
+  const releaseRoot = await realpath(record.source.repositoryPath);
+  for (const [label, path] of [
+    ["runner artifact", record.runnerArtifact.path],
+    ["runner artifact manifest", record.runnerArtifact.manifest.path]
+  ]) {
+    if (!pathIsInside(releaseRoot, await realpath(path))) {
+      throw new Error(`${label} must remain inside the immutable source release`);
+    }
+  }
+  await verifyCommonArtifacts(record, requireInstalled);
+  const currentModelArtifact = await verifyModelArtifact(record);
+  return {
+    status: "ok",
+    schemaVersion: 4,
+    transitionOnly: false,
+    activationId: record.activationId,
+    releaseSha: record.source.revision,
+    runnerArtifactSha256: record.runnerArtifact.sha256,
+    acceptedProtocols: record.acceptedProtocols,
+    modelId: record.model.id,
     modelArtifactSha256: currentModelArtifact.sha256
   };
 }
@@ -471,6 +604,10 @@ function replacePlaceholders(template, values) {
 
 export async function renderLaunchAgents(options) {
   const outputDir = requiredAbsolute(options, "outputDir");
+  const activationId = basename(resolve(outputDir));
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(activationId)) {
+    throw new Error("outputDir basename must be a stable activation identifier");
+  }
   const repositoryPath = requiredAbsolute(options, "repositoryPath");
   const releaseSha = requiredReleaseSha(options);
   const runnerEnvPath = requiredAbsolute(options, "runnerEnvPath");
@@ -497,17 +634,6 @@ export async function renderLaunchAgents(options) {
   const homePath = await prospectiveRealPath(
     environment.HOME?.trim() || homedir()
   );
-  const validatedRunnerEnvPath = environment.SURF_NARRATIVE_RUNNER_ENV_FILE;
-  if (!validatedRunnerEnvPath || !isAbsolute(validatedRunnerEnvPath)) {
-    throw new Error(
-      "SURF_NARRATIVE_RUNNER_ENV_FILE must be set to the absolute runner environment path"
-    );
-  }
-  if (resolve(validatedRunnerEnvPath) !== resolve(runnerEnvPath)) {
-    throw new Error(
-      "runnerEnvPath must exactly match SURF_NARRATIVE_RUNNER_ENV_FILE used by deploy validation"
-    );
-  }
   if (runnerEnvPath.toLowerCase().endsWith(".json")) {
     throw new Error(
       "runnerEnvPath must be a dotenv file because the verified runner guard loads dotenv syntax"
@@ -537,6 +663,12 @@ export async function renderLaunchAgents(options) {
   if (environmentReleaseSha !== releaseSha) {
     throw new Error("runnerEnvPath NARRATIVE_RUNNER_RELEASE_SHA must equal releaseSha");
   }
+  if (
+    runnerEnvironment.NARRATIVE_RUNNER_ACTIVATION_ID !== undefined ||
+    runnerEnvironment.NARRATIVE_RUNNER_ARTIFACT_SHA256 !== undefined
+  ) {
+    throw new Error("runner activation identity is record-owned, not an environment-file setting");
+  }
   const statusFile = environmentString(
     runnerEnvironment,
     "NARRATIVE_RUNNER_STATUS_FILE"
@@ -549,7 +681,10 @@ export async function renderLaunchAgents(options) {
     "NARRATIVE_RUNNER_OMLX_MODEL"
   );
   await validateImmutableRelease(repositoryPath, releaseSha);
-  const requestedPnpmPath = requiredAbsolute(options, "pnpmPath");
+  const runnerArtifactPath = requiredAbsolute(options, "runnerArtifactPath");
+  const runnerArtifactManifestPath = options.runnerArtifactManifestPath
+    ? requiredAbsolute(options, "runnerArtifactManifestPath")
+    : resolve(dirname(runnerArtifactPath), "narrative-runner.manifest.json");
   const requestedNodeBinPath = requiredAbsolute(options, "nodeBinPath");
   const requestedOmlxPath = requiredAbsolute(options, "omlxPath");
   const omlxDataPath = requiredAbsolute(options, "omlxDataPath");
@@ -564,7 +699,37 @@ export async function renderLaunchAgents(options) {
     statusFile
   });
 
-  const pnpmPath = await canonicalExecutable(requestedPnpmPath, "pnpmPath");
+  const canonicalRepositoryPath = await realpath(repositoryPath);
+  let canonicalRunnerArtifactPath;
+  let canonicalRunnerArtifactManifestPath;
+  for (const [label, requestedPath] of [
+    ["runnerArtifactPath", runnerArtifactPath],
+    ["runnerArtifactManifestPath", runnerArtifactManifestPath]
+  ]) {
+    const metadata = await lstat(requestedPath);
+    const canonical = await realpath(requestedPath);
+    if (
+      !metadata.isFile() ||
+      metadata.isSymbolicLink() ||
+      resolve(requestedPath) !== canonical ||
+      !pathIsInside(canonicalRepositoryPath, canonical)
+    ) {
+      throw new Error(`${label} must be a canonical non-symlink file inside repositoryPath`);
+    }
+    if (label === "runnerArtifactPath") canonicalRunnerArtifactPath = canonical;
+    else canonicalRunnerArtifactManifestPath = canonical;
+  }
+  const runnerManifest = await readRunnerArtifactManifest(
+    canonicalRunnerArtifactManifestPath
+  );
+  const runnerArtifactSha256 = await sha256File(canonicalRunnerArtifactPath);
+  const runnerArtifactBytes = (await lstat(canonicalRunnerArtifactPath)).size;
+  if (
+    runnerManifest.artifact.sha256 !== runnerArtifactSha256 ||
+    runnerManifest.artifact.bytes !== runnerArtifactBytes
+  ) {
+    throw new Error("runner artifact does not match its deterministic build manifest");
+  }
   const nodePath = await canonicalExecutable(
     resolve(requestedNodeBinPath, "node"),
     "nodeBinPath/node"
@@ -588,30 +753,6 @@ export async function renderLaunchAgents(options) {
   const modelArtifact = await directoryArtifact(
     canonicalModelArtifactPath,
     "modelArtifactPath"
-  );
-  const wranglerConfigPath = requiredAbsolute(options, "wranglerConfigPath");
-  const workerSecretsPath = requiredAbsolute(options, "workerSecretsPath");
-  const wranglerConfigSha256 = options.wranglerConfigSha256;
-  if (
-    typeof wranglerConfigSha256 !== "string" ||
-    !/^[0-9a-f]{64}$/.test(wranglerConfigSha256)
-  ) {
-    throw new Error("wranglerConfigSha256 must be an exact lowercase SHA-256");
-  }
-  await requireOperationalPathsOutsideRelease(repositoryPath, {
-    wranglerConfigPath,
-    workerSecretsPath
-  });
-  const canonicalWranglerConfigPath = await privateRegularFile(
-    wranglerConfigPath,
-    "wranglerConfigPath"
-  );
-  if ((await sha256File(canonicalWranglerConfigPath)) !== wranglerConfigSha256) {
-    throw new Error("wranglerConfigSha256 does not match wranglerConfigPath");
-  }
-  const workerSecrets = await workerSecretsArtifact(
-    workerSecretsPath,
-    runnerEnvironment
   );
 
   await mkdir(outputDir, { recursive: true });
@@ -673,19 +814,31 @@ export async function renderLaunchAgents(options) {
     written.push(path);
   }
   const activationRecord = {
-    schemaVersion: 3,
-    releaseSha,
-    repositoryPath: await realpath(repositoryPath),
-    runnerEnvPath: await realpath(runnerEnvPath),
-    statusFile: await prospectiveRealPath(statusFile),
-    modelId: configuredModelId,
-    runnerEnvironmentFingerprint: runnerEnvironmentFingerprint(runnerEnvironment),
-    wranglerConfig: {
-      path: canonicalWranglerConfigPath,
-      sha256: wranglerConfigSha256
+    schemaVersion: 4,
+    activationId,
+    source: {
+      revision: releaseSha,
+      repositoryPath: canonicalRepositoryPath
     },
-    workerSecrets,
-    modelArtifact,
+    runnerArtifact: {
+      path: canonicalRunnerArtifactPath,
+      sha256: runnerArtifactSha256,
+      bytes: runnerArtifactBytes,
+      manifest: {
+        path: canonicalRunnerArtifactManifestPath,
+        sha256: await sha256File(canonicalRunnerArtifactManifestPath)
+      }
+    },
+    acceptedProtocols: runnerManifest.acceptedProtocols,
+    runtime: {
+      environmentPath: await realpath(runnerEnvPath),
+      environmentFingerprint: runnerEnvironmentFingerprint(runnerEnvironment),
+      statusFile: await prospectiveRealPath(statusFile)
+    },
+    model: {
+      id: configuredModelId,
+      artifact: modelArtifact
+    },
     renderedLaunchAgents: {
       narrativeRunner: {
         path: await realpath(written[0]),
@@ -712,7 +865,6 @@ export async function renderLaunchAgents(options) {
     },
     executables: {
       node: { path: nodePath, sha256: await sha256File(nodePath) },
-      pnpm: { path: pnpmPath, sha256: await sha256File(pnpmPath) },
       omlx: { path: omlxPath, sha256: await sha256File(omlxPath) },
       omlxSupervisor: {
         path: supervisorPath,

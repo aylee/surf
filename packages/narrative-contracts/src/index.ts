@@ -184,6 +184,111 @@ export const NarrativeFallbackWatchdogSchema = z
   .strict();
 export type NarrativeFallbackWatchdog = z.infer<typeof NarrativeFallbackWatchdogSchema>;
 
+export const NARRATIVE_PROTOCOL_FAMILY = "surf.narrative" as const;
+export const NARRATIVE_PROTOCOL_VERSION = 1 as const;
+// Increment this revision for a behavioral compatibility change that does not
+// alter a JSON wire schema. Schema changes still require a new protocol
+// version; this revision keeps non-schema semantics inside the fingerprint.
+export const NARRATIVE_PROTOCOL_SEMANTIC_REVISION = 1 as const;
+export const NARRATIVE_PROTOCOL_CAPABILITIES = [
+  "openai-chat-completions",
+  "json-schema"
+] as const;
+
+export const NarrativeProtocolDescriptorSchema = z
+  .object({
+    family: z.literal(NARRATIVE_PROTOCOL_FAMILY),
+    version: z.literal(NARRATIVE_PROTOCOL_VERSION),
+    semanticRevision: z.literal(NARRATIVE_PROTOCOL_SEMANTIC_REVISION),
+    fingerprint: FingerprintSchema,
+    wireSchemaVersions: z
+      .object({
+        job: z.literal(1),
+        resultSubmission: z.literal(1),
+        resultResponse: z.literal(1)
+      })
+      .strict(),
+    capabilities: z.tuple([
+      z.literal(NARRATIVE_PROTOCOL_CAPABILITIES[0]),
+      z.literal(NARRATIVE_PROTOCOL_CAPABILITIES[1])
+    ]),
+    limits: z
+      .object({
+        jobBytes: z.literal(NARRATIVE_JOB_MAX_BYTES),
+        resultBytes: z.literal(NARRATIVE_RESULT_MAX_BYTES)
+      })
+      .strict()
+  })
+  .strict();
+
+export type NarrativeProtocolDescriptor = z.infer<
+  typeof NarrativeProtocolDescriptorSchema
+>;
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, nested]) => [key, canonicalJsonValue(nested)])
+  );
+}
+
+/**
+ * Canonical input for the protocol fingerprint. The fallback-watchdog schema
+ * is intentionally excluded: it is a Worker-owned delayed-Queue contract, not
+ * part of the Worker-to-runner job/result protocol.
+ */
+export function canonicalNarrativeProtocolDefinition(): string {
+  return JSON.stringify(
+    canonicalJsonValue({
+      family: NARRATIVE_PROTOCOL_FAMILY,
+      version: NARRATIVE_PROTOCOL_VERSION,
+      semanticRevision: NARRATIVE_PROTOCOL_SEMANTIC_REVISION,
+      wireSchemaVersions: {
+        job: 1,
+        resultSubmission: 1,
+        resultResponse: 1
+      },
+      capabilities: NARRATIVE_PROTOCOL_CAPABILITIES,
+      limits: {
+        jobBytes: NARRATIVE_JOB_MAX_BYTES,
+        resultBytes: NARRATIVE_RESULT_MAX_BYTES
+      },
+      wireSchemas: {
+        job: z.toJSONSchema(NarrativeJobSchema),
+        resultSubmission: z.toJSONSchema(NarrativeResultSubmissionSchema),
+        resultResponse: z.toJSONSchema(NarrativeResultResponseSchema)
+      }
+    })
+  );
+}
+
+// This checked golden is intentionally static. Tests recompute SHA-256 from
+// canonicalNarrativeProtocolDefinition(), so a wire or semantic change cannot
+// silently retain the old compatibility identity.
+export const NARRATIVE_PROTOCOL_FINGERPRINT =
+  "3956bce39909ae82fd1e81591698f1ecc7c28d6b05f9a2a53e99f5a80218f041" as const;
+
+export const NARRATIVE_PROTOCOL_DESCRIPTOR: NarrativeProtocolDescriptor =
+  NarrativeProtocolDescriptorSchema.parse({
+    family: NARRATIVE_PROTOCOL_FAMILY,
+    version: NARRATIVE_PROTOCOL_VERSION,
+    semanticRevision: NARRATIVE_PROTOCOL_SEMANTIC_REVISION,
+    fingerprint: NARRATIVE_PROTOCOL_FINGERPRINT,
+    wireSchemaVersions: {
+      job: 1,
+      resultSubmission: 1,
+      resultResponse: 1
+    },
+    capabilities: NARRATIVE_PROTOCOL_CAPABILITIES,
+    limits: {
+      jobBytes: NARRATIVE_JOB_MAX_BYTES,
+      resultBytes: NARRATIVE_RESULT_MAX_BYTES
+    }
+  });
+
 export function serializedNarrativeJobBytes(job: NarrativeJob): number {
   return new TextEncoder().encode(JSON.stringify(NarrativeJobSchema.parse(job))).byteLength;
 }

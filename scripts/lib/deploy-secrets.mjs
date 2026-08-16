@@ -359,9 +359,10 @@ export function resolveNarrativeDeploySecrets(options) {
       "Narrative runner NARRATIVE_RUNNER_RELEASE_SHA must be an exact lowercase 40-character SHA."
     );
   }
-  if (runner.NARRATIVE_RUNNER_RELEASE_SHA !== releaseSha) {
+  const runnerReleaseSha = runner.NARRATIVE_RUNNER_RELEASE_SHA;
+  if (runnerReleaseSha !== releaseSha) {
     throw new Error(
-      "Narrative runner NARRATIVE_RUNNER_RELEASE_SHA must match the exact Worker deploy checkout HEAD."
+      "Legacy setup requires NARRATIVE_RUNNER_RELEASE_SHA to match the exact Worker checkout HEAD; independent component revisions require pnpm release:prod."
     );
   }
   const statusHmacKey = exactToken(
@@ -441,7 +442,8 @@ export function resolveNarrativeDeploySecrets(options) {
       workerSecretsFingerprint: workerFingerprint,
       runnerEnvPath: runnerPath,
       runnerEnvFingerprint: runnerFingerprint,
-      releaseSha
+      releaseSha,
+      runnerReleaseSha
     }
   };
 }

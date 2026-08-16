@@ -6,6 +6,10 @@ import {
   workerVersionRequestHeaders
 } from "./worker-version.mjs";
 import { SCHEDULED_INGEST_MINUTE } from "./ingest-schedule.mjs";
+import {
+  readBoundedResponseJson,
+  readBoundedResponseText
+} from "./bounded-http-response.mjs";
 
 export const REMOTE_INGEST_POLL_INTERVAL_MS = 5_000;
 export const REMOTE_INGEST_TIMEOUT_MS = 10 * 60_000;
@@ -21,6 +25,9 @@ const REMOTE_INGEST_HANDOFF_MAX_SESSIONS = 60;
 const REMOTE_INGEST_HANDOFF_MAX_PROBES = 60;
 const REMOTE_INGEST_HANDOFF_BACKOFF_MS = [1_000, 2_000];
 const REMOTE_INGEST_PROBE_BACKOFF_MS = 1_000;
+const REMOTE_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
+const REMOTE_ERROR_MAX_BYTES = 16 * 1024;
+const REMOTE_MAX_SPOTS = 64;
 const CLOUDFLARE_WORKERS_VERSION_KEY_HEADER =
   "Cloudflare-Workers-Version-Key";
 const CLOUDFLARE_1102_TYPE =
@@ -134,7 +141,10 @@ function validTimestamp(value) {
 
 async function jsonOrNull(response) {
   try {
-    return await response.json();
+    return await readBoundedResponseJson(response, {
+      maxBytes: REMOTE_RESPONSE_MAX_BYTES,
+      label: "remote ingest response"
+    });
   } catch {
     return null;
   }
@@ -151,7 +161,10 @@ function redactSensitiveValues(value, sensitiveValues = []) {
 }
 
 async function responseEvidence(response, sensitiveValues = []) {
-  const rawBody = await response.text();
+  const rawBody = await readBoundedResponseText(response, {
+    maxBytes: REMOTE_ERROR_MAX_BYTES,
+    label: "remote ingest diagnostic response"
+  });
   let payload = null;
   try {
     payload = rawBody ? JSON.parse(rawBody) : null;
@@ -461,6 +474,7 @@ function nextVersionAffinityKey(factory, sessions) {
 
 function configuredSpotIdsFromPayload(payload, { strict = false } = {}) {
   if (!Array.isArray(payload?.spots)) return null;
+  if (payload.spots.length < 1 || payload.spots.length > REMOTE_MAX_SPOTS) return null;
   if (
     strict &&
     !payload.spots.every(
@@ -583,7 +597,7 @@ async function configuredSpotIds(
     async (response) => {
       if (!response.ok) {
         throw new Error(
-          `spot catalog request failed: ${response.status} ${await response.text()}`
+          `spot catalog request failed: ${response.status} ${await readBoundedResponseText(response, { maxBytes: REMOTE_ERROR_MAX_BYTES, label: "spot catalog response" })}`
         );
       }
       const actualVersionId = responseWorkerVersion(response);
@@ -593,7 +607,10 @@ async function configuredSpotIds(
           `spot catalog was served by Worker version ${actualVersionId ?? "unknown"}; expected ${expectedVersionId}`
         );
       }
-      const payload = await response.json();
+      const payload = await readBoundedResponseJson(response, {
+        maxBytes: REMOTE_RESPONSE_MAX_BYTES,
+        label: "spot catalog response"
+      });
       const spotIds = configuredSpotIdsFromPayload(payload);
       if (!spotIds) {
         throw new Error("spot catalog did not contain a non-empty set of unique spot IDs");
@@ -987,7 +1004,7 @@ async function inspectForecastReadinessSnapshot(
           throw new Error(`${path} returned an invalid 503 response`);
         }
         if (!response.ok) {
-          throw new Error(`${path} failed: ${response.status} ${await response.text()}`);
+          throw new Error(`${path} failed: ${response.status} ${await readBoundedResponseText(response, { maxBytes: REMOTE_ERROR_MAX_BYTES, label: "forecast readiness response" })}`);
         }
         if (!isJsonContentType(response.headers.get("Content-Type"))) {
           cancelBodyWithoutWaiting(response);
@@ -1008,6 +1025,79 @@ async function inspectForecastReadinessSnapshot(
     }
     throw error;
   }
+}
+
+export async function inspectRemoteForecastReadModels(options) {
+  const {
+    baseUrl,
+    ingestId,
+    requestedAt,
+    forecastGeneratedAt = requestedAt,
+    fetcher = globalThis.fetch,
+    expectedVersionId,
+    expectedWorkerName,
+    requestTimeoutMs = REMOTE_INGEST_REQUEST_TIMEOUT_MS,
+    spotIds: configuredSpotIdsOption
+  } = options;
+  const requestedAtMs = Date.parse(requestedAt);
+  const minimumGeneratedAtMs = Date.parse(forecastGeneratedAt);
+  if (typeof ingestId !== "string" || !ingestId) {
+    throw new Error("queued ingest returned an invalid ingestId");
+  }
+  if (
+    !Number.isFinite(requestedAtMs) ||
+    !Number.isFinite(minimumGeneratedAtMs)
+  ) {
+    throw new Error("queued ingest reconciliation requires valid timestamps");
+  }
+  if (!(requestTimeoutMs > 0)) {
+    throw new Error("remote ingest request timeout must be positive");
+  }
+
+  const spotIds =
+    configuredSpotIdsOption ??
+    (await configuredSpotIds(
+      baseUrl,
+      fetcher,
+      expectedVersionId,
+      expectedWorkerName,
+      requestTimeoutMs
+    ));
+  const targets = spotIds.flatMap((spotId) =>
+    FORECAST_INTERVALS.map((interval) => ({ spotId, interval }))
+  );
+  const state = await inspectForecastReadinessSnapshot(
+    baseUrl,
+    targets,
+    ingestId,
+    requestedAtMs,
+    minimumGeneratedAtMs,
+    fetcher,
+    expectedVersionId,
+    expectedWorkerName,
+    requestTimeoutMs
+  );
+  if (state.status === "superseded") {
+    throw new Error(
+      `queued ingest ${ingestId} was superseded before release reconciliation; target=${state.spotId}:${state.interval}`
+    );
+  }
+  if (state.status === "ready") {
+    return Object.freeze({
+      status: "published",
+      ingestId,
+      spots: spotIds.length,
+      forecastReadModels: targets.length,
+      materializedAt: state.materializedAt
+    });
+  }
+  return Object.freeze({
+    status: "pending",
+    ingestId,
+    pending: Object.freeze(
+      state.pending.map(({ spotId, interval }) => `${spotId}:${interval}`)
+    )
+  });
 }
 
 export async function waitForRemoteForecastReadModels(options) {

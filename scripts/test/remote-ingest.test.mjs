@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  enqueueAndWaitForRemoteIngest as enqueueAndWaitForRemoteIngestImplementation
+  enqueueAndWaitForRemoteIngest as enqueueAndWaitForRemoteIngestImplementation,
+  inspectRemoteForecastReadModels
 } from "../lib/remote-ingest.mjs";
 import {
   CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
@@ -488,6 +489,51 @@ test("remote ingest succeeds only after one aggregate snapshot exposes the exact
   assert.equal(result.forecastReadModels, 2);
   assert.equal(result.materializedAt, "2026-08-03T01:01:00.000Z");
   assert.equal(readinessRequests, 3);
+});
+
+test("release reconciliation inspects an existing ingest lineage without enqueueing", async () => {
+  const requests = [];
+  const published = await inspectRemoteForecastReadModels({
+    baseUrl,
+    ingestId,
+    requestedAt,
+    fetcher: async (input) => {
+      const url = new URL(String(input));
+      requests.push(url.pathname);
+      if (url.pathname === "/api/spots") {
+        return Response.json({ spots: [spot] });
+      }
+      if (url.pathname === "/api/forecast-readiness") {
+        return readinessResponse(readinessRows());
+      }
+      throw new Error(`unexpected reconciliation request ${url.pathname}`);
+    }
+  });
+  assert.deepEqual(published, {
+    status: "published",
+    ingestId,
+    spots: 1,
+    forecastReadModels: 2,
+    materializedAt: "2026-08-03T01:00:30.000Z"
+  });
+  assert.deepEqual(requests, ["/api/spots", "/api/forecast-readiness"]);
+
+  const pending = await inspectRemoteForecastReadModels({
+    baseUrl,
+    ingestId,
+    requestedAt,
+    spotIds: [spot.id],
+    fetcher: async () =>
+      readinessResponse([
+        missingReadinessRow(spot.id, "3h"),
+        missingReadinessRow(spot.id, "1h")
+      ])
+  });
+  assert.deepEqual(pending, {
+    status: "pending",
+    ingestId,
+    pending: ["test-break:3h", "test-break:1h"]
+  });
 });
 
 test("remote ingest polling is bounded and names unpublished read models", async () => {

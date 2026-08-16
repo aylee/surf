@@ -705,6 +705,30 @@ describe("NarrativeRunner", () => {
     expect(harness.status.current()).toMatchObject({ state: "stopped", inFlight: 0 });
   });
 
+  it("attempts the final stopped heartbeat when an abort rejects the active sleep", async () => {
+    const controller = new AbortController();
+    let sleepStarted!: () => void;
+    const started = new Promise<void>((resolve) => { sleepStarted = resolve; });
+    const harness = makeRunnerHarness({
+      sleep: async (_milliseconds, signal) => {
+        sleepStarted();
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true }
+          );
+        });
+      }
+    });
+    const running = harness.runner.run(controller.signal);
+    await started;
+    controller.abort();
+    await expect(running).resolves.toBeUndefined();
+    expect(harness.status.current()).toMatchObject({ state: "stopped", inFlight: 0 });
+    expect(harness.store.writes.at(-1)).toMatchObject({ state: "stopped" });
+  });
+
   it("continuous run persistently halts on Queue pull authentication failure", async () => {
     const controller = new AbortController();
     const queue = new FakeQueueClient();
