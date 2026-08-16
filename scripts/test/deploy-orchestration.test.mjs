@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   deployExistingWorker,
   prebuiltWorkerVersionUploadArgs,
+  workerCandidateBuildArgs,
   workerTriggerSyncArgs,
   workerVersionActivationArgs,
   workerVersionUploadArgs
@@ -61,6 +62,13 @@ function recordedSteps({ failAt } = {}) {
 test("staged Wrangler commands upload, activate one exact version, then sync triggers", () => {
   const versionId = "11111111-2222-4333-8444-555555555555";
   assert.deepEqual(workerVersionUploadArgs(), ["versions", "upload"]);
+  assert.deepEqual(workerCandidateBuildArgs("/release/dist/worker"), [
+    "deploy",
+    "--dry-run",
+    "--minify",
+    "--outdir",
+    "/release/dist/worker"
+  ]);
   assert.deepEqual(prebuiltWorkerVersionUploadArgs("/release/dist/index.js"), [
     "versions",
     "upload",
@@ -81,6 +89,10 @@ test("staged Wrangler commands upload, activate one exact version, then sync tri
   assert.throws(
     () => prebuiltWorkerVersionUploadArgs("dist/index.js"),
     /bundle path must be absolute/
+  );
+  assert.throws(
+    () => workerCandidateBuildArgs("dist/worker"),
+    /output directory must be absolute/
   );
 });
 

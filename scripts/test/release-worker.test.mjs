@@ -16,16 +16,19 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   AmbiguousWorkerActivationError,
+  assertWorkerVersionReleaseIdentity,
   buildWorkerCandidate,
   createWorkerReleaseOperations,
   expectedWorkerBindingDescriptor,
   RELEASE_GENERATION_TIMEOUT_MS,
   readBoundedHealthIdentity,
   resolveOptionalWorkerSourceRevision,
+  resolveWorkerDurableObjectNamespaceIds,
   resolveWorkerSourceRevision,
   resolveTaggedWorkerVersion
 } from "../lib/release-worker.mjs";
 import { captureClientOutputIdentity } from "../lib/build-identity.mjs";
+import { workerCandidateBuildArgs } from "../lib/deploy-orchestration.mjs";
 import { SURF_WORKER_VERSION_HEADER } from "../lib/worker-version.mjs";
 
 const predecessor = "11111111-1111-4111-8111-111111111111";
@@ -153,7 +156,10 @@ function context(activeVersions, calls) {
   };
   const resourceBindings = expectedWorkerBindingDescriptor(config).map((binding) => ({
     ...binding,
-    ...(binding.type === "secret_text" ? { text: "redacted" } : {})
+    ...(binding.type === "secret_text" ? { text: "redacted" } : {}),
+    ...(binding.type === "durable_object_namespace"
+      ? { namespace_id: "f".repeat(32) }
+      : {})
   }));
   return {
     workerName: "surf-test",
@@ -207,7 +213,7 @@ function context(activeVersions, calls) {
       }
       if (args[0] === "versions" && args[1] === "view") {
         return JSON.stringify({
-          id: target,
+          id: args[2],
           resources: {
             script_runtime: { usage_model: "standard", limits: { cpu_ms: 2000 } },
             bindings: resourceBindings
@@ -231,6 +237,7 @@ function operations(
 ) {
   return createWorkerReleaseOperations({
     context: instance,
+    predecessorWorkerVersionId: predecessor,
     workerSecretsFile: "/private/worker.json",
     customOrigin: "https://surf.example",
     workersDevOrigin: "https://surf.example.workers.dev",
@@ -245,6 +252,30 @@ function operations(
     fetcher
   });
 }
+
+test("exported Worker version validator preserves exact release identity", () => {
+  const instance = context([], []);
+  const expectedBindings = expectedWorkerBindingDescriptor(instance.readConfig());
+  const namespaceIds = resolveWorkerDurableObjectNamespaceIds(
+    instance.runWrangler(["versions", "view", predecessor, "--json"]),
+    predecessor,
+    expectedBindings
+  );
+  const output = instance.runWrangler(["versions", "view", target, "--json"]);
+  assert.doesNotThrow(() =>
+    assertWorkerVersionReleaseIdentity(
+      output,
+      {
+        versionId: target,
+        sourceRevision: "a".repeat(40),
+        workerRuntimeDigest,
+        clientBuildDigest: "b".repeat(64)
+      },
+      expectedBindings,
+      namespaceIds
+    )
+  );
+});
 
 test("upload uses an inactive version and validates runtime metadata", () => {
   const calls = [];
@@ -261,8 +292,25 @@ test("upload uses an inactive version and validates runtime metadata", () => {
         call.includes("--no-bundle")
     )
   );
+  const uploadCall = calls.find(
+    (call) =>
+      call[0] === "wrangler" &&
+      call[1] === "versions" &&
+      call[2] === "upload"
+  );
+  assert.equal(uploadCall.includes("--minify"), false);
   assert.ok(calls.some((call) => call.includes("--tag") && call.includes("release-1")));
-  assert.ok(calls.some((call) => call[2] === "view"));
+  assert.deepEqual(
+    calls
+      .filter(
+        (call) =>
+          call[0] === "wrangler" &&
+          call[1] === "versions" &&
+          call[2] === "view"
+      )
+      .map((call) => call[3]),
+    [predecessor, target]
+  );
 });
 
 test("upload rejects a prebuilt Worker bundle changed after planning", () => {
@@ -273,6 +321,7 @@ test("upload rejects a prebuilt Worker bundle changed after planning", () => {
     const calls = [];
     const ops = createWorkerReleaseOperations({
       context: context([], calls),
+      predecessorWorkerVersionId: predecessor,
       workerSecretsFile: "/private/worker.json",
       customOrigin: "https://surf.example",
       workersDevOrigin: "https://surf.example.workers.dev",
@@ -368,8 +417,13 @@ test("upload detects client output drift during successful and failed Wrangler c
           /Client build output differs from its planned identity/
         );
       }
-      assert.equal(calls.length, 1);
-      assert.equal(calls[0][2], "upload");
+      const uploadCalls = calls.filter(
+        (call) =>
+          call[0] === "wrangler" &&
+          call[1] === "versions" &&
+          call[2] === "upload"
+      );
+      assert.equal(uploadCalls.length, 1);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -380,12 +434,14 @@ test("candidate build accepts only Wrangler's exact single-module inventory", ()
   const fixtureRoot = temporaryRoot("surf-release-candidate-");
   try {
     const outputDirectory = join(fixtureRoot, "output");
+    const wranglerCalls = [];
     installClientOutput(fixtureRoot);
     const candidate = buildWorkerCandidate({
       context: {
         releaseRoot: fixtureRoot,
         runPnpm() {},
-        runWrangler() {
+        runWrangler(args) {
+          wranglerCalls.push(args);
           writeFileSync(join(outputDirectory, "README.md"), "Wrangler output\n");
           writeFileSync(join(outputDirectory, "index.js"), workerBundleContents);
           writeFileSync(join(outputDirectory, "index.js.map"), "{}\n");
@@ -397,10 +453,117 @@ test("candidate build accepts only Wrangler's exact single-module inventory", ()
     });
     assert.equal(candidate.bundlePath, join(outputDirectory, "index.js"));
     assert.equal(candidate.workerRuntimeDigest, workerRuntimeDigest);
+    assert.deepEqual(wranglerCalls, [workerCandidateBuildArgs(outputDirectory)]);
     assert.deepEqual(
       candidate.clientOutputIdentity,
       captureClientOutputIdentity(candidate.clientDirectory)
     );
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test("minified Worker candidate identity is stable across release roots", async () => {
+  const fixtureRoot = temporaryRoot("surf-release-worker-roots-");
+  try {
+    const surfRoot = resolve(import.meta.dirname, "../..");
+    const buildAt = (name) => {
+      const releaseRoot = join(fixtureRoot, name);
+      const sourceDirectory = join(releaseRoot, "src");
+      const outputDirectory = join(releaseRoot, "output");
+      const configPath = join(releaseRoot, "wrangler.jsonc");
+      mkdirSync(sourceDirectory, { recursive: true, mode: 0o700 });
+      mkdirSync(outputDirectory, { mode: 0o700 });
+      writeFileSync(
+        join(sourceDirectory, "message.ts"),
+        'export const message = "stable";\n',
+        { mode: 0o600 }
+      );
+      writeFileSync(
+        join(sourceDirectory, "index.ts"),
+        [
+          'import { message } from "./message";',
+          "export class ForecastBriefAgent {",
+          "  label() {",
+          "    return message;",
+          "  }",
+          "}",
+          "export default {",
+          "  fetch() {",
+          "    return new Response(message);",
+          "  }",
+          "};",
+          ""
+        ].join("\n"),
+        { mode: 0o600 }
+      );
+      writeFileSync(
+        configPath,
+        `${JSON.stringify(
+          {
+            name: "surf-release-root-identity-test",
+            main: "./src/index.ts",
+            compatibility_date: "2026-07-08"
+          },
+          null,
+          2
+        )}\n`,
+        { mode: 0o600 }
+      );
+      const result = spawnSync(
+        "pnpm",
+        [
+          "--filter",
+          "@surf/web",
+          "exec",
+          "wrangler",
+          ...workerCandidateBuildArgs(outputDirectory),
+          "--config",
+          configPath
+        ],
+        {
+          cwd: surfRoot,
+          encoding: "utf8",
+          timeout: 30_000,
+          env: {
+            ...process.env,
+            CI: "true",
+            CLOUDFLARE_ACCOUNT_ID: "",
+            CLOUDFLARE_API_TOKEN: "",
+            WRANGLER_LOG_PATH: join(releaseRoot, "wrangler.log"),
+            WRANGLER_SEND_METRICS: "false"
+          }
+        }
+      );
+      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+      assert.equal(result.error, undefined, output);
+      assert.equal(result.status, 0, output);
+      assert.deepEqual(readdirSync(outputDirectory).sort(), [
+        "README.md",
+        "index.js",
+        "index.js.map"
+      ]);
+      return Object.freeze({
+        releaseRoot,
+        bundle: readFileSync(join(outputDirectory, "index.js"))
+      });
+    };
+
+    const first = buildAt("first-release-root");
+    const second = buildAt("second-release-root");
+    assert.deepEqual(first.bundle, second.bundle);
+    const bundleText = first.bundle.toString("utf8");
+    assert.equal(bundleText.includes(first.releaseRoot), false);
+    assert.equal(bundleText.includes(second.releaseRoot), false);
+    const runtime = await import(
+      `data:text/javascript;base64,${first.bundle.toString("base64")}`
+    );
+    assert.deepEqual(Object.keys(runtime).sort(), [
+      "ForecastBriefAgent",
+      "default"
+    ]);
+    assert.equal(new runtime.ForecastBriefAgent().label(), "stable");
+    assert.equal(await runtime.default.fetch().text(), "stable");
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
   }
@@ -508,14 +671,26 @@ test("Wrangler no-bundle dry-run preserves the exact planned runtime module", ()
     const surfRoot = resolve(import.meta.dirname, "../..");
     const assetsDirectory = join(fixtureRoot, "assets");
     const outputDirectory = join(fixtureRoot, "output");
-    const fixtureBundlePath = join(fixtureRoot, "planned-index.js");
+    const fixtureBundlePath = join(fixtureRoot, "index.js");
+    const fixtureSourceMapPath = join(fixtureRoot, "index.js.map");
     const configPath = join(fixtureRoot, "wrangler.jsonc");
     mkdirSync(assetsDirectory, { mode: 0o700 });
     mkdirSync(outputDirectory, { mode: 0o700 });
     writeFileSync(join(assetsDirectory, "index.html"), "<!doctype html><p>surf</p>\n", {
       mode: 0o600
     });
-    writeFileSync(fixtureBundlePath, workerBundleContents, { mode: 0o600 });
+    const productionLikeBundle = `${workerBundleContents}//# sourceMappingURL=index.js.map\n`;
+    writeFileSync(fixtureBundlePath, productionLikeBundle, { mode: 0o600 });
+    writeFileSync(
+      fixtureSourceMapPath,
+      `${JSON.stringify({
+        version: 3,
+        sources: ["worker/index.ts"],
+        names: [],
+        mappings: ""
+      })}\n`,
+      { mode: 0o600 }
+    );
     writeFileSync(
       configPath,
       `${JSON.stringify(
@@ -575,7 +750,7 @@ test("Wrangler no-bundle dry-run preserves the exact planned runtime module", ()
     assert.deepEqual(readdirSync(outputDirectory).sort(), [
       "README.md",
       "assets",
-      "planned-index.js"
+      "index.js"
     ]);
     assert.deepEqual(readdirSync(join(outputDirectory, "assets")).sort(), [
       "index.html"
@@ -586,12 +761,12 @@ test("Wrangler no-bundle dry-run preserves the exact planned runtime module", ()
     );
     assert.equal(
       createHash("sha256")
-        .update(readFileSync(join(outputDirectory, "planned-index.js")))
+        .update(readFileSync(join(outputDirectory, "index.js")))
         .digest("hex"),
-      workerRuntimeDigest
+      createHash("sha256").update(productionLikeBundle).digest("hex")
     );
     assert.deepEqual(
-      readFileSync(join(outputDirectory, "planned-index.js")),
+      readFileSync(join(outputDirectory, "index.js")),
       readFileSync(fixtureBundlePath)
     );
   } finally {
@@ -693,13 +868,21 @@ test("Durable Object bindings reject cross-script config and uploaded capabiliti
 
   for (const [field, value] of [
     ["script_name", "different-worker"],
-    ["environment", "production"]
+    ["environment", "production"],
+    ["dispatch_namespace", "tenant-dispatch"],
+    ["future_capability", true]
   ]) {
     const uploaded = context([], []);
     const original = uploaded.runWrangler;
     uploaded.runWrangler = (args) => {
       const output = original(args);
-      if (args[0] !== "versions" || args[1] !== "view") return output;
+      if (
+        args[0] !== "versions" ||
+        args[1] !== "view" ||
+        args[2] !== target
+      ) {
+        return output;
+      }
       const version = JSON.parse(output);
       version.resources.bindings.find(
         (binding) => binding.name === "FORECAST_BRIEF_AGENT"
@@ -708,7 +891,117 @@ test("Durable Object bindings reject cross-script config and uploaded capabiliti
     };
     assert.throws(
       () => operations(uploaded).upload(),
-      /Worker version Durable Object binding FORECAST_BRIEF_AGENT must contain exactly class_name, name, type/
+      /Worker version Durable Object binding FORECAST_BRIEF_AGENT must contain exactly class_name, name, namespace_id, type/
+    );
+  }
+
+  for (const namespaceId of [
+    null,
+    "f".repeat(31),
+    "g".repeat(32),
+    "e".repeat(32)
+  ]) {
+    const uploaded = context([], []);
+    const original = uploaded.runWrangler;
+    uploaded.runWrangler = (args) => {
+      const output = original(args);
+      if (
+        args[0] !== "versions" ||
+        args[1] !== "view" ||
+        args[2] !== target
+      ) {
+        return output;
+      }
+      const version = JSON.parse(output);
+      const binding = version.resources.bindings.find(
+        (candidate) => candidate.name === "FORECAST_BRIEF_AGENT"
+      );
+      if (namespaceId === null) delete binding.namespace_id;
+      else binding.namespace_id = namespaceId;
+      return JSON.stringify(version);
+    };
+    assert.throws(
+      () => operations(uploaded).upload(),
+      namespaceId === null
+        ? /Worker version Durable Object binding FORECAST_BRIEF_AGENT must contain exactly class_name, name, namespace_id, type/
+        : namespaceId === "e".repeat(32)
+          ? /Worker version Durable Object namespace identity mismatch for FORECAST_BRIEF_AGENT/
+          : /Worker version Durable Object binding FORECAST_BRIEF_AGENT\.namespace_id is invalid/
+    );
+  }
+});
+
+test("routine upload rejects a local Durable Object absent from the predecessor", () => {
+  const calls = [];
+  const instance = context([], calls);
+  const original = instance.runWrangler;
+  instance.runWrangler = (args) => {
+    const output = original(args);
+    if (
+      args[0] !== "versions" ||
+      args[1] !== "view" ||
+      args[2] !== predecessor
+    ) {
+      return output;
+    }
+    const version = JSON.parse(output);
+    version.resources.bindings = version.resources.bindings.filter(
+      (binding) => binding.name !== "FORECAST_BRIEF_AGENT"
+    );
+    return JSON.stringify(version);
+  };
+  assert.throws(
+    () => operations(instance).upload(),
+    /Predecessor Worker version binding mismatch for FORECAST_BRIEF_AGENT/
+  );
+  assert.equal(
+    calls.some(
+      (call) =>
+        call[0] === "wrangler" &&
+        call[1] === "versions" &&
+        call[2] === "upload"
+    ),
+    false
+  );
+});
+
+test("predecessor Durable Object identity rejects cross-script capabilities", () => {
+  for (const [field, value] of [
+    ["script_name", "different-worker"],
+    ["environment", "production"],
+    ["dispatch_namespace", "tenant-dispatch"],
+    ["future_capability", true]
+  ]) {
+    const calls = [];
+    const instance = context([], calls);
+    const original = instance.runWrangler;
+    instance.runWrangler = (args) => {
+      const output = original(args);
+      if (
+        args[0] !== "versions" ||
+        args[1] !== "view" ||
+        args[2] !== predecessor
+      ) {
+        return output;
+      }
+      const version = JSON.parse(output);
+      version.resources.bindings.find(
+        (binding) => binding.name === "FORECAST_BRIEF_AGENT"
+      )[field] = value;
+      return JSON.stringify(version);
+    };
+    assert.throws(
+      () => operations(instance).upload(),
+      /Predecessor Worker version Durable Object binding FORECAST_BRIEF_AGENT must contain exactly class_name, name, namespace_id, type/
+    );
+    assert.equal(
+      calls.some(
+        (call) =>
+          call[0] === "wrangler" &&
+          call[1] === "versions" &&
+          call[2] === "upload"
+      ),
+      false
     );
   }
 });

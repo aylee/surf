@@ -5,6 +5,16 @@ export function workerVersionUploadArgs() {
   return ["versions", "upload"];
 }
 
+export function workerCandidateBuildArgs(outputDirectory) {
+  if (typeof outputDirectory !== "string" || !isAbsolute(outputDirectory)) {
+    throw new Error("Worker candidate output directory must be absolute");
+  }
+  // Non-minified esbuild output embeds checkout-relative module labels. Make
+  // minification part of the production identity, then upload these exact
+  // bytes with --no-bundle so release-root paths cannot perturb the digest.
+  return ["deploy", "--dry-run", "--minify", "--outdir", outputDirectory];
+}
+
 export function prebuiltWorkerVersionUploadArgs(workerBundlePath) {
   if (typeof workerBundlePath !== "string" || !isAbsolute(workerBundlePath)) {
     throw new Error("Prebuilt Worker bundle path must be absolute");
