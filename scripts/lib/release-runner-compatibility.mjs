@@ -21,6 +21,7 @@ const RESULT_CALLBACK_PATH = "/api/internal/narratives/results";
 const MAX_RECORD_BYTES = 1024 * 1024;
 const MAX_ENVIRONMENT_BYTES = 1024 * 1024;
 const MAX_STATUS_BYTES = 64 * 1024;
+const MAX_GUARD_CHECK_BYTES = 64 * 1024;
 const MAX_PLIST_BYTES = 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 10_000;
 const HEALTH_CHECK_TIMEOUT_MS = 60_000;
@@ -308,6 +309,156 @@ function parseRunnerStatus(contents) {
     if (value[name] !== null) boundedString(value[name], `Runner status ${name}`);
   }
   return { value, updatedAt };
+}
+
+function parseRunnerGuardCheck(stdout) {
+  if (
+    typeof stdout !== "string" ||
+    Buffer.byteLength(stdout, "utf8") > MAX_GUARD_CHECK_BYTES
+  ) {
+    throw new Error("Active runner live check output is invalid");
+  }
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (lines.length !== 1) {
+    throw new Error("Active runner live check output is ambiguous");
+  }
+  const value = parseJson(
+    Buffer.from(lines[0], "utf8"),
+    "Active runner live check output"
+  );
+  exactObjectKeys(
+    value,
+    ["command", "config", "queue", "omlx"],
+    "Active runner live check output"
+  );
+  if (value.command !== "check") {
+    throw new Error("Active runner live check command is invalid");
+  }
+
+  exactObjectKeys(
+    value.config,
+    [
+      "runnerId",
+      "activationId",
+      "artifactSha256",
+      "sourceRevision",
+      "acceptedProtocolFingerprints",
+      "runtimeFingerprint",
+      "modelId",
+      "queueName",
+      "queueDeadLetterName",
+      "omlxThinkingEnabled",
+      "concurrency",
+      "visibilityTimeoutMs",
+      "queueTimeoutMs",
+      "targetIds",
+      "statusFile"
+    ],
+    "Active runner live check config"
+  );
+  const config = value.config;
+  boundedString(config.runnerId, "Active runner live check runnerId");
+  if (!ACTIVATION_ID_PATTERN.test(config.activationId ?? "")) {
+    throw new Error("Active runner live check activationId is invalid");
+  }
+  for (const [name, candidate, pattern] of [
+    ["artifact", config.artifactSha256, HEX_64_PATTERN],
+    ["source revision", config.sourceRevision, HEX_40_PATTERN],
+    ["runtime fingerprint", config.runtimeFingerprint, HEX_64_PATTERN]
+  ]) {
+    if (!pattern.test(candidate ?? "")) {
+      throw new Error(`Active runner live check ${name} is invalid`);
+    }
+  }
+  if (
+    !Array.isArray(config.acceptedProtocolFingerprints) ||
+    config.acceptedProtocolFingerprints.length < 1 ||
+    config.acceptedProtocolFingerprints.length > 16 ||
+    config.acceptedProtocolFingerprints.some(
+      (fingerprint) => !HEX_64_PATTERN.test(fingerprint)
+    ) ||
+    new Set(config.acceptedProtocolFingerprints).size !==
+      config.acceptedProtocolFingerprints.length
+  ) {
+    throw new Error("Active runner live check protocol fingerprints are invalid");
+  }
+  boundedString(config.modelId, "Active runner live check modelId");
+  boundedString(config.queueName, "Active runner live check Queue name", 256);
+  boundedString(
+    config.queueDeadLetterName,
+    "Active runner live check dead-letter Queue name",
+    256
+  );
+  if (typeof config.omlxThinkingEnabled !== "boolean") {
+    throw new Error("Active runner live check model thinking setting is invalid");
+  }
+  positiveInteger(config.concurrency, "Active runner live check concurrency");
+  positiveInteger(
+    config.visibilityTimeoutMs,
+    "Active runner live check visibility timeout"
+  );
+  positiveInteger(config.queueTimeoutMs, "Active runner live check Queue timeout");
+  if (
+    !Array.isArray(config.targetIds) ||
+    config.targetIds.length < 1 ||
+    config.targetIds.length > 1024 ||
+    config.targetIds.some(
+      (targetId) =>
+        typeof targetId !== "string" ||
+        targetId.length < 1 ||
+        targetId.length > 160 ||
+        !/^[a-z0-9][a-z0-9:._-]*$/i.test(targetId)
+    ) ||
+    new Set(config.targetIds).size !== config.targetIds.length
+  ) {
+    throw new Error("Active runner live check target IDs are invalid");
+  }
+  boundedString(config.statusFile, "Active runner live check status file", 16_384);
+  if (!isAbsolute(config.statusFile)) {
+    throw new Error("Active runner live check status file is invalid");
+  }
+
+  exactObjectKeys(
+    value.queue,
+    ["ready", "code", "queueName", "consumerType", "deadLetterQueueName"],
+    "Active runner live check Queue result"
+  );
+  if (
+    value.queue.ready !== true ||
+    value.queue.code !== null ||
+    value.queue.queueName !== config.queueName ||
+    value.queue.consumerType !== "http_pull" ||
+    value.queue.deadLetterQueueName !== config.queueDeadLetterName
+  ) {
+    throw new Error("Active runner live Queue preflight output is not ready");
+  }
+  exactObjectKeys(
+    value.omlx,
+    ["ready", "code"],
+    "Active runner live check model result"
+  );
+  if (value.omlx.ready !== true || value.omlx.code !== null) {
+    throw new Error("Active runner live model preflight output is not ready");
+  }
+  return Object.freeze(config);
+}
+
+function assertRunnerGuardMatchesStatus(config, status) {
+  if (
+    config.runnerId !== status.runnerId ||
+    config.activationId !== status.activationId ||
+    config.artifactSha256 !== status.runnerArtifactSha256 ||
+    config.sourceRevision !== status.sourceRevision ||
+    config.runtimeFingerprint !== status.runtimeFingerprint ||
+    config.modelId !== status.modelId ||
+    JSON.stringify(config.acceptedProtocolFingerprints) !==
+      JSON.stringify(status.acceptedProtocolFingerprints)
+  ) {
+    throw new Error("Active runner live check semantic identity differs from runner status");
+  }
 }
 
 function environmentInteger(values, name, fallback, minimum, maximum) {
@@ -756,7 +907,6 @@ function attestRunnerStatus(
     status.activationId !== record.activationId ||
     status.runnerArtifactSha256 !== record.runnerArtifact.sha256 ||
     status.sourceRevision !== record.source.revision ||
-    status.runtimeFingerprint !== record.runtime.environmentFingerprint ||
     status.modelId !== record.model.id ||
     JSON.stringify(status.acceptedProtocolFingerprints) !==
       JSON.stringify(acceptedProtocolFingerprints)
@@ -898,6 +1048,11 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
   if (liveCheck?.status !== 0) {
     throw new Error("Active runner live Queue and model preflight failed");
   }
+  const liveCheckConfig = parseRunnerGuardCheck(liveCheck.stdout);
+  if (liveCheckConfig.statusFile !== record.runtime.statusFile) {
+    throw new Error("Active runner live check status file differs from the activation record");
+  }
+  assertRunnerGuardMatchesStatus(liveCheckConfig, status);
 
   const [runnerJobAfter, omlxJobAfter] = await Promise.all([
     attestLoadedJob(RUNNER_LABEL, record.launchAgents.narrativeRunner.path, domain, deps),
@@ -923,6 +1078,7 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
     acceptedProtocolFingerprints,
     { now: afterClock, maximumAge, maximumFutureSkew }
   );
+  assertRunnerGuardMatchesStatus(liveCheckConfig, statusAfter);
   if (statusAfter.pid !== status.pid) {
     throw new Error("Runner heartbeat child identity changed during live preflight");
   }
@@ -963,7 +1119,7 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
     runnerArtifactSha256: record.runnerArtifact.sha256,
     sourceRevision: record.source.revision,
     acceptedProtocolFingerprints: [...acceptedProtocolFingerprints],
-    runtimeFingerprint: record.runtime.environmentFingerprint,
+    runtimeFingerprint: liveCheckConfig.runtimeFingerprint,
     resultTargetId: bindings.resultTargetId,
     bindingHmacs: bindings.fingerprints
   };
