@@ -27,6 +27,7 @@ import {
   createReleaseStateStore,
   recordReleaseJournalFailure,
   replaceBeforeUploadReleaseJournal,
+  replaceInactiveUploadReleaseJournal,
   replacePreMutationReleaseJournal,
   supersedeReleaseJournal,
   transitionReleaseJournal
@@ -331,6 +332,30 @@ function preparedUploadEvidence(failed) {
       remoteVersionCount: 32,
       remoteVersionInventorySha256: "6".repeat(64),
       taggedUploadAbsent: true
+    }
+  };
+}
+
+function inactiveUploadEvidence(failed) {
+  return {
+    ...beforeUploadEvidence(),
+    failedConfigSha256: "2".repeat(64),
+    remoteUploadEvidence: {
+      schemaVersion: 1,
+      workerName: "surf-prod",
+      releaseTag: failed.releaseId,
+      releaseMessage: `surf release ${failed.releaseId}`,
+      inactiveWorkerVersionId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      inactiveWorkerVersionNumber: 33,
+      inactiveWorkerCreatedOn: "2026-08-15T01:00:04.000000Z",
+      sourceRevision: failed.targetGitSha,
+      workerRuntimeDigest: failed.targetFingerprints.workerRuntime,
+      clientBuildDigest: failed.targetFingerprints.workerAssets,
+      runtimeCpuMs: 2_000,
+      remoteVersionCount: 33,
+      remoteVersionInventorySha256: "6".repeat(64),
+      inactiveWorkerVersionDetailSha256: "7".repeat(64),
+      predecessorWorkerVersionDetailSha256: "8".repeat(64)
     }
   };
 }
@@ -824,6 +849,52 @@ test("a linked prepared-upload replacement retry stays pinned after interruption
       join(surfRoot, "scripts/release-prod.mjs"),
       "--plan",
       "--replace-before-upload",
+      failed.releaseId
+    ],
+    {
+      cwd: surfRoot,
+      encoding: "utf8",
+      env: { ...process.env, SURF_PRODUCTION_PROFILE: profilePath }
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+  assert.equal(
+    store.readJournal(failed.releaseId).state,
+    RELEASE_JOURNAL_STATES.REPLACED
+  );
+  assert.equal(store.readJournal(replaced.supersededBy.releaseId), null);
+});
+
+test("a linked inactive-upload replacement retry stays pinned without re-attestation", (t) => {
+  const { profile, profilePath, targetGitSha } = fixture(t);
+  const store = createReleaseStateStore({ rootDir: profile.stateDirectory });
+  const failed = preparedUploadFailure(
+    store,
+    "a".repeat(40),
+    "release-inactive-upload-failure"
+  );
+  const replaced = replaceInactiveUploadReleaseJournal(failed, {
+    releaseId: "release-linked-inactive-upload",
+    targetGitSha,
+    evidence: inactiveUploadEvidence(failed),
+    at: "2026-08-15T01:00:05.000Z"
+  });
+  store.writeJournal(replaced);
+
+  writeFileSync(join(profile.repositoryPath, "README.md"), "newer main\n");
+  runGit(profile.repositoryPath, ["add", "README.md"]);
+  runGit(profile.repositoryPath, ["commit", "-qm", "advance main"]);
+  runGit(profile.repositoryPath, ["push", "-q", "origin", "main"]);
+  assert.notEqual(runGit(profile.repositoryPath, ["rev-parse", "HEAD"]), targetGitSha);
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(surfRoot, "scripts/release-prod.mjs"),
+      "--plan",
+      "--replace-inactive-upload",
       failed.releaseId
     ],
     {

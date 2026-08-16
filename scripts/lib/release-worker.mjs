@@ -2,6 +2,7 @@ import { lstatSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   prebuiltWorkerVersionUploadArgs,
+  workerCandidateBuildArgs,
   workerTriggerSyncArgs,
   workerVersionActivationArgs
 } from "./deploy-orchestration.mjs";
@@ -30,6 +31,7 @@ import { createReleaseStorage } from "./release-storage.mjs";
 const HEALTH_IDENTITY_MAX_BYTES = 64 * 1024;
 const WORKER_VERSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CLOUDFLARE_RESOURCE_ID_PATTERN = /^[0-9a-f]{32}$/i;
 const RELEASE_TAG_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 const REQUIRED_SECRET_BINDINGS = Object.freeze([
   "GEMINI_API_KEY",
@@ -45,6 +47,10 @@ const WORKER_CANDIDATE_INVENTORY = Object.freeze([
   "index.js",
   "index.js.map"
 ]);
+// README.md and index.js.map are required pinned-Wrangler candidate inventory,
+// but only index.js is the runtime identity and positional --no-bundle upload.
+// The integration test proves an adjacent referenced map is not emitted as an
+// upload module and cannot reintroduce release-root identity noise.
 
 function assertWorkerCandidateInventory(outputDirectory) {
   if (realpathSync(outputDirectory) !== resolve(outputDirectory)) {
@@ -190,10 +196,103 @@ export function expectedWorkerBindingDescriptor(config) {
   return Object.freeze(bindings);
 }
 
-function assertVersionBindings(bindings, expectedBindings) {
+function durableObjectNamespaceIdsFromBindings(
+  bindings,
+  expectedBindings,
+  label
+) {
   if (!Array.isArray(bindings) || bindings.length > 256) {
     throw new Error("Worker version bindings are invalid or unbounded");
   }
+  if (!Array.isArray(expectedBindings) || expectedBindings.length > 256) {
+    throw new Error("Expected Worker bindings are invalid or unbounded");
+  }
+  const byName = new Map();
+  for (const binding of bindings) {
+    const name = requiredString(binding?.name, "version binding name");
+    const type = requiredString(binding?.type, "version binding type");
+    if (byName.has(name)) {
+      throw new Error(`Worker version contains duplicate binding ${name}`);
+    }
+    byName.set(name, { ...binding, type });
+  }
+  const expectedDurableObjects = new Map();
+  for (const binding of expectedBindings) {
+    if (binding?.type !== "durable_object_namespace") continue;
+    const name = requiredString(binding?.name, "expected Durable Object name");
+    if (expectedDurableObjects.has(name)) {
+      throw new Error(`Expected Worker bindings contain duplicate binding ${name}`);
+    }
+    expectedDurableObjects.set(name, binding);
+  }
+  for (const [name, binding] of byName) {
+    if (
+      binding.type === "durable_object_namespace" &&
+      !expectedDurableObjects.has(name)
+    ) {
+      throw new Error(`${label} contains unexpected Durable Object binding ${name}`);
+    }
+  }
+  const namespaceIds = [];
+  for (const [name, expected] of expectedDurableObjects) {
+    const actual = byName.get(name);
+    if (!actual || actual.type !== "durable_object_namespace") {
+      throw new Error(`${label} binding mismatch for ${name}`);
+    }
+    assertExactKeys(
+      actual,
+      [...Object.keys(expected), "namespace_id"],
+      `${label} Durable Object binding ${name}`
+    );
+    for (const [key, value] of Object.entries(expected)) {
+      if (actual[key] !== value) {
+        throw new Error(`${label} binding mismatch for ${name}.${key}`);
+      }
+    }
+    if (!CLOUDFLARE_RESOURCE_ID_PATTERN.test(actual.namespace_id ?? "")) {
+      throw new Error(
+        `${label} Durable Object binding ${name}.namespace_id is invalid`
+      );
+    }
+    namespaceIds.push([name, actual.namespace_id]);
+  }
+  return Object.freeze(Object.fromEntries(namespaceIds));
+}
+
+function assertDurableObjectNamespaceIds(actual, expected) {
+  assertExactKeys(
+    expected,
+    Object.keys(actual),
+    "Expected Worker Durable Object namespace identity"
+  );
+  for (const [name, namespaceId] of Object.entries(actual)) {
+    if (!CLOUDFLARE_RESOURCE_ID_PATTERN.test(expected[name] ?? "")) {
+      throw new Error(
+        `Expected Worker Durable Object binding ${name}.namespace_id is invalid`
+      );
+    }
+    if (namespaceId !== expected[name]) {
+      throw new Error(
+        `Worker version Durable Object namespace identity mismatch for ${name}`
+      );
+    }
+  }
+}
+
+function assertVersionBindings(
+  bindings,
+  expectedBindings,
+  expectedDurableObjectNamespaceIds
+) {
+  const actualDurableObjectNamespaceIds = durableObjectNamespaceIdsFromBindings(
+    bindings,
+    expectedBindings,
+    "Worker version"
+  );
+  assertDurableObjectNamespaceIds(
+    actualDurableObjectNamespaceIds,
+    expectedDurableObjectNamespaceIds
+  );
   const byName = new Map();
   for (const binding of bindings) {
     const name = requiredString(binding?.name, "version binding name");
@@ -215,13 +314,6 @@ function assertVersionBindings(bindings, expectedBindings) {
     const actual = byName.get(expected.name);
     if (!actual || actual.type !== expected.type) {
       throw new Error(`Worker version binding mismatch for ${expected.name}`);
-    }
-    if (expected.type === "durable_object_namespace") {
-      assertExactKeys(
-        actual,
-        Object.keys(expected),
-        `Worker version Durable Object binding ${expected.name}`
-      );
     }
     for (const [key, value] of Object.entries(expected)) {
       if (actual[key] !== value) {
@@ -315,17 +407,47 @@ export function resolveTaggedWorkerVersion(output, releaseTag) {
   return matches[0].id;
 }
 
-function assertVersionReleaseIdentity(output, expected, expectedBindings) {
+function parseWorkerVersionDetail(output, expectedVersionId) {
   let version;
   try {
     version = JSON.parse(output);
   } catch {
     throw new Error("Worker version detail returned malformed JSON");
   }
-  if (version?.id !== expected.versionId || !Array.isArray(version?.resources?.bindings)) {
+  if (
+    version?.id !== expectedVersionId ||
+    !Array.isArray(version?.resources?.bindings)
+  ) {
     throw new Error("Worker version detail lacks exact release identity bindings");
   }
-  assertVersionBindings(version.resources.bindings, expectedBindings);
+  return version;
+}
+
+export function resolveWorkerDurableObjectNamespaceIds(
+  output,
+  expectedVersionId,
+  expectedBindings
+) {
+  const version = parseWorkerVersionDetail(output, expectedVersionId);
+  return durableObjectNamespaceIdsFromBindings(
+    version.resources.bindings,
+    expectedBindings,
+    "Predecessor Worker version"
+  );
+}
+
+export function assertWorkerVersionReleaseIdentity(
+  output,
+  expected,
+  expectedBindings,
+  expectedDurableObjectNamespaceIds
+) {
+  const version = parseWorkerVersionDetail(output, expected.versionId);
+  assertVersionBindings(
+    version.resources.bindings,
+    expectedBindings,
+    expectedDurableObjectNamespaceIds
+  );
   for (const [name, text] of Object.entries({
     SURF_SOURCE_REVISION: expected.sourceRevision,
     SURF_WORKER_RUNTIME_DIGEST: expected.workerRuntimeDigest,
@@ -402,6 +524,7 @@ function inspectDeployment(context) {
 
 export function createWorkerReleaseOperations({
   context,
+  predecessorWorkerVersionId,
   workerSecretsFile,
   customOrigin,
   workersDevOrigin,
@@ -418,6 +541,9 @@ export function createWorkerReleaseOperations({
   if (!RELEASE_TAG_PATTERN.test(releaseTag ?? "")) {
     throw new Error("Worker release tag is invalid");
   }
+  if (!WORKER_VERSION_ID_PATTERN.test(predecessorWorkerVersionId ?? "")) {
+    throw new Error("Predecessor Worker version ID is invalid");
+  }
   const origins = Object.freeze([customOrigin, workersDevOrigin]);
   const seedPath = resolve(
     context.releaseRoot,
@@ -425,6 +551,23 @@ export function createWorkerReleaseOperations({
   );
   const releaseStorage = createReleaseStorage({ commandContext: context });
   const expectedBindings = expectedWorkerBindingDescriptor(context.readConfig());
+  let predecessorDurableObjectNamespaceIds = null;
+  const expectedDurableObjectNamespaceIds = () => {
+    if (predecessorDurableObjectNamespaceIds !== null) {
+      return predecessorDurableObjectNamespaceIds;
+    }
+    const output = context.runWrangler(
+      ["versions", "view", predecessorWorkerVersionId, "--json"],
+      { capture: true, echo: false }
+    );
+    predecessorDurableObjectNamespaceIds =
+      resolveWorkerDurableObjectNamespaceIds(
+        output,
+        predecessorWorkerVersionId,
+        expectedBindings
+      );
+    return predecessorDurableObjectNamespaceIds;
+  };
   const assertPlannedBuildOutputsUnchanged = () => {
     if (workerBundleDigest(workerBundlePath) !== workerRuntimeDigest) {
       throw new Error("Prebuilt Worker bundle differs from its planned runtime digest");
@@ -442,12 +585,12 @@ export function createWorkerReleaseOperations({
       expectedVersionId: versionId,
       requireCpuLimit: true
     });
-    assertVersionReleaseIdentity(output, {
+    assertWorkerVersionReleaseIdentity(output, {
       versionId,
       sourceRevision,
       workerRuntimeDigest,
       clientBuildDigest
-    }, expectedBindings);
+    }, expectedBindings, expectedDurableObjectNamespaceIds());
     return runtime;
   };
   const findTaggedUpload = () => {
@@ -461,6 +604,7 @@ export function createWorkerReleaseOperations({
   };
   const upload = () => {
     assertPlannedBuildOutputsUnchanged();
+    expectedDurableObjectNamespaceIds();
     let output;
     let commandError = null;
     try {
@@ -773,7 +917,7 @@ export function buildWorkerCandidate({
     }
   });
   context.runWrangler(
-    ["deploy", "--dry-run", "--outdir", outputDirectory],
+    workerCandidateBuildArgs(outputDirectory),
     { env: { CI: "true" } }
   );
   assertWorkerCandidateInventory(outputDirectory);

@@ -34,6 +34,7 @@ import {
   RELEASE_JOURNAL_STATES,
   RELEASE_POINTER_KINDS,
   assertBeforeUploadReplacementEvidence,
+  assertInactiveUploadReplacementEvidence,
   assertReleaseJournal,
   assertReleaseReplacement,
   assertReleaseSupersession,
@@ -91,6 +92,7 @@ import {
 import {
   buildWorkerCandidate,
   createWorkerReleaseOperations,
+  expectedWorkerBindingDescriptor,
   resolveOptionalWorkerSourceRevision
 } from "./lib/release-worker.mjs";
 import { createReleaseStorage } from "./lib/release-storage.mjs";
@@ -109,6 +111,11 @@ import {
   commitBeforeUploadReplacement,
   previewBeforeUploadReplacement
 } from "./lib/release-before-upload-replacement.mjs";
+import {
+  attestTaggedInactiveWorkerUpload,
+  commitInactiveUploadReplacement,
+  previewInactiveUploadReplacement
+} from "./lib/release-inactive-upload-replacement.mjs";
 
 const INTERNAL_ENV = "SURF_RELEASE_EXECUTION_ROOT";
 const TARGET_ENV = "SURF_RELEASE_TARGET_SHA";
@@ -338,7 +345,9 @@ function isBeforeUploadReplacementBoundary(journal) {
     (verifiedPrepareFailure || preparedUploadFailure) &&
     journal.predecessor.workerVersionId !== null &&
     journal.predecessor.deploymentId !== null &&
-    journal.predecessor.runnerActivationId !== null
+    journal.predecessor.runnerActivationId !== null &&
+    (journal.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+      journal.supersededBy?.beforeUploadAttestation !== undefined)
   );
 }
 
@@ -356,6 +365,48 @@ function journalTargetForBeforeUploadReplacementRetry(profile, releaseId) {
   ) {
     throw new Error(
       "Before-upload replacement requires an exact verified prepare failure or prepared upload failure, or its linked journal"
+    );
+  }
+  return failed.supersededBy.targetGitSha;
+}
+
+function isInactiveUploadReplacementBoundary(journal) {
+  const preparedReceiptKeys = new Set([
+    "profileSha256",
+    "operatorEnvironmentFingerprint",
+    "wranglerConfigSha256",
+    "workerSecretsFingerprint"
+  ]);
+  const exactPreparedUploadFailure =
+    journal.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED &&
+    journal.failureCode === RELEASE_FAILURE_CODES.UPLOAD_FAILED &&
+    Object.entries(journal.receipts).every(([key, value]) =>
+      preparedReceiptKeys.has(key) ? value !== null : value === null
+    ) &&
+    journal.predecessor.workerVersionId !== null &&
+    journal.predecessor.deploymentId !== null &&
+    journal.predecessor.runnerActivationId !== null;
+  return (
+    exactPreparedUploadFailure &&
+    (journal.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+      journal.supersededBy?.inactiveUploadAttestation !== undefined)
+  );
+}
+
+function journalTargetForInactiveUploadReplacementRetry(profile, releaseId) {
+  const failed = recoveryJournal(profile, releaseId);
+  if (
+    failed.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE &&
+    isInactiveUploadReplacementBoundary(failed)
+  ) {
+    return null;
+  }
+  if (
+    failed.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+    !isInactiveUploadReplacementBoundary(failed)
+  ) {
+    throw new Error(
+      "Inactive-upload replacement requires an exact prepared upload failure or its linked journal"
     );
   }
   return failed.supersededBy.targetGitSha;
@@ -447,11 +498,18 @@ async function outerMain(options) {
           options.replaceBeforeUpload
         )
       : null;
+    const linkedInactiveUploadReplacementSha = options.replaceInactiveUpload
+      ? journalTargetForInactiveUploadReplacementRetry(
+          profile,
+          options.replaceInactiveUpload
+        )
+      : null;
     fetchTarget(profile.repositoryPath);
     const linkedTargetSha =
       linkedFixForwardSha ??
       linkedPreMutationReplacementSha ??
-      linkedBeforeUploadReplacementSha;
+      linkedBeforeUploadReplacementSha ??
+      linkedInactiveUploadReplacementSha;
     if (linkedTargetSha !== null) {
       if (options.sha !== null && options.sha !== linkedTargetSha) {
         throw new Error(
@@ -760,7 +818,8 @@ async function internalMain(options) {
     options.resume ??
     options.fixForward ??
     options.replacePreMutation ??
-    options.replaceBeforeUpload;
+    options.replaceBeforeUpload ??
+    options.replaceInactiveUpload;
   for (const journalBatch of store.scanJournalBatches()) {
     for (const journal of journalBatch) {
       if (journal.state === RELEASE_JOURNAL_STATES.SUPERSEDED) {
@@ -780,16 +839,20 @@ async function internalMain(options) {
         continue;
       }
       if (journal.state === RELEASE_JOURNAL_STATES.REPLACED) {
-        const beforeUpload = [
-          RELEASE_JOURNAL_STATES.VERIFIED,
-          RELEASE_JOURNAL_STATES.PREPARED
-        ].includes(journal.resumeFrom);
-        const selectedReplacementId = beforeUpload
-          ? options.replaceBeforeUpload
-          : options.replacePreMutation;
-        const recoveryOption = beforeUpload
-          ? "--replace-before-upload"
-          : "--replace-pre-mutation";
+        const inactiveUpload =
+          journal.supersededBy.inactiveUploadAttestation !== undefined;
+        const beforeUpload =
+          journal.supersededBy.beforeUploadAttestation !== undefined;
+        const selectedReplacementId = inactiveUpload
+          ? options.replaceInactiveUpload
+          : beforeUpload
+            ? options.replaceBeforeUpload
+            : options.replacePreMutation;
+        const recoveryOption = inactiveUpload
+          ? "--replace-inactive-upload"
+          : beforeUpload
+            ? "--replace-before-upload"
+            : "--replace-pre-mutation";
         const replacement = store.readJournal(journal.supersededBy.releaseId);
         if (replacement) {
           assertReleaseReplacement(journal, replacement);
@@ -1197,6 +1260,178 @@ async function internalMain(options) {
         }
       });
     };
+    const attestInactiveUploadReplacement = async (failed) => {
+      const failedJournalSha256 = fingerprintReleaseJournal(failed);
+      const attemptsRoot = existingPrivateSubdirectory(
+        profile.stateDirectory,
+        "attempts",
+        "Release attempts directory"
+      );
+      const failedAttemptDirectory = existingPrivateSubdirectory(
+        attemptsRoot,
+        failed.releaseId,
+        "Failed release attempt directory"
+      );
+      const failedConfigPath = resolve(failedAttemptDirectory, "wrangler.jsonc");
+      const failedConfigSnapshot = readVerifiedFileSnapshot(failedConfigPath, {
+        label: "Failed release Wrangler config",
+        maximumBytes: MAX_RELEASE_PRIVATE_JSON_BYTES,
+        requireMode0600: true,
+        requireCanonical: true
+      });
+      const failedConfigSha256 = createHash("sha256")
+        .update(failedConfigSnapshot.contents)
+        .digest("hex");
+      if (failedConfigSha256 !== failed.receipts.wranglerConfigSha256) {
+        throw new Error(
+          "Failed release Wrangler config differs from its prepared receipt"
+        );
+      }
+      const failedReleaseRoot = resolve(
+        profile.releasesDirectory,
+        failed.targetGitSha
+      );
+      validateImmutableRelease(failedReleaseRoot, failed.targetGitSha);
+      const guardFailedAttempt = () => {
+        validateImmutableRelease(failedReleaseRoot, failed.targetGitSha);
+        const current = store.readJournal(failed.releaseId);
+        if (
+          !current ||
+          fingerprintReleaseJournal(current) !== failedJournalSha256
+        ) {
+          throw new Error(
+            "Failed release journal changed during inactive-upload attestation"
+          );
+        }
+        const currentConfigSnapshot = readVerifiedFileSnapshot(failedConfigPath, {
+          label: "Failed release Wrangler config",
+          maximumBytes: MAX_RELEASE_PRIVATE_JSON_BYTES,
+          requireMode0600: true,
+          requireCanonical: true
+        });
+        if (
+          createHash("sha256")
+            .update(currentConfigSnapshot.contents)
+            .digest("hex") !== failedConfigSha256
+        ) {
+          throw new Error(
+            "Failed release Wrangler config changed during inactive-upload attestation"
+          );
+        }
+        return assertBeforeUploadReplacementArtifactsAbsent({
+          attemptDirectory: failedAttemptDirectory,
+          serviceRoot: profile.serviceRoot,
+          releaseId: failed.releaseId
+        });
+      };
+      guardFailedAttempt();
+      const failedContext = createCloudflareCommandContext({
+        releaseRoot: failedReleaseRoot,
+        configPath: failedConfigSnapshot.path,
+        configSha256: failedConfigSha256,
+        environment,
+        guard: guardFailedAttempt
+      });
+      const failedConfig = failedContext.readConfig();
+      const failedQueueTopologyFingerprint =
+        queueTopologyFingerprint(failedConfig);
+      if (
+        failedQueueTopologyFingerprint !==
+        failed.targetFingerprints.queueTopology
+      ) {
+        throw new Error(
+          "Failed release Wrangler Queue topology differs from its journal"
+        );
+      }
+      const readLiveDeployment = () => {
+        const status = failedContext.runWrangler(
+          ["deployments", "status", "--json"],
+          { capture: true, echo: false }
+        );
+        const workerVersionId = resolveSoleActiveWorkerVersionId(status);
+        const deployment = resolveActiveDeploymentEvidence(
+          status,
+          workerVersionId
+        );
+        return Object.freeze({
+          workerVersionId,
+          deploymentId: deployment.deploymentId,
+          createdOn: deployment.createdOn
+        });
+      };
+      const before = readLiveDeployment();
+      if (
+        before.workerVersionId !== failed.predecessor.workerVersionId ||
+        before.deploymentId !== failed.predecessor.deploymentId
+      ) {
+        throw new Error(
+          "Inactive-upload replacement live predecessor differs from the failed release"
+        );
+      }
+      const beforeRunner =
+        await discoverRunnerActivationFromInstalledPlist({
+          serviceRoot: profile.serviceRoot,
+          allowLegacyV3: true
+        });
+      if (beforeRunner.activationId !== failed.predecessor.runnerActivationId) {
+        throw new Error(
+          "Inactive-upload replacement runner differs from the failed release"
+        );
+      }
+      const expectedQueueNames = configuredReleaseQueueNames(failedConfig);
+      const queueEvidence = await failedContext.attestPreexistingQueues(
+        before.createdOn
+      );
+      const remoteUploadEvidence = await attestTaggedInactiveWorkerUpload({
+        accountId: environment.CLOUDFLARE_ACCOUNT_ID,
+        apiToken: environment.CLOUDFLARE_API_TOKEN,
+        workerName: failedConfig.name,
+        releaseTag: failed.releaseId,
+        activeWorkerVersionId: before.workerVersionId,
+        predecessorWorkerVersionId: failed.predecessor.workerVersionId,
+        sourceRevision: failed.targetGitSha,
+        workerRuntimeDigest: failed.targetFingerprints.workerRuntime,
+        clientBuildDigest: failed.targetFingerprints.workerAssets,
+        expectedBindings: expectedWorkerBindingDescriptor(failedConfig),
+        inspectVersion: (versionId) =>
+          failedContext.runWrangler(
+            ["versions", "view", versionId, "--json"],
+            { capture: true, echo: false }
+          ),
+        guard: guardFailedAttempt
+      });
+      const after = readLiveDeployment();
+      const afterRunner =
+        await discoverRunnerActivationFromInstalledPlist({
+          serviceRoot: profile.serviceRoot,
+          allowLegacyV3: true
+        });
+      if (
+        after.workerVersionId !== before.workerVersionId ||
+        after.deploymentId !== before.deploymentId ||
+        after.createdOn !== before.createdOn ||
+        afterRunner.activationId !== beforeRunner.activationId
+      ) {
+        throw new Error(
+          "Production predecessor changed during inactive-upload attestation"
+        );
+      }
+      const artifactEvidence = guardFailedAttempt();
+      return assertInactiveUploadReplacementEvidence(failed, {
+        liveWorkerVersionId: after.workerVersionId,
+        liveDeploymentId: after.deploymentId,
+        liveDeploymentCreatedOn: after.createdOn,
+        liveRunnerActivationId: afterRunner.activationId,
+        failedConfigSha256,
+        failedQueueTopologyFingerprint,
+        ...artifactEvidence,
+        remoteUploadEvidence,
+        queueEvidence: {
+          expectedQueueNames,
+          queues: queueEvidence.queues
+        }
+      });
+    };
     const liveVersionDetail = finalProbeContext.runWrangler(
       ["versions", "view", livePredecessorVersionId, "--json"],
       { capture: true, echo: false }
@@ -1276,13 +1511,14 @@ async function internalMain(options) {
         RELEASE_CLASSIFICATION_REASON_CODES.FIX_FORWARD_REQUIRED
       );
     }
-    if (options.replaceBeforeUpload) {
+    if (options.replaceBeforeUpload || options.replaceInactiveUpload) {
       classification = forceConservativeReleaseClassification(classification);
     }
     let managedJournal = resumeJournal;
     let fixForwardSource = null;
     let preMutationReplacementSource = null;
     let beforeUploadReplacementSource = null;
+    let inactiveUploadReplacementSource = null;
     let predecessor;
     if (options.resume) {
       classification = managedJournal.classification;
@@ -1404,6 +1640,50 @@ async function internalMain(options) {
         failed.state === RELEASE_JOURNAL_STATES.REPLACED
           ? predecessorForReleaseReplacement(failed)
           : failed.predecessor;
+    } else if (options.replaceInactiveUpload) {
+      const failed = store.readJournal(options.replaceInactiveUpload);
+      if (
+        !failed ||
+        ![
+          RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
+          RELEASE_JOURNAL_STATES.REPLACED
+        ].includes(failed.state) ||
+        !isInactiveUploadReplacementBoundary(failed)
+      ) {
+        throw new Error(
+          "Inactive-upload replacement must name an exact prepared upload failure or its linked journal"
+        );
+      }
+      if (
+        activePointer?.releaseId === failed.releaseId ||
+        lastCompletePointer?.releaseId === failed.releaseId
+      ) {
+        throw new Error(
+          "Inactive-upload replacement cannot target an active or last-complete release"
+        );
+      }
+      if (failed.targetGitSha === targetGitSha) {
+        throw new Error(
+          "Inactive-upload replacement requires a new target SHA; resume the failed release instead"
+        );
+      }
+      if (
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED &&
+        failed.supersededBy.targetGitSha !== targetGitSha
+      ) {
+        throw new Error(
+          "Linked inactive-upload replacement target differs from its immutable journal"
+        );
+      }
+      inactiveUploadReplacementSource = failed;
+      await previewInactiveUploadReplacement(
+        failed,
+        attestInactiveUploadReplacement
+      );
+      predecessor =
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED
+          ? predecessorForReleaseReplacement(failed)
+          : failed.predecessor;
     } else if (activeJournal) {
       predecessor = predecessorFromJournal(activeJournal, activePointer.journalSha256);
     } else {
@@ -1475,6 +1755,7 @@ async function internalMain(options) {
       fixForwardSource?.supersededBy?.releaseId ??
       preMutationReplacementSource?.supersededBy?.releaseId ??
       beforeUploadReplacementSource?.supersededBy?.releaseId ??
+      inactiveUploadReplacementSource?.supersededBy?.releaseId ??
       releaseIdFor(targetGitSha);
     const analysisEnabled =
       finalProbeContext.readConfig().vars?.NARRATIVE_ENABLED === "true";
@@ -1573,6 +1854,31 @@ async function internalMain(options) {
       );
     }
 
+    if (inactiveUploadReplacementSource) {
+      const committed = await commitInactiveUploadReplacement(
+        inactiveUploadReplacementSource,
+        {
+          releaseId,
+          targetGitSha,
+          at: new Date().toISOString(),
+          attest: attestInactiveUploadReplacement
+        }
+      );
+      if (
+        inactiveUploadReplacementSource.state ===
+        RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE
+      ) {
+        inactiveUploadReplacementSource = store.writeJournal(
+          committed.journal
+        );
+      } else {
+        inactiveUploadReplacementSource = committed.journal;
+      }
+      predecessor = predecessorForReleaseReplacement(
+        inactiveUploadReplacementSource
+      );
+    }
+
     const attemptsDirectory = ensurePrivateSubdirectory(
       profile.stateDirectory,
       "attempts",
@@ -1604,6 +1910,12 @@ async function internalMain(options) {
       if (beforeUploadReplacementSource) {
         assertReleaseReplacement(
           beforeUploadReplacementSource,
+          managedJournal
+        );
+      }
+      if (inactiveUploadReplacementSource) {
+        assertReleaseReplacement(
+          inactiveUploadReplacementSource,
           managedJournal
         );
       }
@@ -1655,6 +1967,7 @@ async function internalMain(options) {
       });
       workerOperations = createWorkerReleaseOperations({
         context: finalContext,
+        predecessorWorkerVersionId: predecessor.workerVersionId,
         workerSecretsFile: secretSnapshot.path,
         customOrigin: profile.customOrigin,
         workersDevOrigin: profile.workersDevOrigin,

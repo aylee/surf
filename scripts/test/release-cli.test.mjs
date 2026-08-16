@@ -15,6 +15,7 @@ test("parses the supported owner interface without downgrade switches", () => {
     fixForward: null,
     replacePreMutation: null,
     replaceBeforeUpload: null,
+    replaceInactiveUpload: null,
     forceFull: false
   });
   assert.deepEqual(
@@ -27,6 +28,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       fixForward: null,
       replacePreMutation: null,
       replaceBeforeUpload: null,
+      replaceInactiveUpload: null,
       forceFull: false
     }
   );
@@ -57,6 +59,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       fixForward: null,
       replacePreMutation: "failed-release",
       replaceBeforeUpload: null,
+      replaceInactiveUpload: null,
       forceFull: false
     }
   );
@@ -84,6 +87,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       fixForward: null,
       replacePreMutation: null,
       replaceBeforeUpload: "failed-before-upload",
+      replaceInactiveUpload: null,
       forceFull: false
     }
   );
@@ -93,6 +97,34 @@ test("parses the supported owner interface without downgrade switches", () => {
         "--replace-pre-mutation",
         "one",
         "--replace-before-upload",
+        "two"
+      ]),
+    /mutually exclusive/
+  );
+  assert.deepEqual(
+    parseReleaseProdArguments([
+      "--plan",
+      "--replace-inactive-upload",
+      "failed-inactive-upload"
+    ]),
+    {
+      plan: true,
+      yes: false,
+      sha: null,
+      resume: null,
+      fixForward: null,
+      replacePreMutation: null,
+      replaceBeforeUpload: null,
+      replaceInactiveUpload: "failed-inactive-upload",
+      forceFull: false
+    }
+  );
+  assert.throws(
+    () =>
+      parseReleaseProdArguments([
+        "--replace-before-upload",
+        "one",
+        "--replace-inactive-upload",
         "two"
       ]),
     /mutually exclusive/

@@ -112,6 +112,31 @@ const REMOTE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
   "taggedUploadAbsent",
   "workerName"
 ]);
+const INACTIVE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
+  "failedConfigSha256",
+  "queueEvidence",
+  "queueTopologyFingerprint",
+  "remoteUploadEvidence",
+  "schemaVersion",
+  "predecessorDeploymentCreatedOn"
+]);
+const INACTIVE_REMOTE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
+  "clientBuildDigest",
+  "inactiveWorkerCreatedOn",
+  "inactiveWorkerVersionDetailSha256",
+  "inactiveWorkerVersionId",
+  "inactiveWorkerVersionNumber",
+  "predecessorWorkerVersionDetailSha256",
+  "releaseMessage",
+  "releaseTag",
+  "remoteVersionCount",
+  "remoteVersionInventorySha256",
+  "runtimeCpuMs",
+  "schemaVersion",
+  "sourceRevision",
+  "workerName",
+  "workerRuntimeDigest"
+]);
 
 const PREDECESSOR_KEYS = Object.freeze([
   "releaseId",
@@ -334,16 +359,108 @@ function validateBeforeUploadAttestation(value) {
   });
 }
 
+function validateInactiveRemoteUploadAttestation(value) {
+  exactKeys(
+    value,
+    INACTIVE_REMOTE_UPLOAD_ATTESTATION_KEYS,
+    "Inactive Worker-upload replacement attestation"
+  );
+  if (value.schemaVersion !== 1) {
+    throw new Error(
+      "Inactive Worker-upload replacement attestation schema is unsupported"
+    );
+  }
+  if (
+    typeof value.workerName !== "string" ||
+    !SAFE_ID_PATTERN.test(value.workerName) ||
+    !RELEASE_ID_PATTERN.test(value.releaseTag ?? "") ||
+    value.releaseMessage !== `surf release ${value.releaseTag}` ||
+    !UUID_PATTERN.test(value.inactiveWorkerVersionId ?? "") ||
+    !Number.isSafeInteger(value.inactiveWorkerVersionNumber) ||
+    value.inactiveWorkerVersionNumber < 1 ||
+    !Number.isSafeInteger(value.runtimeCpuMs) ||
+    value.runtimeCpuMs < 1 ||
+    value.runtimeCpuMs > 1_000_000 ||
+    !Number.isInteger(value.remoteVersionCount) ||
+    value.remoteVersionCount < 1 ||
+    value.remoteVersionCount > 10_000 ||
+    !SHA_PATTERN.test(value.sourceRevision ?? "") ||
+    !SHA256_PATTERN.test(value.workerRuntimeDigest ?? "") ||
+    !SHA256_PATTERN.test(value.clientBuildDigest ?? "") ||
+    !SHA256_PATTERN.test(value.remoteVersionInventorySha256 ?? "") ||
+    !SHA256_PATTERN.test(value.inactiveWorkerVersionDetailSha256 ?? "") ||
+    !SHA256_PATTERN.test(value.predecessorWorkerVersionDetailSha256 ?? "")
+  ) {
+    throw new Error("Inactive Worker-upload replacement attestation is invalid");
+  }
+  exactIsoTimestampNanoseconds(
+    value.inactiveWorkerCreatedOn,
+    "Inactive Worker version creation time"
+  );
+  return Object.freeze({ ...value });
+}
+
+function validateInactiveUploadAttestation(value) {
+  exactKeys(
+    value,
+    INACTIVE_UPLOAD_ATTESTATION_KEYS,
+    "Inactive-upload replacement attestation"
+  );
+  if (value.schemaVersion !== 1) {
+    throw new Error(
+      "Inactive-upload replacement attestation schema is unsupported"
+    );
+  }
+  if (!SHA256_PATTERN.test(value.failedConfigSha256 ?? "")) {
+    throw new Error(
+      "Inactive-upload replacement attestation has an invalid config SHA-256"
+    );
+  }
+  if (!SHA256_PATTERN.test(value.queueTopologyFingerprint ?? "")) {
+    throw new Error(
+      "Inactive-upload replacement attestation has an invalid Queue-topology fingerprint"
+    );
+  }
+  exactIsoTimestampNanoseconds(
+    value.predecessorDeploymentCreatedOn,
+    "Predecessor deployment creation time"
+  );
+  return Object.freeze({
+    schemaVersion: value.schemaVersion,
+    failedConfigSha256: value.failedConfigSha256,
+    queueTopologyFingerprint: value.queueTopologyFingerprint,
+    predecessorDeploymentCreatedOn: value.predecessorDeploymentCreatedOn,
+    queueEvidence: validatedBeforeUploadQueueEvidence(
+      value.predecessorDeploymentCreatedOn,
+      value.queueEvidence
+    ),
+    remoteUploadEvidence: validateInactiveRemoteUploadAttestation(
+      value.remoteUploadEvidence
+    )
+  });
+}
+
 function validateSupersededBy(value) {
   if (value === null) return null;
   const hasBeforeUploadAttestation = Object.hasOwn(
     value,
     "beforeUploadAttestation"
   );
+  const hasInactiveUploadAttestation = Object.hasOwn(
+    value,
+    "inactiveUploadAttestation"
+  );
+  if (hasBeforeUploadAttestation && hasInactiveUploadAttestation) {
+    throw new Error(
+      "A replacement link cannot contain two upload attestations"
+    );
+  }
   exactKeys(
     value,
     hasBeforeUploadAttestation
       ? [...SUPERSEDED_BY_KEYS, "beforeUploadAttestation"]
+      : hasInactiveUploadAttestation
+        ? [...SUPERSEDED_BY_KEYS, "inactiveUploadAttestation"]
       : SUPERSEDED_BY_KEYS,
     "Superseding release link"
   );
@@ -360,6 +477,13 @@ function validateSupersededBy(value) {
       ? {
           beforeUploadAttestation: validateBeforeUploadAttestation(
             value.beforeUploadAttestation
+          )
+        }
+      : {}),
+    ...(hasInactiveUploadAttestation
+      ? {
+          inactiveUploadAttestation: validateInactiveUploadAttestation(
+            value.inactiveUploadAttestation
           )
         }
       : {})
@@ -664,6 +788,16 @@ export function assertReleaseJournal(value) {
       "Only a verified or prepared before-upload replacement may retain its attestation"
     );
   }
+  if (
+    supersededBy?.inactiveUploadAttestation !== undefined &&
+    (value.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+      value.resumeFrom !== RELEASE_JOURNAL_STATES.PREPARED ||
+      value.failureCode !== RELEASE_FAILURE_CODES.UPLOAD_FAILED)
+  ) {
+    throw new Error(
+      "Only a prepared inactive-upload replacement may retain its attestation"
+    );
+  }
   nullablePattern(value.failureCode, FAILURE_CODE_PATTERN, "Release failure code");
   if (value.failureCode !== null && !ALLOWED_FAILURE_CODES.has(value.failureCode)) {
     throw new Error("Release journal contains an unknown failure code");
@@ -691,13 +825,28 @@ export function assertReleaseJournal(value) {
       hasOnlyPreparedReceipts(receipts) &&
       exactLivePredecessor &&
       predecessor.runnerActivationId !== null &&
-      supersededBy?.beforeUploadAttestation?.schemaVersion === 2 &&
-      supersededBy.beforeUploadAttestation.failedConfigSha256 ===
-        receipts.wranglerConfigSha256 &&
-      supersededBy.beforeUploadAttestation.queueTopologyFingerprint ===
-        targetFingerprints.queueTopology &&
-      supersededBy.beforeUploadAttestation.remoteUploadEvidence.releaseTag ===
-        value.releaseId);
+      ((supersededBy?.beforeUploadAttestation?.schemaVersion === 2 &&
+        supersededBy.beforeUploadAttestation.failedConfigSha256 ===
+          receipts.wranglerConfigSha256 &&
+        supersededBy.beforeUploadAttestation.queueTopologyFingerprint ===
+          targetFingerprints.queueTopology &&
+        supersededBy.beforeUploadAttestation.remoteUploadEvidence.releaseTag ===
+          value.releaseId) ||
+        (supersededBy?.inactiveUploadAttestation?.schemaVersion === 1 &&
+          supersededBy.inactiveUploadAttestation.failedConfigSha256 ===
+            receipts.wranglerConfigSha256 &&
+          supersededBy.inactiveUploadAttestation.queueTopologyFingerprint ===
+            targetFingerprints.queueTopology &&
+          supersededBy.inactiveUploadAttestation.remoteUploadEvidence.releaseTag ===
+            value.releaseId &&
+          supersededBy.inactiveUploadAttestation.remoteUploadEvidence.sourceRevision ===
+            value.targetGitSha &&
+          supersededBy.inactiveUploadAttestation.remoteUploadEvidence.workerRuntimeDigest ===
+            targetFingerprints.workerRuntime &&
+          supersededBy.inactiveUploadAttestation.remoteUploadEvidence.clientBuildDigest ===
+            targetFingerprints.workerAssets &&
+          supersededBy.inactiveUploadAttestation.remoteUploadEvidence
+            .inactiveWorkerVersionId !== predecessor.workerVersionId)));
   if (
     value.state === RELEASE_JOURNAL_STATES.REPLACED &&
     !validReplacementBoundary
@@ -1155,6 +1304,153 @@ export function replaceBeforeUploadReleaseJournal(
                   validatedEvidence.remoteUploadEvidence
               }
             : {})
+        }
+      })
+    },
+    at
+  );
+}
+
+export function assertInactiveUploadReplacementEvidence(journal, evidence) {
+  const current = assertReleaseJournal(journal);
+  exactKeys(
+    evidence,
+    [
+      "backupArtifactAbsent",
+      "failedConfigSha256",
+      "failedQueueTopologyFingerprint",
+      "liveDeploymentCreatedOn",
+      "liveDeploymentId",
+      "liveRunnerActivationId",
+      "liveWorkerVersionId",
+      "queueEvidence",
+      "remoteUploadEvidence",
+      "rollbackArtifactAbsent",
+      "uploadArtifactAbsent"
+    ],
+    "Inactive-upload replacement evidence"
+  );
+  if (
+    current.state !== RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE ||
+    current.resumeFrom !== RELEASE_JOURNAL_STATES.PREPARED ||
+    current.failureCode !== RELEASE_FAILURE_CODES.UPLOAD_FAILED ||
+    !hasOnlyPreparedReceipts(current.receipts)
+  ) {
+    throw new Error(
+      "Inactive-upload replacement requires an exact prepared upload failure"
+    );
+  }
+  if (
+    evidence.liveWorkerVersionId !== current.predecessor.workerVersionId ||
+    evidence.liveDeploymentId !== current.predecessor.deploymentId ||
+    evidence.liveRunnerActivationId !== current.predecessor.runnerActivationId ||
+    current.predecessor.runnerActivationId === null
+  ) {
+    throw new Error(
+      "Inactive-upload replacement live predecessor differs from the failed release"
+    );
+  }
+  if (
+    evidence.uploadArtifactAbsent !== true ||
+    evidence.backupArtifactAbsent !== true ||
+    evidence.rollbackArtifactAbsent !== true
+  ) {
+    throw new Error(
+      "Inactive-upload replacement found an upload, backup, or rollback artifact"
+    );
+  }
+  if (
+    evidence.failedConfigSha256 !== current.receipts.wranglerConfigSha256
+  ) {
+    throw new Error(
+      "Inactive-upload replacement config differs from the prepared receipt"
+    );
+  }
+  if (
+    evidence.failedQueueTopologyFingerprint !==
+    current.targetFingerprints.queueTopology
+  ) {
+    throw new Error(
+      "Inactive-upload replacement Queue topology differs from the failed journal"
+    );
+  }
+  const liveDeploymentCreatedOn = evidence.liveDeploymentCreatedOn;
+  const predecessorCreatedNanoseconds = exactIsoTimestampNanoseconds(
+    liveDeploymentCreatedOn,
+    "Live predecessor deployment creation time"
+  );
+  const queueEvidence = validatedBeforeUploadQueueEvidence(
+    liveDeploymentCreatedOn,
+    evidence.queueEvidence
+  );
+  const remoteUploadEvidence = validateInactiveRemoteUploadAttestation(
+    evidence.remoteUploadEvidence
+  );
+  if (
+    remoteUploadEvidence.releaseTag !== current.releaseId ||
+    remoteUploadEvidence.sourceRevision !== current.targetGitSha ||
+    remoteUploadEvidence.workerRuntimeDigest !==
+      current.targetFingerprints.workerRuntime ||
+    remoteUploadEvidence.clientBuildDigest !==
+      current.targetFingerprints.workerAssets
+  ) {
+    throw new Error(
+      "Inactive Worker upload does not match the failed release identity"
+    );
+  }
+  if (
+    remoteUploadEvidence.inactiveWorkerVersionId ===
+    evidence.liveWorkerVersionId
+  ) {
+    throw new Error("Tagged Worker upload is active, not inactive");
+  }
+  if (
+    exactIsoTimestampNanoseconds(
+      remoteUploadEvidence.inactiveWorkerCreatedOn,
+      "Inactive Worker version creation time"
+    ) <= predecessorCreatedNanoseconds
+  ) {
+    throw new Error(
+      "Inactive Worker upload does not postdate the live predecessor deployment"
+    );
+  }
+  return Object.freeze({
+    ...evidence,
+    queueEvidence,
+    remoteUploadEvidence
+  });
+}
+
+export function replaceInactiveUploadReleaseJournal(
+  journal,
+  { releaseId, targetGitSha, evidence, at } = {}
+) {
+  const current = assertReleaseJournal(journal);
+  if (current.state !== RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE) {
+    throw new Error(
+      "Only a retryable release may replace a committed inactive Worker upload"
+    );
+  }
+  const validatedEvidence = assertInactiveUploadReplacementEvidence(
+    current,
+    evidence
+  );
+  return revisedJournal(
+    current,
+    {
+      state: RELEASE_JOURNAL_STATES.REPLACED,
+      supersededBy: validateSupersededBy({
+        releaseId,
+        targetGitSha,
+        inactiveUploadAttestation: {
+          schemaVersion: 1,
+          failedConfigSha256: validatedEvidence.failedConfigSha256,
+          queueTopologyFingerprint:
+            validatedEvidence.failedQueueTopologyFingerprint,
+          predecessorDeploymentCreatedOn:
+            validatedEvidence.liveDeploymentCreatedOn,
+          queueEvidence: validatedEvidence.queueEvidence,
+          remoteUploadEvidence: validatedEvidence.remoteUploadEvidence
         }
       })
     },

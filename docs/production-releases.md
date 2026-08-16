@@ -197,6 +197,36 @@ and remote-version count/digest attestation, so an interruption before
 successor-journal creation retries the immutable link instead of repeating a
 mutable attestation.
 
+If that complete inventory instead proves that the failed upload committed one
+tagged Worker version but Cloudflare still serves the exact predecessor at
+100%, use the separate inactive-upload recovery:
+
+```bash
+pnpm release:prod --plan --replace-inactive-upload FAILED_RELEASE_ID
+pnpm release:prod --replace-inactive-upload FAILED_RELEASE_ID
+```
+
+This command accepts only an `upload_failed` journal at `prepared` with exactly
+the four preparation receipts, no upload, D1-backup, rollback, or later
+receipt, and a new target SHA. Before preview and again after confirmation, it
+proves the unchanged Worker/deployment/runner predecessor and preexisting
+Queues, then performs two complete bounded Worker-version inventory scans.
+Both scans must have the same canonical digest and resolve the failed release
+tag to exactly one inactive version with the exact `surf release RELEASE_ID`
+message. The immutable predecessor and inactive version details must prove the
+same Durable Object namespace IDs, the configured binding allowlist, supported
+runtime limits, failed source SHA, Worker-runtime digest, and client-build
+digest. A page shift, duplicate identity, additional matching tag, activation,
+binding drift, or control-plane change fails closed.
+
+After confirmation, the old journal records a bounded inactive-version,
+inventory, version-detail, config, topology, deployment-time, and Queue
+attestation and links to a conservative-full successor. The inactive version
+remains at zero traffic; recovery neither activates nor deletes it. If the
+process stops after writing that terminal link, rerunning the same command is
+pinned to the linked SHA and uses the immutable attestation instead of reading
+mutable recovery evidence again.
+
 There is no automatic production rollback after Worker activation. A Queue,
 schema, or protocol boundary may already have been crossed; follow the
 quiescence procedure in [Runtime operations](runtime-operations.md) before any
