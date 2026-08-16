@@ -34,7 +34,10 @@ import {
   REMOTE_INGEST_RECEIPT_MODE_ENV,
   REMOTE_INGEST_RECEIPT_MODE_V1
 } from "../lib/remote-ingest.mjs";
-import { SURF_WORKER_VERSION_HEADER } from "../lib/worker-version.mjs";
+import {
+  CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER,
+  SURF_WORKER_VERSION_HEADER
+} from "../lib/worker-version.mjs";
 
 const predecessor = "11111111-1111-4111-8111-111111111111";
 const target = "22222222-2222-4222-8222-222222222222";
@@ -1365,12 +1368,20 @@ test("remote generation rejects unframed or conflicting success output without l
   }
 });
 
-test("generation reconciliation proves an existing target lineage without enqueueing", async () => {
+test("generation reconciliation reads an existing target lineage through the exact read-only override", async () => {
   const calls = [];
   const notBefore = "2026-08-15T20:00:00.000Z";
-  const fetcher = async (input) => {
+  const expectedOverride = `surf-test="${target}"`;
+  const requestOverrides = [];
+  const fetcher = async (input, init = {}) => {
     const url = new URL(String(input));
-    const headers = { [SURF_WORKER_VERSION_HEADER]: target };
+    const requestOverride = new Headers(init.headers).get(
+      CLOUDFLARE_WORKERS_VERSION_OVERRIDES_HEADER
+    );
+    requestOverrides.push([url.pathname, requestOverride]);
+    const responseVersion =
+      requestOverride === expectedOverride ? target : predecessor;
+    const headers = { [SURF_WORKER_VERSION_HEADER]: responseVersion };
     if (url.pathname === "/api/spots") {
       return Response.json(
         { spots: [{ id: "obsf-north", timezone: "America/Los_Angeles" }] },
@@ -1398,6 +1409,10 @@ test("generation reconciliation proves an existing target lineage without enqueu
   assert.deepEqual(await ops.inspectGeneration(target, notBefore), {
     generationId: target
   });
+  assert.deepEqual(requestOverrides, [
+    ["/api/spots", expectedOverride],
+    ["/api/forecast-readiness", expectedOverride]
+  ]);
   assert.equal(calls.length, 0);
 });
 
