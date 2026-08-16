@@ -20,6 +20,7 @@ const RELEASE_IDENTITY_VARS = new Set([
   "SURF_WORKER_RUNTIME_DIGEST",
   "SURF_CLIENT_BUILD_DIGEST"
 ]);
+const INSTALLED_DEPENDENCY_PATH = /(?:^|\/)node_modules(?:\/|$)/;
 
 const MATERIALIZATION_INPUTS = Object.freeze([
   // Materialization is dispatched by the Worker entrypoint and crosses brief,
@@ -67,8 +68,9 @@ function repoRelative(root, path) {
 }
 
 function walk(root, candidate, entries, includeFile = () => true) {
-  const metadata = lstatSync(candidate);
   const name = repoRelative(root, candidate);
+  if (INSTALLED_DEPENDENCY_PATH.test(name)) return;
+  const metadata = lstatSync(candidate);
   if (metadata.isSymbolicLink()) {
     throw new Error(`Release fingerprint input must not be a symlink: ${name}`);
   }
