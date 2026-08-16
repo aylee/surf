@@ -70,6 +70,30 @@ function timestamp(now) {
   return value;
 }
 
+export function persistPreControllerPreparationFailure({
+  journal,
+  store,
+  at
+}) {
+  if (
+    [
+      RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
+      RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD,
+      RELEASE_JOURNAL_STATES.SUPERSEDED,
+      RELEASE_JOURNAL_STATES.REPLACED,
+      RELEASE_JOURNAL_STATES.COMPLETE
+    ].includes(journal.state)
+  ) {
+    return journal;
+  }
+  return store.writeJournal(
+    recordReleaseJournalFailure(journal, {
+      code: RELEASE_FAILURE_CODES.PREPARE_FAILED,
+      at
+    })
+  );
+}
+
 function hasActivated(journal) {
   const effective = [
     RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
@@ -407,6 +431,7 @@ export async function executeRelease({
         RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
         RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD,
         RELEASE_JOURNAL_STATES.SUPERSEDED,
+        RELEASE_JOURNAL_STATES.REPLACED,
         RELEASE_JOURNAL_STATES.COMPLETE
       ].includes(journal.state)
     ) {

@@ -225,14 +225,14 @@ verification gate, previews the inferred mutations, asks once, and journals
 the result.
 
 ```bash
-pnpm release:prod -- --plan
+pnpm release:prod --plan
 pnpm release:prod
 pnpm release:status
 ```
 
 Expected results:
 
-- `pnpm release:prod -- --plan` is read-only and fails closed to a conservative
+- `pnpm release:prod --plan` is read-only and fails closed to a conservative
   lane until built identities exist.
 - `pnpm release:prod` runs `pnpm verify` and the deterministic identity builds
   before confirmation. Proven assets-only changes skip D1, Queues, triggers,

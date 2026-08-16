@@ -107,10 +107,18 @@ export function expectedWorkerBindingDescriptor(config) {
     });
   }
   for (const bucket of config.r2_buckets ?? []) {
+    const binding = requiredString(bucket?.binding, "R2 name");
+    // Wrangler's automatic provisioning derives an omitted bucket name from
+    // the Worker and binding names; keep the post-upload proof independent.
+    const bucketName =
+      bucket?.bucket_name ??
+      `${requiredString(config.name, "R2 Worker name")}-${binding
+        .toLowerCase()
+        .replaceAll("_", "-")}`;
     add({
-      name: requiredString(bucket?.binding, "R2 name"),
+      name: binding,
       type: "r2_bucket",
-      bucket_name: requiredString(bucket?.bucket_name, "R2 bucket name")
+      bucket_name: requiredString(bucketName, "R2 bucket name")
     });
   }
   for (const producer of config.queues?.producers ?? []) {

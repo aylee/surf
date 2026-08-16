@@ -128,7 +128,8 @@ if (journalsDirectoryHandle !== null) {
       if (
         ![
           RELEASE_JOURNAL_STATES.COMPLETE,
-          RELEASE_JOURNAL_STATES.SUPERSEDED
+          RELEASE_JOURNAL_STATES.SUPERSEDED,
+          RELEASE_JOURNAL_STATES.REPLACED
         ].includes(journal.state)
       ) {
         if (incompleteJournals.length === 256) {
