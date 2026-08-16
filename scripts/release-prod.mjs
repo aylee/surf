@@ -27,7 +27,8 @@ import {
   RELEASE_CLASSIFICATION_REASON_CODES,
   RELEASE_LANES,
   classifyReleaseImpact,
-  forceConservativeReleaseClassification
+  forceConservativeReleaseClassification,
+  sameReleaseFingerprintSet
 } from "./lib/release-impact.mjs";
 import {
   RELEASE_FAILURE_CODES,
@@ -2315,7 +2316,7 @@ async function internalMain(options) {
       }
       managedJournal = store.writeJournal(managedJournal);
     } else if (
-      JSON.stringify(managedJournal.targetFingerprints) !== JSON.stringify(fingerprints)
+      !sameReleaseFingerprintSet(managedJournal.targetFingerprints, fingerprints)
     ) {
       throw new Error("Resume target fingerprints differ from the journal");
     }
