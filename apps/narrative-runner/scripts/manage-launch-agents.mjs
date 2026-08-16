@@ -364,23 +364,47 @@ async function writeImmutablePrivateJson(path, value, label) {
   }
 }
 
-function createDrainIntent(target, prior, priorPid, labelInitiallyLoaded, nowMs) {
+function createDrainIntent(
+  target,
+  prior,
+  priorPid,
+  labelInitiallyLoaded,
+  nowMs,
+  heartbeatPid = null
+) {
   if (!Number.isSafeInteger(priorPid) || priorPid < 1) {
     throw new Error("prior activation is missing its attested runner PID");
   }
+  const bindsRunnerChild = heartbeatPid !== null;
+  if (
+    bindsRunnerChild &&
+    (!Number.isSafeInteger(heartbeatPid) ||
+      heartbeatPid < 1 ||
+      heartbeatPid === priorPid ||
+      ![3, 4].includes(prior.schemaVersion) ||
+      target.schemaVersion !== 4 ||
+      !labelInitiallyLoaded)
+  ) {
+    throw new Error("runner child PID cannot be bound to this transition");
+  }
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: bindsRunnerChild ? 2 : 1,
     targetActivationId: target.activationId,
     targetReleaseSha: recordReleaseSha(target),
     priorActivationId: prior.schemaVersion === 4 ? prior.activationId : null,
     priorReleaseSha: recordReleaseSha(prior),
     priorPid,
+    ...(bindsRunnerChild ? { heartbeatPid } : {}),
     runnerLabelInitiallyLoaded: labelInitiallyLoaded,
     observedAt: new Date(nowMs).toISOString()
   });
 }
 
 function validateDrainIntent(value, target, prior) {
+  const schemaVersion = value?.schemaVersion;
+  if (![1, 2].includes(schemaVersion)) {
+    throw new Error("Runner drain intent schema is unsupported");
+  }
   exactKeys(
     value,
     [
@@ -390,13 +414,13 @@ function validateDrainIntent(value, target, prior) {
       "priorActivationId",
       "priorReleaseSha",
       "priorPid",
+      ...(schemaVersion === 2 ? ["heartbeatPid"] : []),
       "runnerLabelInitiallyLoaded",
       "observedAt"
     ],
     "Runner drain intent"
   );
   if (
-    value.schemaVersion !== 1 ||
     value.targetActivationId !== target.activationId ||
     value.targetReleaseSha !== recordReleaseSha(target) ||
     value.priorActivationId !==
@@ -404,7 +428,14 @@ function validateDrainIntent(value, target, prior) {
     value.priorReleaseSha !== recordReleaseSha(prior) ||
     !Number.isSafeInteger(value.priorPid) ||
     value.priorPid < 1 ||
-    typeof value.runnerLabelInitiallyLoaded !== "boolean"
+    typeof value.runnerLabelInitiallyLoaded !== "boolean" ||
+    (schemaVersion === 2 &&
+      (!Number.isSafeInteger(value.heartbeatPid) ||
+        value.heartbeatPid < 1 ||
+        value.heartbeatPid === value.priorPid ||
+        ![3, 4].includes(prior.schemaVersion) ||
+        target.schemaVersion !== 4 ||
+        value.runnerLabelInitiallyLoaded !== true))
   ) {
     throw new Error("Runner drain intent does not match the exact transition");
   }
@@ -412,7 +443,11 @@ function validateDrainIntent(value, target, prior) {
   return Object.freeze({ ...value });
 }
 
-function validateDrainReceipt(value, intent, prior) {
+function validateDrainReceipt(value, intent, prior, target, nowMs = null) {
+  const schemaVersion = value?.schemaVersion;
+  if (![1, 2].includes(schemaVersion)) {
+    throw new Error("Runner drain receipt schema is unsupported");
+  }
   exactKeys(
     value,
     [
@@ -420,6 +455,7 @@ function validateDrainReceipt(value, intent, prior) {
       "priorActivationId",
       "priorReleaseSha",
       "priorPid",
+      ...(schemaVersion === 2 ? ["heartbeatPid"] : []),
       "outcome",
       "heartbeatUpdatedAt",
       "observedAt",
@@ -432,22 +468,62 @@ function validateDrainReceipt(value, intent, prior) {
   );
   const expectedProtocols =
     prior.schemaVersion === 4 ? [...recordProtocols(prior)].sort() : [];
+  const heartbeatPid = schemaVersion === 2
+    ? value.heartbeatPid
+    : value.priorPid;
+  const childHeartbeat = heartbeatPid !== value.priorPid;
+  const validBoundOutcome = Boolean(
+    value.outcome === "stopped" ||
+      (schemaVersion === 2 &&
+        value.outcome === "compatible-halted" &&
+        prior.schemaVersion === 4 &&
+        target.schemaVersion === 4 &&
+        exactProtocolSet(recordProtocols(prior), recordProtocols(target)))
+  );
   if (
-    value.schemaVersion !== 1 ||
+    schemaVersion !== intent.schemaVersion ||
     value.priorActivationId !== intent.priorActivationId ||
     value.priorReleaseSha !== intent.priorReleaseSha ||
     value.priorPid !== intent.priorPid ||
+    !Number.isSafeInteger(heartbeatPid) ||
+    heartbeatPid < 1 ||
     !["stopped", "compatible-halted"].includes(value.outcome) ||
     JSON.stringify(value.acceptedProtocolFingerprints) !==
       JSON.stringify(expectedProtocols) ||
     value.runnerLabelInitiallyLoaded !== intent.runnerLabelInitiallyLoaded ||
     value.runnerLabelUnloaded !== true ||
-    value.maxWaitMs !== RUNNER_DRAIN_TIMEOUT_MS
+    value.maxWaitMs !== RUNNER_DRAIN_TIMEOUT_MS ||
+    (schemaVersion === 2 &&
+      (heartbeatPid !== intent.heartbeatPid || !validBoundOutcome)) ||
+    (childHeartbeat &&
+      !(
+        schemaVersion === 2 &&
+        heartbeatPid === intent.heartbeatPid &&
+        [3, 4].includes(prior.schemaVersion) &&
+        target.schemaVersion === 4 &&
+        intent.runnerLabelInitiallyLoaded === true
+      ))
   ) {
     throw new Error("Runner drain receipt does not match its immutable intent");
   }
   exactTimestamp(value.heartbeatUpdatedAt, "Runner drain receipt heartbeat");
   exactTimestamp(value.observedAt, "Runner drain receipt observation");
+  if (schemaVersion === 2) {
+    const intentObservedMs = Date.parse(intent.observedAt);
+    const heartbeatUpdatedMs = Date.parse(value.heartbeatUpdatedAt);
+    const receiptObservedMs = Date.parse(value.observedAt);
+    if (
+      heartbeatUpdatedMs < intentObservedMs ||
+      heartbeatUpdatedMs >
+        intentObservedMs + RUNNER_DRAIN_TIMEOUT_MS ||
+      receiptObservedMs < heartbeatUpdatedMs ||
+      (Number.isFinite(nowMs) && receiptObservedMs > nowMs)
+    ) {
+      throw new Error(
+        "Runner drain receipt timestamps do not fit the immutable drain window"
+      );
+    }
+  }
   return Object.freeze({
     ...value,
     acceptedProtocolFingerprints: Object.freeze([
@@ -456,7 +532,7 @@ function validateDrainReceipt(value, intent, prior) {
   });
 }
 
-async function readDrainEvidence(target, prior) {
+async function readDrainEvidence(target, prior, nowMs) {
   const paths = drainEvidencePaths(target);
   const intentValue = await readPrivateJson(paths.intent, "Runner drain intent");
   const receiptValue = await readPrivateJson(paths.receipt, "Runner drain receipt");
@@ -468,7 +544,7 @@ async function readDrainEvidence(target, prior) {
   const receipt =
     receiptValue === null
       ? null
-      : validateDrainReceipt(receiptValue, intent, prior);
+      : validateDrainReceipt(receiptValue, intent, prior, target, nowMs);
   return Object.freeze({ paths, intent, receipt });
 }
 
@@ -539,6 +615,20 @@ function heartbeatIsFresh(heartbeat, nowMs) {
   );
 }
 
+function heartbeatWithinDrainIntent(heartbeat, intent, nowMs) {
+  const heartbeatMs = heartbeatTimestamp(heartbeat);
+  const observedMs = Date.parse(intent?.observedAt);
+  return Boolean(
+    heartbeatMs !== null &&
+      Number.isFinite(observedMs) &&
+      new Date(observedMs).toISOString() === intent.observedAt &&
+      Number.isFinite(nowMs) &&
+      heartbeatMs >= observedMs &&
+      heartbeatMs <= observedMs + RUNNER_DRAIN_TIMEOUT_MS &&
+      heartbeatMs <= nowMs
+  );
+}
+
 function heartbeatMatchesRecord(heartbeat, record) {
   return record.schemaVersion === 4
     ? heartbeatMatchesV4Record(heartbeat, record)
@@ -550,12 +640,35 @@ export function canRecoverHaltedRunner({
   targetRecord,
   heartbeat,
   labelUnloaded,
-  priorPid,
-  pidAlive: heartbeatPidAlive,
+  drainIntent,
+  priorPidAlive,
+  heartbeatPidAlive,
   nowMs
 }) {
+  const priorPid = drainIntent?.priorPid;
+  const exactTransition = Boolean(
+    priorRecord?.schemaVersion === 4 &&
+      targetRecord?.schemaVersion === 4 &&
+      [1, 2].includes(drainIntent?.schemaVersion) &&
+      drainIntent.targetActivationId === targetRecord.activationId &&
+      drainIntent.targetReleaseSha === recordReleaseSha(targetRecord) &&
+      drainIntent.priorActivationId === priorRecord.activationId &&
+      drainIntent.priorReleaseSha === recordReleaseSha(priorRecord)
+  );
+  const samePidBinding = Boolean(
+    drainIntent?.schemaVersion === 1 && heartbeat?.pid === priorPid
+  );
+  const childPidBinding = Boolean(
+    drainIntent?.schemaVersion === 2 &&
+      drainIntent.runnerLabelInitiallyLoaded === true &&
+      heartbeat?.pid === drainIntent.heartbeatPid &&
+      heartbeat.pid !== priorPid &&
+      heartbeatWithinDrainIntent(heartbeat, drainIntent, nowMs)
+  );
   if (
     !labelUnloaded ||
+    !exactTransition ||
+    priorPidAlive ||
     heartbeatPidAlive ||
     !Number.isSafeInteger(priorPid) ||
     priorPid < 1 ||
@@ -563,13 +676,64 @@ export function canRecoverHaltedRunner({
     targetRecord?.schemaVersion !== 4 ||
     heartbeat?.state !== "halted" ||
     heartbeat.inFlight !== 0 ||
-    heartbeat.pid !== priorPid ||
+    (!samePidBinding && !childPidBinding) ||
     !heartbeatIsFresh(heartbeat, nowMs) ||
     !heartbeatMatchesV4Record(heartbeat, priorRecord)
   ) {
     return false;
   }
   return exactProtocolSet(recordProtocols(priorRecord), recordProtocols(targetRecord));
+}
+
+function stoppedChildRunnerProof({
+  priorRecord,
+  targetRecord,
+  heartbeat,
+  labelUnloaded,
+  drainIntent,
+  priorPidAlive,
+  heartbeatPidAlive,
+  nowMs
+}) {
+  const priorPid = drainIntent?.priorPid;
+  const exactTransition = Boolean(
+    [3, 4].includes(priorRecord?.schemaVersion) &&
+      targetRecord?.schemaVersion === 4 &&
+      drainIntent?.schemaVersion === 2 &&
+      drainIntent.targetActivationId === targetRecord?.activationId &&
+      drainIntent.targetReleaseSha === recordReleaseSha(targetRecord) &&
+      drainIntent.priorActivationId ===
+        (priorRecord.schemaVersion === 4 ? priorRecord.activationId : null) &&
+      drainIntent.priorReleaseSha === recordReleaseSha(priorRecord) &&
+      drainIntent.runnerLabelInitiallyLoaded === true
+  );
+  const transitionFresh = heartbeatWithinDrainIntent(
+    heartbeat,
+    drainIntent,
+    nowMs
+  );
+  return Boolean(
+    labelUnloaded &&
+      exactTransition &&
+      !priorPidAlive &&
+      !heartbeatPidAlive &&
+      Number.isSafeInteger(priorPid) &&
+      priorPid > 0 &&
+      [3, 4].includes(priorRecord?.schemaVersion) &&
+      targetRecord?.schemaVersion === 4 &&
+      heartbeat?.state === "stopped" &&
+      heartbeat.inFlight === 0 &&
+      Number.isSafeInteger(heartbeat.pid) &&
+      heartbeat.pid > 0 &&
+      heartbeat.pid !== priorPid &&
+      heartbeat.pid === drainIntent.heartbeatPid &&
+      transitionFresh &&
+      heartbeatMatchesRecord(heartbeat, priorRecord)
+  );
+}
+
+export function canRecoverStoppedChildRunner(options) {
+  return stoppedChildRunnerProof(options);
 }
 
 async function readPriorRunnerHeartbeat(record, deps) {
@@ -589,7 +753,7 @@ async function readPriorRunnerHeartbeat(record, deps) {
   return heartbeat;
 }
 
-function drainReceipt(record, heartbeat, labelInitiallyLoaded, nowMs) {
+function drainReceipt(record, heartbeat, intent, nowMs) {
   const heartbeatUpdatedAt = heartbeatTimestamp(heartbeat);
   if (heartbeatUpdatedAt === null) {
     throw new Error("prior runner drain heartbeat timestamp is invalid");
@@ -602,64 +766,129 @@ function drainReceipt(record, heartbeat, labelInitiallyLoaded, nowMs) {
   ) {
     throw new Error("prior runner drain protocol evidence is not bounded");
   }
-  return Object.freeze({
-    schemaVersion: 1,
+  const receipt = {
+    schemaVersion: intent.schemaVersion,
     priorActivationId: record.schemaVersion === 4 ? record.activationId : null,
     priorReleaseSha: recordReleaseSha(record),
-    priorPid: heartbeat.pid,
+    priorPid: intent.priorPid,
+    ...(intent.schemaVersion === 2 ? { heartbeatPid: heartbeat.pid } : {}),
     outcome: heartbeat.state === "halted" ? "compatible-halted" : "stopped",
     heartbeatUpdatedAt: heartbeat.updatedAt,
     observedAt: new Date(nowMs).toISOString(),
     acceptedProtocolFingerprints: Object.freeze(protocolFingerprints),
-    runnerLabelInitiallyLoaded: labelInitiallyLoaded,
+    runnerLabelInitiallyLoaded: intent.runnerLabelInitiallyLoaded,
     runnerLabelUnloaded: true,
     maxWaitMs: RUNNER_DRAIN_TIMEOUT_MS
-  });
+  };
+  return Object.freeze(receipt);
 }
 
 async function waitPriorRunnerStopped(
   record,
   target,
-  priorPid,
-  labelInitiallyLoaded,
+  intent,
   deadline,
   deps
 ) {
+  const priorPid = intent.priorPid;
   while (remainingMs(deadline, deps.now) > 0) {
     try {
       const heartbeat = JSON.parse(await deps.readFile(recordStatusFile(record), "utf8"));
-      const heartbeatPidAlive =
-        heartbeat?.pid === priorPid
-          ? deps.pidAlive(priorPid)
-          : true;
+      const priorPidAlive = deps.pidAlive(priorPid);
+      const stoppedChildHeartbeat = stoppedChildRunnerProof(
+        {
+          priorRecord: record,
+          targetRecord: target,
+          heartbeat,
+          labelUnloaded: true,
+          drainIntent: intent,
+          priorPidAlive: false,
+          heartbeatPidAlive: false,
+          nowMs: deps.now()
+        }
+      );
+      const boundChildHeartbeat = Boolean(
+        intent.schemaVersion === 2 &&
+          Number.isSafeInteger(heartbeat?.pid) &&
+          heartbeat.pid > 0 &&
+          heartbeat.pid !== priorPid &&
+          heartbeat.pid === intent.heartbeatPid &&
+          heartbeatMatchesRecord(heartbeat, record)
+      );
+      const heartbeatPidAlive = Number.isSafeInteger(heartbeat?.pid) && heartbeat.pid > 0
+        ? heartbeat.pid === priorPid
+          ? priorPidAlive
+          : stoppedChildHeartbeat || boundChildHeartbeat
+            ? deps.pidAlive(heartbeat.pid)
+            : true
+        : true;
       if (
         heartbeat?.state === "stopped" &&
         heartbeat.inFlight === 0 &&
         heartbeat.pid === priorPid &&
-        !heartbeatPidAlive &&
+        !priorPidAlive &&
         heartbeatIsFresh(heartbeat, deps.now()) &&
         heartbeatMatchesRecord(heartbeat, record)
       ) {
-        return drainReceipt(record, heartbeat, labelInitiallyLoaded, deps.now());
-      }
-      if (heartbeat?.state === "halted" && heartbeat.pid !== priorPid) {
-        throw new Error(
-          "halted runner recovery rejected a heartbeat PID that differs from the attested loaded PID"
+        return drainReceipt(
+          record,
+          heartbeat,
+          intent,
+          deps.now()
         );
       }
-      if (heartbeat?.state === "halted" && !heartbeatPidAlive) {
+      if (
+        stoppedChildRunnerProof(
+          {
+            priorRecord: record,
+            targetRecord: target,
+            heartbeat,
+            labelUnloaded: true,
+            drainIntent: intent,
+            priorPidAlive,
+            heartbeatPidAlive,
+            nowMs: deps.now()
+          }
+        )
+      ) {
+        return drainReceipt(
+          record,
+          heartbeat,
+          intent,
+          deps.now()
+        );
+      }
+      const expectedHeartbeatPid = intent.schemaVersion === 2
+        ? intent.heartbeatPid
+        : priorPid;
+      if (heartbeat?.state === "halted" && heartbeat.pid !== expectedHeartbeatPid) {
+        throw new Error(
+          "halted runner recovery rejected a heartbeat PID outside the attested drain intent"
+        );
+      }
+      if (
+        heartbeat?.state === "halted" &&
+        !priorPidAlive &&
+        !heartbeatPidAlive
+      ) {
         if (
           canRecoverHaltedRunner({
             priorRecord: record,
             targetRecord: target,
             heartbeat,
             labelUnloaded: true,
-            priorPid,
-            pidAlive: heartbeatPidAlive,
+            drainIntent: intent,
+            priorPidAlive,
+            heartbeatPidAlive,
             nowMs: deps.now()
           })
         ) {
-          return drainReceipt(record, heartbeat, labelInitiallyLoaded, deps.now());
+          return drainReceipt(
+            record,
+            heartbeat,
+            intent,
+            deps.now()
+          );
         }
         throw new Error(
           "halted runner recovery requires fresh matching v4 evidence, exact protocol-set equality, zero in-flight work, an unloaded label, and the attested dead PID"
@@ -945,7 +1174,7 @@ export async function activateLaunchAgents(
 
   const priorIsDistinct = prior && !sameActivation(prior, target);
   const persistedDrain = priorIsDistinct
-    ? await readDrainEvidence(target, prior)
+    ? await readDrainEvidence(target, prior, deps.now())
     : null;
   let receipt = persistedDrain?.receipt ?? null;
   if (targetCommitted && priorIsDistinct && receipt === null) {
@@ -962,10 +1191,45 @@ export async function activateLaunchAgents(
     let intent = persistedDrain.intent;
     if (intent === null) {
       if (priorRunnerLoaded) {
-        intent = createDrainIntent(target, prior, runner.pid, true, deps.now());
+        const recheckedRunner = await inspectLoadedJob(
+          RUNNER_LABEL,
+          "narrativeRunner",
+          records,
+          domain,
+          deps.now() + COMMAND_TIMEOUT_MS,
+          deps
+        );
+        if (
+          !recheckedRunner.loaded ||
+          recheckedRunner.record.activationRecordPath !==
+            runner.record.activationRecordPath ||
+          recheckedRunner.pid !== runner.pid
+        ) {
+          throw new Error(`${RUNNER_LABEL} identity changed before bounded bootout`);
+        }
+        let heartbeatPid = null;
+        if ([3, 4].includes(prior.schemaVersion) && target.schemaVersion === 4) {
+          const heartbeat = await readPriorRunnerHeartbeat(prior, deps);
+          if (heartbeat.pid !== runner.pid) heartbeatPid = heartbeat.pid;
+        }
+        intent = createDrainIntent(
+          target,
+          prior,
+          runner.pid,
+          true,
+          deps.now(),
+          heartbeatPid
+        );
       } else {
         const heartbeat = await readPriorRunnerHeartbeat(prior, deps);
         const heartbeatPidAlive = deps.pidAlive(heartbeat.pid);
+        const unloadedIntent = createDrainIntent(
+          target,
+          prior,
+          heartbeat.pid,
+          false,
+          deps.now()
+        );
         const stoppedSafe = Boolean(
           heartbeat.state === "stopped" &&
             heartbeat.inFlight === 0 &&
@@ -977,8 +1241,9 @@ export async function activateLaunchAgents(
           targetRecord: target,
           heartbeat,
           labelUnloaded: true,
-          priorPid: heartbeat.pid,
-          pidAlive: heartbeatPidAlive,
+          drainIntent: unloadedIntent,
+          priorPidAlive: heartbeatPidAlive,
+          heartbeatPidAlive,
           nowMs: deps.now()
         });
         if (!stoppedSafe && !haltedSafe) {
@@ -986,13 +1251,7 @@ export async function activateLaunchAgents(
             "already-unloaded prior runner lacks a fresh matching stopped heartbeat and dead PID or compatible-halted evidence"
           );
         }
-        intent = createDrainIntent(
-          target,
-          prior,
-          heartbeat.pid,
-          false,
-          deps.now()
-        );
+        intent = unloadedIntent;
       }
       await writeImmutablePrivateJson(
         persistedDrain.paths.intent,
@@ -1026,13 +1285,18 @@ export async function activateLaunchAgents(
     if (!Number.isSafeInteger(priorPid) || priorPid < 1) {
       throw new Error("prior activation is missing its attested runner PID");
     }
-    receipt = await waitPriorRunnerStopped(
+    receipt = validateDrainReceipt(
+      await waitPriorRunnerStopped(
+        prior,
+        target,
+        intent,
+        runnerDeadline,
+        deps
+      ),
+      intent,
       prior,
       target,
-      priorPid,
-      priorRunnerLoaded,
-      runnerDeadline,
-      deps
+      deps.now()
     );
     await writeImmutablePrivateJson(
       persistedDrain.paths.receipt,

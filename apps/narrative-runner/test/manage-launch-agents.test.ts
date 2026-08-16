@@ -5,16 +5,17 @@ import { describe, expect, it, vi } from "vitest";
 import { NARRATIVE_PROTOCOL_FINGERPRINT } from "@surf/narrative-contracts";
 import {
   activateLaunchAgents,
-  canRecoverHaltedRunner
+  canRecoverHaltedRunner,
+  canRecoverStoppedChildRunner
 } from "../scripts/manage-launch-agents.mjs";
 
 const NOW = Date.parse("2026-08-15T12:00:00.000Z");
 
 function recordValue(
   root: string,
-  fingerprints: string | readonly string[] = NARRATIVE_PROTOCOL_FINGERPRINT
+  fingerprints: string | readonly string[] = NARRATIVE_PROTOCOL_FINGERPRINT,
+  revision = "a".repeat(40)
 ) {
-  const revision = "a".repeat(40);
   const values = typeof fingerprints === "string" ? [fingerprints] : fingerprints;
   const transitionRoot = ["prior", "target"].includes(basename(root))
     ? dirname(root)
@@ -53,11 +54,14 @@ function recordValue(
 
 async function activationRecord(
   root: string,
-  fingerprints?: string | readonly string[]
+  fingerprints?: string | readonly string[],
+  revision?: string
 ): Promise<string> {
   await mkdir(root, { recursive: true });
   const path = join(root, "activation-record.json");
-  await writeFile(path, `${JSON.stringify(recordValue(root, fingerprints))}\n`);
+  await writeFile(path, `${JSON.stringify(recordValue(root, fingerprints, revision))}\n`, {
+    mode: 0o600
+  });
   return path;
 }
 
@@ -77,6 +81,49 @@ function heartbeat(
     ),
     state,
     inFlight: 0,
+    updatedAt: options.updatedAt ?? new Date(NOW - 1_000).toISOString()
+  };
+}
+
+function legacyRecordValue(
+  root: string,
+  target: ReturnType<typeof recordValue>
+) {
+  return {
+    schemaVersion: 3,
+    releaseSha: "c".repeat(40),
+    modelId: "legacy-model",
+    statusFile: join(root, "status.json"),
+    executables: target.executables,
+    launchAgents: {
+      narrativeRunner: {
+        ...target.launchAgents.narrativeRunner,
+        sha256: "d".repeat(64)
+      },
+      omlxServer: {
+        ...target.launchAgents.omlxServer,
+        sha256: "e".repeat(64)
+      }
+    }
+  };
+}
+
+function legacyHeartbeat(
+  record: ReturnType<typeof legacyRecordValue>,
+  options: {
+    pid?: number;
+    state?: string;
+    inFlight?: number;
+    updatedAt?: string;
+  } = {}
+) {
+  return {
+    schemaVersion: 2,
+    pid: options.pid ?? 5678,
+    releaseSha: record.releaseSha,
+    modelId: record.modelId,
+    state: options.state ?? "stopped",
+    inFlight: options.inFlight ?? 0,
     updatedAt: options.updatedAt ?? new Date(NOW - 1_000).toISOString()
   };
 }
@@ -300,21 +347,33 @@ describe("bounded LaunchAgent activation", () => {
       NARRATIVE_PROTOCOL_FINGERPRINT
     ]);
     const stopped = heartbeat(prior);
+    const drainIntent = {
+      schemaVersion: 1,
+      targetActivationId: target.activationId,
+      targetReleaseSha: target.source.revision,
+      priorActivationId: prior.activationId,
+      priorReleaseSha: prior.source.revision,
+      priorPid: 1234,
+      runnerLabelInitiallyLoaded: false,
+      observedAt: new Date(NOW).toISOString()
+    };
     expect(
       canRecoverHaltedRunner({
         priorRecord: prior,
         targetRecord: target,
         heartbeat: stopped,
         labelUnloaded: true,
-        priorPid: 1234,
-        pidAlive: false,
+        drainIntent,
+        priorPidAlive: false,
+        heartbeatPidAlive: false,
         nowMs: NOW
       })
     ).toBe(true);
     for (const overrides of [
       { labelUnloaded: false },
-      { pidAlive: true },
-      { priorPid: 9876 },
+      { priorPidAlive: true },
+      { heartbeatPidAlive: true },
+      { drainIntent: { ...drainIntent, priorPid: 9876 } },
       { heartbeat: { ...stopped, inFlight: 1 } },
       { heartbeat: { ...stopped, state: "backing_off" } },
       {
@@ -359,13 +418,201 @@ describe("bounded LaunchAgent activation", () => {
           targetRecord: target,
           heartbeat: stopped,
           labelUnloaded: true,
-          priorPid: 1234,
-          pidAlive: false,
+          drainIntent,
+          priorPidAlive: false,
+          heartbeatPidAlive: false,
           nowMs: NOW,
           ...overrides
         })
       ).toBe(false);
     }
+
+    const childHeartbeat = heartbeat(prior, "halted", {
+      pid: 5678,
+      updatedAt: new Date(NOW - 1_000).toISOString()
+    });
+    const childIntent = {
+      ...drainIntent,
+      schemaVersion: 2,
+      heartbeatPid: 5678,
+      runnerLabelInitiallyLoaded: true,
+      observedAt: new Date(NOW - 2_000).toISOString()
+    };
+    expect(
+      canRecoverHaltedRunner({
+        priorRecord: prior,
+        targetRecord: target,
+        heartbeat: childHeartbeat,
+        labelUnloaded: true,
+        drainIntent: childIntent,
+        priorPidAlive: false,
+        heartbeatPidAlive: false,
+        nowMs: NOW
+      })
+    ).toBe(true);
+    expect(
+      canRecoverHaltedRunner({
+        priorRecord: prior,
+        targetRecord: target,
+        heartbeat: childHeartbeat,
+        labelUnloaded: true,
+        drainIntent,
+        priorPidAlive: false,
+        heartbeatPidAlive: false,
+        nowMs: NOW
+      })
+    ).toBe(false);
+    expect(
+      canRecoverHaltedRunner({
+        priorRecord: prior,
+        targetRecord: target,
+        heartbeat: {
+          ...childHeartbeat,
+          updatedAt: new Date(NOW - 2_001).toISOString()
+        },
+        labelUnloaded: true,
+        drainIntent: childIntent,
+        priorPidAlive: false,
+        heartbeatPidAlive: false,
+        nowMs: NOW
+      })
+    ).toBe(false);
+  });
+
+  it("allows a distinct stopped child PID only from an exact transition-bounded v2 binding", () => {
+    const target = recordValue("/tmp/target");
+    const prior = legacyRecordValue("/tmp/prior", target);
+    const stopped = legacyHeartbeat(prior, {
+      updatedAt: new Date(NOW - 1_000).toISOString()
+    });
+    const drainIntent = {
+      schemaVersion: 2,
+      targetActivationId: target.activationId,
+      targetReleaseSha: target.source.revision,
+      priorActivationId: null,
+      priorReleaseSha: prior.releaseSha,
+      priorPid: 1234,
+      heartbeatPid: 5678,
+      runnerLabelInitiallyLoaded: true,
+      observedAt: new Date(NOW - 2_000).toISOString()
+    };
+    const valid = {
+      priorRecord: prior,
+      targetRecord: target,
+      heartbeat: stopped,
+      labelUnloaded: true,
+      drainIntent,
+      priorPidAlive: false,
+      heartbeatPidAlive: false,
+      nowMs: NOW
+    };
+
+    expect(canRecoverStoppedChildRunner(valid)).toBe(true);
+    expect(
+      canRecoverStoppedChildRunner({
+        ...valid,
+        drainIntent: {
+          ...drainIntent,
+          observedAt: new Date(NOW - 1_000_000).toISOString()
+        },
+        heartbeat: legacyHeartbeat(prior, {
+          updatedAt: new Date(NOW - 999_000).toISOString()
+        })
+      })
+    ).toBe(true);
+    for (const overrides of [
+      { labelUnloaded: false },
+      {
+        drainIntent: { ...drainIntent, runnerLabelInitiallyLoaded: false }
+      },
+      { priorPidAlive: true },
+      { heartbeatPidAlive: true },
+      { drainIntent: { ...drainIntent, priorPid: 5678 } },
+      { heartbeat: legacyHeartbeat(prior, { state: "halted" }) },
+      { heartbeat: legacyHeartbeat(prior, { inFlight: 1 }) },
+      {
+        heartbeat: legacyHeartbeat(prior, {
+          updatedAt: new Date(NOW - 2_001).toISOString()
+        })
+      },
+      {
+        drainIntent: {
+          ...drainIntent,
+          observedAt: new Date(NOW - 1_000_000).toISOString()
+        },
+        heartbeat: legacyHeartbeat(prior, {
+          updatedAt: new Date(NOW - 39_999).toISOString()
+        })
+      },
+      {
+        heartbeat: legacyHeartbeat(prior, {
+          updatedAt: new Date(NOW + 1).toISOString()
+        })
+      },
+      {
+        heartbeat: { ...stopped, releaseSha: "d".repeat(40) }
+      },
+      {
+        heartbeat: { ...stopped, modelId: "different-model" }
+      },
+      {
+        priorRecord: recordValue("/tmp/prior-v4"),
+        heartbeat: heartbeat(recordValue("/tmp/prior-v4"), "stopped", {
+          pid: 5678
+        })
+      },
+      { targetRecord: { ...target, schemaVersion: 3 } }
+    ]) {
+      expect(canRecoverStoppedChildRunner({ ...valid, ...overrides })).toBe(false);
+    }
+
+    expect(
+      canRecoverStoppedChildRunner({
+        ...valid,
+        drainIntent,
+        heartbeat: { ...stopped, pid: 6789 }
+      })
+    ).toBe(false);
+    expect(
+      canRecoverStoppedChildRunner({
+        ...valid,
+        drainIntent,
+        heartbeat: legacyHeartbeat(prior, {
+          updatedAt: new Date(NOW - 300_001).toISOString()
+        })
+      })
+    ).toBe(false);
+
+    const priorV4 = recordValue("/tmp/prior-v4");
+    const v4Stopped = heartbeat(priorV4, "stopped", { pid: 5678 });
+    const v4Intent = {
+      ...drainIntent,
+      priorActivationId: priorV4.activationId,
+      priorReleaseSha: priorV4.source.revision
+    };
+    expect(
+      canRecoverStoppedChildRunner({
+        ...valid,
+        priorRecord: priorV4,
+        heartbeat: v4Stopped,
+        drainIntent: v4Intent
+      })
+    ).toBe(true);
+    const v4Unbound = { ...v4Intent, schemaVersion: 1 } as Record<string, unknown>;
+    delete v4Unbound.heartbeatPid;
+    expect(
+      canRecoverStoppedChildRunner({
+        ...valid,
+        priorRecord: priorV4,
+        heartbeat: v4Stopped,
+        drainIntent: v4Unbound
+      })
+    ).toBe(false);
+    const unboundV1 = { ...drainIntent, schemaVersion: 1 } as Record<string, unknown>;
+    delete unboundV1.heartbeatPid;
+    expect(
+      canRecoverStoppedChildRunner({ ...valid, drainIntent: unboundV1 })
+    ).toBe(false);
   });
 
   it("uses the halted exception only after bootout proves the label unloaded", async () => {
@@ -376,7 +623,10 @@ describe("bounded LaunchAgent activation", () => {
     const priorRecordPath = await activationRecord(priorRoot);
     const target = recordValue(targetRoot);
     const prior = recordValue(priorRoot);
-    await writeFile(prior.runtime.statusFile, `${JSON.stringify(heartbeat(prior))}\n`);
+    await writeFile(
+      prior.runtime.statusFile,
+      `${JSON.stringify(heartbeat(prior, "halted", { pid: 5678 }))}\n`
+    );
     const launchd = launchdHarness(targetRoot, target, [
       { root: priorRoot, record: prior, component: "narrativeRunner" },
       { root: priorRoot, record: prior, component: "omlxServer" }
@@ -391,6 +641,17 @@ describe("bounded LaunchAgent activation", () => {
         pidAlive: () => false,
         portOpen: async () => false,
         sleep: async () => undefined,
+        afterDrainIntent: async () => {
+          await writeFile(
+            prior.runtime.statusFile,
+            `${JSON.stringify(
+              heartbeat(prior, "halted", {
+                pid: 5678,
+                updatedAt: new Date(NOW).toISOString()
+              })
+            )}\n`
+          );
+        },
         command: launchd.command
       }
     );
@@ -398,12 +659,13 @@ describe("bounded LaunchAgent activation", () => {
       status: "ok",
       changed: true,
       drainReceipt: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         priorActivationId: prior.activationId,
         priorReleaseSha: prior.source.revision,
         priorPid: 1234,
+        heartbeatPid: 5678,
         outcome: "compatible-halted",
-        heartbeatUpdatedAt: new Date(NOW - 1_000).toISOString(),
+        heartbeatUpdatedAt: new Date(NOW).toISOString(),
         observedAt: new Date(NOW).toISOString(),
         acceptedProtocolFingerprints: [NARRATIVE_PROTOCOL_FINGERPRINT],
         runnerLabelInitiallyLoaded: true,
@@ -645,6 +907,150 @@ describe("bounded LaunchAgent activation", () => {
     expect(resumed.drainReceipt).toMatchObject({ priorPid: 1234, outcome: "stopped" });
   });
 
+  it("receipts both dead PIDs when a loaded v3 wrapper stops through its child", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-manage-v3-child-"));
+    const targetRoot = join(root, "target");
+    const priorRoot = join(root, "prior");
+    const targetRecordPath = await activationRecord(targetRoot);
+    const target = recordValue(targetRoot);
+    await mkdir(priorRoot, { recursive: true });
+    const priorRecordPath = join(priorRoot, "activation-record.json");
+    const legacy = legacyRecordValue(priorRoot, target);
+    await writeFile(priorRecordPath, `${JSON.stringify(legacy)}\n`);
+    await writeFile(
+      legacy.statusFile,
+      `${JSON.stringify(legacyHeartbeat(legacy))}\n`
+    );
+    const launchd = launchdHarness(targetRoot, target, [
+      {
+        root: priorRoot,
+        record: legacy as unknown as ReturnType<typeof recordValue>,
+        component: "narrativeRunner",
+        pid: 1234
+      },
+      {
+        root: priorRoot,
+        record: legacy as unknown as ReturnType<typeof recordValue>,
+        component: "omlxServer"
+      }
+    ]);
+    const pidAlive = vi.fn(() => false);
+
+    const result = await activateLaunchAgents(
+      { recordPath: targetRecordPath, priorRecordPath },
+      {
+        uid: 501,
+        now: () => NOW,
+        verify: installationVerifier(targetRecordPath, priorRecordPath, "prior"),
+        install: async () => ({ status: "ok" }),
+        pidAlive,
+        portOpen: async () => false,
+        sleep: async () => undefined,
+        afterDrainIntent: async () => {
+          await writeFile(
+            legacy.statusFile,
+            `${JSON.stringify(
+              legacyHeartbeat(legacy, {
+                updatedAt: new Date(NOW).toISOString()
+              })
+            )}\n`
+          );
+        },
+        command: launchd.command
+      }
+    );
+
+    expect(result.drainReceipt).toMatchObject({
+      schemaVersion: 2,
+      priorActivationId: null,
+      priorReleaseSha: legacy.releaseSha,
+      priorPid: 1234,
+      heartbeatPid: 5678,
+      outcome: "stopped",
+      runnerLabelInitiallyLoaded: true,
+      runnerLabelUnloaded: true
+    });
+    expect(pidAlive).toHaveBeenCalledWith(1234);
+    expect(pidAlive).toHaveBeenCalledWith(5678);
+
+  });
+
+  it("resumes a prebound v2 stopped child after the intent window has elapsed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-manage-v2-resume-"));
+    const targetRoot = join(root, "target");
+    const priorRoot = join(root, "prior");
+    const targetRecordPath = await activationRecord(targetRoot);
+    const target = recordValue(targetRoot);
+    await mkdir(priorRoot, { recursive: true });
+    const priorRecordPath = join(priorRoot, "activation-record.json");
+    const legacy = legacyRecordValue(priorRoot, target);
+    await writeFile(priorRecordPath, `${JSON.stringify(legacy)}\n`);
+    await writeFile(
+      legacy.statusFile,
+      `${JSON.stringify(legacyHeartbeat(legacy))}\n`
+    );
+    const launchd = launchdHarness(targetRoot, target, [
+      {
+        root: priorRoot,
+        record: legacy as unknown as ReturnType<typeof recordValue>,
+        component: "narrativeRunner",
+        pid: 1234
+      },
+      {
+        root: priorRoot,
+        record: legacy as unknown as ReturnType<typeof recordValue>,
+        component: "omlxServer"
+      }
+    ]);
+    let clock = NOW;
+    const common = {
+      uid: 501,
+      now: () => clock,
+      verify: installationVerifier(targetRecordPath, priorRecordPath, "prior"),
+      install: async () => ({ status: "ok" }),
+      pidAlive: () => false,
+      portOpen: async () => false,
+      sleep: async () => undefined,
+      command: launchd.command
+    };
+
+    await expect(
+      activateLaunchAgents(
+        { recordPath: targetRecordPath, priorRecordPath },
+        {
+          ...common,
+          afterDrainIntent: async () => {
+            await writeFile(
+              legacy.statusFile,
+              `${JSON.stringify(
+                legacyHeartbeat(legacy, {
+                  updatedAt: new Date(NOW).toISOString()
+                })
+              )}\n`
+            );
+            throw new Error("injected after v2 intent");
+          }
+        }
+      )
+    ).rejects.toThrow(/injected after v2 intent/);
+
+    launchd.loaded.delete("gui/501/ai.alex.narrative-runner");
+    clock = NOW + 960_001;
+    const resumed = await activateLaunchAgents(
+      { recordPath: targetRecordPath, priorRecordPath },
+      common
+    );
+
+    expect(resumed.drainReceipt).toMatchObject({
+      schemaVersion: 2,
+      priorPid: 1234,
+      heartbeatPid: 5678,
+      outcome: "stopped",
+      heartbeatUpdatedAt: new Date(NOW).toISOString(),
+      observedAt: new Date(clock).toISOString()
+    });
+  });
+
   it("recovers a v3-prior to v4-target oMLX-first mixed installation", async () => {
     const root = await mkdtemp(join(tmpdir(), "surf-launch-manage-v3-mixed-"));
     const targetRoot = join(root, "target");
@@ -653,26 +1059,11 @@ describe("bounded LaunchAgent activation", () => {
     const target = recordValue(targetRoot);
     await mkdir(priorRoot, { recursive: true });
     const priorRecordPath = join(priorRoot, "activation-record.json");
-    const legacy = {
-      schemaVersion: 3,
-      releaseSha: "c".repeat(40),
-      modelId: "legacy-model",
-      statusFile: join(priorRoot, "status.json"),
-      executables: target.executables,
-      launchAgents: target.launchAgents
-    };
+    const legacy = legacyRecordValue(priorRoot, target);
     await writeFile(priorRecordPath, `${JSON.stringify(legacy)}\n`);
     await writeFile(
       legacy.statusFile,
-      `${JSON.stringify({
-        schemaVersion: 2,
-        pid: 1234,
-        releaseSha: legacy.releaseSha,
-        modelId: legacy.modelId,
-        state: "stopped",
-        inFlight: 0,
-        updatedAt: new Date(NOW - 1_000).toISOString()
-      })}\n`
+      `${JSON.stringify(legacyHeartbeat(legacy, { pid: 1234 }))}\n`
     );
     const launchd = launchdHarness(targetRoot, target);
     const install = vi.fn(async () => ({ status: "ok" }));
@@ -993,5 +1384,67 @@ describe("bounded LaunchAgent activation", () => {
       allowLegacyV3: true,
       priorRecordPath: null
     });
+  });
+
+  it("restarts an unloaded installed v3 runner beside its exact loaded oMLX", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-launch-manage-v3-restart-"));
+    const recordPath = join(root, "activation-record.json");
+    const legacy = legacyRecordValue(root, recordValue(root));
+    await writeFile(recordPath, `${JSON.stringify(legacy)}\n`);
+    const launchd = launchdHarness(
+      root,
+      legacy as unknown as ReturnType<typeof recordValue>,
+      [
+        {
+          root,
+          record: legacy as unknown as ReturnType<typeof recordValue>,
+          component: "omlxServer"
+        }
+      ]
+    );
+    const commands: Array<[string, string[]]> = [];
+    const install = vi.fn();
+
+    const result = await activateLaunchAgents(
+      {
+        recordPath,
+        priorRecordPath: recordPath,
+        transitionMode: "rollback"
+      },
+      {
+        uid: 501,
+        verify: installationVerifier(recordPath, recordPath, "target"),
+        install,
+        command: async (file: string, args: string[]) => {
+          commands.push([file, args]);
+          return await launchd.command(file, args);
+        }
+      }
+    );
+
+    expect(result).toMatchObject({
+      status: "ok",
+      releaseSha: legacy.releaseSha,
+      activationId: null,
+      changed: true,
+      drainReceipt: null
+    });
+    expect(install).not.toHaveBeenCalled();
+    expect(commands.some(([, args]) => args[0] === "bootout")).toBe(false);
+    expect(
+      commands.some(
+        ([file, args]) =>
+          file === "/bin/launchctl" &&
+          args[0] === "bootstrap" &&
+          args[2] === legacy.launchAgents.narrativeRunner.path
+      )
+    ).toBe(true);
+    expect(
+      commands
+        .filter(([file]) => file === legacy.executables.node.path)
+        .map(([, args]) => args.at(-1))
+    ).toEqual(["check", "status"]);
+    expect(launchd.loaded.has("gui/501/ai.alex.omlx-server")).toBe(true);
+    expect(launchd.loaded.has("gui/501/ai.alex.narrative-runner")).toBe(true);
   });
 });
