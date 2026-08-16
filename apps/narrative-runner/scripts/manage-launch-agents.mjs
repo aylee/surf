@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { link, open, readFile, rm } from "node:fs/promises";
+import { link, open, readFile, realpath, rm } from "node:fs/promises";
 import { connect } from "node:net";
 import { basename, dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -278,7 +279,7 @@ function drainEvidencePaths(target) {
   });
 }
 
-async function readPrivateJson(path, label) {
+async function readPrivateJsonSnapshot(path, label) {
   let handle;
   try {
     handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -309,13 +310,20 @@ async function readPrivateJson(path, label) {
       throw new Error(`${label} changed while it was read`);
     }
     try {
-      return JSON.parse(contents.toString("utf8"));
+      return Object.freeze({
+        value: JSON.parse(contents.toString("utf8")),
+        sha256: createHash("sha256").update(contents).digest("hex")
+      });
     } catch {
       throw new Error(`${label} is not valid JSON`);
     }
   } finally {
     await handle.close();
   }
+}
+
+async function readPrivateJson(path, label) {
+  return (await readPrivateJsonSnapshot(path, label))?.value ?? null;
 }
 
 async function writeImmutablePrivateJson(path, value, label) {
@@ -546,6 +554,180 @@ async function readDrainEvidence(target, prior, nowMs) {
       ? null
       : validateDrainReceipt(receiptValue, intent, prior, target, nowMs);
   return Object.freeze({ paths, intent, receipt });
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalJson(value[key])])
+    );
+  }
+  return value;
+}
+
+function semanticJsonSha256(value) {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalJson(value)))
+    .digest("hex");
+}
+
+async function verifiedActivationRecordSnapshot(
+  recordPath,
+  { label, requireInstalled, allowLegacyV3 },
+  deps
+) {
+  let canonical;
+  try {
+    canonical = await realpath(recordPath);
+  } catch {
+    throw new Error(`${label} path must be canonical and readable`);
+  }
+  if (
+    typeof recordPath !== "string" ||
+    resolve(recordPath) !== recordPath ||
+    canonical !== recordPath
+  ) {
+    throw new Error(`${label} path must be canonical and absolute`);
+  }
+  await deps.verify(recordPath, { requireInstalled, allowLegacyV3 });
+  const before = await readPrivateJsonSnapshot(recordPath, label);
+  if (before === null) throw new Error(`${label} is required`);
+  await deps.verify(recordPath, { requireInstalled, allowLegacyV3 });
+  const after = await readPrivateJsonSnapshot(recordPath, label);
+  if (after === null || before.sha256 !== after.sha256) {
+    throw new Error(`${label} changed while its activation was verified`);
+  }
+  return Object.freeze({
+    value: Object.freeze({
+      ...after.value,
+      activationRecordPath: recordPath
+    }),
+    sha256: after.sha256
+  });
+}
+
+export async function verifyCommittedRunnerDrainEvidence(
+  {
+    targetRecordPath,
+    priorRecordPath,
+    attemptDrainReceiptPath = null
+  },
+  overrides = {}
+) {
+  const deps = dependencies(overrides);
+  const targetSnapshot = await verifiedActivationRecordSnapshot(
+    targetRecordPath,
+    {
+      label: "Committed target activation record",
+      requireInstalled: true,
+      allowLegacyV3: false
+    },
+    deps
+  );
+  const priorSnapshot = await verifiedActivationRecordSnapshot(
+    priorRecordPath,
+    {
+      label: "Prior activation record",
+      requireInstalled: false,
+      allowLegacyV3: true
+    },
+    deps
+  );
+  const target = targetSnapshot.value;
+  const prior = priorSnapshot.value;
+  if (
+    targetRecordPath === priorRecordPath ||
+    target.schemaVersion !== 4 ||
+    ![3, 4].includes(prior.schemaVersion)
+  ) {
+    throw new Error(
+      "Committed runner drain evidence requires a distinct v4 target and v3 or v4 prior"
+    );
+  }
+
+  const drain = await readDrainEvidence(target, prior, deps.now());
+  if (drain.intent?.schemaVersion !== 2 || drain.receipt?.schemaVersion !== 2) {
+    throw new Error(
+      "Committed runner drain evidence requires exact immutable schema-v2 intent and receipt"
+    );
+  }
+  const intentSnapshot = await readPrivateJsonSnapshot(
+    drain.paths.intent,
+    "Runner drain intent"
+  );
+  const receiptSnapshot = await readPrivateJsonSnapshot(
+    drain.paths.receipt,
+    "Runner drain receipt"
+  );
+  if (
+    intentSnapshot === null ||
+    receiptSnapshot === null ||
+    semanticJsonSha256(intentSnapshot.value) !==
+      semanticJsonSha256(drain.intent) ||
+    semanticJsonSha256(receiptSnapshot.value) !==
+      semanticJsonSha256(drain.receipt)
+  ) {
+    throw new Error("Committed runner drain evidence changed while it was read");
+  }
+
+  let attemptDrainReceiptSha256 = null;
+  if (attemptDrainReceiptPath !== null) {
+    let canonicalAttemptPath;
+    try {
+      canonicalAttemptPath = await realpath(attemptDrainReceiptPath);
+    } catch {
+      throw new Error("Attempt runner drain receipt path must be canonical and readable");
+    }
+    if (
+      typeof attemptDrainReceiptPath !== "string" ||
+      resolve(attemptDrainReceiptPath) !== attemptDrainReceiptPath ||
+      canonicalAttemptPath !== attemptDrainReceiptPath
+    ) {
+      throw new Error("Attempt runner drain receipt path must be canonical and absolute");
+    }
+    const attemptSnapshot = await readPrivateJsonSnapshot(
+      attemptDrainReceiptPath,
+      "Attempt runner drain receipt"
+    );
+    if (attemptSnapshot === null) {
+      throw new Error("Attempt runner drain receipt is required when its path is supplied");
+    }
+    const attemptReceipt = validateDrainReceipt(
+      attemptSnapshot.value,
+      drain.intent,
+      prior,
+      target,
+      deps.now()
+    );
+    if (
+      semanticJsonSha256(attemptReceipt) !==
+      semanticJsonSha256(drain.receipt)
+    ) {
+      throw new Error(
+        "Attempt runner drain receipt differs from the committed manager receipt"
+      );
+    }
+    attemptDrainReceiptSha256 = attemptSnapshot.sha256;
+  }
+
+  return Object.freeze({
+    schemaVersion: 1,
+    targetActivationId: target.activationId,
+    targetReleaseSha: recordReleaseSha(target),
+    targetRecordSha256: targetSnapshot.sha256,
+    priorActivationId: prior.schemaVersion === 4 ? prior.activationId : null,
+    priorReleaseSha: recordReleaseSha(prior),
+    priorRecordSha256: priorSnapshot.sha256,
+    drainIntent: drain.intent,
+    drainIntentSha256: intentSnapshot.sha256,
+    drainReceipt: drain.receipt,
+    drainReceiptSha256: receiptSnapshot.sha256,
+    attemptDrainReceiptSha256,
+    semanticReceiptSha256: semanticJsonSha256(drain.receipt)
+  });
 }
 
 function boundedProtocolSet(values) {
@@ -1020,6 +1202,146 @@ async function installationState({ target, prior, environment, allowLegacyTarget
   });
 }
 
+function classifyTransitionInstallation(installed) {
+  const targetCommitted =
+    installed.narrativeRunner === "target" && installed.omlxServer === "target";
+  // The only resumable pre-commit state has the target oMLX plist and prior
+  // runner plist. A target runner plist proves the bounded installer reached
+  // its final commit write after the prior drain.
+  const validPrecommit =
+    installed.narrativeRunner === "prior" &&
+    ["prior", "target"].includes(installed.omlxServer);
+  if (!targetCommitted && !validPrecommit) {
+    throw new Error(
+      "mixed LaunchAgent state violates the oMLX-first, runner-last commit order"
+    );
+  }
+  return Object.freeze({ targetCommitted, validPrecommit });
+}
+
+export async function inspectRunnerTransitionInstallState(
+  {
+    targetRecordPath,
+    priorRecordPath,
+    environment = process.env
+  },
+  overrides = {}
+) {
+  const deps = dependencies(overrides);
+  const targetSnapshot = await verifiedActivationRecordSnapshot(
+    targetRecordPath,
+    {
+      label: "Transition target activation record",
+      requireInstalled: false,
+      allowLegacyV3: false
+    },
+    deps
+  );
+  const priorSnapshot = await verifiedActivationRecordSnapshot(
+    priorRecordPath,
+    {
+      label: "Transition prior activation record",
+      requireInstalled: false,
+      allowLegacyV3: true
+    },
+    deps
+  );
+  const target = targetSnapshot.value;
+  const prior = priorSnapshot.value;
+  if (
+    sameActivation(target, prior) ||
+    target.schemaVersion !== 4 ||
+    ![3, 4].includes(prior.schemaVersion)
+  ) {
+    throw new Error(
+      "runner transition installation inspection requires a distinct v4 target and v3 or v4 prior"
+    );
+  }
+  const installed = await installationState(
+    { target, prior, environment, allowLegacyTarget: false },
+    deps
+  );
+  if (installed === null) {
+    throw new Error(
+      "runner transition installation inspection requires exact prior, target, or resumable mixed LaunchAgents"
+    );
+  }
+  const classification = classifyTransitionInstallation(installed);
+  const targetRecheck = await verifiedActivationRecordSnapshot(
+    targetRecordPath,
+    {
+      label: "Transition target activation record",
+      requireInstalled: false,
+      allowLegacyV3: false
+    },
+    deps
+  );
+  const priorRecheck = await verifiedActivationRecordSnapshot(
+    priorRecordPath,
+    {
+      label: "Transition prior activation record",
+      requireInstalled: false,
+      allowLegacyV3: true
+    },
+    deps
+  );
+  if (
+    targetRecheck.sha256 !== targetSnapshot.sha256 ||
+    priorRecheck.sha256 !== priorSnapshot.sha256
+  ) {
+    throw new Error(
+      "runner transition activation records changed during installation inspection"
+    );
+  }
+  const installedRecheck = await installationState(
+    { target, prior, environment, allowLegacyTarget: false },
+    deps
+  );
+  if (installedRecheck === null) {
+    throw new Error(
+      "runner transition installation changed during inspection"
+    );
+  }
+  const classificationRecheck = classifyTransitionInstallation(installedRecheck);
+  const [targetFinal, priorFinal] = await Promise.all([
+    readPrivateJsonSnapshot(
+      targetRecordPath,
+      "Transition target activation record"
+    ),
+    readPrivateJsonSnapshot(
+      priorRecordPath,
+      "Transition prior activation record"
+    )
+  ]);
+  if (
+    targetFinal === null ||
+    priorFinal === null ||
+    targetFinal.sha256 !== targetSnapshot.sha256 ||
+    priorFinal.sha256 !== priorSnapshot.sha256 ||
+    installedRecheck.narrativeRunner !== installed.narrativeRunner ||
+    installedRecheck.omlxServer !== installed.omlxServer ||
+    classificationRecheck.targetCommitted !== classification.targetCommitted ||
+    classificationRecheck.validPrecommit !== classification.validPrecommit
+  ) {
+    throw new Error(
+      "runner transition installation changed during inspection"
+    );
+  }
+  return Object.freeze({
+    schemaVersion: 1,
+    targetActivationId: target.activationId,
+    targetReleaseSha: recordReleaseSha(target),
+    targetRecordSha256: targetSnapshot.sha256,
+    priorActivationId: prior.schemaVersion === 4 ? prior.activationId : null,
+    priorReleaseSha: recordReleaseSha(prior),
+    priorRecordSha256: priorSnapshot.sha256,
+    narrativeRunner: installed.narrativeRunner,
+    omlxServer: installed.omlxServer,
+    targetCommitted: classification.targetCommitted,
+    validPrecommit: classification.validPrecommit
+  });
+}
+
 async function attestTargetBootstrap(label, component, target, domain, deps) {
   const loaded = await inspectLoadedJob(
     label,
@@ -1146,19 +1468,8 @@ export async function activateLaunchAgents(
     };
   }
 
-  const targetCommitted =
-    installed.narrativeRunner === "target" && installed.omlxServer === "target";
-  // The only resumable pre-commit state has the target oMLX plist and prior
-  // runner plist. A target runner plist proves the bounded installer reached
-  // its final commit write after the prior drain.
-  const validPrecommit =
-    installed.narrativeRunner === "prior" &&
-    ["prior", "target"].includes(installed.omlxServer);
-  if (!targetCommitted && !validPrecommit) {
-    throw new Error(
-      "mixed LaunchAgent state violates the oMLX-first, runner-last commit order"
-    );
-  }
+  const { targetCommitted, validPrecommit } =
+    classifyTransitionInstallation(installed);
   if (validPrecommit && runner.loaded && !sameActivation(runner.record, prior)) {
     throw new Error("pre-commit runner label is not the exact verified prior activation");
   }

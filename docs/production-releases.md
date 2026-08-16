@@ -239,7 +239,8 @@ pnpm release:prod --replace-runner-failure FAILED_RELEASE_ID
 This command accepts only a conservative-full `runner_failed` journal whose
 resume boundary is exactly `data-prepared`, with the four preparation receipts,
 one inactive Worker receipt, and the complete D1 bookmark/export pair. No
-runner-drain, runner-activation, deployment, or generation receipt may exist.
+journaled runner-drain, runner-activation, deployment, or generation receipt
+may exist.
 The replacement target must be a distinct freshly fetched `origin/main` SHA.
 Every target fingerprint except `runnerArtifact` and `releaseTooling` must
 remain byte-identical to the failed release, and at least one of those two
@@ -258,14 +259,37 @@ commands pass. The release controller repeats that health proof and rehashes
 the full D1 export immediately before writing the terminal link. `--plan`
 remains mutation-free and reports this restoration as a planned mutation.
 
+If the failed controller actually committed its target v4 runner before losing
+the journal transition, the same command takes a schema-disjoint read-only
+recovery branch. It requires the exact installed and healthy failed-release
+activation, the manager's immutable schema-v2 drain intent and receipt, and
+semantic equality with the attempt receipt when that file exists. The terminal
+attestation separately records the legacy live-Worker source revision, the
+committed runner source/artifact/protocol/record identity, and the exact drain
+transition hash. The successor inherits that committed v4 activation as its
+runner predecessor; it does not roll back to v3.
+
 The terminal replacement link retains only bounded IDs, hashes, sizes, and
 canonical control-plane evidence—never secret values or artifact paths. The
-successor is an ordinary conservative-full release: it drains the now-live v3
-runner through the standard dual-PID v2 transition, with no recovery-only
-runner protocol or resume authority. If interrupted after the terminal link,
-rerunning the same replacement command stays pinned to its linked SHA and
-creates the exact successor without repeating the recovery mutation. Once the
-successor journal exists, normal `--resume` semantics apply.
+successor is an ordinary conservative-full release: it drains the attested
+live predecessor through the standard dual-PID v2 transition, with no
+recovery-only runner protocol or resume authority. If interrupted after the
+terminal link, rerunning the same replacement command stays pinned to its
+linked SHA and creates the exact successor without repeating the recovery
+mutation. Once the successor journal exists, normal `--resume` semantics
+apply. Before Worker activation, that resume follows the exact predecessor
+journal hash back to the committed-runner attestation, preventing the
+unmanaged live Worker from being
+re-associated with a newer runner source. If the successor runner transition
+was interrupted, resume accepts only the manager-verified prior/prior,
+oMLX-first prior/target, or fully committed target/target plist state. The two
+precommit states defer health repair to the ordinary runner controller; the
+committed state additionally requires its exact drain evidence. The live
+Worker root and legacy runner release/record identities are re-derived through
+any exact schema-v1 predecessor link rather than trusted from the newer runner
+source. A further schema-v2
+committed-runner replacement chain is rejected until a separately audited
+lineage-carrying design exists.
 
 There is no automatic production rollback after Worker activation. A Queue,
 schema, or protocol boundary may already have been crossed; follow the

@@ -661,6 +661,111 @@ async function assertInstalledPlist(recorded, label) {
   return snapshot;
 }
 
+function parseProcessSnapshot(stdout, expectedPid, label) {
+  if (typeof stdout !== "string" || stdout.length > 64 * 1024) {
+    throw new Error(`${label} process attestation is invalid`);
+  }
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (lines.length !== 1) {
+    throw new Error(`${label} process attestation is ambiguous`);
+  }
+  const match = /^([1-9][0-9]*)\s+([0-9]+)\s+(.+)$/.exec(lines[0]);
+  if (!match) throw new Error(`${label} process attestation is malformed`);
+  const pid = Number(match[1]);
+  const parentPid = Number(match[2]);
+  const startedAt = match[3];
+  if (
+    pid !== expectedPid ||
+    !Number.isSafeInteger(pid) ||
+    !Number.isSafeInteger(parentPid) ||
+    parentPid < 0
+  ) {
+    throw new Error(`${label} process identity is inconsistent`);
+  }
+  boundedString(startedAt, `${label} process start identity`, 128);
+  return Object.freeze({ pid, parentPid, startedAt });
+}
+
+async function attestProcess(pid, label, deps) {
+  const result = await deps.command(
+    "/bin/ps",
+    ["-o", "pid=,ppid=,lstart=", "-p", String(pid)],
+    { timeoutMs: COMMAND_TIMEOUT_MS }
+  );
+  if (result?.status !== 0) {
+    throw new Error(`${label} process is not inspectable`);
+  }
+  return parseProcessSnapshot(result.stdout, pid, label);
+}
+
+async function attestRunnerProcessTree(wrapperPid, heartbeatPid, deps) {
+  if (
+    !Number.isSafeInteger(wrapperPid) ||
+    wrapperPid < 1 ||
+    !Number.isSafeInteger(heartbeatPid) ||
+    heartbeatPid < 1 ||
+    wrapperPid === heartbeatPid
+  ) {
+    throw new Error("Runner wrapper and heartbeat child PIDs are not distinct");
+  }
+  if (!deps.pidAlive(wrapperPid) || !deps.pidAlive(heartbeatPid)) {
+    throw new Error("Runner wrapper or heartbeat child process is not alive");
+  }
+  const [wrapper, heartbeat] = await Promise.all([
+    attestProcess(wrapperPid, "Runner wrapper", deps),
+    attestProcess(heartbeatPid, "Runner heartbeat child", deps)
+  ]);
+  if (heartbeat.parentPid !== wrapper.pid) {
+    throw new Error("Runner heartbeat process is not a direct child of the loaded wrapper");
+  }
+  if (!deps.pidAlive(wrapperPid) || !deps.pidAlive(heartbeatPid)) {
+    throw new Error("Runner wrapper or heartbeat child process changed during attestation");
+  }
+  return Object.freeze({ wrapper, heartbeat });
+}
+
+function assertSameRunnerProcessTree(before, after) {
+  if (
+    before.wrapper.pid !== after.wrapper.pid ||
+    before.wrapper.startedAt !== after.wrapper.startedAt ||
+    before.heartbeat.pid !== after.heartbeat.pid ||
+    before.heartbeat.parentPid !== after.heartbeat.parentPid ||
+    before.heartbeat.startedAt !== after.heartbeat.startedAt
+  ) {
+    throw new Error("Runner wrapper or heartbeat child process identity changed");
+  }
+}
+
+function attestRunnerStatus(
+  contents,
+  record,
+  acceptedProtocolFingerprints,
+  { now, maximumAge, maximumFutureSkew }
+) {
+  const { value: status, updatedAt } = parseRunnerStatus(contents);
+  if (
+    status.activationId !== record.activationId ||
+    status.runnerArtifactSha256 !== record.runnerArtifact.sha256 ||
+    status.sourceRevision !== record.source.revision ||
+    status.runtimeFingerprint !== record.runtime.environmentFingerprint ||
+    status.modelId !== record.model.id ||
+    JSON.stringify(status.acceptedProtocolFingerprints) !==
+      JSON.stringify(acceptedProtocolFingerprints)
+  ) {
+    throw new Error("Runner status identity differs from the activation record");
+  }
+  if (!["idle", "processing"].includes(status.state) || status.lastErrorCode !== null) {
+    throw new Error("Active runner status is not healthy");
+  }
+  if (updatedAt > now + maximumFutureSkew || now - updatedAt > maximumAge) {
+    throw new Error("Active runner status is stale or future-dated");
+  }
+  return Object.freeze({ status, updatedAt });
+}
+
 export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
   if (!ACTIVATION_ID_PATTERN.test(options?.activationId ?? "")) {
     throw new Error("A trusted active runner activationId is required");
@@ -751,24 +856,6 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
     "Runner status file",
     MAX_STATUS_BYTES
   );
-  const { value: status, updatedAt } = parseRunnerStatus(statusSnapshot.contents);
-  if (
-    status.activationId !== record.activationId ||
-    status.runnerArtifactSha256 !== record.runnerArtifact.sha256 ||
-    status.sourceRevision !== record.source.revision ||
-    status.runtimeFingerprint !== record.runtime.environmentFingerprint ||
-    status.modelId !== record.model.id ||
-    JSON.stringify(status.acceptedProtocolFingerprints) !==
-      JSON.stringify(acceptedProtocolFingerprints)
-  ) {
-    throw new Error("Runner status identity differs from the activation record");
-  }
-  if (status.pid !== runnerJob.pid || !deps.pidAlive(status.pid)) {
-    throw new Error("Runner status PID differs from the loaded LaunchAgent process");
-  }
-  if (!["idle", "processing"].includes(status.state) || status.lastErrorCode !== null) {
-    throw new Error("Active runner status is not healthy");
-  }
   const now = deps.now();
   if (!Number.isFinite(now)) throw new Error("Runner attestation clock is invalid");
   const maximumAge =
@@ -779,9 +866,17 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
     options.maxFutureSkewMs === undefined
       ? 5_000
       : nonnegativeInteger(options.maxFutureSkewMs, "Maximum runner status clock skew");
-  if (updatedAt > now + maximumFutureSkew || now - updatedAt > maximumAge) {
-    throw new Error("Active runner status is stale or future-dated");
-  }
+  const { status } = attestRunnerStatus(
+    statusSnapshot.contents,
+    record,
+    acceptedProtocolFingerprints,
+    { now, maximumAge, maximumFutureSkew }
+  );
+  const processTreeBefore = await attestRunnerProcessTree(
+    runnerJob.pid,
+    status.pid,
+    deps
+  );
 
   const liveCheck = await deps.command(
     record.executables.node.path,
@@ -798,6 +893,40 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
     throw new Error("Active runner live Queue and model preflight failed");
   }
 
+  const [runnerJobAfter, omlxJobAfter] = await Promise.all([
+    attestLoadedJob(RUNNER_LABEL, record.launchAgents.narrativeRunner.path, domain, deps),
+    attestLoadedJob(OMLX_LABEL, record.launchAgents.omlxServer.path, domain, deps)
+  ]);
+  if (
+    runnerJobAfter.pid !== runnerJob.pid ||
+    omlxJobAfter.pid !== omlxJob.pid ||
+    !deps.pidAlive(omlxJobAfter.pid)
+  ) {
+    throw new Error("Active runner LaunchAgent process identity changed during preflight");
+  }
+  const statusAfterSnapshot = await privateFileSnapshot(
+    record.runtime.statusFile,
+    "Runner status file",
+    MAX_STATUS_BYTES
+  );
+  const afterClock = deps.now();
+  if (!Number.isFinite(afterClock)) throw new Error("Runner attestation clock is invalid");
+  const { status: statusAfter } = attestRunnerStatus(
+    statusAfterSnapshot.contents,
+    record,
+    acceptedProtocolFingerprints,
+    { now: afterClock, maximumAge, maximumFutureSkew }
+  );
+  if (statusAfter.pid !== status.pid) {
+    throw new Error("Runner heartbeat child identity changed during live preflight");
+  }
+  const processTreeAfter = await attestRunnerProcessTree(
+    runnerJobAfter.pid,
+    statusAfter.pid,
+    deps
+  );
+  assertSameRunnerProcessTree(processTreeBefore, processTreeAfter);
+
   const environmentAfter = await privateFileSnapshot(
     record.runtime.environmentPath,
     "Active runner environment",
@@ -813,6 +942,14 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
     ),
     assertInstalledPlist(record.launchAgents.omlxServer, "Installed omlx plist")
   ]);
+  const recordFinal = await privateFileSnapshot(
+    recordPath,
+    "Active runner activation record",
+    MAX_RECORD_BYTES
+  );
+  if (!recordBefore.contents.equals(recordFinal.contents)) {
+    throw new Error("Active runner activation record changed during compatibility verification");
+  }
 
   return {
     schemaVersion: 1,

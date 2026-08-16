@@ -30,6 +30,10 @@ const NOW_ISO = "2026-08-15T20:00:00.000Z";
 const NOW_MS = Date.parse(NOW_ISO);
 const CLOUDFLARE_ACCOUNT_ID = "a".repeat(32);
 const QUEUE_ID = "b".repeat(32);
+const RUNNER_WRAPPER_PID = 4101;
+const OMLX_PID = 4102;
+const RUNNER_HEARTBEAT_PID = 4103;
+const PROCESS_STARTED_AT = "Sat Aug 15 19:00:00 2026";
 
 function sha256(contents) {
   return createHash("sha256").update(contents).digest("hex");
@@ -79,7 +83,7 @@ function status(overrides = {}) {
   return {
     schemaVersion: 3,
     runnerId: "runner-test",
-    pid: 4101,
+    pid: RUNNER_HEARTBEAT_PID,
     modelId: "model-test",
     activationId: ACTIVATION_ID,
     runnerArtifactSha256: ARTIFACT,
@@ -239,11 +243,20 @@ function verificationDependencies(value, overrides = {}) {
           calls.push({ type: "health-check", file, args });
           return { status: 0, stdout: "" };
         }
+        if (file === "/bin/ps") {
+          const pid = Number(args.at(-1));
+          const parentPid = pid === RUNNER_HEARTBEAT_PID ? RUNNER_WRAPPER_PID : 1;
+          calls.push({ type: "ps", pid, parentPid });
+          return {
+            status: 0,
+            stdout: `${pid} ${parentPid} ${PROCESS_STARTED_AT}\n`
+          };
+        }
         const label = args[1].endsWith("/ai.alex.narrative-runner")
           ? "runner"
           : "omlx";
         const path = label === "runner" ? value.runnerPlistPath : value.omlxPlistPath;
-        const pid = label === "runner" ? 4101 : 4102;
+        const pid = label === "runner" ? RUNNER_WRAPPER_PID : OMLX_PID;
         calls.push({ type: "launchctl", label, path, pid });
         return { status: 0, stdout: `path = ${path}\nstate = running\npid = ${pid}\n` };
       },
@@ -290,7 +303,8 @@ test("trusted-id verification returns a bounded secret-free v4 compatibility rec
     recordPath: value.recordPath,
     options: { requireInstalled: true, allowLegacyV3: false }
   });
-  assert.equal(calls.filter(({ type }) => type === "launchctl").length, 2);
+  assert.equal(calls.filter(({ type }) => type === "launchctl").length, 4);
+  assert.equal(calls.filter(({ type }) => type === "ps").length, 4);
   assert.deepEqual(
     calls.find(({ type }) => type === "health-check")?.args,
     [
@@ -376,7 +390,7 @@ test("installed and loaded plist identity is exact and process-bound", async (t)
         const path = runner ? `${value.runnerPlistPath}.other` : value.omlxPlistPath;
         return {
           status: 0,
-          stdout: `path = ${path}\nstate = running\npid = ${runner ? 4101 : 4102}\n`
+          stdout: `path = ${path}\nstate = running\npid = ${runner ? RUNNER_WRAPPER_PID : OMLX_PID}\n`
         };
       }
     });
@@ -386,7 +400,7 @@ test("installed and loaded plist identity is exact and process-bound", async (t)
     );
   });
 
-  await t.test("loaded PID equals heartbeat PID", async () => {
+  await t.test("loaded wrapper directly owns the heartbeat child", async () => {
     const value = await fixture();
     await value.writeStatus({ pid: 9999 });
     await assert.rejects(
@@ -394,18 +408,139 @@ test("installed and loaded plist identity is exact and process-bound", async (t)
         verificationOptions(value),
         verificationDependencies(value).dependencies
       ),
-      /status PID differs/
+      /not a direct child/
+    );
+  });
+
+  await t.test("wrapper and heartbeat PIDs must be distinct", async () => {
+    const value = await fixture();
+    await value.writeStatus({ pid: RUNNER_WRAPPER_PID });
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(
+        verificationOptions(value),
+        verificationDependencies(value).dependencies
+      ),
+      /not distinct/
+    );
+  });
+
+  for (const [name, stdout, message] of [
+    ["malformed ps", "not-a-process\n", /process attestation is malformed/],
+    [
+      "ambiguous ps",
+      `${RUNNER_HEARTBEAT_PID} ${RUNNER_WRAPPER_PID} ${PROCESS_STARTED_AT}\n${RUNNER_HEARTBEAT_PID} ${RUNNER_WRAPPER_PID} ${PROCESS_STARTED_AT}\n`,
+      /process attestation is ambiguous/
+    ]
+  ]) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      const base = verificationDependencies(value);
+      const command = base.dependencies.command;
+      await assert.rejects(
+        verifyActiveRunnerCompatibility(verificationOptions(value), {
+          ...base.dependencies,
+          command: async (file, args, options) =>
+            file === "/bin/ps" && Number(args.at(-1)) === RUNNER_HEARTBEAT_PID
+              ? { status: 0, stdout }
+              : command(file, args, options)
+        }),
+        message
+      );
+    });
+  }
+
+  await t.test("heartbeat child must remain directly parented to the wrapper", async () => {
+    const value = await fixture();
+    const base = verificationDependencies(value);
+    const command = base.dependencies.command;
+    let heartbeatInspections = 0;
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(verificationOptions(value), {
+        ...base.dependencies,
+        command: async (file, args, options) => {
+          if (file === "/bin/ps" && Number(args.at(-1)) === RUNNER_HEARTBEAT_PID) {
+            heartbeatInspections += 1;
+            return {
+              status: 0,
+              stdout: `${RUNNER_HEARTBEAT_PID} ${heartbeatInspections === 1 ? RUNNER_WRAPPER_PID : 1} ${PROCESS_STARTED_AT}\n`
+            };
+          }
+          return command(file, args, options);
+        }
+      }),
+      /not a direct child/
+    );
+  });
+
+  await t.test("wrapper PID reuse is rejected by stable process start identity", async () => {
+    const value = await fixture();
+    const base = verificationDependencies(value);
+    const command = base.dependencies.command;
+    let wrapperInspections = 0;
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(verificationOptions(value), {
+        ...base.dependencies,
+        command: async (file, args, options) => {
+          if (file === "/bin/ps" && Number(args.at(-1)) === RUNNER_WRAPPER_PID) {
+            wrapperInspections += 1;
+            return {
+              status: 0,
+              stdout: `${RUNNER_WRAPPER_PID} 1 ${wrapperInspections === 1 ? PROCESS_STARTED_AT : "Sat Aug 15 19:00:01 2026"}\n`
+            };
+          }
+          return command(file, args, options);
+        }
+      }),
+      /process identity changed/
+    );
+  });
+
+  await t.test("launchd wrapper restart is rejected after the live check", async () => {
+    const value = await fixture();
+    const base = verificationDependencies(value);
+    const command = base.dependencies.command;
+    let runnerPrints = 0;
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(verificationOptions(value), {
+        ...base.dependencies,
+        command: async (file, args, options) => {
+          if (
+            file === "/bin/launchctl" &&
+            args[1].endsWith("/ai.alex.narrative-runner")
+          ) {
+            runnerPrints += 1;
+            const pid = runnerPrints === 1 ? RUNNER_WRAPPER_PID : 4999;
+            return {
+              status: 0,
+              stdout: `path = ${value.runnerPlistPath}\nstate = running\npid = ${pid}\n`
+            };
+          }
+          return command(file, args, options);
+        }
+      }),
+      /process identity changed during preflight/
     );
   });
 
   await t.test("both loaded PIDs remain alive", async () => {
     const value = await fixture();
     const { dependencies } = verificationDependencies(value, {
-      pidAlive: (pid) => pid !== 4102
+      pidAlive: (pid) => pid !== OMLX_PID
     });
     await assert.rejects(
       verifyActiveRunnerCompatibility(verificationOptions(value), dependencies),
       /process identity is not alive/
+    );
+  });
+
+  await t.test("heartbeat child must remain alive", async () => {
+    const value = await fixture();
+    const { dependencies } = verificationDependencies(value, {
+      pidAlive: (pid) => pid !== RUNNER_HEARTBEAT_PID
+    });
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(verificationOptions(value), dependencies),
+      /heartbeat child process is not alive/
     );
   });
 });

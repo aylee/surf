@@ -121,6 +121,16 @@ import {
   establishRunnerFailureReplacement
 } from "./lib/release-runner-failure-replacement.mjs";
 import { createRunnerFailureRecoveryAttestor } from "./lib/release-runner-failure-attestation.mjs";
+import {
+  committedRunnerLineagePlan,
+  committedRunnerResumeLineagePlan,
+  linkedCommittedRunnerFailureSource,
+  runnerFailureRecoveryMode
+} from "./lib/release-runner-failure-lineage.mjs";
+import {
+  inspectRunnerTransitionInstallState,
+  verifyCommittedRunnerDrainEvidence
+} from "../apps/narrative-runner/scripts/manage-launch-agents.mjs";
 
 const INTERNAL_ENV = "SURF_RELEASE_EXECUTION_ROOT";
 const TARGET_ENV = "SURF_RELEASE_TARGET_SHA";
@@ -1506,13 +1516,208 @@ async function internalMain(options) {
       createRunnerFailureRecoveryAttestor({
         profile,
         environment,
-        store
+        store,
+        workerSecrets: inspectedSecrets
       });
+    const committedRunnerLineage = async (selectedJournal) => {
+      const selected = assertReleaseJournal(selectedJournal);
+      const readJournal = (releaseId) => store.readJournal(releaseId);
+      const installed =
+        await discoverRunnerActivationFromInstalledPlist({
+          serviceRoot: profile.serviceRoot,
+          allowLegacyV3: false
+        });
+      if (options.replaceRunnerFailure) {
+        const previous =
+          selected.predecessor.releaseId === null
+            ? null
+            : readJournal(selected.predecessor.releaseId);
+        if (
+          previous?.supersededBy?.runnerFailureAttestation?.schemaVersion === 2
+        ) {
+          linkedCommittedRunnerFailureSource(selected, { readJournal });
+          throw new Error(
+            "A committed-runner replacement cannot replace another committed-runner recovery"
+          );
+        }
+        if (installed.activationId !== selected.releaseId) {
+          throw new Error(
+            "Installed v4 runner is not the failed release recovery target"
+          );
+        }
+        const attestation = selected.supersededBy?.runnerFailureAttestation;
+        let expectedArtifactSha256;
+        let expectedProtocolFingerprint;
+        if (attestation?.schemaVersion === 2) {
+          expectedArtifactSha256 =
+            attestation.committedRunnerArtifactSha256;
+          expectedProtocolFingerprint =
+            attestation.committedRunnerProtocolFingerprint;
+        } else {
+          const sourceReleaseRoot = resolve(
+            profile.releasesDirectory,
+            selected.targetGitSha
+          );
+          validateImmutableRelease(sourceReleaseRoot, selected.targetGitSha);
+          const manifest = exactRunnerManifest(
+            resolve(
+              sourceReleaseRoot,
+              "apps/narrative-runner/dist/narrative-runner.manifest.json"
+            )
+          );
+          if (
+            sha256File(
+              resolve(
+                sourceReleaseRoot,
+                "apps/narrative-runner/dist/narrative-runner.mjs"
+              )
+            ) !== manifest.artifactSha256
+          ) {
+            throw new Error(
+              "Committed runner artifact differs from its failed release manifest"
+            );
+          }
+          expectedArtifactSha256 = manifest.artifactSha256;
+          expectedProtocolFingerprint = manifest.protocolFingerprint;
+        }
+        const priorActivationId = selected.predecessor.runnerActivationId;
+        if (priorActivationId === null) {
+          throw new Error(
+            "Committed runner lineage lacks its prior activation"
+          );
+        }
+        const attemptDrainReceiptPath = resolve(
+          profile.stateDirectory,
+          "attempts",
+          selected.releaseId,
+          "runner-drain.json"
+        );
+        const drainEvidence = await verifyCommittedRunnerDrainEvidence({
+          targetRecordPath: installed.recordPath,
+          priorRecordPath: resolve(
+            profile.serviceRoot,
+            "launch-agents",
+            priorActivationId,
+            "activation-record.json"
+          ),
+          attemptDrainReceiptPath: existsSync(attemptDrainReceiptPath)
+            ? attemptDrainReceiptPath
+            : null
+        });
+        const lineage = committedRunnerLineagePlan(selected, {
+          readJournal,
+          drainEvidence
+        });
+        const config = finalProbeContext.readConfig();
+        const producer = (config.queues?.producers ?? []).find(
+          (candidate) => candidate.binding === "NARRATIVE_QUEUE"
+        );
+        if (!producer?.queue) {
+          throw new Error("Release config lacks NARRATIVE_QUEUE");
+        }
+        const queueIdentities =
+          await finalProbeContext.inspectQueueIdentities();
+        const queueId = queueIdentities.queues?.[producer.queue];
+        if (!queueId) {
+          throw new Error("Release Queue identity lacks NARRATIVE_QUEUE");
+        }
+        inspectedSecrets.assertUnchanged();
+        const compatible = await verifyActiveRunnerCompatibility({
+          activationId: installed.activationId,
+          serviceRoot: profile.serviceRoot,
+          expectedProtocolFingerprint,
+          expectedCloudflareAccountId: queueIdentities.accountId,
+          expectedQueueId: queueId,
+          expectedQueueName: producer.queue,
+          expectedDeadLetterQueueName: `${config.name}-narrative-dlq`,
+          expectedCallbackOrigin: profile.customOrigin,
+          workerGeminiToken: inspectedSecrets.geminiToken,
+          workerResultToken: inspectedSecrets.resultToken
+        });
+        if (
+          compatible.activationId !== installed.activationId ||
+          compatible.sourceRevision !== drainEvidence.targetReleaseSha ||
+          compatible.runnerArtifactSha256 !== expectedArtifactSha256 ||
+          !compatible.acceptedProtocolFingerprints.includes(
+            expectedProtocolFingerprint
+          )
+        ) {
+          throw new Error(
+            "Installed committed runner is not the exact healthy recovery target"
+          );
+        }
+        inspectedSecrets.assertUnchanged();
+        guardSources();
+        return lineage;
+      }
+
+      const source = linkedCommittedRunnerFailureSource(selected, {
+        readJournal
+      });
+      const attestation = source.supersededBy.runnerFailureAttestation;
+      const sourceRecordPath = resolve(
+        profile.serviceRoot,
+        "launch-agents",
+        attestation.committedRunnerActivationId,
+        "activation-record.json"
+      );
+      const targetRecordPath = resolve(
+        profile.serviceRoot,
+        "launch-agents",
+        selected.releaseId,
+        "activation-record.json"
+      );
+      let installState = null;
+      let targetDrainEvidence = null;
+      if (existsSync(targetRecordPath)) {
+        installState = await inspectRunnerTransitionInstallState({
+          targetRecordPath,
+          priorRecordPath: sourceRecordPath,
+          environment
+        });
+        if (installState.targetCommitted) {
+          const attemptDrainReceiptPath = resolve(
+            profile.stateDirectory,
+            "attempts",
+            selected.releaseId,
+            "runner-drain.json"
+          );
+          targetDrainEvidence = await verifyCommittedRunnerDrainEvidence({
+            targetRecordPath,
+            priorRecordPath: sourceRecordPath,
+            attemptDrainReceiptPath: existsSync(attemptDrainReceiptPath)
+              ? attemptDrainReceiptPath
+              : null
+          });
+        }
+      }
+      const installedRecordSnapshot = readVerifiedFileSnapshot(
+        installed.recordPath,
+        {
+          label: "Installed runner activation record",
+          maximumBytes: 1024 * 1024,
+          requireMode0600: true,
+          requireCanonical: true
+        }
+      );
+      const lineage = committedRunnerResumeLineagePlan(selected, {
+        readJournal,
+        installedRunnerActivationId: installed.activationId,
+        installedRunnerRecordSha256: createHash("sha256")
+          .update(installedRecordSnapshot.contents)
+          .digest("hex"),
+        installState,
+        targetDrainEvidence
+      });
+      guardSources();
+      return lineage;
+    };
     const liveVersionDetail = finalProbeContext.runWrangler(
       ["versions", "view", livePredecessorVersionId, "--json"],
       { capture: true, echo: false }
     );
     let legacyLineageEvidence = null;
+    let committedLineageEvidence = null;
     let liveSourceRevision = resolveOptionalWorkerSourceRevision(
       liveVersionDetail,
       livePredecessorVersionId
@@ -1523,23 +1728,57 @@ async function internalMain(options) {
           "Trusted active receipt exists but the live Worker lacks managed source identity"
         );
       }
-      legacyLineageEvidence =
-        await discoverRunnerActivationFromInstalledPlist({
-          serviceRoot: profile.serviceRoot,
-          allowLegacyV3: true
-        });
-      if (
-        legacyLineageEvidence.recordSchemaVersion !== 3 ||
-        legacyLineageEvidence.transitionOnly !== true ||
-        !SHA_PATTERN.test(
-          legacyLineageEvidence.legacyCoupledSourceRevision ?? ""
-        )
-      ) {
-        throw new Error(
-          "Unmanaged Worker adoption requires exact legacy v3 coupled-lineage evidence"
+      const linkedRunnerFailureSource =
+        resumeJournal?.predecessor.releaseId
+          ? store.readJournal(resumeJournal.predecessor.releaseId)
+          : null;
+      let replacementRecoveryMode = null;
+      if (options.replaceRunnerFailure) {
+        const failed = store.readJournal(options.replaceRunnerFailure);
+        const installed =
+          await discoverRunnerActivationFromInstalledPlist({
+            serviceRoot: profile.serviceRoot,
+            allowLegacyV3: true
+          });
+        replacementRecoveryMode = runnerFailureRecoveryMode(
+          failed,
+          installed
         );
+        if (replacementRecoveryMode === "legacy") {
+          legacyLineageEvidence = installed;
+        }
       }
-      liveSourceRevision = legacyLineageEvidence.legacyCoupledSourceRevision;
+      const committedRecoverySelected = Boolean(
+        replacementRecoveryMode === "committed" ||
+          linkedRunnerFailureSource?.supersededBy
+            ?.runnerFailureAttestation?.schemaVersion === 2
+      );
+      if (committedRecoverySelected) {
+        committedLineageEvidence = await committedRunnerLineage(
+          options.replaceRunnerFailure
+            ? store.readJournal(options.replaceRunnerFailure)
+            : resumeJournal
+        );
+        liveSourceRevision = committedLineageEvidence.liveSourceRevision;
+      } else {
+        legacyLineageEvidence ??=
+          await discoverRunnerActivationFromInstalledPlist({
+            serviceRoot: profile.serviceRoot,
+            allowLegacyV3: true
+          });
+        if (
+          legacyLineageEvidence.recordSchemaVersion !== 3 ||
+          legacyLineageEvidence.transitionOnly !== true ||
+          !SHA_PATTERN.test(
+            legacyLineageEvidence.legacyCoupledSourceRevision ?? ""
+          )
+        ) {
+          throw new Error(
+            "Unmanaged Worker adoption requires exact legacy v3 coupled-lineage evidence"
+          );
+        }
+        liveSourceRevision = legacyLineageEvidence.legacyCoupledSourceRevision;
+      }
       if (
         resolveGitRevision(profile.repositoryPath, liveSourceRevision) !==
         liveSourceRevision
@@ -1893,6 +2132,7 @@ async function internalMain(options) {
       mutations: mutationsForClassification(classification, {
         analysisEnabled,
         restoreLegacyRunner:
+          committedLineageEvidence === null &&
           runnerFailureReplacementSource?.state ===
           RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE
       })

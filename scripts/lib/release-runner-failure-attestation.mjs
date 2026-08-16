@@ -11,7 +11,10 @@ import { createCloudflareCommandContext } from "./cloudflare-command-context.mjs
 import {
   configuredReleaseQueueNames
 } from "./cloudflare-command-context.mjs";
-import { queueTopologyFingerprint } from "./release-fingerprints.mjs";
+import {
+  queueTopologyFingerprint,
+  sha256File
+} from "./release-fingerprints.mjs";
 import {
   attestD1BackupReceiptArtifact,
   validateD1BackupReceipt
@@ -20,12 +23,15 @@ import {
   expectedWorkerBindingDescriptor
 } from "./release-worker.mjs";
 import {
-  discoverRunnerActivationFromInstalledPlist
+  discoverRunnerActivationFromInstalledPlist,
+  verifyActiveRunnerCompatibility
 } from "./release-runner-compatibility.mjs";
 import { attestTaggedInactiveWorkerUpload } from "./release-inactive-upload-replacement.mjs";
+import { replacementLiveWorkerLineageEvidence } from "./release-runner-failure-lineage.mjs";
 import { resolveSoleActiveWorkerVersionId } from "./worker-runtime.mjs";
 import { resolveActiveDeploymentEvidence } from "./deploy-url.mjs";
 import { activateLaunchAgents } from "../../apps/narrative-runner/scripts/manage-launch-agents.mjs";
+import { verifyCommittedRunnerDrainEvidence } from "../../apps/narrative-runner/scripts/manage-launch-agents.mjs";
 import { verifyLaunchActivation } from "../../apps/narrative-runner/scripts/render-launch-agents.mjs";
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
@@ -37,6 +43,8 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   attestTaggedInactiveWorkerUpload,
   createCloudflareCommandContext,
   discoverRunnerActivationFromInstalledPlist,
+  verifyActiveRunnerCompatibility,
+  verifyCommittedRunnerDrainEvidence,
   validateImmutableRelease,
   verifyLaunchActivation
 });
@@ -98,6 +106,40 @@ function exactSnapshot(path, label) {
   return Object.freeze({
     ...value,
     sha256: createHash("sha256").update(value.contents).digest("hex")
+  });
+}
+
+function exactRunnerManifest(releaseRoot) {
+  const path = resolve(
+    releaseRoot,
+    "apps/narrative-runner/dist/narrative-runner.manifest.json"
+  );
+  const snapshot = readVerifiedFileSnapshot(path, {
+    label: "Failed release runner manifest",
+    maximumBytes: MAX_PRIVATE_JSON_BYTES,
+    requireCanonical: true
+  });
+  const value = JSON.parse(snapshot.contents.toString("utf8"));
+  const protocol = value?.acceptedProtocols?.find(
+    (candidate) => candidate?.family === "surf.narrative"
+  );
+  if (
+    value?.schemaVersion !== 1 ||
+    !/^[0-9a-f]{64}$/.test(value.artifact?.sha256 ?? "") ||
+    !/^[0-9a-f]{64}$/.test(protocol?.fingerprint ?? "")
+  ) {
+    throw new Error("Failed release runner manifest is invalid");
+  }
+  const artifactPath = resolve(
+    releaseRoot,
+    "apps/narrative-runner/dist/narrative-runner.mjs"
+  );
+  if (sha256File(artifactPath) !== value.artifact.sha256) {
+    throw new Error("Failed release runner artifact differs from its manifest");
+  }
+  return Object.freeze({
+    artifactSha256: value.artifact.sha256,
+    protocolFingerprint: protocol.fingerprint
   });
 }
 
@@ -185,8 +227,126 @@ async function restorePriorRunner({
   });
 }
 
+async function attestCommittedTargetRunner({
+  deps,
+  environment,
+  failed,
+  failedConfig,
+  failedContext,
+  failedReleaseRoot,
+  profile,
+  runnerDrainReceiptPath,
+  workerSecrets
+}) {
+  if (
+    typeof workerSecrets?.geminiToken !== "string" ||
+    typeof workerSecrets?.resultToken !== "string" ||
+    typeof workerSecrets?.assertUnchanged !== "function"
+  ) {
+    throw new Error(
+      "Committed runner recovery requires the unchanged Worker secret source"
+    );
+  }
+  const targetRecordPath = resolve(
+    profile.serviceRoot,
+    "launch-agents",
+    failed.releaseId,
+    "activation-record.json"
+  );
+  const priorRecordPath = resolve(
+    profile.serviceRoot,
+    "launch-agents",
+    failed.predecessor.runnerActivationId,
+    "activation-record.json"
+  );
+  const manifest = exactRunnerManifest(failedReleaseRoot);
+  const queueProducer = (failedConfig.queues?.producers ?? []).find(
+    (candidate) => candidate.binding === "NARRATIVE_QUEUE"
+  );
+  if (!queueProducer?.queue) {
+    throw new Error("Failed release config lacks NARRATIVE_QUEUE");
+  }
+  const queueIdentities = await failedContext.inspectQueueIdentities();
+  const queueId = queueIdentities.queues?.[queueProducer.queue];
+  if (!queueId) {
+    throw new Error("Failed release Queue identity lacks NARRATIVE_QUEUE");
+  }
+  const compatibilityOptions = {
+    activationId: failed.releaseId,
+    serviceRoot: profile.serviceRoot,
+    expectedProtocolFingerprint: manifest.protocolFingerprint,
+    expectedCloudflareAccountId: queueIdentities.accountId,
+    expectedQueueId: queueId,
+    expectedQueueName: queueProducer.queue,
+    expectedDeadLetterQueueName: `${failedConfig.name}-narrative-dlq`,
+    expectedCallbackOrigin: profile.customOrigin,
+    workerGeminiToken: workerSecrets.geminiToken,
+    workerResultToken: workerSecrets.resultToken
+  };
+  const verifyHealthy = async () => {
+    workerSecrets.assertUnchanged();
+    const compatible = await deps.verifyActiveRunnerCompatibility(
+      compatibilityOptions
+    );
+    if (
+      compatible.activationId !== failed.releaseId ||
+      compatible.sourceRevision !== failed.targetGitSha ||
+      compatible.runnerArtifactSha256 !== manifest.artifactSha256 ||
+      !compatible.acceptedProtocolFingerprints.includes(
+        manifest.protocolFingerprint
+      )
+    ) {
+      throw new Error(
+        "Committed runner identity differs from the failed release"
+      );
+    }
+    return compatible;
+  };
+  const compatible = await verifyHealthy();
+  const transition = await deps.verifyCommittedRunnerDrainEvidence({
+    targetRecordPath,
+    priorRecordPath,
+    attemptDrainReceiptPath: runnerDrainReceiptPath
+  });
+  const targetRecord = exactSnapshot(
+    targetRecordPath,
+    "Committed runner activation record"
+  );
+  const priorRecord = exactSnapshot(
+    priorRecordPath,
+    "Prior legacy runner activation record"
+  );
+  if (
+    transition.targetActivationId !== failed.releaseId ||
+    transition.targetReleaseSha !== failed.targetGitSha ||
+    transition.targetRecordSha256 !== targetRecord.sha256 ||
+    transition.priorActivationId !== null ||
+    !SHA_PATTERN.test(transition.priorReleaseSha ?? "") ||
+    transition.priorRecordSha256 !== priorRecord.sha256 ||
+    !/^[0-9a-f]{64}$/.test(transition.semanticReceiptSha256 ?? "")
+  ) {
+    throw new Error(
+      "Committed runner transition differs from the failed release"
+    );
+  }
+  const compatibleAfter = await verifyHealthy();
+  if (JSON.stringify(compatibleAfter) !== JSON.stringify(compatible)) {
+    throw new Error("Committed runner identity changed during attestation");
+  }
+  return Object.freeze({
+    priorActivationId: failed.predecessor.runnerActivationId,
+    priorRecordSha256: priorRecord.sha256,
+    priorReleaseSha: transition.priorReleaseSha,
+    committedActivationId: failed.releaseId,
+    committedArtifactSha256: manifest.artifactSha256,
+    committedProtocolFingerprint: manifest.protocolFingerprint,
+    committedRecordSha256: targetRecord.sha256,
+    runnerTransitionSha256: transition.semanticReceiptSha256
+  });
+}
+
 export function createRunnerFailureRecoveryAttestor(
-  { profile, environment, store },
+  { profile, environment, store, workerSecrets = null },
   overrides = {}
 ) {
   if (!profile || !environment || typeof store?.readJournal !== "function") {
@@ -214,11 +374,16 @@ export function createRunnerFailureRecoveryAttestor(
       failedAttemptDirectory,
       "d1-backup.json"
     );
-    if (existsSync(resolve(failedAttemptDirectory, "runner-drain.json"))) {
-      throw new Error(
-        "Runner-failure replacement cannot recover a release with a committed runner drain receipt"
-      );
-    }
+    const runnerDrainReceiptPath = resolve(
+      failedAttemptDirectory,
+      "runner-drain.json"
+    );
+    const runnerDrainSnapshot = existsSync(runnerDrainReceiptPath)
+      ? exactSnapshot(
+          runnerDrainReceiptPath,
+          "Failed release runner drain receipt"
+        )
+      : null;
     const failedConfigSnapshot = exactSnapshot(
       failedConfigPath,
       "Failed release Wrangler config"
@@ -289,15 +454,27 @@ export function createRunnerFailureRecoveryAttestor(
       for (const [path, label, sha256] of [
         [failedConfigPath, "Failed release Wrangler config", failedConfigSnapshot.sha256],
         [workerUploadReceiptPath, "Failed release Worker upload receipt", uploadSnapshot.sha256],
-        [d1BackupReceiptPath, "Failed release D1 backup receipt", backupSnapshot.sha256]
+        [d1BackupReceiptPath, "Failed release D1 backup receipt", backupSnapshot.sha256],
+        ...(runnerDrainSnapshot
+          ? [
+              [
+                runnerDrainReceiptPath,
+                "Failed release runner drain receipt",
+                runnerDrainSnapshot.sha256
+              ]
+            ]
+          : [])
       ]) {
         if (exactSnapshot(path, label).sha256 !== sha256) {
           throw new Error(`${label} changed during runner-failure attestation`);
         }
       }
-      if (existsSync(resolve(failedAttemptDirectory, "runner-drain.json"))) {
+      if (
+        (runnerDrainSnapshot === null) !==
+        !existsSync(runnerDrainReceiptPath)
+      ) {
         throw new Error(
-          "Runner drain receipt appeared during runner-failure attestation"
+          "Runner drain receipt presence changed during runner-failure attestation"
         );
       }
     };
@@ -380,30 +557,103 @@ export function createRunnerFailureRecoveryAttestor(
       );
     }
 
+    const discoveredRunner =
+      await deps.discoverRunnerActivationFromInstalledPlist({
+        serviceRoot: profile.serviceRoot,
+        allowLegacyV3: true
+      });
     const priorRecordPath = resolve(
       profile.serviceRoot,
       "launch-agents",
       failed.predecessor.runnerActivationId,
       "activation-record.json"
     );
-    const restoredRunner = await restorePriorRunner({
-      deps,
-      environment,
-      failed,
-      priorRecordPath,
-      profile
-    });
+    let runnerEvidence;
+    let reattestRunner;
+    if (
+      discoveredRunner.activationId ===
+        failed.predecessor.runnerActivationId &&
+      discoveredRunner.recordPath === priorRecordPath &&
+      discoveredRunner.recordSchemaVersion === 3 &&
+      discoveredRunner.transitionOnly === true
+    ) {
+      if (runnerDrainSnapshot !== null) {
+        throw new Error(
+          "Legacy runner recovery cannot accept a target drain receipt"
+        );
+      }
+      const restoredRunner = await restorePriorRunner({
+        deps,
+        environment,
+        failed,
+        priorRecordPath,
+        profile
+      });
+      runnerEvidence = Object.freeze({
+        schemaVersion: 1,
+        priorActivationId: restoredRunner.activationId,
+        priorRecordSha256: restoredRunner.recordSha256,
+        priorReleaseSha: restoredRunner.releaseSha
+      });
+      reattestRunner = async () => {
+        const restored = await restorePriorRunner({
+          deps,
+          environment,
+          failed,
+          priorRecordPath,
+          profile
+        });
+        return Object.freeze({
+          schemaVersion: 1,
+          priorActivationId: restored.activationId,
+          priorRecordSha256: restored.recordSha256,
+          priorReleaseSha: restored.releaseSha
+        });
+      };
+    } else if (
+      discoveredRunner.activationId === failed.releaseId &&
+      discoveredRunner.recordSchemaVersion === 4 &&
+      discoveredRunner.transitionOnly === false
+    ) {
+      const committed = await attestCommittedTargetRunner({
+        deps,
+        environment,
+        failed,
+        failedConfig,
+        failedContext,
+        failedReleaseRoot,
+        profile,
+        runnerDrainReceiptPath:
+          runnerDrainSnapshot === null ? null : runnerDrainReceiptPath,
+        workerSecrets
+      });
+      runnerEvidence = Object.freeze({ schemaVersion: 2, ...committed });
+      reattestRunner = async () =>
+        Object.freeze({
+          schemaVersion: 2,
+          ...(await attestCommittedTargetRunner({
+            deps,
+            environment,
+            failed,
+            failedConfig,
+            failedContext,
+            failedReleaseRoot,
+            profile,
+            runnerDrainReceiptPath:
+              runnerDrainSnapshot === null ? null : runnerDrainReceiptPath,
+            workerSecrets
+          }))
+        });
+    } else {
+      throw new Error(
+        "Runner-failure replacement requires the exact legacy predecessor or committed target v4 runner"
+      );
+    }
     const d1ArtifactAfter = await deps.attestD1BackupReceiptArtifact(
       backupReceipt
     );
     const after = readLiveDeployment();
-    const restoredRunnerAfter = await restorePriorRunner({
-      deps,
-      environment,
-      failed,
-      priorRecordPath,
-      profile
-    });
+    const runnerEvidenceAfter = await reattestRunner();
     if (
       after.workerVersionId !== before.workerVersionId ||
       after.deploymentId !== before.deploymentId ||
@@ -413,15 +663,29 @@ export function createRunnerFailureRecoveryAttestor(
       d1ArtifactAfter.exportPath !== d1Artifact.exportPath ||
       d1ArtifactAfter.exportBytes !== d1Artifact.exportBytes ||
       d1ArtifactAfter.exportSha256 !== d1Artifact.exportSha256 ||
-      restoredRunnerAfter.activationId !== restoredRunner.activationId ||
-      restoredRunnerAfter.recordSha256 !== restoredRunner.recordSha256 ||
-      restoredRunnerAfter.releaseSha !== restoredRunner.releaseSha
+      JSON.stringify(runnerEvidenceAfter) !== JSON.stringify(runnerEvidence)
     ) {
       throw new Error(
         "Production predecessor changed during runner-failure attestation"
       );
     }
     guardFailedAttempt();
+    const linkedLiveWorker = replacementLiveWorkerLineageEvidence(failed, {
+      readJournal: (releaseId) => store.readJournal(releaseId)
+    });
+    if (
+      linkedLiveWorker !== null &&
+      (runnerEvidence.priorReleaseSha !==
+        linkedLiveWorker.runnerReleaseSha ||
+        runnerEvidence.priorRecordSha256 !==
+          linkedLiveWorker.runnerRecordSha256)
+    ) {
+      throw new Error(
+        "Runner evidence differs from its hash-linked prior runner lineage"
+      );
+    }
+    const linkedLiveWorkerSourceRevision =
+      linkedLiveWorker?.sourceRevision ?? null;
     return assertRunnerFailureReplacementEvidence(failed, {
       failedJournalSha256,
       failedConfigSha256: failedConfigSnapshot.sha256,
@@ -429,9 +693,26 @@ export function createRunnerFailureRecoveryAttestor(
       d1BackupReceiptSha256: backupSnapshot.sha256,
       d1ExportBytes: d1Artifact.exportBytes,
       d1ExportSha256: d1Artifact.exportSha256,
-      priorRunnerActivationId: restoredRunner.activationId,
-      priorRunnerRecordSha256: restoredRunner.recordSha256,
-      priorRunnerReleaseSha: restoredRunner.releaseSha,
+      priorRunnerActivationId: runnerEvidence.priorActivationId,
+      priorRunnerRecordSha256: runnerEvidence.priorRecordSha256,
+      priorRunnerReleaseSha: runnerEvidence.priorReleaseSha,
+      ...(runnerEvidence.schemaVersion === 2
+        ? {
+            committedRunnerActivationId:
+              runnerEvidence.committedActivationId,
+            committedRunnerArtifactSha256:
+              runnerEvidence.committedArtifactSha256,
+            committedRunnerProtocolFingerprint:
+              runnerEvidence.committedProtocolFingerprint,
+            committedRunnerRecordSha256:
+              runnerEvidence.committedRecordSha256,
+            liveWorkerSourceRevision:
+              linkedLiveWorkerSourceRevision ??
+              runnerEvidence.priorReleaseSha,
+            runnerTransitionSha256:
+              runnerEvidence.runnerTransitionSha256
+          }
+        : {}),
       liveWorkerVersionId: after.workerVersionId,
       liveDeploymentId: after.deploymentId,
       predecessorDeploymentCreatedOn: after.createdOn,
