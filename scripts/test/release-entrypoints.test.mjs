@@ -249,6 +249,53 @@ function verifiedPrepareFailure(
   return store.writeJournal(journal);
 }
 
+function preparedUploadFailure(
+  store,
+  targetGitSha,
+  releaseId = "release-upload-failure"
+) {
+  const targetFingerprints = fingerprints();
+  const classification = classifyReleaseImpact({
+    changedPaths: ["package.json"],
+    targetFingerprints,
+    activeReceipt: null
+  });
+  let journal = createReleaseJournal({
+    releaseId,
+    targetGitSha,
+    classification,
+    targetFingerprints,
+    predecessor: {
+      releaseId: null,
+      journalSha256: null,
+      workerVersionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      deploymentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      runnerActivationId: "runner-prior"
+    },
+    createdAt: "2026-08-15T01:00:00.000Z"
+  });
+  store.writeJournal(journal);
+  journal = transitionReleaseJournal(journal, RELEASE_JOURNAL_STATES.VERIFIED, {
+    at: "2026-08-15T01:00:01.000Z"
+  });
+  store.writeJournal(journal);
+  journal = transitionReleaseJournal(journal, RELEASE_JOURNAL_STATES.PREPARED, {
+    at: "2026-08-15T01:00:02.000Z",
+    receipts: {
+      profileSha256: "1".repeat(64),
+      operatorEnvironmentFingerprint: "4".repeat(64),
+      wranglerConfigSha256: "2".repeat(64),
+      workerSecretsFingerprint: "3".repeat(64)
+    }
+  });
+  store.writeJournal(journal);
+  journal = recordReleaseJournalFailure(journal, {
+    code: RELEASE_FAILURE_CODES.UPLOAD_FAILED,
+    at: "2026-08-15T01:00:03.000Z"
+  });
+  return store.writeJournal(journal);
+}
+
 function beforeUploadEvidence() {
   return {
     liveWorkerVersionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -260,6 +307,7 @@ function beforeUploadEvidence() {
     uploadArtifactAbsent: true,
     backupArtifactAbsent: true,
     rollbackArtifactAbsent: true,
+    remoteUploadEvidence: null,
     queueEvidence: {
       expectedQueueNames: ["surf-ingest"],
       queues: [
@@ -268,6 +316,21 @@ function beforeUploadEvidence() {
           createdOn: "2026-08-10T04:58:17.532408Z"
         }
       ]
+    }
+  };
+}
+
+function preparedUploadEvidence(failed) {
+  return {
+    ...beforeUploadEvidence(),
+    failedConfigSha256: "2".repeat(64),
+    remoteUploadEvidence: {
+      schemaVersion: 1,
+      workerName: "surf-prod",
+      releaseTag: failed.releaseId,
+      remoteVersionCount: 32,
+      remoteVersionInventorySha256: "6".repeat(64),
+      taggedUploadAbsent: true
     }
   };
 }
@@ -704,6 +767,48 @@ test("a linked before-upload replacement retry stays pinned after interruption",
     targetGitSha,
     evidence: beforeUploadEvidence(),
     at: "2026-08-15T01:00:03.000Z"
+  });
+  store.writeJournal(replaced);
+
+  writeFileSync(join(profile.repositoryPath, "README.md"), "newer main\n");
+  runGit(profile.repositoryPath, ["add", "README.md"]);
+  runGit(profile.repositoryPath, ["commit", "-qm", "advance main"]);
+  runGit(profile.repositoryPath, ["push", "-q", "origin", "main"]);
+  assert.notEqual(runGit(profile.repositoryPath, ["rev-parse", "HEAD"]), targetGitSha);
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(surfRoot, "scripts/release-prod.mjs"),
+      "--plan",
+      "--replace-before-upload",
+      failed.releaseId
+    ],
+    {
+      cwd: surfRoot,
+      encoding: "utf8",
+      env: { ...process.env, SURF_PRODUCTION_PROFILE: profilePath }
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+  assert.equal(
+    store.readJournal(failed.releaseId).state,
+    RELEASE_JOURNAL_STATES.REPLACED
+  );
+  assert.equal(store.readJournal(replaced.supersededBy.releaseId), null);
+});
+
+test("a linked prepared-upload replacement retry stays pinned after interruption", (t) => {
+  const { profile, profilePath, targetGitSha } = fixture(t);
+  const store = createReleaseStateStore({ rootDir: profile.stateDirectory });
+  const failed = preparedUploadFailure(store, "a".repeat(40));
+  const replaced = replaceBeforeUploadReleaseJournal(failed, {
+    releaseId: "release-linked-prepared-upload",
+    targetGitSha,
+    evidence: preparedUploadEvidence(failed),
+    at: "2026-08-15T01:00:04.000Z"
   });
   store.writeJournal(replaced);
 

@@ -105,6 +105,7 @@ import { activateTargetRunner } from "./lib/release-runner-activation.mjs";
 import { readVerifiedFileSnapshot } from "./lib/verified-file-snapshot.mjs";
 import {
   assertBeforeUploadReplacementArtifactsAbsent,
+  attestNoTaggedWorkerUpload,
   commitBeforeUploadReplacement,
   previewBeforeUploadReplacement
 } from "./lib/release-before-upload-replacement.mjs";
@@ -317,10 +318,24 @@ function journalTargetForPreMutationReplacementRetry(profile, releaseId) {
 }
 
 function isBeforeUploadReplacementBoundary(journal) {
-  return (
+  const verifiedPrepareFailure =
     journal.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED &&
     journal.failureCode === RELEASE_FAILURE_CODES.PREPARE_FAILED &&
-    Object.values(journal.receipts).every((value) => value === null) &&
+    Object.values(journal.receipts).every((value) => value === null);
+  const preparedReceiptKeys = new Set([
+    "profileSha256",
+    "operatorEnvironmentFingerprint",
+    "wranglerConfigSha256",
+    "workerSecretsFingerprint"
+  ]);
+  const preparedUploadFailure =
+    journal.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED &&
+    journal.failureCode === RELEASE_FAILURE_CODES.UPLOAD_FAILED &&
+    Object.entries(journal.receipts).every(([key, value]) =>
+      preparedReceiptKeys.has(key) ? value !== null : value === null
+    );
+  return (
+    (verifiedPrepareFailure || preparedUploadFailure) &&
     journal.predecessor.workerVersionId !== null &&
     journal.predecessor.deploymentId !== null &&
     journal.predecessor.runnerActivationId !== null
@@ -340,7 +355,7 @@ function journalTargetForBeforeUploadReplacementRetry(profile, releaseId) {
     !isBeforeUploadReplacementBoundary(failed)
   ) {
     throw new Error(
-      "Before-upload replacement requires a receipt-free prepare failure from verified or its linked journal"
+      "Before-upload replacement requires an exact verified prepare failure or prepared upload failure, or its linked journal"
     );
   }
   return failed.supersededBy.targetGitSha;
@@ -765,8 +780,10 @@ async function internalMain(options) {
         continue;
       }
       if (journal.state === RELEASE_JOURNAL_STATES.REPLACED) {
-        const beforeUpload =
-          journal.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED;
+        const beforeUpload = [
+          RELEASE_JOURNAL_STATES.VERIFIED,
+          RELEASE_JOURNAL_STATES.PREPARED
+        ].includes(journal.resumeFrom);
         const selectedReplacementId = beforeUpload
           ? options.replaceBeforeUpload
           : options.replacePreMutation;
@@ -846,7 +863,7 @@ async function internalMain(options) {
   }
   if (activeJournal?.state === RELEASE_JOURNAL_STATES.REPLACED) {
     throw new Error(
-      "A pre-mutation replaced journal cannot be the active production release"
+      "A replaced journal cannot be the active production release"
     );
   }
   let activeReceipt = null;
@@ -1069,6 +1086,14 @@ async function internalMain(options) {
       const failedConfigSha256 = createHash("sha256")
         .update(failedConfigSnapshot.contents)
         .digest("hex");
+      if (
+        failed.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED &&
+        failedConfigSha256 !== failed.receipts.wranglerConfigSha256
+      ) {
+        throw new Error(
+          "Failed release Wrangler config differs from its prepared receipt"
+        );
+      }
       const failedReleaseRoot = resolve(
         profile.releasesDirectory,
         failed.targetGitSha
@@ -1146,6 +1171,16 @@ async function internalMain(options) {
           serviceRoot: profile.serviceRoot,
           allowLegacyV3: true
         });
+      const remoteUploadEvidence =
+        failed.resumeFrom === RELEASE_JOURNAL_STATES.PREPARED
+          ? await attestNoTaggedWorkerUpload({
+              accountId: environment.CLOUDFLARE_ACCOUNT_ID,
+              apiToken: environment.CLOUDFLARE_API_TOKEN,
+              workerName: failedConfig.name,
+              releaseTag: failed.releaseId,
+              guard: guardFailedAttempt
+            })
+          : null;
       const artifactEvidence = guardFailedAttempt();
       return assertBeforeUploadReplacementEvidence(failed, {
         liveWorkerVersionId,
@@ -1155,6 +1190,7 @@ async function internalMain(options) {
         failedConfigSha256,
         failedQueueTopologyFingerprint,
         ...artifactEvidence,
+        remoteUploadEvidence,
         queueEvidence: {
           expectedQueueNames,
           queues: queueEvidence.queues
@@ -1335,7 +1371,7 @@ async function internalMain(options) {
         !isBeforeUploadReplacementBoundary(failed)
       ) {
         throw new Error(
-          "Before-upload replacement must name a receipt-free prepare failure from verified or its linked journal"
+          "Before-upload replacement must name an exact verified prepare failure or prepared upload failure, or its linked journal"
         );
       }
       if (
@@ -1625,6 +1661,8 @@ async function internalMain(options) {
         clientDirectory: workerBuild.clientDirectory,
         sourceRevision: targetGitSha,
         clientBuildDigest: clientDigest,
+        clientOutputIdentity: workerBuild.clientOutputIdentity,
+        workerBundlePath: workerBuild.bundlePath,
         workerRuntimeDigest: workerBuild.workerRuntimeDigest,
         narrativeProtocolFingerprint: runnerManifest.protocolFingerprint,
         releaseTag: releaseId
@@ -1737,15 +1775,6 @@ async function internalMain(options) {
           };
           atomicWriteReleaseJsonSync(uploadReceiptPath, receipt);
           return receipt;
-        }
-        const finalBuild = buildWorkerCandidate({
-          context: finalContext,
-          outputDirectory: resolve(releaseRoot, "dist/release-worker-upload"),
-          sourceRevision: targetGitSha,
-          clientBuildDigest: clientDigest
-        });
-        if (finalBuild.workerRuntimeDigest !== workerBuild.workerRuntimeDigest) {
-          throw new Error("Final Worker dry-run differs from the planned runtime digest");
         }
         const uploaded = workerOperations.upload();
         targetWorkerVersionId = uploaded.versionId;

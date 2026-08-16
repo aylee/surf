@@ -1,7 +1,15 @@
+import { isAbsolute } from "node:path";
 import { assertWorkerVersionId } from "./worker-version.mjs";
 
 export function workerVersionUploadArgs() {
   return ["versions", "upload"];
+}
+
+export function prebuiltWorkerVersionUploadArgs(workerBundlePath) {
+  if (typeof workerBundlePath !== "string" || !isAbsolute(workerBundlePath)) {
+    throw new Error("Prebuilt Worker bundle path must be absolute");
+  }
+  return ["versions", "upload", workerBundlePath, "--no-bundle"];
 }
 
 export function workerVersionActivationArgs(versionId) {
