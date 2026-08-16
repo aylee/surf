@@ -13,6 +13,7 @@ test("parses the supported owner interface without downgrade switches", () => {
     sha: null,
     resume: null,
     fixForward: null,
+    replacePreMutation: null,
     forceFull: false
   });
   assert.deepEqual(
@@ -23,6 +24,7 @@ test("parses the supported owner interface without downgrade switches", () => {
       sha: "a".repeat(40),
       resume: null,
       fixForward: null,
+      replacePreMutation: null,
       forceFull: false
     }
   );
@@ -35,6 +37,34 @@ test("parses the supported owner interface without downgrade switches", () => {
   );
   assert.throws(
     () => parseReleaseProdArguments(["--resume", "one", "--fix-forward", "two"]),
+    /mutually exclusive/
+  );
+  assert.deepEqual(
+    parseReleaseProdArguments([
+      "--replace-pre-mutation",
+      "failed-release",
+      "--yes",
+      "--sha",
+      "b".repeat(40)
+    ]),
+    {
+      plan: false,
+      yes: true,
+      sha: "b".repeat(40),
+      resume: null,
+      fixForward: null,
+      replacePreMutation: "failed-release",
+      forceFull: false
+    }
+  );
+  assert.throws(
+    () =>
+      parseReleaseProdArguments([
+        "--resume",
+        "one",
+        "--replace-pre-mutation",
+        "two"
+      ]),
     /mutually exclusive/
   );
 });

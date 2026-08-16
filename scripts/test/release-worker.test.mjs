@@ -89,6 +89,7 @@ function deploymentStatus(versionId, deploymentId = deployment) {
 
 function context(activeVersions, calls) {
   const config = {
+    name: "surf-test",
     assets: { binding: "ASSETS" },
     version_metadata: { binding: "CF_VERSION_METADATA" },
     vars: {
@@ -100,7 +101,7 @@ function context(activeVersions, calls) {
       { binding: "DB", database_id: "database-id" }
     ],
     r2_buckets: [
-      { binding: "RAW_ARTIFACTS", bucket_name: "raw-artifacts" }
+      { binding: "RAW_ARTIFACTS", bucket_name: "surf-test-raw-artifacts" }
     ],
     queues: {
       producers: [{ binding: "INGEST_QUEUE", queue: "surf-ingest" }]
@@ -205,6 +206,41 @@ test("upload uses an inactive version and validates runtime metadata", () => {
   assert.ok(calls.some((call) => call.includes("--secrets-file")));
   assert.ok(calls.some((call) => call.includes("--tag") && call.includes("release-1")));
   assert.ok(calls.some((call) => call[2] === "view"));
+});
+
+test("portable R2 bindings resolve to Wrangler's exact auto-provisioned name", () => {
+  const calls = [];
+  const instance = context([], calls);
+  delete instance.readConfig().r2_buckets[0].bucket_name;
+
+  assert.deepEqual(
+    expectedWorkerBindingDescriptor(instance.readConfig()).find(
+      (binding) => binding.name === "RAW_ARTIFACTS"
+    ),
+    {
+      name: "RAW_ARTIFACTS",
+      type: "r2_bucket",
+      bucket_name: "surf-test-raw-artifacts"
+    }
+  );
+  assert.deepEqual(operations(instance).upload(), { versionId: target });
+
+  const drifted = context([], []);
+  delete drifted.readConfig().r2_buckets[0].bucket_name;
+  const original = drifted.runWrangler;
+  drifted.runWrangler = (args) => {
+    const output = original(args);
+    if (args[0] !== "versions" || args[1] !== "view") return output;
+    const version = JSON.parse(output);
+    version.resources.bindings.find(
+      (binding) => binding.name === "RAW_ARTIFACTS"
+    ).bucket_name = "wrong-bucket";
+    return JSON.stringify(version);
+  };
+  assert.throws(
+    () => operations(drifted).upload(),
+    /RAW_ARTIFACTS\.bucket_name/
+  );
 });
 
 test("uploaded versions must preserve exact stateful and secret binding identity", () => {

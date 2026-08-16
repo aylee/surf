@@ -5,9 +5,11 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   executeRelease,
+  persistPreControllerPreparationFailure,
   reconcileReleaseActivationBoundary
 } from "../lib/release-controller.mjs";
 import {
+  RELEASE_FAILURE_CODES,
   RELEASE_JOURNAL_STATES,
   RELEASE_POINTER_KINDS,
   createReleaseJournal,
@@ -161,6 +163,34 @@ function operations(trace, overrides = {}) {
     ...overrides
   };
 }
+
+test("pre-controller preparation failure is durably journaled without raw output", (t) => {
+  const candidate = fixture(RELEASE_LANES.ASSETS_ONLY);
+  t.after(() => rmSync(candidate.root, { recursive: true, force: true }));
+  const failed = persistPreControllerPreparationFailure({
+    journal: candidate.journal,
+    store: candidate.store,
+    at: "2026-08-15T00:00:01.000Z"
+  });
+
+  assert.equal(failed.state, RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE);
+  assert.equal(failed.resumeFrom, RELEASE_JOURNAL_STATES.PLANNED);
+  assert.equal(failed.failureCode, RELEASE_FAILURE_CODES.PREPARE_FAILED);
+  assert.deepEqual(
+    candidate.store.readJournal(candidate.journal.releaseId),
+    failed
+  );
+  assert.equal(JSON.stringify(failed).includes("wrangler stack trace"), false);
+
+  assert.equal(
+    persistPreControllerPreparationFailure({
+      journal: failed,
+      store: candidate.store,
+      at: "2026-08-15T00:00:02.000Z"
+    }),
+    failed
+  );
+});
 
 function clock() {
   let tick = 0;

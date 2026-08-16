@@ -29,7 +29,8 @@ export const RELEASE_JOURNAL_STATES = Object.freeze({
   COMPLETE: "complete",
   RETRYABLE_FAILURE: "retryable-failure",
   NEEDS_FIX_FORWARD: "needs-fix-forward",
-  SUPERSEDED: "superseded"
+  SUPERSEDED: "superseded",
+  REPLACED: "replaced"
 });
 
 export const RELEASE_POINTER_KINDS = Object.freeze({
@@ -297,7 +298,8 @@ function validateStateRequirements(journal) {
   const effectiveState = [
     RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
     RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD,
-    RELEASE_JOURNAL_STATES.SUPERSEDED
+    RELEASE_JOURNAL_STATES.SUPERSEDED,
+    RELEASE_JOURNAL_STATES.REPLACED
   ].includes(journal.state)
     ? journal.resumeFrom
     : journal.state;
@@ -470,6 +472,7 @@ export function assertReleaseJournal(value) {
         RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
         RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD,
         RELEASE_JOURNAL_STATES.SUPERSEDED,
+        RELEASE_JOURNAL_STATES.REPLACED,
         RELEASE_JOURNAL_STATES.COMPLETE
       ].includes(value.resumeFrom))
   ) {
@@ -478,7 +481,8 @@ export function assertReleaseJournal(value) {
   const hasFailureContext = [
     RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
     RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD,
-    RELEASE_JOURNAL_STATES.SUPERSEDED
+    RELEASE_JOURNAL_STATES.SUPERSEDED,
+    RELEASE_JOURNAL_STATES.REPLACED
   ].includes(value.state);
   if (
     hasFailureContext !==
@@ -487,23 +491,41 @@ export function assertReleaseJournal(value) {
     throw new Error("Release failure state, resume state, and failure code must agree");
   }
   if (
-    (value.state === RELEASE_JOURNAL_STATES.SUPERSEDED) !==
+    ([
+      RELEASE_JOURNAL_STATES.SUPERSEDED,
+      RELEASE_JOURNAL_STATES.REPLACED
+    ].includes(value.state)) !==
     (supersededBy !== null)
   ) {
-    throw new Error("Only a superseded release may contain a superseding release link");
+    throw new Error(
+      "Only a superseded or pre-mutation replaced release may contain a replacement link"
+    );
   }
   if (
     supersededBy !== null &&
     (supersededBy.releaseId === value.releaseId ||
       supersededBy.targetGitSha === value.targetGitSha)
   ) {
-    throw new Error("A fix-forward must name a different release and target Git SHA");
+    throw new Error(
+      "A replacement must name a different release and target Git SHA"
+    );
   }
   nullablePattern(value.failureCode, FAILURE_CODE_PATTERN, "Release failure code");
   if (value.failureCode !== null && !ALLOWED_FAILURE_CODES.has(value.failureCode)) {
     throw new Error("Release journal contains an unknown failure code");
   }
   const receipts = validateReceipts(value.receipts);
+  if (
+    value.state === RELEASE_JOURNAL_STATES.REPLACED &&
+    (value.resumeFrom !== RELEASE_JOURNAL_STATES.PLANNED ||
+      Object.values(receipts).some((entry) => entry !== null) ||
+      predecessor.workerVersionId === null ||
+      predecessor.deploymentId === null)
+  ) {
+    throw new Error(
+      "A pre-mutation replaced release must retain a receipt-free planned boundary and exact live predecessor"
+    );
+  }
   if (!Number.isInteger(value.attempt) || value.attempt < 1) {
     throw new Error("Release journal attempt must be a positive integer");
   }
@@ -631,7 +653,8 @@ export function transitionReleaseJournal(
   if (
     current.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE ||
     current.state === RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD ||
-    current.state === RELEASE_JOURNAL_STATES.SUPERSEDED
+    current.state === RELEASE_JOURNAL_STATES.SUPERSEDED ||
+    current.state === RELEASE_JOURNAL_STATES.REPLACED
   ) {
     throw new Error("Resume a failed release before applying another transition");
   }
@@ -660,7 +683,8 @@ export function recordReleaseJournalFailure(journal, { code, at } = {}) {
     current.state === RELEASE_JOURNAL_STATES.COMPLETE ||
     current.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE ||
     current.state === RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD ||
-    current.state === RELEASE_JOURNAL_STATES.SUPERSEDED
+    current.state === RELEASE_JOURNAL_STATES.SUPERSEDED ||
+    current.state === RELEASE_JOURNAL_STATES.REPLACED
   ) {
     throw new Error(`Cannot record another failure from ${current.state}`);
   }
@@ -726,6 +750,78 @@ export function supersedeReleaseJournal(
     },
     at
   );
+}
+
+export function replacePreMutationReleaseJournal(
+  journal,
+  { releaseId, targetGitSha, at } = {}
+) {
+  const current = assertReleaseJournal(journal);
+  const hasReceipts = Object.values(current.receipts).some(
+    (value) => value !== null
+  );
+  if (
+    current.state !== RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE ||
+    current.resumeFrom !== RELEASE_JOURNAL_STATES.PLANNED ||
+    hasReceipts ||
+    current.predecessor.workerVersionId === null ||
+    current.predecessor.deploymentId === null
+  ) {
+    throw new Error(
+      "Only a receipt-free release that failed from planned with an exact live predecessor may be replaced before mutation"
+    );
+  }
+  return revisedJournal(
+    current,
+    {
+      state: RELEASE_JOURNAL_STATES.REPLACED,
+      supersededBy: validateSupersededBy({ releaseId, targetGitSha })
+    },
+    at
+  );
+}
+
+export function predecessorForPreMutationReplacement(journal) {
+  const replaced = assertReleaseJournal(journal);
+  if (replaced.state !== RELEASE_JOURNAL_STATES.REPLACED) {
+    throw new Error("Pre-mutation replacement predecessor requires a replaced journal");
+  }
+  if (
+    replaced.predecessor.workerVersionId === null ||
+    replaced.predecessor.deploymentId === null
+  ) {
+    throw new Error(
+      "Pre-mutation replacement requires an exact live Worker predecessor"
+    );
+  }
+  return Object.freeze({
+    releaseId: replaced.releaseId,
+    journalSha256: fingerprintReleaseJournal(replaced),
+    workerVersionId: replaced.predecessor.workerVersionId,
+    deploymentId: replaced.predecessor.deploymentId,
+    runnerActivationId: replaced.predecessor.runnerActivationId
+  });
+}
+
+export function assertPreMutationReleaseReplacement(
+  failedJournal,
+  replacementJournal
+) {
+  const failed = assertReleaseJournal(failedJournal);
+  const replacement = assertReleaseJournal(replacementJournal);
+  const expectedPredecessor = predecessorForPreMutationReplacement(failed);
+  if (
+    failed.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+    failed.supersededBy?.releaseId !== replacement.releaseId ||
+    failed.supersededBy?.targetGitSha !== replacement.targetGitSha ||
+    canonicalReleaseJson(replacement.predecessor) !==
+      canonicalReleaseJson(expectedPredecessor)
+  ) {
+    throw new Error(
+      "Pre-mutation replacement does not exactly link its replaced release"
+    );
+  }
+  return Object.freeze({ failed, replacement });
 }
 
 export function assertReleaseSupersession(failedJournal, replacementJournal) {
@@ -815,7 +911,8 @@ export function createReleasePointer(journal, kind, { at } = {}) {
   const resumeState = [
     RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
     RELEASE_JOURNAL_STATES.NEEDS_FIX_FORWARD,
-    RELEASE_JOURNAL_STATES.SUPERSEDED
+    RELEASE_JOURNAL_STATES.SUPERSEDED,
+    RELEASE_JOURNAL_STATES.REPLACED
   ].includes(current.state)
     ? current.resumeFrom
     : current.state;

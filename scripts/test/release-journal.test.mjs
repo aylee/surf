@@ -22,6 +22,7 @@ import {
   RELEASE_JOURNAL_STATES,
   RELEASE_LANE_STATE_PATHS,
   RELEASE_POINTER_KINDS,
+  assertPreMutationReleaseReplacement,
   assertReleaseSupersession,
   assertReleaseJournal,
   assertReleasePointer,
@@ -30,10 +31,12 @@ import {
   createReleasePointer,
   createReleaseStateStore,
   fingerprintReleaseJournal,
+  predecessorForPreMutationReplacement,
   recordReleaseJournalFailure,
   reconcileReleaseActivation,
   resolveTrustedActiveReleaseReceipt,
   resumeReleaseJournal,
+  replacePreMutationReleaseJournal,
   supersedeReleaseJournal,
   transitionReleaseJournal
 } from "../lib/release-journal.mjs";
@@ -476,6 +479,110 @@ test("failure states preserve the exact resume boundary without raw errors", () 
         at: "2026-08-15T22:00:02.000Z"
       }),
     /bounded reason code/
+  );
+});
+
+test("a receipt-free planned failure can be terminally linked to a new target", () => {
+  const failed = recordReleaseJournalFailure(initialJournal(), {
+    code: RELEASE_FAILURE_CODES.VERIFY_FAILED,
+    at: "2026-08-15T22:00:01.000Z"
+  });
+  const replacementSha = "f".repeat(40);
+  const replaced = replacePreMutationReleaseJournal(failed, {
+    releaseId: "release-replacement-2",
+    targetGitSha: replacementSha,
+    at: "2026-08-15T22:00:02.000Z"
+  });
+  assert.equal(replaced.state, RELEASE_JOURNAL_STATES.REPLACED);
+  assert.equal(replaced.resumeFrom, RELEASE_JOURNAL_STATES.PLANNED);
+  assert.equal(replaced.failureCode, RELEASE_FAILURE_CODES.VERIFY_FAILED);
+  assert.deepEqual(replaced.supersededBy, {
+    releaseId: "release-replacement-2",
+    targetGitSha: replacementSha
+  });
+  assert.deepEqual(predecessorForPreMutationReplacement(replaced), {
+    releaseId: replaced.releaseId,
+    journalSha256: fingerprintReleaseJournal(replaced),
+    workerVersionId: predecessor().workerVersionId,
+    deploymentId: predecessor().deploymentId,
+    runnerActivationId: predecessor().runnerActivationId
+  });
+  assert.throws(
+    () =>
+      assertReleaseJournal({
+        ...replaced,
+        resumeFrom: RELEASE_JOURNAL_STATES.VERIFIED
+      }),
+    /receipt-free planned boundary and exact live predecessor/
+  );
+
+  const targetFingerprints = fingerprints("replacement");
+  const replacement = createReleaseJournal({
+    releaseId: replaced.supersededBy.releaseId,
+    targetGitSha: replaced.supersededBy.targetGitSha,
+    classification: assetsClassification(targetFingerprints),
+    targetFingerprints,
+    predecessor: predecessorForPreMutationReplacement(replaced),
+    createdAt: "2026-08-15T22:00:03.000Z"
+  });
+  assert.doesNotThrow(() =>
+    assertPreMutationReleaseReplacement(replaced, replacement)
+  );
+
+  const verifiedFailure = recordReleaseJournalFailure(
+    transitionReleaseJournal(initialJournal(), RELEASE_JOURNAL_STATES.VERIFIED, {
+      at: "2026-08-15T22:00:01.000Z"
+    }),
+    {
+      code: RELEASE_FAILURE_CODES.PREPARE_FAILED,
+      at: "2026-08-15T22:00:02.000Z"
+    }
+  );
+  assert.throws(
+    () =>
+      replacePreMutationReleaseJournal(verifiedFailure, {
+        releaseId: "release-too-late",
+        targetGitSha: replacementSha,
+        at: "2026-08-15T22:00:03.000Z"
+      }),
+    /receipt-free release that failed from planned/
+  );
+});
+
+test("a pre-mutation replacement is recoverable after its terminal link is stored", (t) => {
+  const stateRoot = mkdtempSync(join(tmpdir(), "surf-replace-release-"));
+  t.after(() => rmSync(stateRoot, { recursive: true, force: true }));
+  const store = createReleaseStateStore({ rootDir: stateRoot });
+  const failed = recordReleaseJournalFailure(initialJournal(), {
+    code: RELEASE_FAILURE_CODES.VERIFY_FAILED,
+    at: "2026-08-15T22:00:01.000Z"
+  });
+  store.writeJournal(initialJournal());
+  store.writeJournal(failed);
+  const replaced = store.writeJournal(
+    replacePreMutationReleaseJournal(failed, {
+      releaseId: "release-after-interruption",
+      targetGitSha: "f".repeat(40),
+      at: "2026-08-15T22:00:02.000Z"
+    })
+  );
+
+  assert.equal(store.readJournal(replaced.supersededBy.releaseId), null);
+  assert.equal(store.readPointer(RELEASE_POINTER_KINDS.ACTIVE), null);
+  assert.equal(store.readPointer(RELEASE_POINTER_KINDS.LAST_COMPLETE), null);
+
+  const targetFingerprints = fingerprints("after-interruption");
+  const replacement = createReleaseJournal({
+    releaseId: replaced.supersededBy.releaseId,
+    targetGitSha: replaced.supersededBy.targetGitSha,
+    classification: assetsClassification(targetFingerprints),
+    targetFingerprints,
+    predecessor: predecessorForPreMutationReplacement(replaced),
+    createdAt: "2026-08-15T22:00:03.000Z"
+  });
+  const storedReplacement = store.writeJournal(replacement);
+  assert.doesNotThrow(() =>
+    assertPreMutationReleaseReplacement(replaced, storedReplacement)
   );
 });
 

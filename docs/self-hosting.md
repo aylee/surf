@@ -423,7 +423,7 @@ mode-`0600` production profile, then preview and release:
 
 ```bash
 export SURF_PRODUCTION_PROFILE=/absolute/path/to/production-profile.json
-pnpm release:prod -- --plan
+pnpm release:prod --plan
 pnpm release:prod
 ```
 

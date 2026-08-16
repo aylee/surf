@@ -33,6 +33,7 @@ import {
   RELEASE_FAILURE_CODES,
   RELEASE_JOURNAL_STATES,
   RELEASE_POINTER_KINDS,
+  assertPreMutationReleaseReplacement,
   assertReleaseJournal,
   assertReleaseSupersession,
   atomicWriteReleaseJsonSync,
@@ -40,11 +41,14 @@ import {
   createReleasePointer,
   createReleaseStateStore,
   fingerprintReleaseJournal,
+  predecessorForPreMutationReplacement,
   releasePointerMatchesJournal,
+  replacePreMutationReleaseJournal,
   supersedeReleaseJournal
 } from "./lib/release-journal.mjs";
 import {
   executeRelease,
+  persistPreControllerPreparationFailure,
   reconcileReleaseActivationBoundary
 } from "./lib/release-controller.mjs";
 import {
@@ -262,6 +266,25 @@ function journalTargetForFixForwardRetry(profile, releaseId) {
   return failed.supersededBy.targetGitSha;
 }
 
+function journalTargetForPreMutationReplacementRetry(profile, releaseId) {
+  const failed = recoveryJournal(profile, releaseId);
+  if (
+    failed.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE &&
+    failed.resumeFrom === RELEASE_JOURNAL_STATES.PLANNED &&
+    Object.values(failed.receipts).every((value) => value === null) &&
+    failed.predecessor.workerVersionId !== null &&
+    failed.predecessor.deploymentId !== null
+  ) {
+    return null;
+  }
+  if (failed.state !== RELEASE_JOURNAL_STATES.REPLACED) {
+    throw new Error(
+      "Pre-mutation replacement requires a receipt-free failure from planned or its linked journal"
+    );
+  }
+  return failed.supersededBy.targetGitSha;
+}
+
 function runnerCompatibilityRequired(impact) {
   return (
     impact.workerRuntime ||
@@ -336,9 +359,22 @@ async function outerMain(options) {
     const linkedFixForwardSha = options.fixForward
       ? journalTargetForFixForwardRetry(profile, options.fixForward)
       : null;
+    const linkedPreMutationReplacementSha = options.replacePreMutation
+      ? journalTargetForPreMutationReplacementRetry(
+          profile,
+          options.replacePreMutation
+        )
+      : null;
     fetchTarget(profile.repositoryPath);
-    if (linkedFixForwardSha !== null) {
-      targetSha = linkedFixForwardSha;
+    const linkedTargetSha =
+      linkedFixForwardSha ?? linkedPreMutationReplacementSha;
+    if (linkedTargetSha !== null) {
+      if (options.sha !== null && options.sha !== linkedTargetSha) {
+        throw new Error(
+          "--sha must match the exact linked pre-mutation replacement target"
+        );
+      }
+      targetSha = linkedTargetSha;
     } else {
       const fetchedMain = resolveGitRevision(profile.repositoryPath, "origin/main");
       if (options.sha !== null && options.sha !== fetchedMain) {
@@ -636,7 +672,8 @@ async function internalMain(options) {
   ) {
     throw new Error("Resume journal does not match the exact target release");
   }
-  const explicitlySelectedReleaseId = options.resume ?? options.fixForward;
+  const explicitlySelectedReleaseId =
+    options.resume ?? options.fixForward ?? options.replacePreMutation;
   for (const journalBatch of store.scanJournalBatches()) {
     for (const journal of journalBatch) {
       if (journal.state === RELEASE_JOURNAL_STATES.SUPERSEDED) {
@@ -651,6 +688,22 @@ async function internalMain(options) {
         } else if (options.fixForward !== journal.releaseId) {
           throw new Error(
             `Superseded release ${journal.releaseId} requires exact --fix-forward recovery before its linked journal exists`
+          );
+        }
+        continue;
+      }
+      if (journal.state === RELEASE_JOURNAL_STATES.REPLACED) {
+        const replacement = store.readJournal(journal.supersededBy.releaseId);
+        if (replacement) {
+          assertPreMutationReleaseReplacement(journal, replacement);
+          if (options.replacePreMutation === journal.releaseId) {
+            throw new Error(
+              `Pre-mutation replacement journal ${replacement.releaseId} already exists; use --resume ${replacement.releaseId}`
+            );
+          }
+        } else if (options.replacePreMutation !== journal.releaseId) {
+          throw new Error(
+            `Replaced release ${journal.releaseId} requires exact --replace-pre-mutation recovery before its linked journal exists`
           );
         }
         continue;
@@ -690,7 +743,8 @@ async function internalMain(options) {
     activeJournal &&
     ![
       RELEASE_JOURNAL_STATES.COMPLETE,
-      RELEASE_JOURNAL_STATES.SUPERSEDED
+      RELEASE_JOURNAL_STATES.SUPERSEDED,
+      RELEASE_JOURNAL_STATES.REPLACED
     ].includes(activeJournal.state) &&
     options.resume !== activeJournal.releaseId &&
     options.fixForward !== activeJournal.releaseId
@@ -709,6 +763,11 @@ async function internalMain(options) {
         `Production points at superseded release ${activeJournal.releaseId}; recover linked release ${linkedReleaseId}`
       );
     }
+  }
+  if (activeJournal?.state === RELEASE_JOURNAL_STATES.REPLACED) {
+    throw new Error(
+      "A pre-mutation replaced journal cannot be the active production release"
+    );
   }
   let activeReceipt = null;
   if (
@@ -983,6 +1042,7 @@ async function internalMain(options) {
     }
     let managedJournal = resumeJournal;
     let fixForwardSource = null;
+    let preMutationReplacementSource = null;
     let predecessor;
     if (options.resume) {
       classification = managedJournal.classification;
@@ -1010,6 +1070,56 @@ async function internalMain(options) {
       }
       fixForwardSource = failed;
       predecessor = predecessorFromJournal(failed, fingerprintReleaseJournal(failed));
+    } else if (options.replacePreMutation) {
+      const failed = store.readJournal(options.replacePreMutation);
+      if (
+        !failed ||
+        ![
+          RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
+          RELEASE_JOURNAL_STATES.REPLACED
+        ].includes(failed.state)
+      ) {
+        throw new Error(
+          "Pre-mutation replacement must name a receipt-free failure from planned or its linked journal"
+        );
+      }
+      if (
+        activePointer?.releaseId === failed.releaseId ||
+        lastCompletePointer?.releaseId === failed.releaseId
+      ) {
+        throw new Error(
+          "Pre-mutation replacement cannot target an active or last-complete release"
+        );
+      }
+      if (failed.targetGitSha === targetGitSha) {
+        throw new Error(
+          "Pre-mutation replacement requires a new target SHA; resume the failed release instead"
+        );
+      }
+      if (
+        failed.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE &&
+        (failed.resumeFrom !== RELEASE_JOURNAL_STATES.PLANNED ||
+          Object.values(failed.receipts).some((value) => value !== null) ||
+          failed.predecessor.workerVersionId === null ||
+          failed.predecessor.deploymentId === null)
+      ) {
+        throw new Error(
+          "Pre-mutation replacement is limited to a receipt-free failure from planned with an exact live predecessor"
+        );
+      }
+      if (
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED &&
+        failed.supersededBy.targetGitSha !== targetGitSha
+      ) {
+        throw new Error(
+          "Linked pre-mutation replacement target differs from its immutable journal"
+        );
+      }
+      preMutationReplacementSource = failed;
+      predecessor =
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED
+          ? predecessorForPreMutationReplacement(failed)
+          : failed.predecessor;
     } else if (activeJournal) {
       predecessor = predecessorFromJournal(activeJournal, activePointer.journalSha256);
     } else {
@@ -1079,6 +1189,7 @@ async function internalMain(options) {
     const releaseId =
       managedJournal?.releaseId ??
       fixForwardSource?.supersededBy?.releaseId ??
+      preMutationReplacementSource?.supersededBy?.releaseId ??
       releaseIdFor(targetGitSha);
     const analysisEnabled =
       finalProbeContext.readConfig().vars?.NARRATIVE_ENABLED === "true";
@@ -1129,6 +1240,31 @@ async function internalMain(options) {
       );
     }
 
+    if (preMutationReplacementSource) {
+      if (
+        preMutationReplacementSource.state ===
+        RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE
+      ) {
+        preMutationReplacementSource = store.writeJournal(
+          replacePreMutationReleaseJournal(preMutationReplacementSource, {
+            releaseId,
+            targetGitSha,
+            at: new Date().toISOString()
+          })
+        );
+      } else if (
+        preMutationReplacementSource.supersededBy.releaseId !== releaseId ||
+        preMutationReplacementSource.supersededBy.targetGitSha !== targetGitSha
+      ) {
+        throw new Error(
+          "Linked pre-mutation replacement identity changed before journal creation"
+        );
+      }
+      predecessor = predecessorForPreMutationReplacement(
+        preMutationReplacementSource
+      );
+    }
+
     const attemptsDirectory = ensurePrivateSubdirectory(
       profile.stateDirectory,
       "attempts",
@@ -1150,6 +1286,12 @@ async function internalMain(options) {
       });
       if (fixForwardSource) {
         assertReleaseSupersession(fixForwardSource, managedJournal);
+      }
+      if (preMutationReplacementSource) {
+        assertPreMutationReleaseReplacement(
+          preMutationReplacementSource,
+          managedJournal
+        );
       }
       managedJournal = store.writeJournal(managedJournal);
     } else if (
@@ -1211,20 +1353,29 @@ async function internalMain(options) {
       });
     };
 
-    prepareRuntime();
-    if (managedJournal.receipts.profileSha256 !== null) {
-      const preparedReceipts = managedJournal.receipts;
-      if (
-        preparedReceipts.profileSha256 !== profileSha256 ||
-        preparedReceipts.operatorEnvironmentFingerprint !==
-          operatorEnvironmentFingerprint ||
-        preparedReceipts.wranglerConfigSha256 !== finalContext.configSha256 ||
-        preparedReceipts.workerSecretsFingerprint !== secretSnapshot.fingerprint
-      ) {
-        throw new Error(
-          "Resume production inputs differ from the journaled prepared release"
-        );
+    try {
+      prepareRuntime();
+      if (managedJournal.receipts.profileSha256 !== null) {
+        const preparedReceipts = managedJournal.receipts;
+        if (
+          preparedReceipts.profileSha256 !== profileSha256 ||
+          preparedReceipts.operatorEnvironmentFingerprint !==
+            operatorEnvironmentFingerprint ||
+          preparedReceipts.wranglerConfigSha256 !== finalContext.configSha256 ||
+          preparedReceipts.workerSecretsFingerprint !== secretSnapshot.fingerprint
+        ) {
+          throw new Error(
+            "Resume production inputs differ from the journaled prepared release"
+          );
+        }
       }
+    } catch (error) {
+      managedJournal = persistPreControllerPreparationFailure({
+        journal: managedJournal,
+        store,
+        at: new Date().toISOString()
+      });
+      throw error;
     }
 
     let queueIdentityReceipt = null;

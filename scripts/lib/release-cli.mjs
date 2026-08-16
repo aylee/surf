@@ -8,6 +8,7 @@ export function parseReleaseProdArguments(argv) {
     sha: null,
     resume: null,
     fixForward: null,
+    replacePreMutation: null,
     forceFull: false
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -15,7 +16,14 @@ export function parseReleaseProdArguments(argv) {
     if (argument === "--plan") options.plan = true;
     else if (argument === "--yes") options.yes = true;
     else if (argument === "--force-full") options.forceFull = true;
-    else if (["--sha", "--resume", "--fix-forward"].includes(argument)) {
+    else if (
+      [
+        "--sha",
+        "--resume",
+        "--fix-forward",
+        "--replace-pre-mutation"
+      ].includes(argument)
+    ) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) {
         throw new Error(`${argument} requires one value`);
@@ -24,6 +32,9 @@ export function parseReleaseProdArguments(argv) {
       if (argument === "--sha") options.sha = value;
       if (argument === "--resume") options.resume = value;
       if (argument === "--fix-forward") options.fixForward = value;
+      if (argument === "--replace-pre-mutation") {
+        options.replacePreMutation = value;
+      }
     } else {
       throw new Error(`Unknown release option: ${argument}`);
     }
@@ -33,14 +44,20 @@ export function parseReleaseProdArguments(argv) {
   }
   for (const [name, value] of [
     ["--resume", options.resume],
-    ["--fix-forward", options.fixForward]
+    ["--fix-forward", options.fixForward],
+    ["--replace-pre-mutation", options.replacePreMutation]
   ]) {
     if (value !== null && !RELEASE_ID_PATTERN.test(value)) {
       throw new Error(`${name} requires a valid release ID`);
     }
   }
-  if (options.resume && options.fixForward) {
-    throw new Error("--resume and --fix-forward are mutually exclusive");
+  if (
+    [options.resume, options.fixForward, options.replacePreMutation].filter(Boolean)
+      .length > 1
+  ) {
+    throw new Error(
+      "--resume, --fix-forward, and --replace-pre-mutation are mutually exclusive"
+    );
   }
   if ((options.resume || options.fixForward) && options.sha) {
     throw new Error("Resume/fix-forward target identity comes from its journal, not --sha");

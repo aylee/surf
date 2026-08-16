@@ -26,6 +26,7 @@ import {
   createReleasePointer,
   createReleaseStateStore,
   recordReleaseJournalFailure,
+  replacePreMutationReleaseJournal,
   supersedeReleaseJournal,
   transitionReleaseJournal
 } from "../lib/release-journal.mjs";
@@ -181,6 +182,35 @@ function completeRelease(store, targetGitSha) {
   return journal;
 }
 
+function plannedFailure(store, targetGitSha, releaseId = "release-planned-failure") {
+  const targetFingerprints = fingerprints();
+  const classification = classifyReleaseImpact({
+    changedPaths: ["package.json"],
+    targetFingerprints,
+    activeReceipt: null
+  });
+  const initial = createReleaseJournal({
+    releaseId,
+    targetGitSha,
+    classification,
+    targetFingerprints,
+    predecessor: {
+      releaseId: null,
+      journalSha256: null,
+      workerVersionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      deploymentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      runnerActivationId: "runner-prior"
+    },
+    createdAt: "2026-08-15T01:00:00.000Z"
+  });
+  store.writeJournal(initial);
+  const failed = recordReleaseJournalFailure(initial, {
+    code: RELEASE_FAILURE_CODES.VERIFY_FAILED,
+    at: "2026-08-15T01:00:01.000Z"
+  });
+  return store.writeJournal(failed);
+}
+
 function fileTree(root) {
   const result = [];
   const visit = (directory) => {
@@ -212,6 +242,38 @@ test("--plan delegates to the exact origin/main release without creating product
   assert.equal(preview.readOnly, true);
   assert.equal(existsSync(profile.releasesDirectory), true);
   assert.equal(existsSync(profile.stateDirectory), false);
+});
+
+test("--plan previews a pre-mutation replacement without changing its journal", (t) => {
+  const { profile, profilePath, targetGitSha } = fixture(t);
+  const store = createReleaseStateStore({ rootDir: profile.stateDirectory });
+  const failed = plannedFailure(store, "a".repeat(40));
+  const journalPath = join(
+    profile.stateDirectory,
+    "journals",
+    `${failed.releaseId}.json`
+  );
+  const before = readFileSync(journalPath, "utf8");
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(surfRoot, "scripts/release-prod.mjs"),
+      "--plan",
+      "--replace-pre-mutation",
+      failed.releaseId
+    ],
+    {
+      cwd: surfRoot,
+      encoding: "utf8",
+      env: { ...process.env, SURF_PRODUCTION_PROFILE: profilePath }
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+  assert.equal(readFileSync(journalPath, "utf8"), before);
+  assert.equal(store.readJournal(failed.releaseId).state, failed.state);
 });
 
 test("the outer owner process forwards terminal signals to the exact release group", async (t) => {
@@ -275,6 +337,18 @@ test("release:status verifies immutable history without changing state", (t) => 
     createdAt: "2026-08-15T01:00:00.000Z"
   });
   store.writeJournal(interrupted);
+  const replaceable = plannedFailure(
+    store,
+    "b".repeat(40),
+    "release-replaced-terminal"
+  );
+  store.writeJournal(
+    replacePreMutationReleaseJournal(replaceable, {
+      releaseId: "release-replaced-successor",
+      targetGitSha: "c".repeat(40),
+      at: "2026-08-15T01:00:02.000Z"
+    })
+  );
   const before = fileTree(profile.stateDirectory);
   const result = spawnSync(process.execPath, [join(surfRoot, "scripts/release-status.mjs")], {
     cwd: surfRoot,
@@ -485,6 +559,47 @@ test("a linked fix-forward retry stays pinned when origin/main advances", (t) =>
   );
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+});
+
+test("a linked pre-mutation replacement retry stays pinned after interruption", (t) => {
+  const { profile, profilePath, targetGitSha } = fixture(t);
+  const store = createReleaseStateStore({ rootDir: profile.stateDirectory });
+  const failed = plannedFailure(store, "a".repeat(40));
+  const replaced = replacePreMutationReleaseJournal(failed, {
+    releaseId: "release-linked-pre-mutation",
+    targetGitSha,
+    at: "2026-08-15T01:00:02.000Z"
+  });
+  store.writeJournal(replaced);
+
+  writeFileSync(join(profile.repositoryPath, "README.md"), "newer main\n");
+  runGit(profile.repositoryPath, ["add", "README.md"]);
+  runGit(profile.repositoryPath, ["commit", "-qm", "advance main"]);
+  runGit(profile.repositoryPath, ["push", "-q", "origin", "main"]);
+  assert.notEqual(runGit(profile.repositoryPath, ["rev-parse", "HEAD"]), targetGitSha);
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(surfRoot, "scripts/release-prod.mjs"),
+      "--plan",
+      "--replace-pre-mutation",
+      failed.releaseId
+    ],
+    {
+      cwd: surfRoot,
+      encoding: "utf8",
+      env: { ...process.env, SURF_PRODUCTION_PROFILE: profilePath }
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+  assert.equal(
+    store.readJournal(failed.releaseId).state,
+    RELEASE_JOURNAL_STATES.REPLACED
+  );
+  assert.equal(store.readJournal(replaced.supersededBy.releaseId), null);
 });
 
 test("ambient internal-execution variables cannot bypass the outer release gate", () => {

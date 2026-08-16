@@ -70,7 +70,7 @@ it never writes secret values into a journal or log.
 Inspect a read-only, fail-closed preview:
 
 ```bash
-pnpm release:prod -- --plan
+pnpm release:prod --plan
 ```
 
 The preview performs the same target-owned preparation needed for an exact
@@ -92,7 +92,7 @@ pnpm release:prod
 For unattended use, pin the exact commit explicitly:
 
 ```bash
-pnpm release:prod -- --yes --sha 0123456789abcdef0123456789abcdef01234567
+pnpm release:prod --yes --sha 0123456789abcdef0123456789abcdef01234567
 ```
 
 `--yes` is rejected without an exact SHA. `--force-full` may make a release
@@ -135,7 +135,7 @@ version at 100%; `last-complete` advances only after post-deploy verification.
 Before Worker activation, continue the exact journal:
 
 ```bash
-pnpm release:prod -- --resume RELEASE_ID
+pnpm release:prod --resume RELEASE_ID
 ```
 
 The command reuses recorded upload and D1 receipts and will not silently
@@ -143,8 +143,23 @@ change the target. If production already runs a failed target, either resume
 the same journal or merge a repair and link it explicitly:
 
 ```bash
-pnpm release:prod -- --fix-forward FAILED_RELEASE_ID
+pnpm release:prod --fix-forward FAILED_RELEASE_ID
 ```
+
+If an attempt failed from `planned` before recording any receipt, and repairing
+an external input requires a new commit, replace that attempt explicitly:
+
+```bash
+pnpm release:prod --replace-pre-mutation FAILED_RELEASE_ID
+```
+
+This is rejected after verification advances or any receipt exists. After the
+normal preview and confirmation, the old journal becomes a terminal `replaced`
+record linked to the exact new release ID and Git SHA. The replacement journal
+hash-links back to it while retaining the same live Worker, deployment, and
+runner predecessor. Neither the old journal nor this link advances a production
+pointer. If interrupted between the terminal link and replacement-journal
+creation, rerun the same command; it remains pinned to the linked target.
 
 There is no automatic production rollback after Worker activation. A Queue,
 schema, or protocol boundary may already have been crossed; follow the
