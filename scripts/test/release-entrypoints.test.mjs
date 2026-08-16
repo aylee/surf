@@ -26,6 +26,7 @@ import {
   createReleasePointer,
   createReleaseStateStore,
   recordReleaseJournalFailure,
+  replaceBeforeUploadReleaseJournal,
   replacePreMutationReleaseJournal,
   supersedeReleaseJournal,
   transitionReleaseJournal
@@ -211,6 +212,66 @@ function plannedFailure(store, targetGitSha, releaseId = "release-planned-failur
   return store.writeJournal(failed);
 }
 
+function verifiedPrepareFailure(
+  store,
+  targetGitSha,
+  releaseId = "release-before-upload-failure"
+) {
+  const targetFingerprints = fingerprints();
+  const classification = classifyReleaseImpact({
+    changedPaths: ["package.json"],
+    targetFingerprints,
+    activeReceipt: null
+  });
+  let journal = createReleaseJournal({
+    releaseId,
+    targetGitSha,
+    classification,
+    targetFingerprints,
+    predecessor: {
+      releaseId: null,
+      journalSha256: null,
+      workerVersionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      deploymentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      runnerActivationId: "runner-prior"
+    },
+    createdAt: "2026-08-15T01:00:00.000Z"
+  });
+  store.writeJournal(journal);
+  journal = transitionReleaseJournal(journal, RELEASE_JOURNAL_STATES.VERIFIED, {
+    at: "2026-08-15T01:00:01.000Z"
+  });
+  store.writeJournal(journal);
+  journal = recordReleaseJournalFailure(journal, {
+    code: RELEASE_FAILURE_CODES.PREPARE_FAILED,
+    at: "2026-08-15T01:00:02.000Z"
+  });
+  return store.writeJournal(journal);
+}
+
+function beforeUploadEvidence() {
+  return {
+    liveWorkerVersionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    liveDeploymentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    liveDeploymentCreatedOn: "2026-08-14T23:00:00.000000Z",
+    liveRunnerActivationId: "runner-prior",
+    failedConfigSha256: "9".repeat(64),
+    failedQueueTopologyFingerprint: fingerprints().queueTopology,
+    uploadArtifactAbsent: true,
+    backupArtifactAbsent: true,
+    rollbackArtifactAbsent: true,
+    queueEvidence: {
+      expectedQueueNames: ["surf-ingest"],
+      queues: [
+        {
+          name: "surf-ingest",
+          createdOn: "2026-08-10T04:58:17.532408Z"
+        }
+      ]
+    }
+  };
+}
+
 function fileTree(root) {
   const result = [];
   const visit = (directory) => {
@@ -261,6 +322,38 @@ test("--plan previews a pre-mutation replacement without changing its journal", 
       join(surfRoot, "scripts/release-prod.mjs"),
       "--plan",
       "--replace-pre-mutation",
+      failed.releaseId
+    ],
+    {
+      cwd: surfRoot,
+      encoding: "utf8",
+      env: { ...process.env, SURF_PRODUCTION_PROFILE: profilePath }
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+  assert.equal(readFileSync(journalPath, "utf8"), before);
+  assert.equal(store.readJournal(failed.releaseId).state, failed.state);
+});
+
+test("--plan delegates a before-upload replacement without changing its journal", (t) => {
+  const { profile, profilePath, targetGitSha } = fixture(t);
+  const store = createReleaseStateStore({ rootDir: profile.stateDirectory });
+  const failed = verifiedPrepareFailure(store, "a".repeat(40));
+  const journalPath = join(
+    profile.stateDirectory,
+    "journals",
+    `${failed.releaseId}.json`
+  );
+  const before = readFileSync(journalPath, "utf8");
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(surfRoot, "scripts/release-prod.mjs"),
+      "--plan",
+      "--replace-before-upload",
       failed.releaseId
     ],
     {
@@ -584,6 +677,48 @@ test("a linked pre-mutation replacement retry stays pinned after interruption", 
       join(surfRoot, "scripts/release-prod.mjs"),
       "--plan",
       "--replace-pre-mutation",
+      failed.releaseId
+    ],
+    {
+      cwd: surfRoot,
+      encoding: "utf8",
+      env: { ...process.env, SURF_PRODUCTION_PROFILE: profilePath }
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).targetGitSha, targetGitSha);
+  assert.equal(
+    store.readJournal(failed.releaseId).state,
+    RELEASE_JOURNAL_STATES.REPLACED
+  );
+  assert.equal(store.readJournal(replaced.supersededBy.releaseId), null);
+});
+
+test("a linked before-upload replacement retry stays pinned after interruption", (t) => {
+  const { profile, profilePath, targetGitSha } = fixture(t);
+  const store = createReleaseStateStore({ rootDir: profile.stateDirectory });
+  const failed = verifiedPrepareFailure(store, "a".repeat(40));
+  const replaced = replaceBeforeUploadReleaseJournal(failed, {
+    releaseId: "release-linked-before-upload",
+    targetGitSha,
+    evidence: beforeUploadEvidence(),
+    at: "2026-08-15T01:00:03.000Z"
+  });
+  store.writeJournal(replaced);
+
+  writeFileSync(join(profile.repositoryPath, "README.md"), "newer main\n");
+  runGit(profile.repositoryPath, ["add", "README.md"]);
+  runGit(profile.repositoryPath, ["commit", "-qm", "advance main"]);
+  runGit(profile.repositoryPath, ["push", "-q", "origin", "main"]);
+  assert.notEqual(runGit(profile.repositoryPath, ["rev-parse", "HEAD"]), targetGitSha);
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(surfRoot, "scripts/release-prod.mjs"),
+      "--plan",
+      "--replace-before-upload",
       failed.releaseId
     ],
     {

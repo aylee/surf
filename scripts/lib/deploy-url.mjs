@@ -1,5 +1,7 @@
 const VERSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ISO_UTC_NANOSECONDS_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
 
 function stripAnsi(output) {
   return output.replace(/\u001b\[[0-9;]*m/g, "");
@@ -47,7 +49,22 @@ export function resolveUploadedVersionId(output) {
   return match[1];
 }
 
-export function resolveActiveDeploymentId(output, expectedVersionId) {
+function exactCloudflareTimestamp(value) {
+  if (typeof value !== "string" || value.length > 64) return null;
+  const match = value.match(ISO_UTC_NANOSECONDS_PATTERN);
+  if (!match) return null;
+  const wholeSecond = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`;
+  const milliseconds = Date.parse(`${wholeSecond}.000Z`);
+  if (
+    !Number.isFinite(milliseconds) ||
+    new Date(milliseconds).toISOString() !== `${wholeSecond}.000Z`
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function activeDeploymentStatus(output, expectedVersionId) {
   if (!VERSION_ID_PATTERN.test(expectedVersionId)) {
     throw new Error("Expected Worker version must be a UUID.");
   }
@@ -93,7 +110,22 @@ export function resolveActiveDeploymentId(output, expectedVersionId) {
       `Uploaded Worker version must receive exactly 100% of deployment traffic; received ${String(activeVersion.percentage)}.`
     );
   }
-  return status.id;
+  return status;
+}
+
+export function resolveActiveDeploymentId(output, expectedVersionId) {
+  return activeDeploymentStatus(output, expectedVersionId).id;
+}
+
+export function resolveActiveDeploymentEvidence(output, expectedVersionId) {
+  const status = activeDeploymentStatus(output, expectedVersionId);
+  const createdOn = exactCloudflareTimestamp(status.created_on);
+  if (createdOn === null) {
+    throw new Error(
+      "Wrangler deployment status contained an invalid Cloudflare creation time."
+    );
+  }
+  return Object.freeze({ deploymentId: status.id, createdOn });
 }
 
 export function resolveDeployedUrl(output, configuredUrl) {

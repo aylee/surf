@@ -1,8 +1,12 @@
 import { existsSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SCHEDULED_INGEST_CRON } from "./ingest-schedule.mjs";
 
 const OVERRIDE_ADDRESSABLE_WORKER_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
+const TRACKED_CANONICAL_CONFIG_PATH = fileURLToPath(
+  new URL("../../apps/web/wrangler.jsonc", import.meta.url)
+);
 export const SUPPORTED_WORKER_CPU_LIMIT_MS = 2_000;
 
 function exactlyOne(collection, binding, kind, failures) {
@@ -173,7 +177,8 @@ export function wranglerStructureFailures(config, configPath) {
   ) {
     failures.push("SURF_USER_AGENT must identify the instance with an operator contact.");
   }
-  const isTrackedCanonicalConfig = basename(configPath) === "wrangler.jsonc";
+  const isTrackedCanonicalConfig =
+    resolve(configPath) === TRACKED_CANONICAL_CONFIG_PATH;
   const briefEnabled = config?.vars?.FORECAST_BRIEF_ENABLED;
   if (briefEnabled !== "false") {
     failures.push(

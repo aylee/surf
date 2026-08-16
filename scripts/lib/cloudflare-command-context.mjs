@@ -44,6 +44,36 @@ function apiErrorCodes(output) {
   return [...codes];
 }
 
+const ISO_UTC_TIMESTAMP_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/;
+
+function exactIsoTimestampNanoseconds(value, label) {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 64 ||
+    /[\x00-\x1f\x7f]/.test(value)
+  ) {
+    throw new Error(`${label} must be an exact ISO timestamp`);
+  }
+  const match = value.match(ISO_UTC_TIMESTAMP_PATTERN);
+  if (!match) {
+    throw new Error(`${label} must be an exact ISO timestamp`);
+  }
+  const wholeSecond = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}`;
+  const milliseconds = Date.parse(`${wholeSecond}.000Z`);
+  if (
+    !Number.isFinite(milliseconds) ||
+    new Date(milliseconds).toISOString() !== `${wholeSecond}.000Z`
+  ) {
+    throw new Error(`${label} must be an exact ISO timestamp`);
+  }
+  const fractionalNanoseconds = BigInt(
+    (match[7] ?? "").padEnd(9, "0") || "0"
+  );
+  return BigInt(milliseconds) * 1_000_000n + fractionalNanoseconds;
+}
+
 export function configuredReleaseQueueNames(config) {
   const names = new Set();
   for (const producer of config.queues?.producers ?? []) {
@@ -486,7 +516,11 @@ export function createCloudflareCommandContext({
         }
         queues.set(
           queue.queue_name,
-          Object.freeze({ name: queue.queue_name, id: queue.queue_id })
+          Object.freeze({
+            name: queue.queue_name,
+            id: queue.queue_id,
+            createdOn: queue.created_on
+          })
         );
         if (queues.size > QUEUE_INSPECTION_MAX_QUEUES) {
           throw new Error("Cloudflare Queue inventory exceeded its queue bound");
@@ -589,6 +623,43 @@ export function createCloudflareCommandContext({
         )
       )
     });
+  };
+
+  const attestPreexistingQueues = async (createdBefore) => {
+    const cutoffNanoseconds = exactIsoTimestampNanoseconds(
+      createdBefore,
+      "Queue preexistence cutoff"
+    );
+    const config = assertConfig();
+    const expectedNames = configuredReleaseQueueNames(config);
+    if (expectedNames.length === 0) {
+      throw new Error("Pinned Wrangler config does not define any Queues");
+    }
+    const inventory = await inspectQueueInventory(
+      AbortSignal.timeout(QUEUE_TOPOLOGY_OPERATION_TIMEOUT_MS)
+    );
+    const byName = new Map(
+      inventory.queues.map((queue) => [queue.name, queue])
+    );
+    const evidence = expectedNames.map((name) => {
+      const queue = byName.get(name);
+      if (!queue) {
+        throw new Error(
+          "Cloudflare Queue preexistence attestation lacks a configured Queue"
+        );
+      }
+      const createdNanoseconds = exactIsoTimestampNanoseconds(
+        queue.createdOn,
+        `Cloudflare Queue ${name} created_on`
+      );
+      if (createdNanoseconds >= cutoffNanoseconds) {
+        throw new Error(
+          `Cloudflare Queue ${name} was not created before the release cutoff`
+        );
+      }
+      return Object.freeze({ name, createdOn: queue.createdOn });
+    });
+    return Object.freeze({ queues: Object.freeze(evidence) });
   };
 
   const inspectQueueConsumersWithSignal = async (signal) => {
@@ -869,6 +940,7 @@ export function createCloudflareCommandContext({
     probeWrangler,
     inspectQueues,
     inspectQueueIdentities,
+    attestPreexistingQueues,
     inspectQueueConsumers,
     removeStaleQueueConsumers,
     ensureQueues,

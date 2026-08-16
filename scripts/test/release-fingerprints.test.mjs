@@ -21,6 +21,7 @@ import {
   fingerprintReleasePaths,
   logicalWranglerConfig,
   privateFileHmacFingerprint,
+  queueTopologyFingerprint,
   runnerReplacementRequired,
   secretHmacFingerprint,
   sha256File
@@ -34,6 +35,22 @@ test("logical Wrangler fingerprint omits per-release identity only", () => {
   assert.equal("SURF_WORKER_RUNTIME_DIGEST" in config.vars, false);
   assert.equal("SURF_CLIENT_BUILD_DIGEST" in config.vars, false);
   assert.equal(typeof config.name, "string");
+});
+
+test("Queue-topology fingerprints authenticate the exact configured Queue set", () => {
+  const config = logicalWranglerConfig(join(repository, "apps/web/wrangler.jsonc"));
+  const expected = queueTopologyFingerprint(config);
+  assert.match(expected, /^[0-9a-f]{64}$/);
+  assert.notEqual(
+    queueTopologyFingerprint({
+      ...config,
+      queues: {
+        ...config.queues,
+        producers: config.queues.producers.slice(1)
+      }
+    }),
+    expected
+  );
 });
 
 test("file fingerprints are order-independent and reject traversal", () => {

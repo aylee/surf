@@ -33,15 +33,16 @@ import {
   RELEASE_FAILURE_CODES,
   RELEASE_JOURNAL_STATES,
   RELEASE_POINTER_KINDS,
-  assertPreMutationReleaseReplacement,
+  assertBeforeUploadReplacementEvidence,
   assertReleaseJournal,
+  assertReleaseReplacement,
   assertReleaseSupersession,
   atomicWriteReleaseJsonSync,
   createReleaseJournal,
   createReleasePointer,
   createReleaseStateStore,
   fingerprintReleaseJournal,
-  predecessorForPreMutationReplacement,
+  predecessorForReleaseReplacement,
   releasePointerMatchesJournal,
   replacePreMutationReleaseJournal,
   supersedeReleaseJournal
@@ -64,7 +65,10 @@ import {
 } from "./lib/immutable-release.mjs";
 import { readProductionProfile } from "./lib/release-profile.mjs";
 import { stageWranglerConfigSnapshot } from "./lib/wrangler-config-snapshot.mjs";
-import { createCloudflareCommandContext } from "./lib/cloudflare-command-context.mjs";
+import {
+  configuredReleaseQueueNames,
+  createCloudflareCommandContext
+} from "./lib/cloudflare-command-context.mjs";
 import { clientBuildDigest } from "./lib/build-identity.mjs";
 import {
   assertRoutineNarrativeContractTransition,
@@ -72,6 +76,7 @@ import {
   assertRoutineWorkerSecretTransition,
   computeReleaseFingerprints,
   privateFileHmacFingerprint,
+  queueTopologyFingerprint,
   runnerReplacementRequired,
   sha256File
 } from "./lib/release-fingerprints.mjs";
@@ -98,6 +103,11 @@ import {
 } from "./lib/release-runner-compatibility.mjs";
 import { activateTargetRunner } from "./lib/release-runner-activation.mjs";
 import { readVerifiedFileSnapshot } from "./lib/verified-file-snapshot.mjs";
+import {
+  assertBeforeUploadReplacementArtifactsAbsent,
+  commitBeforeUploadReplacement,
+  previewBeforeUploadReplacement
+} from "./lib/release-before-upload-replacement.mjs";
 
 const INTERNAL_ENV = "SURF_RELEASE_EXECUTION_ROOT";
 const TARGET_ENV = "SURF_RELEASE_TARGET_SHA";
@@ -232,6 +242,27 @@ function ensurePrivateSubdirectory(parent, name, label) {
   return path;
 }
 
+function existingPrivateSubdirectory(parent, name, label) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(name)) {
+    throw new Error(`${label} has an unsafe directory name`);
+  }
+  const canonicalParent = realpathSync(parent);
+  if (canonicalParent !== resolve(parent)) {
+    throw new Error(`${label} parent must be canonical`);
+  }
+  const path = resolve(canonicalParent, name);
+  const metadata = lstatSync(path);
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    (metadata.mode & 0o777) !== 0o700 ||
+    realpathSync(path) !== path
+  ) {
+    throw new Error(`${label} must be a canonical non-symlink mode-0700 directory`);
+  }
+  return path;
+}
+
 function fetchTarget(repositoryPath) {
   run("git", ["-C", repositoryPath, "fetch", "--prune", "origin", "main"]);
 }
@@ -280,6 +311,36 @@ function journalTargetForPreMutationReplacementRetry(profile, releaseId) {
   if (failed.state !== RELEASE_JOURNAL_STATES.REPLACED) {
     throw new Error(
       "Pre-mutation replacement requires a receipt-free failure from planned or its linked journal"
+    );
+  }
+  return failed.supersededBy.targetGitSha;
+}
+
+function isBeforeUploadReplacementBoundary(journal) {
+  return (
+    journal.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED &&
+    journal.failureCode === RELEASE_FAILURE_CODES.PREPARE_FAILED &&
+    Object.values(journal.receipts).every((value) => value === null) &&
+    journal.predecessor.workerVersionId !== null &&
+    journal.predecessor.deploymentId !== null &&
+    journal.predecessor.runnerActivationId !== null
+  );
+}
+
+function journalTargetForBeforeUploadReplacementRetry(profile, releaseId) {
+  const failed = recoveryJournal(profile, releaseId);
+  if (
+    failed.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE &&
+    isBeforeUploadReplacementBoundary(failed)
+  ) {
+    return null;
+  }
+  if (
+    failed.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+    !isBeforeUploadReplacementBoundary(failed)
+  ) {
+    throw new Error(
+      "Before-upload replacement requires a receipt-free prepare failure from verified or its linked journal"
     );
   }
   return failed.supersededBy.targetGitSha;
@@ -365,13 +426,21 @@ async function outerMain(options) {
           options.replacePreMutation
         )
       : null;
+    const linkedBeforeUploadReplacementSha = options.replaceBeforeUpload
+      ? journalTargetForBeforeUploadReplacementRetry(
+          profile,
+          options.replaceBeforeUpload
+        )
+      : null;
     fetchTarget(profile.repositoryPath);
     const linkedTargetSha =
-      linkedFixForwardSha ?? linkedPreMutationReplacementSha;
+      linkedFixForwardSha ??
+      linkedPreMutationReplacementSha ??
+      linkedBeforeUploadReplacementSha;
     if (linkedTargetSha !== null) {
       if (options.sha !== null && options.sha !== linkedTargetSha) {
         throw new Error(
-          "--sha must match the exact linked pre-mutation replacement target"
+          "--sha must match the exact linked replacement target"
         );
       }
       targetSha = linkedTargetSha;
@@ -673,7 +742,10 @@ async function internalMain(options) {
     throw new Error("Resume journal does not match the exact target release");
   }
   const explicitlySelectedReleaseId =
-    options.resume ?? options.fixForward ?? options.replacePreMutation;
+    options.resume ??
+    options.fixForward ??
+    options.replacePreMutation ??
+    options.replaceBeforeUpload;
   for (const journalBatch of store.scanJournalBatches()) {
     for (const journal of journalBatch) {
       if (journal.state === RELEASE_JOURNAL_STATES.SUPERSEDED) {
@@ -693,17 +765,25 @@ async function internalMain(options) {
         continue;
       }
       if (journal.state === RELEASE_JOURNAL_STATES.REPLACED) {
+        const beforeUpload =
+          journal.resumeFrom === RELEASE_JOURNAL_STATES.VERIFIED;
+        const selectedReplacementId = beforeUpload
+          ? options.replaceBeforeUpload
+          : options.replacePreMutation;
+        const recoveryOption = beforeUpload
+          ? "--replace-before-upload"
+          : "--replace-pre-mutation";
         const replacement = store.readJournal(journal.supersededBy.releaseId);
         if (replacement) {
-          assertPreMutationReleaseReplacement(journal, replacement);
-          if (options.replacePreMutation === journal.releaseId) {
+          assertReleaseReplacement(journal, replacement);
+          if (selectedReplacementId === journal.releaseId) {
             throw new Error(
-              `Pre-mutation replacement journal ${replacement.releaseId} already exists; use --resume ${replacement.releaseId}`
+              `Replacement journal ${replacement.releaseId} already exists; use --resume ${replacement.releaseId}`
             );
           }
-        } else if (options.replacePreMutation !== journal.releaseId) {
+        } else if (selectedReplacementId !== journal.releaseId) {
           throw new Error(
-            `Replaced release ${journal.releaseId} requires exact --replace-pre-mutation recovery before its linked journal exists`
+            `Replaced release ${journal.releaseId} requires exact ${recoveryOption} recovery before its linked journal exists`
           );
         }
         continue;
@@ -955,12 +1035,132 @@ async function internalMain(options) {
     const { resolveSoleActiveWorkerVersionId } = await import(
       "./lib/worker-runtime.mjs"
     );
-    const { resolveActiveDeploymentId } = await import("./lib/deploy-url.mjs");
+    const {
+      resolveActiveDeploymentEvidence,
+      resolveActiveDeploymentId
+    } = await import("./lib/deploy-url.mjs");
     const livePredecessorVersionId = resolveSoleActiveWorkerVersionId(readOnlyActive);
     const livePredecessorDeploymentId = resolveActiveDeploymentId(
       readOnlyActive,
       livePredecessorVersionId
     );
+    const attestBeforeUploadReplacement = async (failed) => {
+      const failedJournalSha256 = fingerprintReleaseJournal(failed);
+      const attemptsRoot = existingPrivateSubdirectory(
+        profile.stateDirectory,
+        "attempts",
+        "Release attempts directory"
+      );
+      const failedAttemptDirectory = existingPrivateSubdirectory(
+        attemptsRoot,
+        failed.releaseId,
+        "Failed release attempt directory"
+      );
+      const failedConfigPath = resolve(
+        failedAttemptDirectory,
+        "wrangler.jsonc"
+      );
+      const failedConfigSnapshot = readVerifiedFileSnapshot(failedConfigPath, {
+        label: "Failed release Wrangler config",
+        maximumBytes: MAX_RELEASE_PRIVATE_JSON_BYTES,
+        requireMode0600: true,
+        requireCanonical: true
+      });
+      const failedConfigSha256 = createHash("sha256")
+        .update(failedConfigSnapshot.contents)
+        .digest("hex");
+      const failedReleaseRoot = resolve(
+        profile.releasesDirectory,
+        failed.targetGitSha
+      );
+      validateImmutableRelease(failedReleaseRoot, failed.targetGitSha);
+      const guardFailedAttempt = () => {
+        validateImmutableRelease(failedReleaseRoot, failed.targetGitSha);
+        const current = store.readJournal(failed.releaseId);
+        if (
+          !current ||
+          fingerprintReleaseJournal(current) !== failedJournalSha256
+        ) {
+          throw new Error(
+            "Failed release journal changed during before-upload attestation"
+          );
+        }
+        const currentConfigSnapshot = readVerifiedFileSnapshot(failedConfigPath, {
+          label: "Failed release Wrangler config",
+          maximumBytes: MAX_RELEASE_PRIVATE_JSON_BYTES,
+          requireMode0600: true,
+          requireCanonical: true
+        });
+        if (
+          createHash("sha256")
+            .update(currentConfigSnapshot.contents)
+            .digest("hex") !== failedConfigSha256
+        ) {
+          throw new Error(
+            "Failed release Wrangler config changed during before-upload attestation"
+          );
+        }
+        return assertBeforeUploadReplacementArtifactsAbsent({
+          attemptDirectory: failedAttemptDirectory,
+          serviceRoot: profile.serviceRoot,
+          releaseId: failed.releaseId
+        });
+      };
+      guardFailedAttempt();
+      const failedContext = createCloudflareCommandContext({
+        releaseRoot: failedReleaseRoot,
+        configPath: failedConfigSnapshot.path,
+        configSha256: failedConfigSha256,
+        environment,
+        guard: guardFailedAttempt
+      });
+      const failedConfig = failedContext.readConfig();
+      const failedQueueTopologyFingerprint =
+        queueTopologyFingerprint(failedConfig);
+      if (
+        failedQueueTopologyFingerprint !==
+        failed.targetFingerprints.queueTopology
+      ) {
+        throw new Error(
+          "Failed release Wrangler Queue topology differs from its journal"
+        );
+      }
+      const expectedQueueNames = configuredReleaseQueueNames(failedConfig);
+      const liveDeploymentStatus = failedContext.runWrangler(
+        ["deployments", "status", "--json"],
+        { capture: true, echo: false }
+      );
+      const liveWorkerVersionId =
+        resolveSoleActiveWorkerVersionId(liveDeploymentStatus);
+      const liveDeployment = resolveActiveDeploymentEvidence(
+        liveDeploymentStatus,
+        liveWorkerVersionId
+      );
+      const liveDeploymentId = liveDeployment.deploymentId;
+      const liveDeploymentCreatedOn = liveDeployment.createdOn;
+      const queueEvidence = await failedContext.attestPreexistingQueues(
+        liveDeploymentCreatedOn
+      );
+      const installedRunner =
+        await discoverRunnerActivationFromInstalledPlist({
+          serviceRoot: profile.serviceRoot,
+          allowLegacyV3: true
+        });
+      const artifactEvidence = guardFailedAttempt();
+      return assertBeforeUploadReplacementEvidence(failed, {
+        liveWorkerVersionId,
+        liveDeploymentId,
+        liveDeploymentCreatedOn,
+        liveRunnerActivationId: installedRunner.activationId,
+        failedConfigSha256,
+        failedQueueTopologyFingerprint,
+        ...artifactEvidence,
+        queueEvidence: {
+          expectedQueueNames,
+          queues: queueEvidence.queues
+        }
+      });
+    };
     const liveVersionDetail = finalProbeContext.runWrangler(
       ["versions", "view", livePredecessorVersionId, "--json"],
       { capture: true, echo: false }
@@ -1040,9 +1240,13 @@ async function internalMain(options) {
         RELEASE_CLASSIFICATION_REASON_CODES.FIX_FORWARD_REQUIRED
       );
     }
+    if (options.replaceBeforeUpload) {
+      classification = forceConservativeReleaseClassification(classification);
+    }
     let managedJournal = resumeJournal;
     let fixForwardSource = null;
     let preMutationReplacementSource = null;
+    let beforeUploadReplacementSource = null;
     let predecessor;
     if (options.resume) {
       classification = managedJournal.classification;
@@ -1118,7 +1322,51 @@ async function internalMain(options) {
       preMutationReplacementSource = failed;
       predecessor =
         failed.state === RELEASE_JOURNAL_STATES.REPLACED
-          ? predecessorForPreMutationReplacement(failed)
+          ? predecessorForReleaseReplacement(failed)
+          : failed.predecessor;
+    } else if (options.replaceBeforeUpload) {
+      const failed = store.readJournal(options.replaceBeforeUpload);
+      if (
+        !failed ||
+        ![
+          RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE,
+          RELEASE_JOURNAL_STATES.REPLACED
+        ].includes(failed.state) ||
+        !isBeforeUploadReplacementBoundary(failed)
+      ) {
+        throw new Error(
+          "Before-upload replacement must name a receipt-free prepare failure from verified or its linked journal"
+        );
+      }
+      if (
+        activePointer?.releaseId === failed.releaseId ||
+        lastCompletePointer?.releaseId === failed.releaseId
+      ) {
+        throw new Error(
+          "Before-upload replacement cannot target an active or last-complete release"
+        );
+      }
+      if (failed.targetGitSha === targetGitSha) {
+        throw new Error(
+          "Before-upload replacement requires a new target SHA; resume the failed release instead"
+        );
+      }
+      if (
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED &&
+        failed.supersededBy.targetGitSha !== targetGitSha
+      ) {
+        throw new Error(
+          "Linked before-upload replacement target differs from its immutable journal"
+        );
+      }
+      beforeUploadReplacementSource = failed;
+      await previewBeforeUploadReplacement(
+        failed,
+        attestBeforeUploadReplacement
+      );
+      predecessor =
+        failed.state === RELEASE_JOURNAL_STATES.REPLACED
+          ? predecessorForReleaseReplacement(failed)
           : failed.predecessor;
     } else if (activeJournal) {
       predecessor = predecessorFromJournal(activeJournal, activePointer.journalSha256);
@@ -1190,6 +1438,7 @@ async function internalMain(options) {
       managedJournal?.releaseId ??
       fixForwardSource?.supersededBy?.releaseId ??
       preMutationReplacementSource?.supersededBy?.releaseId ??
+      beforeUploadReplacementSource?.supersededBy?.releaseId ??
       releaseIdFor(targetGitSha);
     const analysisEnabled =
       finalProbeContext.readConfig().vars?.NARRATIVE_ENABLED === "true";
@@ -1260,8 +1509,31 @@ async function internalMain(options) {
           "Linked pre-mutation replacement identity changed before journal creation"
         );
       }
-      predecessor = predecessorForPreMutationReplacement(
+      predecessor = predecessorForReleaseReplacement(
         preMutationReplacementSource
+      );
+    }
+
+    if (beforeUploadReplacementSource) {
+      const committed = await commitBeforeUploadReplacement(
+        beforeUploadReplacementSource,
+        {
+          releaseId,
+          targetGitSha,
+          at: new Date().toISOString(),
+          attest: attestBeforeUploadReplacement
+        }
+      );
+      if (
+        beforeUploadReplacementSource.state ===
+        RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE
+      ) {
+        beforeUploadReplacementSource = store.writeJournal(committed.journal);
+      } else {
+        beforeUploadReplacementSource = committed.journal;
+      }
+      predecessor = predecessorForReleaseReplacement(
+        beforeUploadReplacementSource
       );
     }
 
@@ -1288,8 +1560,14 @@ async function internalMain(options) {
         assertReleaseSupersession(fixForwardSource, managedJournal);
       }
       if (preMutationReplacementSource) {
-        assertPreMutationReleaseReplacement(
+        assertReleaseReplacement(
           preMutationReplacementSource,
+          managedJournal
+        );
+      }
+      if (beforeUploadReplacementSource) {
+        assertReleaseReplacement(
+          beforeUploadReplacementSource,
           managedJournal
         );
       }
