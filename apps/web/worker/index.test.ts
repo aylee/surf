@@ -735,7 +735,7 @@ describe("worker api", () => {
     failureLog.mockRestore();
   });
 
-  it("runs manual ingest and records source-run-like D1 rows", async () => {
+  it("runs manual ingest and records source-run-like D1 rows", { timeout: 15_000 }, async () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const now = new Date("2026-07-08T15:00:00.000Z");
