@@ -42,6 +42,13 @@ const LAZY_JAVASCRIPT = [
   ""
 ].join("\n");
 const SHARED_JAVASCRIPT = "export const chartScale = 1;\n";
+const WEB_ANALYTICS_SCRIPT_VERSION = "1".repeat(45);
+const WEB_ANALYTICS_INTEGRITY = Buffer.alloc(64, 1).toString("base64");
+const WEB_ANALYTICS_CONFIGURATION = Object.freeze({
+  version: "2024.11.0",
+  token: "2".repeat(32),
+  r: 1
+});
 
 function indexHtml({ javascript = JAVASCRIPT_PATH, css = CSS_PATH, extra = "" } = {}) {
   return [
@@ -62,6 +69,20 @@ function buildManifest(overrides = {}) {
     clientBuildDigest: CLIENT_BUILD_DIGEST,
     ...overrides
   });
+}
+
+function webAnalyticsScript({
+  scheme = "https",
+  host = "static.cloudflareinsights.com",
+  path = `beacon.min.js/v${WEB_ANALYTICS_SCRIPT_VERSION}`,
+  integrity = `sha512-${WEB_ANALYTICS_INTEGRITY}`,
+  configuration = JSON.stringify(WEB_ANALYTICS_CONFIGURATION)
+} = {}) {
+  return `<script type="module" src="${scheme}://${host}/${path}" integrity="${integrity}" data-cf-beacon='${configuration}' crossorigin="anonymous"></script>`;
+}
+
+function injectWebAnalytics(index, script = webAnalyticsScript()) {
+  return index.replace("</body>", `${script}\n</body>`);
 }
 
 function sha256(value) {
@@ -195,6 +216,147 @@ test("static asset smoke proves the exact local index, manifest, JavaScript, and
     assert.equal(init.redirect, "error");
     assert.equal(init.headers["Cache-Control"], "no-cache, no-store, max-age=0");
     assert.ok(init.signal instanceof AbortSignal);
+  }
+});
+
+test("the exact canonical Cloudflare Web Analytics insertion preserves index and asset proof", async (t) => {
+  const { clientDirectory, index } = await fixture(t);
+  const requests = [];
+  const result = await smokeStaticAssets(
+    ORIGIN,
+    smokeOptions(
+      clientDirectory,
+      fakeFetcher(index, {
+        requests,
+        overrides: {
+          "/": {
+            body: injectWebAnalytics(index),
+            contentType: "text/html; charset=utf-8"
+          }
+        }
+      })
+    )
+  );
+
+  assert.equal(result.indexSha256, sha256(index));
+  assert.deepEqual(
+    result.assets.map(({ path, sha256: digest }) => ({ path, digest })),
+    [
+      { path: JAVASCRIPT_PATH, digest: sha256(JAVASCRIPT) },
+      { path: CSS_PATH, digest: sha256(CSS) },
+      { path: FAVICON_PATH, digest: sha256(FAVICON) },
+      { path: FONT_PATH, digest: sha256(FONT) }
+    ]
+  );
+  assert.deepEqual(
+    requests.map(({ url }) => url.pathname),
+    ["/", "/build.json", JAVASCRIPT_PATH, CSS_PATH, FAVICON_PATH, FONT_PATH]
+  );
+});
+
+test("noncanonical or nonexclusive Web Analytics transformations fail closed", async (t) => {
+  const { clientDirectory, index } = await fixture(t);
+  const canonical = webAnalyticsScript();
+  const cases = [
+    {
+      name: "wrong insertion location",
+      remoteIndex: index.replace("</head>", `${canonical}\n</head>`)
+    },
+    {
+      name: "duplicate marker",
+      remoteIndex: injectWebAnalytics(index, `${canonical}\n${canonical}`)
+    },
+    {
+      name: "reordered attributes",
+      remoteIndex: injectWebAnalytics(
+        index,
+        canonical.replace(
+          '<script type="module" src=',
+          '<script src='
+        ).replace(
+          `/${WEB_ANALYTICS_SCRIPT_VERSION}" integrity=`,
+          `/${WEB_ANALYTICS_SCRIPT_VERSION}" type="module" integrity=`
+        )
+      )
+    },
+    {
+      name: "extra attribute",
+      remoteIndex: injectWebAnalytics(index, canonical.replace("<script ", "<script defer "))
+    },
+    {
+      name: "non-HTTPS URL",
+      remoteIndex: injectWebAnalytics(index, webAnalyticsScript({ scheme: "http" }))
+    },
+    {
+      name: "wrong host",
+      remoteIndex: injectWebAnalytics(index, webAnalyticsScript({ host: "analytics.example" }))
+    },
+    {
+      name: "wrong path",
+      remoteIndex: injectWebAnalytics(
+        index,
+        webAnalyticsScript({ path: `other.min.js/v${WEB_ANALYTICS_SCRIPT_VERSION}` })
+      )
+    },
+    {
+      name: "bad SRI",
+      remoteIndex: injectWebAnalytics(index, webAnalyticsScript({ integrity: "sha256-invalid" }))
+    },
+    {
+      name: "absent SRI",
+      remoteIndex: injectWebAnalytics(
+        index,
+        canonical.replace(` integrity="sha512-${WEB_ANALYTICS_INTEGRITY}"`, "")
+      )
+    },
+    {
+      name: "noncanonical configuration JSON",
+      remoteIndex: injectWebAnalytics(
+        index,
+        webAnalyticsScript({
+          configuration: JSON.stringify(WEB_ANALYTICS_CONFIGURATION, null, 0).replace(
+            '"version":',
+            '"version": '
+          )
+        })
+      )
+    },
+    {
+      name: "extra configuration field",
+      remoteIndex: injectWebAnalytics(
+        index,
+        webAnalyticsScript({
+          configuration: JSON.stringify({ ...WEB_ANALYTICS_CONFIGURATION, extra: true })
+        })
+      )
+    },
+    {
+      name: "arbitrary surrounding byte drift",
+      remoteIndex: injectWebAnalytics(index, canonical).replace(
+        "</html>",
+        "<!-- unexpected -->\n</html>"
+      )
+    }
+  ];
+
+  for (const candidate of cases) {
+    await t.test(candidate.name, async () => {
+      await assert.rejects(
+        () =>
+          smokeStaticAssets(
+            ORIGIN,
+            smokeOptions(
+              clientDirectory,
+              fakeFetcher(index, {
+                overrides: {
+                  "/": { body: candidate.remoteIndex, contentType: "text/html" }
+                }
+              })
+            )
+          ),
+        (error) => error.message === "remote client index does not match the expected build"
+      );
+    });
   }
 });
 
