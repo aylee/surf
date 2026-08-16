@@ -22,7 +22,7 @@
     "smoke:cloudflare": "node scripts/smoke-cloudflare.mjs"
   },
   "dependencies": {
-    "@ai-sdk/google": "4.0.33",
+    "@ai-sdk/google": "4.0.44",
     "@hono/zod-validator": "0.9.0",
     "@radix-ui/react-accordion": "1.2.20",
     "@radix-ui/react-dialog": "1.1.23",
@@ -34,11 +34,11 @@
     "@surf/forecast-core": "workspace:*",
     "@surf/narrative-contracts": "workspace:*",
     "agents": "0.20.1",
-    "ai": "7.0.51",
+    "ai": "7.0.65",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
-    "hono": "4.13.0",
-    "lucide-react": "1.28.0",
+    "hono": "4.13.2",
+    "lucide-react": "1.31.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "recharts": "3.10.1",
@@ -46,8 +46,8 @@
     "zod": "4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "0.20.1",
-    "@cloudflare/workers-types": "5.20260810.1",
+    "@cloudflare/vitest-pool-workers": "0.21.3",
+    "@cloudflare/workers-types": "5.20260813.1",
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/dom": "10.4.1",
     "@testing-library/react": "16.3.2",
@@ -57,8 +57,8 @@
     "jsdom": "30.0.1",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
-    "vite": "8.2.0",
+    "vite": "8.2.1",
     "vitest": "4.1.10",
-    "wrangler": "4.118.0"
+    "wrangler": "4.123.0"
   }
 }
