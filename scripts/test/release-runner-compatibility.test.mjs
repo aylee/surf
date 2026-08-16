@@ -79,6 +79,27 @@ function environmentFingerprint(values = runnerEnvironmentValues()) {
     .digest("hex");
 }
 
+function realisticLaunchctlOutput(path, pid, rootFields = "") {
+  return `gui/501/ai.alex.test = {
+\tactive count = 1
+\tpath = ${path}
+\ttype = LaunchAgent
+\tstate = running
+${rootFields}\tresource coalition = {
+\t\tID = 1201
+\t\ttype = resource
+\t\tstate = active
+\t}
+\tjetsam coalition = {
+\t\tID = 1202
+\t\ttype = jetsam
+\t\tstate = active
+\t}
+\tpid = ${pid}
+}
+`;
+}
+
 function status(overrides = {}) {
   return {
     schemaVersion: 3,
@@ -396,6 +417,83 @@ test("installed and loaded plist identity is exact and process-bound", async (t)
     });
     await assert.rejects(
       verifyActiveRunnerCompatibility(verificationOptions(value), dependencies),
+      /not loaded from the exact recorded persistent plist/
+    );
+  });
+
+  await t.test("nested launchd coalition state does not obscure root job state", async () => {
+    const value = await fixture();
+    const base = verificationDependencies(value);
+    const command = base.dependencies.command;
+    await verifyActiveRunnerCompatibility(verificationOptions(value), {
+      ...base.dependencies,
+      command: async (file, args, options) => {
+        if (file !== "/bin/launchctl") return command(file, args, options);
+        const runner = args[1].endsWith("/ai.alex.narrative-runner");
+        const path = runner ? value.runnerPlistPath : value.omlxPlistPath;
+        const pid = runner ? RUNNER_WRAPPER_PID : OMLX_PID;
+        return { status: 0, stdout: realisticLaunchctlOutput(path, pid) };
+      }
+    });
+  });
+
+  for (const [name, rootFields] of [
+    ["duplicate root state", "\tstate = running\n"],
+    ["duplicate root pid", `\tpid = ${RUNNER_WRAPPER_PID}\n`],
+    ["duplicate root path", `\tpath = duplicate.plist\n`]
+  ]) {
+    await t.test(name, async () => {
+      const value = await fixture();
+      const base = verificationDependencies(value);
+      const command = base.dependencies.command;
+      await assert.rejects(
+        verifyActiveRunnerCompatibility(verificationOptions(value), {
+          ...base.dependencies,
+          command: async (file, args, options) => {
+            if (
+              file !== "/bin/launchctl" ||
+              !args[1].endsWith("/ai.alex.narrative-runner")
+            ) {
+              return command(file, args, options);
+            }
+            return {
+              status: 0,
+              stdout: realisticLaunchctlOutput(
+                value.runnerPlistPath,
+                RUNNER_WRAPPER_PID,
+                rootFields
+              )
+            };
+          }
+        }),
+        /not loaded from the exact recorded persistent plist/
+      );
+    });
+  }
+
+  await t.test("wrong root state remains rejected", async () => {
+    const value = await fixture();
+    const base = verificationDependencies(value);
+    const command = base.dependencies.command;
+    await assert.rejects(
+      verifyActiveRunnerCompatibility(verificationOptions(value), {
+        ...base.dependencies,
+        command: async (file, args, options) => {
+          if (
+            file !== "/bin/launchctl" ||
+            !args[1].endsWith("/ai.alex.narrative-runner")
+          ) {
+            return command(file, args, options);
+          }
+          return {
+            status: 0,
+            stdout: realisticLaunchctlOutput(
+              value.runnerPlistPath,
+              RUNNER_WRAPPER_PID
+            ).replace("\tstate = running\n", "\tstate = waiting\n")
+          };
+        }
+      }),
       /not loaded from the exact recorded persistent plist/
     );
   });
