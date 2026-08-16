@@ -114,7 +114,7 @@ function configuredQueueConsumerDescriptors(config) {
     .sort((left, right) => left.queue.localeCompare(right.queue));
 }
 
-function normalizedRemoteWorkerConsumer(consumer) {
+function normalizedRemoteWorkerConsumer(consumer, queue) {
   if (!consumer || typeof consumer !== "object" || Array.isArray(consumer)) {
     return null;
   }
@@ -132,6 +132,7 @@ function normalizedRemoteWorkerConsumer(consumer) {
     "dead_letter_queue",
     "environment",
     "environment_name",
+    "queue_id",
     "queue_name",
     "script",
     "script_name",
@@ -149,6 +150,12 @@ function normalizedRemoteWorkerConsumer(consumer) {
   if (
     Object.keys(consumer).some((key) => !allowedConsumerKeys.has(key)) ||
     Object.keys(consumer.settings).some((key) => !allowedSettingKeys.has(key))
+  ) {
+    return null;
+  }
+  if (
+    (consumer.queue_id !== undefined && consumer.queue_id !== queue.id) ||
+    (consumer.queue_name !== undefined && consumer.queue_name !== queue.name)
   ) {
     return null;
   }
@@ -588,7 +595,7 @@ export function createCloudflareCommandContext({
       if (consumer.type !== "worker") {
         throw new Error("Cloudflare Queue consumer inspection returned an unknown type");
       }
-      const normalized = normalizedRemoteWorkerConsumer(consumer);
+      const normalized = normalizedRemoteWorkerConsumer(consumer, queue);
       if (normalized === null || normalized.consumerId === null) {
         throw new Error(
           "Cloudflare Queue consumer inspection returned an invalid Worker consumer"
