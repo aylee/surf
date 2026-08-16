@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -6,10 +7,16 @@ import { NARRATIVE_PROTOCOL_FINGERPRINT } from "@surf/narrative-contracts";
 import {
   activateLaunchAgents,
   canRecoverHaltedRunner,
-  canRecoverStoppedChildRunner
+  canRecoverStoppedChildRunner,
+  inspectRunnerTransitionInstallState,
+  verifyCommittedRunnerDrainEvidence
 } from "../scripts/manage-launch-agents.mjs";
 
 const NOW = Date.parse("2026-08-15T12:00:00.000Z");
+
+function sha256(contents: Uint8Array | string) {
+  return createHash("sha256").update(contents).digest("hex");
+}
 
 function recordValue(
   root: string,
@@ -21,7 +28,7 @@ function recordValue(
     ? dirname(root)
     : root;
   return {
-    schemaVersion: 4,
+    schemaVersion: 4 as const,
     activationId: `${revision}-${root.endsWith("prior") ? "r0" : "r1"}`,
     source: { revision, repositoryPath: join(root, "release") },
     runnerArtifact: { path: join(root, "runner.mjs"), sha256: "b".repeat(64) },
@@ -71,7 +78,7 @@ function heartbeat(
   options: { pid?: number; updatedAt?: string } = {}
 ) {
   return {
-    schemaVersion: 3,
+    schemaVersion: 3 as const,
     pid: options.pid ?? 1234,
     activationId: record.activationId,
     runnerArtifactSha256: record.runnerArtifact.sha256,
@@ -90,7 +97,7 @@ function legacyRecordValue(
   target: ReturnType<typeof recordValue>
 ) {
   return {
-    schemaVersion: 3,
+    schemaVersion: 3 as const,
     releaseSha: "c".repeat(40),
     modelId: "legacy-model",
     statusFile: join(root, "status.json"),
@@ -209,7 +216,358 @@ function launchdHarness(
   };
 }
 
+async function committedDrainFixture(priorSchemaVersion: 3 | 4 = 3) {
+  const createdRoot = await mkdtemp(join(tmpdir(), "surf-committed-drain-"));
+  const root = await realpath(createdRoot);
+  const targetRoot = join(root, "target");
+  const priorRoot = join(root, "prior");
+  const targetRevision = "a".repeat(40);
+  const priorRevision = "c".repeat(40);
+  const targetRecordPath = await activationRecord(
+    targetRoot,
+    NARRATIVE_PROTOCOL_FINGERPRINT,
+    targetRevision
+  );
+  const target = recordValue(
+    targetRoot,
+    NARRATIVE_PROTOCOL_FINGERPRINT,
+    targetRevision
+  );
+  let prior: ReturnType<typeof recordValue> | ReturnType<typeof legacyRecordValue>;
+  let priorRecordPath: string;
+  if (priorSchemaVersion === 4) {
+    priorRecordPath = await activationRecord(
+      priorRoot,
+      NARRATIVE_PROTOCOL_FINGERPRINT,
+      priorRevision
+    );
+    prior = recordValue(priorRoot, NARRATIVE_PROTOCOL_FINGERPRINT, priorRevision);
+  } else {
+    await mkdir(priorRoot, { recursive: true });
+    priorRecordPath = join(priorRoot, "activation-record.json");
+    prior = legacyRecordValue(priorRoot, target);
+    await writeFile(priorRecordPath, `${JSON.stringify(prior, null, 2)}\n`, {
+      mode: 0o600
+    });
+  }
+  const observedAt = new Date(NOW - 2_000).toISOString();
+  const heartbeatUpdatedAt = new Date(NOW - 1_000).toISOString();
+  const intent = {
+    schemaVersion: 2,
+    targetActivationId: target.activationId,
+    targetReleaseSha: target.source.revision,
+    priorActivationId: prior.schemaVersion === 4 ? prior.activationId : null,
+    priorReleaseSha:
+      prior.schemaVersion === 4 ? prior.source.revision : prior.releaseSha,
+    priorPid: 4101,
+    heartbeatPid: 4103,
+    runnerLabelInitiallyLoaded: true,
+    observedAt
+  };
+  const receipt = {
+    schemaVersion: 2,
+    priorActivationId: intent.priorActivationId,
+    priorReleaseSha: intent.priorReleaseSha,
+    priorPid: intent.priorPid,
+    heartbeatPid: intent.heartbeatPid,
+    outcome: "stopped",
+    heartbeatUpdatedAt,
+    observedAt: new Date(NOW).toISOString(),
+    acceptedProtocolFingerprints:
+      prior.schemaVersion === 4
+        ? prior.acceptedProtocols.map(({ fingerprint }) => fingerprint).sort()
+        : [],
+    runnerLabelInitiallyLoaded: true,
+    runnerLabelUnloaded: true,
+    maxWaitMs: 960_000
+  };
+  const intentPath = join(targetRoot, "runner-drain-intent.json");
+  const receiptPath = join(targetRoot, "runner-drain-receipt.json");
+  const attemptDrainReceiptPath = join(root, "attempt-runner-drain.json");
+  await Promise.all([
+    writeFile(intentPath, `${JSON.stringify(intent, null, 2)}\n`, { mode: 0o600 }),
+    writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 }),
+    writeFile(
+      attemptDrainReceiptPath,
+      `${JSON.stringify(Object.fromEntries(Object.entries(receipt).reverse()))}\n`,
+      { mode: 0o600 }
+    )
+  ]);
+  return {
+    root,
+    target,
+    prior,
+    targetRecordPath,
+    priorRecordPath,
+    intentPath,
+    receiptPath,
+    attemptDrainReceiptPath,
+    intent,
+    receipt
+  };
+}
+
 describe("bounded LaunchAgent activation", () => {
+  it("attests an exact committed v4 drain against its installed target and prior record", async () => {
+    const fixture = await committedDrainFixture(3);
+    if (fixture.prior.schemaVersion !== 3) throw new Error("expected legacy prior");
+    const verify = vi.fn(async () => ({ status: "ok" }));
+    const evidence = await verifyCommittedRunnerDrainEvidence(
+      {
+        targetRecordPath: fixture.targetRecordPath,
+        priorRecordPath: fixture.priorRecordPath,
+        attemptDrainReceiptPath: fixture.attemptDrainReceiptPath
+      },
+      { verify, now: () => NOW }
+    );
+
+    expect(evidence).toMatchObject({
+      schemaVersion: 1,
+      targetActivationId: fixture.target.activationId,
+      targetReleaseSha: fixture.target.source.revision,
+      priorActivationId: null,
+      priorReleaseSha: fixture.prior.releaseSha,
+      drainIntent: fixture.intent,
+      drainReceipt: fixture.receipt
+    });
+    expect(evidence.targetRecordSha256).toBe(
+      sha256(await readFile(fixture.targetRecordPath))
+    );
+    expect(evidence.priorRecordSha256).toBe(
+      sha256(await readFile(fixture.priorRecordPath))
+    );
+    expect(evidence.drainIntentSha256).toBe(sha256(await readFile(fixture.intentPath)));
+    expect(evidence.drainReceiptSha256).toBe(
+      sha256(await readFile(fixture.receiptPath))
+    );
+    expect(evidence.attemptDrainReceiptSha256).toBe(
+      sha256(await readFile(fixture.attemptDrainReceiptPath))
+    );
+    expect(evidence.semanticReceiptSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(evidence.attemptDrainReceiptSha256).not.toBe(
+      evidence.drainReceiptSha256
+    );
+    expect(verify.mock.calls).toEqual([
+      [fixture.targetRecordPath, { requireInstalled: true, allowLegacyV3: false }],
+      [fixture.targetRecordPath, { requireInstalled: true, allowLegacyV3: false }],
+      [fixture.priorRecordPath, { requireInstalled: false, allowLegacyV3: true }],
+      [fixture.priorRecordPath, { requireInstalled: false, allowLegacyV3: true }]
+    ]);
+  });
+
+  it("accepts a committed v4 prior and an absent attempt receipt without weakening identity", async () => {
+    const fixture = await committedDrainFixture(4);
+    if (fixture.prior.schemaVersion !== 4) throw new Error("expected v4 prior");
+    const evidence = await verifyCommittedRunnerDrainEvidence(
+      {
+        targetRecordPath: fixture.targetRecordPath,
+        priorRecordPath: fixture.priorRecordPath
+      },
+      { verify: async () => ({ status: "ok" }), now: () => NOW }
+    );
+
+    expect(evidence.priorActivationId).toBe(fixture.prior.activationId);
+    expect(evidence.priorReleaseSha).toBe(fixture.prior.source.revision);
+    expect(evidence.priorRecordSha256).toBe(
+      sha256(await readFile(fixture.priorRecordPath))
+    );
+    expect(evidence.attemptDrainReceiptSha256).toBeNull();
+  });
+
+  it("rejects an attempt receipt that is valid for the transition but differs semantically", async () => {
+    const fixture = await committedDrainFixture(3);
+    await writeFile(
+      fixture.attemptDrainReceiptPath,
+      `${JSON.stringify({
+        ...fixture.receipt,
+        heartbeatUpdatedAt: new Date(NOW - 500).toISOString()
+      })}\n`,
+      { mode: 0o600 }
+    );
+
+    await expect(
+      verifyCommittedRunnerDrainEvidence(
+        {
+          targetRecordPath: fixture.targetRecordPath,
+          priorRecordPath: fixture.priorRecordPath,
+          attemptDrainReceiptPath: fixture.attemptDrainReceiptPath
+        },
+        { verify: async () => ({ status: "ok" }), now: () => NOW }
+      )
+    ).rejects.toThrow(/differs from the committed manager receipt/);
+  });
+
+  it("attests fully prior, oMLX-first mixed, and fully target transition installs", async () => {
+    const cases = [
+      {
+        name: "prior",
+        installed: "prior" as const,
+        inspected: null,
+        expected: {
+          narrativeRunner: "prior",
+          omlxServer: "prior",
+          targetCommitted: false,
+          validPrecommit: true
+        }
+      },
+      {
+        name: "oMLX-first mixed",
+        installed: "mixed" as const,
+        inspected: { narrativeRunner: "prior", omlxServer: "target" },
+        expected: {
+          narrativeRunner: "prior",
+          omlxServer: "target",
+          targetCommitted: false,
+          validPrecommit: true
+        }
+      },
+      {
+        name: "target",
+        installed: "target" as const,
+        inspected: null,
+        expected: {
+          narrativeRunner: "target",
+          omlxServer: "target",
+          targetCommitted: true,
+          validPrecommit: false
+        }
+      }
+    ];
+    for (const testCase of cases) {
+      const fixture = await committedDrainFixture(4);
+      if (fixture.prior.schemaVersion !== 4) throw new Error("expected v4 prior");
+      const inspectInstalled = vi.fn(async () => ({
+        status: "ok",
+        launchAgents: testCase.inspected
+      }));
+      const state = await inspectRunnerTransitionInstallState(
+        {
+          targetRecordPath: fixture.targetRecordPath,
+          priorRecordPath: fixture.priorRecordPath
+        },
+        {
+          verify: installationVerifier(
+            fixture.targetRecordPath,
+            fixture.priorRecordPath,
+            testCase.installed
+          ),
+          inspectInstalled
+        }
+      );
+
+      expect(state).toMatchObject({
+        schemaVersion: 1,
+        targetActivationId: fixture.target.activationId,
+        targetReleaseSha: fixture.target.source.revision,
+        priorActivationId: fixture.prior.activationId,
+        priorReleaseSha: fixture.prior.source.revision,
+        ...testCase.expected
+      });
+      expect(state.targetRecordSha256).toBe(
+        sha256(await readFile(fixture.targetRecordPath))
+      );
+      expect(state.priorRecordSha256).toBe(
+        sha256(await readFile(fixture.priorRecordPath))
+      );
+      expect(inspectInstalled).toHaveBeenCalledTimes(
+        testCase.installed === "mixed" ? 2 : 0
+      );
+    }
+  });
+
+  it("rejects runner-first mixed transition installation state", async () => {
+    const fixture = await committedDrainFixture(4);
+    await expect(
+      inspectRunnerTransitionInstallState(
+        {
+          targetRecordPath: fixture.targetRecordPath,
+          priorRecordPath: fixture.priorRecordPath
+        },
+        {
+          verify: installationVerifier(
+            fixture.targetRecordPath,
+            fixture.priorRecordPath,
+            "mixed"
+          ),
+          inspectInstalled: async () => ({
+            status: "ok",
+            launchAgents: { narrativeRunner: "target", omlxServer: "prior" }
+          })
+        }
+      )
+    ).rejects.toThrow(/oMLX-first, runner-last commit order/);
+  });
+
+  it("rejects activation-record drift during transition installation inspection", async () => {
+    const fixture = await committedDrainFixture(4);
+    let inspections = 0;
+    await expect(
+      inspectRunnerTransitionInstallState(
+        {
+          targetRecordPath: fixture.targetRecordPath,
+          priorRecordPath: fixture.priorRecordPath
+        },
+        {
+          verify: installationVerifier(
+            fixture.targetRecordPath,
+            fixture.priorRecordPath,
+            "mixed"
+          ),
+          inspectInstalled: async () => {
+            inspections += 1;
+            if (inspections === 1) {
+              await writeFile(
+                fixture.targetRecordPath,
+                `${JSON.stringify({
+                  ...fixture.target,
+                  source: {
+                    ...fixture.target.source,
+                    revision: "d".repeat(40)
+                  }
+                })}\n`,
+                { mode: 0o600 }
+              );
+            }
+            return {
+              status: "ok",
+              launchAgents: { narrativeRunner: "prior", omlxServer: "target" }
+            };
+          }
+        }
+      )
+    ).rejects.toThrow(/activation records changed during installation inspection/);
+  });
+
+  it("rejects plist-state drift during transition installation inspection", async () => {
+    const fixture = await committedDrainFixture(4);
+    let inspections = 0;
+    await expect(
+      inspectRunnerTransitionInstallState(
+        {
+          targetRecordPath: fixture.targetRecordPath,
+          priorRecordPath: fixture.priorRecordPath
+        },
+        {
+          verify: installationVerifier(
+            fixture.targetRecordPath,
+            fixture.priorRecordPath,
+            "mixed"
+          ),
+          inspectInstalled: async () => {
+            inspections += 1;
+            return {
+              status: "ok",
+              launchAgents:
+                inspections === 1
+                  ? { narrativeRunner: "prior", omlxServer: "target" }
+                  : { narrativeRunner: "prior", omlxServer: "prior" }
+            };
+          }
+        }
+      )
+    ).rejects.toThrow(/installation changed during inspection/);
+  });
+
   it("is idempotent when the exact installed v4 activation is healthy", async () => {
     const root = await mkdtemp(join(tmpdir(), "surf-launch-manage-idempotent-"));
     const recordPath = await activationRecord(root);

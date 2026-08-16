@@ -738,6 +738,62 @@ test("resume continues after the exact persisted boundary without reupload", asy
   }
 });
 
+test("a committed successor runner crash resumes through ensureRunner reconciliation", async () => {
+  const candidate = fixture(RELEASE_LANES.CONSERVATIVE_FULL);
+  const now = clock();
+  let journal = candidate.journal;
+  const advance = (state, receipts = {}) => {
+    journal = transitionReleaseJournal(journal, state, {
+      at: now().toISOString(),
+      receipts
+    });
+    candidate.store.writeJournal(journal);
+  };
+  try {
+    advance(RELEASE_JOURNAL_STATES.VERIFIED);
+    advance(RELEASE_JOURNAL_STATES.PREPARED, {
+      profileSha256: "1".repeat(64),
+      operatorEnvironmentFingerprint: "4".repeat(64),
+      wranglerConfigSha256: "2".repeat(64),
+      workerSecretsFingerprint: "3".repeat(64)
+    });
+    advance(RELEASE_JOURNAL_STATES.WORKER_UPLOADED, {
+      workerVersionId: worker
+    });
+    advance(RELEASE_JOURNAL_STATES.DATA_PREPARED, {
+      d1Bookmark: "bookmark-committed-successor",
+      d1ExportSha256: "e".repeat(64)
+    });
+    journal = recordReleaseJournalFailure(journal, {
+      code: RELEASE_FAILURE_CODES.RUNNER_FAILED,
+      at: now().toISOString()
+    });
+    candidate.store.writeJournal(journal);
+
+    const trace = [];
+    const complete = await executeRelease({
+      journal,
+      store: candidate.store,
+      operations: operations(trace, {
+        ensureRunner: async () => {
+          trace.push("ensureRunner:reconcile-committed-target");
+          return {
+            runnerActivationId: "release-conservative-full",
+            runnerDrainSha256: "f".repeat(64)
+          };
+        }
+      }),
+      now
+    });
+    assert.equal(complete.state, RELEASE_JOURNAL_STATES.COMPLETE);
+    assert.equal(trace[0], "ensureRunner:reconcile-committed-target");
+    assert.equal(trace.includes("prepareData"), false);
+    assert.equal(trace.includes("uploadWorker"), false);
+  } finally {
+    rmSync(candidate.root, { recursive: true, force: true });
+  }
+});
+
 test("exact resume reconciles a complete journal and repairs both pointers", async () => {
   const candidate = fixture(RELEASE_LANES.ASSETS_ONLY);
   const trace = [];

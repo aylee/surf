@@ -138,7 +138,7 @@ const INACTIVE_REMOTE_UPLOAD_ATTESTATION_KEYS = Object.freeze([
   "workerName",
   "workerRuntimeDigest"
 ]);
-const RUNNER_FAILURE_ATTESTATION_KEYS = Object.freeze([
+const RUNNER_FAILURE_ATTESTATION_V1_KEYS = Object.freeze([
   "d1BackupReceiptSha256",
   "d1ExportBytes",
   "d1ExportSha256",
@@ -153,6 +153,15 @@ const RUNNER_FAILURE_ATTESTATION_KEYS = Object.freeze([
   "remoteUploadEvidence",
   "schemaVersion",
   "workerUploadReceiptSha256"
+]);
+const RUNNER_FAILURE_ATTESTATION_V2_KEYS = Object.freeze([
+  ...RUNNER_FAILURE_ATTESTATION_V1_KEYS,
+  "committedRunnerActivationId",
+  "committedRunnerArtifactSha256",
+  "committedRunnerProtocolFingerprint",
+  "committedRunnerRecordSha256",
+  "liveWorkerSourceRevision",
+  "runnerTransitionSha256"
 ]);
 
 const PREDECESSOR_KEYS = Object.freeze([
@@ -458,12 +467,16 @@ function validateInactiveUploadAttestation(value) {
 }
 
 function validateRunnerFailureAttestation(value) {
+  const keys =
+    value?.schemaVersion === 2
+      ? RUNNER_FAILURE_ATTESTATION_V2_KEYS
+      : RUNNER_FAILURE_ATTESTATION_V1_KEYS;
   exactKeys(
     value,
-    RUNNER_FAILURE_ATTESTATION_KEYS,
+    keys,
     "Runner-failure replacement attestation"
   );
-  if (value.schemaVersion !== 1) {
+  if (![1, 2].includes(value.schemaVersion)) {
     throw new Error(
       "Runner-failure replacement attestation schema is unsupported"
     );
@@ -475,7 +488,18 @@ function validateRunnerFailureAttestation(value) {
     [value.d1BackupReceiptSha256, "D1 backup receipt"],
     [value.d1ExportSha256, "D1 export"],
     [value.priorRunnerRecordSha256, "prior runner record"],
-    [value.queueTopologyFingerprint, "Queue topology"]
+    [value.queueTopologyFingerprint, "Queue topology"],
+    ...(value.schemaVersion === 2
+      ? [
+          [value.committedRunnerArtifactSha256, "committed runner artifact"],
+          [
+            value.committedRunnerProtocolFingerprint,
+            "committed runner protocol"
+          ],
+          [value.committedRunnerRecordSha256, "committed runner record"],
+          [value.runnerTransitionSha256, "runner transition"]
+        ]
+      : [])
   ]) {
     if (!SHA256_PATTERN.test(field ?? "")) {
       throw new Error(
@@ -490,6 +514,15 @@ function validateRunnerFailureAttestation(value) {
     value.d1ExportBytes < 1
   ) {
     throw new Error("Runner-failure replacement attestation is invalid");
+  }
+  if (
+    value.schemaVersion === 2 &&
+    (!SAFE_ID_PATTERN.test(value.committedRunnerActivationId ?? "") ||
+      !SHA_PATTERN.test(value.liveWorkerSourceRevision ?? ""))
+  ) {
+    throw new Error(
+      "Runner-failure replacement committed runner identity is invalid"
+    );
   }
   exactIsoTimestampNanoseconds(
     value.predecessorDeploymentCreatedOn,
@@ -964,7 +997,7 @@ export function assertReleaseJournal(value) {
     hasExactRunnerFailureReceipts(receipts) &&
     exactLivePredecessor &&
     predecessor.runnerActivationId !== null &&
-    runnerFailureAttestation?.schemaVersion === 1 &&
+    [1, 2].includes(runnerFailureAttestation?.schemaVersion) &&
     runnerFailureAttestation.failedJournalSha256 ===
       value.previousJournalSha256 &&
     runnerFailureAttestation.failedConfigSha256 ===
@@ -985,7 +1018,15 @@ export function assertReleaseJournal(value) {
       predecessor.workerVersionId &&
     runnerFailureAttestation.d1ExportSha256 === receipts.d1ExportSha256 &&
     runnerFailureAttestation.priorRunnerActivationId ===
-      predecessor.runnerActivationId;
+      predecessor.runnerActivationId &&
+    (runnerFailureAttestation.schemaVersion === 1 ||
+      (runnerFailureAttestation.committedRunnerActivationId ===
+        value.releaseId &&
+        runnerFailureAttestation.committedRunnerProtocolFingerprint ===
+          targetFingerprints.narrativeContract &&
+        (predecessor.releaseId !== null ||
+          runnerFailureAttestation.liveWorkerSourceRevision ===
+            runnerFailureAttestation.priorRunnerReleaseSha)));
   if (
     value.state === RELEASE_JOURNAL_STATES.REPLACED &&
     !validReplacementBoundary &&
@@ -1600,10 +1641,20 @@ export function replaceInactiveUploadReleaseJournal(
 
 export function assertRunnerFailureReplacementEvidence(journal, evidence) {
   const current = assertReleaseJournal(journal);
+  const schemaVersion = Object.hasOwn(
+    evidence ?? {},
+    "committedRunnerActivationId"
+  )
+    ? 2
+    : 1;
+  const attestationKeys =
+    schemaVersion === 2
+      ? RUNNER_FAILURE_ATTESTATION_V2_KEYS
+      : RUNNER_FAILURE_ATTESTATION_V1_KEYS;
   exactKeys(
     evidence,
     [
-      ...RUNNER_FAILURE_ATTESTATION_KEYS.filter(
+      ...attestationKeys.filter(
         (key) => key !== "schemaVersion"
       ),
       "liveDeploymentId",
@@ -1632,9 +1683,9 @@ export function assertRunnerFailureReplacementEvidence(journal, evidence) {
     );
   }
   const attestation = validateRunnerFailureAttestation({
-    schemaVersion: 1,
+    schemaVersion,
     ...Object.fromEntries(
-      RUNNER_FAILURE_ATTESTATION_KEYS.filter(
+      attestationKeys.filter(
         (key) => key !== "schemaVersion"
       ).map((key) => [key, evidence[key]])
     )
@@ -1656,7 +1707,14 @@ export function assertRunnerFailureReplacementEvidence(journal, evidence) {
       current.predecessor.workerVersionId ||
     attestation.d1ExportSha256 !== current.receipts.d1ExportSha256 ||
     attestation.priorRunnerActivationId !==
-      current.predecessor.runnerActivationId
+      current.predecessor.runnerActivationId ||
+    (schemaVersion === 2 &&
+      (attestation.committedRunnerActivationId !== current.releaseId ||
+        attestation.committedRunnerProtocolFingerprint !==
+          current.targetFingerprints.narrativeContract ||
+        (current.predecessor.releaseId === null &&
+          attestation.liveWorkerSourceRevision !==
+            attestation.priorRunnerReleaseSha)))
   ) {
     throw new Error(
       "Runner-failure replacement evidence differs from the failed release"
@@ -1697,6 +1755,16 @@ export function replaceRunnerFailureReleaseJournal(
     current,
     evidence
   );
+  const schemaVersion = Object.hasOwn(
+    validatedEvidence,
+    "committedRunnerActivationId"
+  )
+    ? 2
+    : 1;
+  const attestationKeys =
+    schemaVersion === 2
+      ? RUNNER_FAILURE_ATTESTATION_V2_KEYS
+      : RUNNER_FAILURE_ATTESTATION_V1_KEYS;
   return revisedJournal(
     current,
     {
@@ -1705,9 +1773,9 @@ export function replaceRunnerFailureReleaseJournal(
         releaseId,
         targetGitSha,
         runnerFailureAttestation: {
-          schemaVersion: 1,
+          schemaVersion,
           ...Object.fromEntries(
-            RUNNER_FAILURE_ATTESTATION_KEYS.filter(
+            attestationKeys.filter(
               (key) => key !== "schemaVersion"
             ).map((key) => [key, validatedEvidence[key]])
           )
@@ -1736,7 +1804,11 @@ export function predecessorForReleaseReplacement(journal) {
     journalSha256: fingerprintReleaseJournal(replaced),
     workerVersionId: replaced.predecessor.workerVersionId,
     deploymentId: replaced.predecessor.deploymentId,
-    runnerActivationId: replaced.predecessor.runnerActivationId
+    runnerActivationId:
+      replaced.supersededBy?.runnerFailureAttestation?.schemaVersion === 2
+        ? replaced.supersededBy.runnerFailureAttestation
+            .committedRunnerActivationId
+        : replaced.predecessor.runnerActivationId
   });
 }
 
