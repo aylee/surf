@@ -120,7 +120,7 @@ function priorRuntimePaths(record) {
   if (
     typeof modelArtifact?.path !== "string" ||
     typeof nodePath !== "string" ||
-    typeof omlxPath !== "string"
+    (record.omlxLifecycle !== "external" && typeof omlxPath !== "string")
   ) {
     throw new Error("Prior runner record lacks pinned runtime paths");
   }
@@ -128,7 +128,8 @@ function priorRuntimePaths(record) {
     modelArtifactPath: modelArtifact.path,
     omlxDataPath: dirname(dirname(modelArtifact.path)),
     nodeBinPath: dirname(nodePath),
-    omlxPath
+    omlxPath,
+    omlxLifecycle: record.omlxLifecycle
   };
 }
 
@@ -227,6 +228,7 @@ export async function activateTargetRunner(
     runnerArtifactManifestPath,
     nodeBinPath: runtime.nodeBinPath,
     omlxPath: runtime.omlxPath,
+    omlxLifecycle: runtime.omlxLifecycle,
     omlxDataPath: runtime.omlxDataPath,
     modelArtifactPath: runtime.modelArtifactPath,
     logDir: logDirectory,

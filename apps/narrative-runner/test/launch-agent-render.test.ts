@@ -226,6 +226,38 @@ async function fixture(root: string) {
 }
 
 describe("LaunchAgent activation records", () => {
+  it("external mode verifies only its runner and model, without pinning the app", async () => {
+    const value = await fixture(await mkdtemp(join(tmpdir(), "surf-external-")));
+    const written = await value.release.render({ ...value.options, omlxPath: undefined, omlxLifecycle: "external" });
+    expect(written).toHaveLength(2);
+    const path = written[1]!;
+    const record = JSON.parse(await readFile(path, "utf8"));
+    expect(record.omlxLifecycle).toBe("external");
+    expect(record.executables).not.toHaveProperty("omlx");
+    expect(record.launchAgents).not.toHaveProperty("omlxServer");
+    await value.release.install(path, { environment: value.options.environment });
+    await expect(value.release.verify(path, { requireInstalled: true })).resolves.toMatchObject({ status: "ok" });
+    await writeFile(record.launchAgents.narrativeRunner.path, "changed", { mode: 0o600 });
+    await expect(value.release.verify(path, { requireInstalled: true })).rejects.toThrow();
+  });
+
+  it("retires only an attested managed plist and resumes the runner-last install", async () => {
+    const value = await fixture(await mkdtemp(join(tmpdir(), "surf-external-migrate-")));
+    const prior = await value.release.render({ ...value.options, outputDir: join(dirname(value.outputDir), "activation-r0") });
+    const target = await value.release.render({ ...value.options, omlxLifecycle: "external" });
+    const options = { environment: value.options.environment, allowReplace: true, priorRecordPath: prior[2]! };
+    await value.release.install(prior[2]!, { environment: value.options.environment });
+    await expect(value.release.install(target[1]!, options, {
+      afterInstall(name) { if (name === "omlxServer") throw new Error("injected removal crash"); }
+    })).rejects.toThrow("injected removal crash");
+    await expect(value.release.inspect({ targetRecordPath: target[1]!, priorRecordPath: prior[2]! }, options))
+      .resolves.toMatchObject({ launchAgents: { omlxServer: "target", narrativeRunner: "prior" } });
+    await value.release.install(target[1]!, options);
+    await expect(value.release.verify(target[1]!, { requireInstalled: true })).resolves.toMatchObject({ status: "ok" });
+    await value.release.install(prior[2]!, { ...options, priorRecordPath: target[1]! });
+    await expect(value.release.verify(prior[2]!, { requireInstalled: true })).resolves.toMatchObject({ status: "ok" });
+  });
+
   it("renders and verifies a runner-owned v4 activation", async () => {
     const root = await mkdtemp(join(tmpdir(), "surf-launch-v4-"));
     const value = await fixture(root);

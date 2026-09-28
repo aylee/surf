@@ -531,6 +531,46 @@ Queue, credential, and process topology rather than domain branches in runner
 code. Apply the account-wide admission estimate above before provisioning any
 additional domain Queue.
 
+## Desktop-owned shared oMLX
+
+Use `--omlxLifecycle external` when the oMLX desktop/menu bar app owns the
+server. Surf then manages only its narrative runner. It still verifies the
+immutable runner, protocol descriptors, environment fingerprint, exact model
+artifact, installed runner plist, and authenticated model endpoint. It does
+not attest or restart the external server binary. The desktop app is the
+runtime owner and its updates do not require replacing a pinned Homebrew path.
+Omitting the option retains the existing managed two-service topology below.
+
+Keep the desktop server on the configured loopback endpoint with the same API
+authentication and accepted model. Enable desktop launch at login and automatic
+server start. Closing its settings window is fine; quitting the app stops
+inference for every client sharing that endpoint. Keep only one server owner.
+
+Render a **new** immutable activation with the usual release, runner environment,
+model artifact, logs and LaunchAgents arguments, adding `--omlxLifecycle external`.
+The external mode does not need `--omlxPath` and does not install an oMLX
+supervisor plist. Keep `--omlxDataPath` to verify the accepted local model artifact. Never hand-edit an old activation record.
+Use the normal activation controller with the exact prior record for migration.
+A managed predecessor must be drained and its exact supervisor stopped before
+the desktop server can take the port. Start the desktop server when that port is
+free, then let activation finish its authenticated preflight. A failed/preflight
+interruption retains the durable transition for exact retry; it is not license
+to erase transition files or start a second server.
+
+Future external-to-external runner releases leave the shared server running.
+To return to a managed server, stop the desktop server first; an occupied port
+must refuse that switch before draining the healthy runner. Retain the previous
+activation and its exact runtime installation until the new topology passes
+both client checks. Removing that installation removes the immediate managed
+rollback path.
+
+After a desktop update or topology change, require the release-pinned Surf
+`status` to report authenticated oMLX and Queue readiness with a fresh matching
+heartbeat. Also run each other client's synthetic inference checks. Uninstall
+the old runtime only after these checks pass; retain model weights, settings,
+and caches. This changes local process ownership only, not cloud admission,
+Queue credentials, model selection, or fallback policy.
+
 ## LaunchAgent example
 
 The tracked narrative-runner and oMLX-server plist templates contain no secrets

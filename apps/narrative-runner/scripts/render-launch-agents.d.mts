@@ -8,7 +8,8 @@ export type LaunchAgentRenderOptions = {
   launchAgentsDir?: string;
   runnerExitTimeoutSeconds: number | string;
   nodeBinPath: string;
-  omlxPath: string;
+  omlxPath?: string;
+  omlxLifecycle?: "external";
   omlxDataPath: string;
   modelArtifactPath: string;
   logDir: string;

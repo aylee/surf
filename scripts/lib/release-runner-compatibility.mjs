@@ -178,8 +178,11 @@ function activationRecordShape(record, activationId) {
     record.acceptedProtocols.length > 16 ||
     typeof record.launchAgents?.narrativeRunner?.path !== "string" ||
     !HEX_64_PATTERN.test(record.launchAgents?.narrativeRunner?.sha256 ?? "") ||
-    typeof record.launchAgents?.omlxServer?.path !== "string" ||
-    !HEX_64_PATTERN.test(record.launchAgents?.omlxServer?.sha256 ?? "") ||
+    (record.omlxLifecycle !== undefined && record.omlxLifecycle !== "external") ||
+    (record.omlxLifecycle === "external"
+      ? record.launchAgents?.omlxServer !== undefined
+      : (typeof record.launchAgents?.omlxServer?.path !== "string" ||
+         !HEX_64_PATTERN.test(record.launchAgents?.omlxServer?.sha256 ?? ""))) ||
     typeof record.executables?.node?.path !== "string" ||
     typeof record.executables?.runnerGuard?.path !== "string"
   ) {
@@ -798,6 +801,17 @@ function parseLoadedJob(stdout, expectedPath, label) {
   return { pid: pids[0] };
 }
 
+async function attestModelOwner(record, domain, deps) {
+  if (record.omlxLifecycle !== "external") {
+    return attestLoadedJob(OMLX_LABEL, record.launchAgents.omlxServer.path, domain, deps);
+  }
+  const result = await deps.command("/bin/launchctl", ["print", `${domain}/${OMLX_LABEL}`], {
+    timeoutMs: HEALTH_CHECK_TIMEOUT_MS
+  });
+  if (result.status === 0) throw new Error("External oMLX has a competing managed LaunchAgent");
+  return null;
+}
+
 async function attestLoadedJob(label, expectedPath, domain, deps) {
   const result = await deps.command(
     "/bin/launchctl",
@@ -983,14 +997,16 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
       record.launchAgents.narrativeRunner,
       "Installed narrative runner plist"
     ),
-    assertInstalledPlist(record.launchAgents.omlxServer, "Installed omlx plist")
+    ...(record.omlxLifecycle === "external" ? [] : [
+      assertInstalledPlist(record.launchAgents.omlxServer, "Installed omlx plist")
+    ])
   ]);
   const domain = `gui/${deps.uid}`;
   const [runnerJob, omlxJob] = await Promise.all([
     attestLoadedJob(RUNNER_LABEL, record.launchAgents.narrativeRunner.path, domain, deps),
-    attestLoadedJob(OMLX_LABEL, record.launchAgents.omlxServer.path, domain, deps)
+    attestModelOwner(record, domain, deps)
   ]);
-  if (!deps.pidAlive(runnerJob.pid) || !deps.pidAlive(omlxJob.pid)) {
+  if (!deps.pidAlive(runnerJob.pid) || (omlxJob && !deps.pidAlive(omlxJob.pid))) {
     throw new Error("Active runner LaunchAgent process identity is not alive");
   }
 
@@ -1056,12 +1072,12 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
 
   const [runnerJobAfter, omlxJobAfter] = await Promise.all([
     attestLoadedJob(RUNNER_LABEL, record.launchAgents.narrativeRunner.path, domain, deps),
-    attestLoadedJob(OMLX_LABEL, record.launchAgents.omlxServer.path, domain, deps)
+    attestModelOwner(record, domain, deps)
   ]);
   if (
     runnerJobAfter.pid !== runnerJob.pid ||
-    omlxJobAfter.pid !== omlxJob.pid ||
-    !deps.pidAlive(omlxJobAfter.pid)
+    omlxJobAfter?.pid !== omlxJob?.pid ||
+    (omlxJobAfter && !deps.pidAlive(omlxJobAfter.pid))
   ) {
     throw new Error("Active runner LaunchAgent process identity changed during preflight");
   }
@@ -1102,7 +1118,9 @@ export async function verifyActiveRunnerCompatibility(options, overrides = {}) {
       record.launchAgents.narrativeRunner,
       "Installed narrative runner plist"
     ),
-    assertInstalledPlist(record.launchAgents.omlxServer, "Installed omlx plist")
+    ...(record.omlxLifecycle === "external" ? [] : [
+      assertInstalledPlist(record.launchAgents.omlxServer, "Installed omlx plist")
+    ])
   ]);
   const recordFinal = await privateFileSnapshot(
     recordPath,
