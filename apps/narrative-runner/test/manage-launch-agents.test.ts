@@ -568,6 +568,110 @@ describe("bounded LaunchAgent activation", () => {
     ).rejects.toThrow(/installation changed during inspection/);
   });
 
+  it.each([false, true])("external mode starts only the runner without waiting for port closure (installed=%s)", async (installed) => {
+    const root = await mkdtemp(join(tmpdir(), "surf-external-controller-"));
+    const recordPath = await activationRecord(root);
+    const record = recordValue(root);
+    const { omlxServer: _unused, ...runnerOnly } = record.launchAgents;
+    await writeFile(recordPath, JSON.stringify({ ...record, omlxLifecycle: "external", launchAgents: runnerOnly }));
+    const launchd = launchdHarness(root, record);
+    const portOpen = vi.fn(async () => true);
+    const install = vi.fn();
+    const result = await activateLaunchAgents({ recordPath }, {
+      uid: 501, now: () => NOW,
+      verify: installationVerifier(recordPath, null, installed ? "target" : "none"),
+      install, portOpen, command: launchd.command
+    });
+    expect(result.status).toBe("ok");
+    expect(portOpen).not.toHaveBeenCalled();
+    expect([...launchd.loaded.keys()]).toEqual(["gui/501/ai.alex.narrative-runner"]);
+  });
+
+  it.each(["external", "managed"])("migrates a %s prior to external with exact runner drain", async (priorMode) => {
+    const root = await mkdtemp(join(tmpdir(), "surf-external-switch-"));
+    const targetRoot = join(root, "target"), priorRoot = join(root, "prior");
+    const recordPath = await activationRecord(targetRoot), priorRecordPath = await activationRecord(priorRoot);
+    const target = recordValue(targetRoot), prior = recordValue(priorRoot);
+    for (const [path, record, external] of [[recordPath, target, true], [priorRecordPath, prior, priorMode === "external"]] as const) {
+      if (external) {
+        const { omlxServer: _unused, ...runnerOnly } = record.launchAgents;
+        await writeFile(path, JSON.stringify({ ...record, omlxLifecycle: "external", launchAgents: runnerOnly }));
+      }
+    }
+    await writeFile(prior.runtime.statusFile, JSON.stringify(heartbeat(prior, "stopped")));
+    const launchd = launchdHarness(targetRoot, target);
+    const portOpen = vi.fn(async () => true);
+    const result = await activateLaunchAgents({ recordPath, priorRecordPath }, {
+      uid: 501, now: () => NOW, pidAlive: () => false,
+      verify: installationVerifier(recordPath, priorRecordPath, "prior"),
+      install: vi.fn(), portOpen, command: launchd.command
+    });
+    expect(result.status).toBe("ok");
+    expect(result.drainReceipt).toMatchObject({ outcome: "stopped", priorPid: 1234 });
+    expect(portOpen).not.toHaveBeenCalled();
+    expect([...launchd.loaded.keys()]).toEqual(["gui/501/ai.alex.narrative-runner"]);
+  });
+
+  it("inspects external-to-managed installation without runtime port operations", async () => {
+    const fixture = await committedDrainFixture(4);
+    const { omlxServer: _unused, ...runnerOnly } = fixture.prior.launchAgents;
+    await writeFile(fixture.priorRecordPath, JSON.stringify({ ...fixture.prior, omlxLifecycle: "external", launchAgents: runnerOnly }));
+    const command = vi.fn(), portOpen = vi.fn();
+    await expect(inspectRunnerTransitionInstallState({
+      targetRecordPath: fixture.targetRecordPath, priorRecordPath: fixture.priorRecordPath
+    }, {
+      verify: installationVerifier(fixture.targetRecordPath, fixture.priorRecordPath, "prior"),
+      command, portOpen
+    })).resolves.toMatchObject({ validPrecommit: true, targetCommitted: false });
+    expect(command).not.toHaveBeenCalled();
+    expect(portOpen).not.toHaveBeenCalled();
+  });
+
+  it("refuses an occupied external port before draining a prior runner", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-external-port-busy-"));
+    const targetRoot = join(root, "target"), priorRoot = join(root, "prior");
+    const recordPath = await activationRecord(targetRoot), priorRecordPath = await activationRecord(priorRoot);
+    const target = recordValue(targetRoot), prior = recordValue(priorRoot);
+    const { omlxServer: _unused, ...runnerOnly } = prior.launchAgents;
+    await writeFile(priorRecordPath, JSON.stringify({ ...prior, omlxLifecycle: "external", launchAgents: runnerOnly }));
+    const launchd = launchdHarness(targetRoot, target, [{ root: priorRoot, record: prior, component: "narrativeRunner" }]);
+    let now = NOW;
+    const install = vi.fn(), command = vi.fn(launchd.command);
+    await expect(activateLaunchAgents({ recordPath, priorRecordPath }, {
+      uid: 501, now: () => now, sleep: async (ms: number) => { now += ms; },
+      verify: installationVerifier(recordPath, priorRecordPath, "prior"),
+      install, command, portOpen: async () => true
+    })).rejects.toThrow(/8000|port|close/i);
+    expect(install).not.toHaveBeenCalled();
+    expect(command.mock.calls.every(([, args]) => args[0] === "print")).toBe(true);
+    expect(launchd.loaded.has("gui/501/ai.alex.narrative-runner")).toBe(true);
+  });
+
+  it("replays external-to-managed activation without rejecting its own server port", async () => {
+    const root = await mkdtemp(join(tmpdir(), "surf-external-rollback-"));
+    const targetRoot = join(root, "target"), priorRoot = join(root, "prior");
+    const recordPath = await activationRecord(targetRoot), priorRecordPath = await activationRecord(priorRoot);
+    const target = recordValue(targetRoot), prior = recordValue(priorRoot);
+    const { omlxServer: _unused, ...runnerOnly } = prior.launchAgents;
+    await writeFile(priorRecordPath, JSON.stringify({ ...prior, omlxLifecycle: "external", launchAgents: runnerOnly }));
+    await writeFile(prior.runtime.statusFile, JSON.stringify(heartbeat(prior, "stopped")));
+    const launchd = launchdHarness(targetRoot, target);
+    let installed: "prior" | "target" = "prior";
+    const portOpen = vi.fn(async () => false);
+    const deps = {
+      uid: 501, now: () => NOW, pidAlive: () => false,
+      verify: async (path: string, options: { requireInstalled: boolean }) =>
+        installationVerifier(recordPath, priorRecordPath, installed)(path, options),
+      install: vi.fn(async () => { installed = "target"; }),
+      portOpen, command: launchd.command
+    };
+    await expect(activateLaunchAgents({ recordPath, priorRecordPath }, deps)).resolves.toMatchObject({ status: "ok" });
+    portOpen.mockClear().mockResolvedValue(true);
+    await expect(activateLaunchAgents({ recordPath, priorRecordPath }, deps)).resolves.toMatchObject({ status: "ok", changed: false });
+    expect(portOpen).not.toHaveBeenCalled();
+    expect(deps.install).toHaveBeenCalledOnce();
+  });
+
   it("is idempotent when the exact installed v4 activation is healthy", async () => {
     const root = await mkdtemp(join(tmpdir(), "surf-launch-manage-idempotent-"));
     const recordPath = await activationRecord(root);

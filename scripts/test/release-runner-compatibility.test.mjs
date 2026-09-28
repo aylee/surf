@@ -375,6 +375,26 @@ test("trusted-id verification returns a bounded secret-free v4 compatibility rec
   );
 });
 
+test("external model ownership retains live preflight and rejects a competing managed job", async () => {
+  const value = await fixture();
+  value.record.omlxLifecycle = "external";
+  delete value.record.launchAgents.omlxServer;
+  await writeFile(value.recordPath, JSON.stringify(value.record));
+  const { calls, dependencies } = verificationDependencies(value);
+  const command = dependencies.command;
+  let competing = false;
+  dependencies.command = async (file, args, options) => {
+    if (file === "/bin/launchctl" && args[1].endsWith("/ai.alex.omlx-server")) {
+      return { status: competing ? 0 : 1, stdout: "" };
+    }
+    return command(file, args, options);
+  };
+  await verifyActiveRunnerCompatibility(verificationOptions(value), dependencies);
+  assert.ok(calls.some(({ type }) => type === "health-check"));
+  competing = true;
+  await assert.rejects(verifyActiveRunnerCompatibility(verificationOptions(value), dependencies), /competing managed/);
+});
+
 test("normal verification cannot discover or traverse an untrusted activation", async () => {
   const value = await fixture();
   const { dependencies } = verificationDependencies(value);

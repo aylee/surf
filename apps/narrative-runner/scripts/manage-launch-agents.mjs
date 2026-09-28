@@ -129,7 +129,7 @@ async function inspectLoadedJob(
     { timeoutMs }
   );
   if (result.status !== 0) return Object.freeze({ loaded: false });
-  const candidates = distinctRecords(records);
+  const candidates = distinctRecords(records).filter((record) => record.launchAgents?.[component]);
   const persistentPaths = new Set(
     candidates.map((record) => record.launchAgents?.[component]?.path)
   );
@@ -1359,7 +1359,9 @@ async function attestTargetBootstrap(label, component, target, domain, deps) {
 
 async function startOrCheckTarget({ target, runner, omlx, domain }, deps) {
   let changed = false;
-  if (!omlx.loaded) {
+  if (target.omlxLifecycle === "external") {
+    if (omlx.loaded) throw new Error("external oMLX requires the managed server label to be unloaded");
+  } else if (!omlx.loaded) {
     await bootstrap(OMLX_LABEL, target.launchAgents.omlxServer.path, domain, deps);
     omlx = await attestTargetBootstrap(OMLX_LABEL, "omlxServer", target, domain, deps);
     changed = true;
@@ -1441,6 +1443,12 @@ export async function activateLaunchAgents(
     attestationDeadline,
     deps
   );
+  // An already-attested target server owns this port on a successful retry.
+  // Otherwise the operator must stop the external owner before any drain.
+  if (prior?.omlxLifecycle === "external" && target.omlxLifecycle !== "external" &&
+      !(omlx.loaded && sameActivation(omlx.record, target))) {
+    await waitPortClosed(deps.now() + COMMAND_TIMEOUT_MS, deps);
+  }
   const installed = await installationState(
     { target, prior, environment, allowLegacyTarget },
     deps
@@ -1451,7 +1459,7 @@ export async function activateLaunchAgents(
       throw new Error("priorRecordPath is required before replacing a loaded activation");
     }
     const modelDeadline = deps.now() + OMLX_STOP_TIMEOUT_MS;
-    await waitPortClosed(modelDeadline, deps);
+    if (target.omlxLifecycle !== "external") await waitPortClosed(modelDeadline, deps);
     await deps.install(recordPath, {
       environment,
       allowReplace: false,
@@ -1619,8 +1627,7 @@ export async function activateLaunchAgents(
 
   let changed = false;
   const mustStopOmlx =
-    validPrecommit ||
-    priorRunnerLoaded ||
+    (prior?.omlxLifecycle !== "external" && (validPrecommit || priorRunnerLoaded)) ||
     (omlx.loaded && !sameActivation(omlx.record, target));
   if (mustStopOmlx) {
     const modelDeadline = deps.now() + OMLX_STOP_TIMEOUT_MS;
@@ -1633,7 +1640,9 @@ export async function activateLaunchAgents(
       modelDeadline,
       deps
     );
-    await waitPortClosed(modelDeadline, deps);
+    if (omlx.loaded || target.omlxLifecycle !== "external") {
+      await waitPortClosed(modelDeadline, deps);
+    }
     omlx = Object.freeze({ loaded: false });
     changed = true;
   }

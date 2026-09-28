@@ -26,6 +26,7 @@ async function readRecord(recordPath) {
 
 async function validateLaunchAgentDestinations(record, canonicalLaunchAgentsDir) {
   for (const name of INSTALL_ORDER) {
+    if (name === "omlxServer" && record.omlxLifecycle === "external") continue;
     const source = record.renderedLaunchAgents?.[name];
     const target = record.launchAgents?.[name];
     if (
@@ -150,6 +151,25 @@ export async function inspectInstalledLaunchAgents(
   for (const name of INSTALL_ORDER) {
     const target = targetRecord.value.launchAgents[name];
     const prior = priorRecord.value.launchAgents[name];
+    if (!target || !prior) {
+      const path = target?.path ?? prior?.path ?? resolve(canonicalLaunchAgentsDir, "ai.alex.omlx-server.plist");
+      let installed;
+      try { installed = await installedSnapshot(path); }
+      catch (error) {
+        // Distinguish a missing entry from an unreadable or substituted entry.
+        try { await lstat(path); } catch (missing) {
+          if (missing.code === "ENOENT") {
+            launchAgents[name] = !target ? "target" : "prior";
+            continue;
+          }
+        }
+        throw error;
+      }
+      if (target && installed.sha256 === target.sha256) launchAgents[name] = "target";
+      else if (prior && installed.sha256 === prior.sha256) launchAgents[name] = "prior";
+      else throw new Error(`installed ${name} bytes match neither activation`);
+      continue;
+    }
     if (target.path !== prior.path || target.sha256 === prior.sha256) {
       throw new Error(
         `prior and target ${name} records do not define distinct bytes at one persistent path`
@@ -210,6 +230,22 @@ export async function installLaunchAgents(
   }
 
   for (const name of INSTALL_ORDER) {
+    if (name === "omlxServer" && record.omlxLifecycle === "external") {
+      const path = resolve(canonicalLaunchAgentsDir, "ai.alex.omlx-server.plist");
+      let existing;
+      try { existing = await installedSnapshot(path); }
+      catch (error) {
+        try { await lstat(path); } catch (missing) { if (missing.code === "ENOENT") continue; }
+        throw error;
+      }
+      if (!allowReplace || prior?.launchAgents?.omlxServer?.path !== path ||
+          existing.sha256 !== prior.launchAgents.omlxServer.sha256) {
+        throw new Error("cannot retire an unowned managed oMLX plist");
+      }
+      await rm(path);
+      if (overrides.afterInstall) await overrides.afterInstall(name);
+      continue;
+    }
     const source = record.renderedLaunchAgents[name];
     const target = record.launchAgents[name];
     const contents = await readFile(source.path);
@@ -219,10 +255,11 @@ export async function installLaunchAgents(
     const acceptedExistingSha256 = new Set([target.sha256]);
     if (allowReplace) {
       const priorTarget = prior?.launchAgents?.[name];
-      if (!priorTarget || priorTarget.path !== target.path) {
+      if ((!priorTarget && !(name === "omlxServer" && prior.omlxLifecycle === "external")) ||
+          (priorTarget && priorTarget.path !== target.path)) {
         throw new Error(`verified prior record does not own the persistent ${name} path`);
       }
-      acceptedExistingSha256.add(priorTarget.sha256);
+      if (priorTarget) acceptedExistingSha256.add(priorTarget.sha256);
     }
     const changed = await writeAtomicPrivate(
       target.path,
@@ -243,7 +280,7 @@ export async function installLaunchAgents(
     activationRecord: canonicalRecordPath,
     launchAgents: {
       narrativeRunner: record.launchAgents.narrativeRunner.path,
-      omlxServer: record.launchAgents.omlxServer.path
+      ...(record.omlxLifecycle === "external" ? {} : { omlxServer: record.launchAgents.omlxServer.path })
     }
   };
 }

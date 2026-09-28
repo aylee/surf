@@ -387,11 +387,30 @@ async function readRunnerArtifactManifest(path) {
 }
 
 async function verifyCommonArtifacts(record, requireInstalled) {
-  for (const name of ["node", "omlx", "omlxSupervisor"]) {
+  if (record.omlxLifecycle !== undefined && record.omlxLifecycle !== "external") {
+    throw new Error("unsupported oMLX lifecycle");
+  }
+  if (record.omlxLifecycle === "external") {
+    if (record.schemaVersion !== 4) throw new Error("external oMLX requires a v4 activation");
+    if (record.executables?.omlx || record.executables?.omlxSupervisor ||
+        record.launchAgents?.omlxServer || record.renderedLaunchAgents?.omlxServer) {
+      throw new Error("external oMLX must not declare a managed server");
+    }
+    if (requireInstalled) {
+      const stale = resolve(dirname(record.launchAgents.narrativeRunner.path), "ai.alex.omlx-server.plist");
+      let exists = true;
+      try { await lstat(stale); }
+      catch (error) { if (error.code !== "ENOENT") throw error; exists = false; }
+      if (exists) throw new Error("external oMLX requires the managed server plist to be absent");
+    }
+  }
+
+  const external = record.omlxLifecycle === "external";
+  for (const name of external ? ["node"] : ["node", "omlx", "omlxSupervisor"]) {
     await verifyRecordedFile(record.executables?.[name], name, true);
   }
   await verifyRecordedFile(record.executables?.runnerGuard, "runnerGuard", false);
-  for (const name of ["narrativeRunner", "omlxServer"]) {
+  for (const name of external ? ["narrativeRunner"] : ["narrativeRunner", "omlxServer"]) {
     await verifyRecordedFile(
       record.renderedLaunchAgents?.[name],
       `rendered ${name}`,
@@ -686,7 +705,9 @@ export async function renderLaunchAgents(options) {
     ? requiredAbsolute(options, "runnerArtifactManifestPath")
     : resolve(dirname(runnerArtifactPath), "narrative-runner.manifest.json");
   const requestedNodeBinPath = requiredAbsolute(options, "nodeBinPath");
-  const requestedOmlxPath = requiredAbsolute(options, "omlxPath");
+  const external = options.omlxLifecycle === "external";
+  if (options.omlxLifecycle !== undefined && !external) throw new Error("unsupported oMLX lifecycle");
+  const requestedOmlxPath = external ? null : requiredAbsolute(options, "omlxPath");
   const omlxDataPath = requiredAbsolute(options, "omlxDataPath");
   const modelArtifactPath = requiredAbsolute(options, "modelArtifactPath");
   const logDir = requiredAbsolute(options, "logDir");
@@ -738,7 +759,7 @@ export async function renderLaunchAgents(options) {
     throw new Error("nodeBinPath must be the canonical directory of the pinned node executable");
   }
   const nodeBinPath = dirname(nodePath);
-  const omlxPath = await canonicalExecutable(requestedOmlxPath, "omlxPath");
+  const omlxPath = external ? null : await canonicalExecutable(requestedOmlxPath, "omlxPath");
   const expectedModelArtifactPath = resolve(
     await realpath(omlxDataPath),
     "models",
@@ -788,7 +809,7 @@ export async function renderLaunchAgents(options) {
         LOG_DIRECTORY_ABSOLUTE_PATH: logDir
       })
     },
-    {
+    ...external ? [] : [{
       name: "ai.alex.omlx-server.plist",
       contents: replacePlaceholders(omlxTemplate, {
         HOME_ABSOLUTE_PATH: homePath,
@@ -804,7 +825,7 @@ export async function renderLaunchAgents(options) {
         OMLX_DATA_ABSOLUTE_PATH: omlxDataPath,
         LOG_DIRECTORY_ABSOLUTE_PATH: logDir
       })
-    }
+    }]
   ];
 
   const written = [];
@@ -815,6 +836,7 @@ export async function renderLaunchAgents(options) {
   }
   const activationRecord = {
     schemaVersion: 4,
+    ...(external ? { omlxLifecycle: "external" } : {}),
     activationId,
     source: {
       revision: releaseSha,
@@ -844,10 +866,10 @@ export async function renderLaunchAgents(options) {
         path: await realpath(written[0]),
         sha256: await sha256File(written[0])
       },
-      omlxServer: {
+      ...external ? {} : { omlxServer: {
         path: await realpath(written[1]),
         sha256: await sha256File(written[1])
-      }
+      } }
     },
     launchAgents: {
       narrativeRunner: {
@@ -856,20 +878,20 @@ export async function renderLaunchAgents(options) {
         ),
         sha256: await sha256File(written[0])
       },
-      omlxServer: {
+      ...external ? {} : { omlxServer: {
         path: await prospectiveRealPath(
           resolve(launchAgentsDir, "ai.alex.omlx-server.plist")
         ),
         sha256: await sha256File(written[1])
-      }
+      } }
     },
     executables: {
       node: { path: nodePath, sha256: await sha256File(nodePath) },
-      omlx: { path: omlxPath, sha256: await sha256File(omlxPath) },
+      ...external ? {} : { omlx: { path: omlxPath, sha256: await sha256File(omlxPath) },
       omlxSupervisor: {
         path: supervisorPath,
         sha256: await sha256File(supervisorPath)
-      },
+      } },
       runnerGuard: {
         path: runnerGuardPath,
         sha256: await sha256File(runnerGuardPath)
