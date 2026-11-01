@@ -41,6 +41,14 @@ export function verifyCommittedRunnerDrainEvidence(
   dependencies?: Record<string, unknown>
 ): Promise<CommittedRunnerDrainEvidence>;
 
+export function verifyExternalRunnerMigrationEvidence(
+  options: {
+    targetRecordPath: string;
+    priorRecordPath: string;
+  },
+  dependencies?: Record<string, unknown>
+): Promise<CommittedRunnerDrainEvidence>;
+
 export type RunnerTransitionInstallState = Readonly<{
   schemaVersion: 1;
   targetActivationId: string;

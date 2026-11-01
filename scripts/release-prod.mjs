@@ -121,11 +121,15 @@ import {
 import {
   establishRunnerFailureReplacement
 } from "./lib/release-runner-failure-replacement.mjs";
-import { createRunnerFailureRecoveryAttestor } from "./lib/release-runner-failure-attestation.mjs";
+import {
+  createRunnerFailureRecoveryAttestor,
+  guardExternalRunnerMigrationRecord
+} from "./lib/release-runner-failure-attestation.mjs";
 import {
   committedRunnerLineagePlan,
   committedRunnerResumeLineagePlan,
   linkedCommittedRunnerFailureSource,
+  linkedExternalRunnerMigrationEvidence,
   runnerFailureRecoveryMode
 } from "./lib/release-runner-failure-lineage.mjs";
 import {
@@ -1061,6 +1065,7 @@ async function internalMain(options) {
     hmacKey: secretFingerprintKey,
     domain: "surf-release-operator-environment-v1"
   });
+  let guardAdoptedRunnerEvidence = () => {};
   const guardSources = () => {
     validateImmutableRelease(releaseRoot, targetGitSha);
     inspectedSecrets.assertUnchanged();
@@ -1073,6 +1078,7 @@ async function internalMain(options) {
     ) {
       throw new Error("Production profile input changed during release");
     }
+    guardAdoptedRunnerEvidence();
   };
   try {
     const provisional = stageWranglerConfigSnapshot({
@@ -1802,6 +1808,20 @@ async function internalMain(options) {
     ) {
       throw new Error("Trusted active receipt differs from the live Worker source revision");
     }
+    if (
+      activeJournal && finalProbeContext.readConfig().vars?.NARRATIVE_ENABLED === "true" &&
+      !options.resume && !options.replaceRunnerFailure
+    ) {
+      const installedRunner = await discoverRunnerActivationFromInstalledPlist({
+        serviceRoot: profile.serviceRoot,
+        allowLegacyV3: true
+      });
+      if (installedRunner.activationId !== activeRunnerId(activeJournal)) {
+        throw new Error(
+          "Installed runner differs from the active release receipt; explicitly attest its migration before releasing"
+        );
+      }
+    }
     const baseSha = activeReceipt?.targetGitSha ?? liveSourceRevision;
     assertAppendOnlyMigrationHistory(
       profile.repositoryPath,
@@ -2122,6 +2142,28 @@ async function internalMain(options) {
       releaseIdFor(targetGitSha);
     const analysisEnabled =
       finalProbeContext.readConfig().vars?.NARRATIVE_ENABLED === "true";
+    let externalMigrationRecovery =
+      runnerFailureReplacementSource?.supersededBy?.runnerFailureAttestation?.schemaVersion === 3;
+    const previewAdoption = externalMigrationRecovery
+      ? runnerFailureReplacementSource.supersededBy.runnerFailureAttestation
+      : managedJournal
+        ? linkedExternalRunnerMigrationEvidence(managedJournal, { readJournal: (id) => store.readJournal(id) })
+        : null;
+    if (previewAdoption !== null) {
+      guardExternalRunnerMigrationRecord({ serviceRoot: profile.serviceRoot, evidence: previewAdoption });
+    }
+    if (runnerFailureReplacementSource?.state === RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE) {
+      const installed = await discoverRunnerActivationFromInstalledPlist({
+        serviceRoot: profile.serviceRoot, allowLegacyV3: true
+      });
+      if (installed.recordSchemaVersion === 4 &&
+          installed.transitionOnly === false &&
+          installed.activationId !== runnerFailureReplacementSource.releaseId &&
+          installed.activationId !== runnerFailureReplacementSource.predecessor.runnerActivationId) {
+        await attestRunnerFailureReplacement(runnerFailureReplacementSource, { requireExternalMigration: true });
+        externalMigrationRecovery = true;
+      }
+    }
     const preview = boundedReleasePreview({
       releaseId,
       targetGitSha,
@@ -2133,6 +2175,7 @@ async function internalMain(options) {
       mutations: mutationsForClassification(classification, {
         analysisEnabled,
         restoreLegacyRunner:
+          !externalMigrationRecovery &&
           committedLineageEvidence === null &&
           runnerFailureReplacementSource?.state ===
           RELEASE_JOURNAL_STATES.RETRYABLE_FAILURE
@@ -2326,12 +2369,21 @@ async function internalMain(options) {
     let secretSnapshot;
     let currentRunnerActivationId =
       managedJournal.receipts.runnerActivationId ??
-      activeRunnerId(activeJournal) ??
-      predecessor.runnerActivationId;
+      predecessor.runnerActivationId ??
+      activeRunnerId(activeJournal);
     let targetWorkerVersionId = managedJournal.receipts.workerVersionId;
     const uploadReceiptPath = resolve(attemptDirectory, "worker-upload.json");
     const backupReceiptPath = resolve(attemptDirectory, "d1-backup.json");
     let rollbackDirectory = null;
+    const adoptedRunner = linkedExternalRunnerMigrationEvidence(managedJournal, {
+      readJournal: (id) => store.readJournal(id)
+    });
+    if (adoptedRunner !== null) {
+      guardAdoptedRunnerEvidence = () => guardExternalRunnerMigrationRecord({
+        serviceRoot: profile.serviceRoot, evidence: adoptedRunner
+      });
+      guardAdoptedRunnerEvidence();
+    }
 
     const prepareRuntime = () => {
       if (finalContext) return;

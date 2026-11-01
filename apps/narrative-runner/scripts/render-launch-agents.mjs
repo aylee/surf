@@ -325,15 +325,7 @@ async function verifyRecordedFile(
   executable = false,
   requirePrivateMode = false
 ) {
-  if (
-    !record ||
-    typeof record !== "object" ||
-    typeof record.path !== "string" ||
-    typeof record.sha256 !== "string" ||
-    !/^[0-9a-f]{64}$/.test(record.sha256)
-  ) {
-    throw new Error(`${label} activation record is invalid`);
-  }
+  validateRecordedFileDescriptor(record, label);
   const canonical = executable
     ? await canonicalExecutable(record.path, label)
     : await realpath(record.path);
@@ -348,6 +340,18 @@ async function verifyRecordedFile(
   }
   if (await sha256File(canonical) !== record.sha256) {
     throw new Error(`${label} SHA-256 differs from the activation record`);
+  }
+}
+
+function validateRecordedFileDescriptor(record, label) {
+  if (
+    !record ||
+    typeof record !== "object" ||
+    typeof record.path !== "string" ||
+    typeof record.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(record.sha256)
+  ) {
+    throw new Error(`${label} activation record is invalid`);
   }
 }
 
@@ -386,7 +390,7 @@ async function readRunnerArtifactManifest(path) {
   return manifest;
 }
 
-async function verifyCommonArtifacts(record, requireInstalled) {
+async function verifyCommonArtifacts(record, requireInstalled, retiredManagedPrior = false) {
   if (record.omlxLifecycle !== undefined && record.omlxLifecycle !== "external") {
     throw new Error("unsupported oMLX lifecycle");
   }
@@ -407,6 +411,21 @@ async function verifyCommonArtifacts(record, requireInstalled) {
 
   const external = record.omlxLifecycle === "external";
   for (const name of external ? ["node"] : ["node", "omlx", "omlxSupervisor"]) {
+    if (retiredManagedPrior && name === "omlx") {
+      // A completed managed-to-external migration may have removed Homebrew's
+      // old executable. Only ENOENT permits historical descriptor evidence;
+      // any remaining file still receives normal executable/hash checks.
+      validateRecordedFileDescriptor(record.executables?.omlx, "retired omlx");
+      if (resolve(record.executables.omlx.path) !== record.executables.omlx.path) {
+        throw new Error("retired omlx must retain its canonical absolute path");
+      }
+      try {
+        await lstat(record.executables.omlx.path);
+      } catch (error) {
+        if (error && typeof error === "object" && error.code === "ENOENT") continue;
+        throw error;
+      }
+    }
     await verifyRecordedFile(record.executables?.[name], name, true);
   }
   await verifyRecordedFile(record.executables?.runnerGuard, "runnerGuard", false);
@@ -498,9 +517,10 @@ async function verifyLegacyV3Activation(record, requireInstalled) {
   };
 }
 
-export async function verifyLaunchActivation(
+async function verifyActivationRecord(
   recordPath,
-  { requireInstalled = true, allowLegacyV3 = false } = {}
+  { requireInstalled = true, allowLegacyV3 = false } = {},
+  retiredManagedPrior = false
 ) {
   let metadata;
   let record;
@@ -514,6 +534,9 @@ export async function verifyLaunchActivation(
     throw new Error("activation record must be a non-symlink mode-0600 regular file");
   }
   if (!record || typeof record !== "object") throw new Error("activation record schema is invalid");
+  if (retiredManagedPrior && (record.schemaVersion !== 4 || record.omlxLifecycle !== undefined)) {
+    throw new Error("retired runner evidence requires a managed v4 activation");
+  }
   if (record.schemaVersion === 3) {
     if (!allowLegacyV3) {
       throw new Error("legacy v3 activation records are accepted only for explicit rollback transition");
@@ -588,12 +611,13 @@ export async function verifyLaunchActivation(
       throw new Error(`${label} must remain inside the immutable source release`);
     }
   }
-  await verifyCommonArtifacts(record, requireInstalled);
+  await verifyCommonArtifacts(record, requireInstalled, retiredManagedPrior);
   const currentModelArtifact = await verifyModelArtifact(record);
   return {
     status: "ok",
     schemaVersion: 4,
-    transitionOnly: false,
+    transitionOnly: retiredManagedPrior,
+    ...(retiredManagedPrior ? { retiredManagedPrior: true } : {}),
     activationId: record.activationId,
     releaseSha: record.source.revision,
     runnerArtifactSha256: record.runnerArtifact.sha256,
@@ -601,6 +625,16 @@ export async function verifyLaunchActivation(
     modelId: record.model.id,
     modelArtifactSha256: currentModelArtifact.sha256
   };
+}
+
+export async function verifyLaunchActivation(recordPath, options = {}) {
+  return verifyActivationRecord(recordPath, options);
+}
+
+// Read-only historical attestation for the dedicated external-migration path.
+// No ordinary activation API can opt out of the retired executable check.
+export async function verifyRetiredManagedRunnerActivation(recordPath) {
+  return verifyActivationRecord(recordPath, { requireInstalled: false, allowLegacyV3: false }, true);
 }
 
 function replacePlaceholders(template, values) {

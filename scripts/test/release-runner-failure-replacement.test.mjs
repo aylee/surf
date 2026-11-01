@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  readFileSync,
   rmSync,
   writeFileSync
 } from "node:fs";
@@ -26,6 +27,7 @@ import {
   createReleaseJournal,
   fingerprintReleaseJournal,
   predecessorForReleaseReplacement,
+  resumeReleaseJournal,
   recordReleaseJournalFailure,
   replaceRunnerFailureReleaseJournal,
   transitionReleaseJournal
@@ -34,10 +36,15 @@ import {
   commitRunnerFailureReplacement,
   establishRunnerFailureReplacement
 } from "../lib/release-runner-failure-replacement.mjs";
-import { createRunnerFailureRecoveryAttestor } from "../lib/release-runner-failure-attestation.mjs";
+import {
+  createRunnerFailureRecoveryAttestor,
+  guardExternalRunnerMigrationRecord
+} from "../lib/release-runner-failure-attestation.mjs";
 import {
   committedRunnerLineagePlan,
   committedRunnerResumeLineagePlan,
+  linkedExternalRunnerMigrationEvidence,
+  replacementLiveWorkerLineageEvidence,
   runnerFailureRecoveryMode
 } from "../lib/release-runner-failure-lineage.mjs";
 import { attestD1BackupReceiptArtifact } from "../lib/release-storage.mjs";
@@ -73,6 +80,8 @@ function fingerprints(seed = "failed") {
 }
 
 function failedRunnerJournal({
+  day = "2026-08-16",
+  uploadedWorkerVersionId = failedWorkerVersionId,
   d1ExportSha256 = "5".repeat(64),
   predecessor = {
     releaseId: null,
@@ -97,18 +106,18 @@ function failedRunnerJournal({
     classification,
     targetFingerprints,
     predecessor,
-    createdAt: "2026-08-16T16:50:00.000Z"
+    createdAt: `${day}T16:50:00.000Z`
   });
   current = transitionReleaseJournal(
     current,
     RELEASE_JOURNAL_STATES.VERIFIED,
-    { at: "2026-08-16T16:50:01.000Z" }
+    { at: `${day}T16:50:01.000Z` }
   );
   current = transitionReleaseJournal(
     current,
     RELEASE_JOURNAL_STATES.PREPARED,
     {
-      at: "2026-08-16T16:50:02.000Z",
+      at: `${day}T16:50:02.000Z`,
       receipts: {
         profileSha256: "1".repeat(64),
         operatorEnvironmentFingerprint: "2".repeat(64),
@@ -121,15 +130,15 @@ function failedRunnerJournal({
     current,
     RELEASE_JOURNAL_STATES.WORKER_UPLOADED,
     {
-      at: "2026-08-16T16:50:03.000Z",
-      receipts: { workerVersionId: failedWorkerVersionId }
+      at: `${day}T16:50:03.000Z`,
+      receipts: { workerVersionId: uploadedWorkerVersionId }
     }
   );
   current = transitionReleaseJournal(
     current,
     RELEASE_JOURNAL_STATES.DATA_PREPARED,
     {
-      at: "2026-08-16T16:50:04.000Z",
+      at: `${day}T16:50:04.000Z`,
       receipts: {
         d1Bookmark: "bookmark-runner-failure-0001",
         d1ExportSha256
@@ -138,8 +147,30 @@ function failedRunnerJournal({
   );
   return recordReleaseJournalFailure(current, {
     code: RELEASE_FAILURE_CODES.RUNNER_FAILED,
-    at: "2026-08-16T17:07:52.508Z"
+    at: `${day}T17:07:52.508Z`
   });
+}
+
+function priorCloudJournal() {
+  let journal = resumeReleaseJournal(failedRunnerJournal({
+    day: "2026-08-14", releaseId: "cloud-prior", targetGitSha: "d".repeat(40),
+    uploadedWorkerVersionId: liveWorkerVersionId
+  }), { at: "2026-08-14T17:08:00.000Z" });
+  const steps = [
+    [RELEASE_JOURNAL_STATES.RUNNER_READY, { runnerActivationId: priorRunnerActivationId }],
+    [RELEASE_JOURNAL_STATES.PREDECESSOR_RECHECKED, {}],
+    [RELEASE_JOURNAL_STATES.WORKER_ACTIVE, { deploymentId: liveDeploymentId }],
+    [RELEASE_JOURNAL_STATES.TRIGGERS_SYNCED, {}],
+    [RELEASE_JOURNAL_STATES.GENERATION_VERIFIED, { generationId: "prior-generation" }],
+    [RELEASE_JOURNAL_STATES.VERIFIED_LIVE, {}],
+    [RELEASE_JOURNAL_STATES.COMPLETE, {}]
+  ];
+  for (const [index, [state, receipts]] of steps.entries()) {
+    journal = transitionReleaseJournal(journal, state, {
+      at: `2026-08-14T17:08:0${index + 1}.000Z`, receipts
+    });
+  }
+  return journal;
 }
 
 function replacementEvidence(failed) {
@@ -226,7 +257,9 @@ function committedDrainEvidence({
 
 function productionAttestorFixture(
   t,
-  { committedRunner = false, failInactiveUpload = false } = {}
+  { committedRunner = false, externalRunner = false, failInactiveUpload = false,
+    mutateExternalEvidence = () => {}, changeInstalledRecord = false,
+    invalidExternalCompatibility = false } = {}
 ) {
   const root = realpathSync(
     mkdtempSync(join(tmpdir(), "surf-runner-production-attestor-"))
@@ -245,7 +278,7 @@ function productionAttestorFixture(
     queues: {
       producers: [
         { binding: "INGEST_QUEUE", queue: "surf-ingest" },
-        ...(committedRunner
+        ...(committedRunner || externalRunner
           ? [{ binding: "NARRATIVE_QUEUE", queue: "surf-narrative" }]
           : [])
       ]
@@ -269,7 +302,12 @@ function productionAttestorFixture(
   const failed = failedRunnerJournal({
     d1ExportSha256: exportSha256,
     targetFingerprints,
-    wranglerConfigSha256: configArtifact.sha256
+    wranglerConfigSha256: configArtifact.sha256,
+    ...(externalRunner ? { predecessor: {
+      releaseId: "cloud-prior", journalSha256: fingerprintReleaseJournal(priorCloudJournal()),
+      workerVersionId: liveWorkerVersionId, deploymentId: liveDeploymentId,
+      runnerActivationId: priorRunnerActivationId
+    } } : {})
   });
   const uploadArtifact = privateJson(
     join(attemptDirectory, "worker-upload.json"),
@@ -298,8 +336,9 @@ function productionAttestorFixture(
   );
   const priorRecordPath = resolve(activationDirectory, "activation-record.json");
   const priorRecordArtifact = privateJson(priorRecordPath, {
-    schemaVersion: 3,
-    releaseSha
+    ...(externalRunner ? {
+      schemaVersion: 4, activationId: priorRunnerActivationId, source: { revision: releaseSha }
+    } : { schemaVersion: 3, releaseSha })
   });
   let committedArtifactSha256 = null;
   const committedProtocolFingerprint =
@@ -307,7 +346,9 @@ function productionAttestorFixture(
   let committedRecordSha256 = null;
   const transitionSha256 = "c".repeat(64);
   let committedRecordPath = null;
-  if (committedRunner) {
+  const externalActivationId = "external-desktop-r1";
+  const externalSourceRevision = "c".repeat(40);
+  if (committedRunner || externalRunner) {
     const dist = privateDirectory(
       join(failedReleaseRoot, "apps/narrative-runner/dist")
     );
@@ -326,19 +367,25 @@ function productionAttestorFixture(
       ]
     });
     const committedDirectory = privateDirectory(
-      join(launchAgents, failed.releaseId)
+      join(launchAgents, externalRunner ? externalActivationId : failed.releaseId)
     );
     committedRecordPath = resolve(
       committedDirectory,
       "activation-record.json"
     );
     committedRecordSha256 = privateJson(committedRecordPath, {
-      schemaVersion: 4
+      schemaVersion: 4,
+      ...(externalRunner ? { omlxLifecycle: "external", activationId: externalActivationId,
+        source: { revision: externalSourceRevision },
+        runnerArtifact: { sha256: committedArtifactSha256 },
+        acceptedProtocols: [{ family: "surf.narrative", fingerprint: committedProtocolFingerprint }]
+      } : {})
     }).sha256;
-    privateJson(join(attemptDirectory, "runner-drain.json"), {
-      schemaVersion: 2,
-      outcome: "stopped"
-    });
+    if (!externalRunner) {
+      privateJson(join(attemptDirectory, "runner-drain.json"), {
+        schemaVersion: 2, outcome: "stopped"
+      });
+    }
   }
 
   const liveStatus = JSON.stringify({
@@ -351,6 +398,7 @@ function productionAttestorFixture(
   const remoteUploadEvidence = replacementEvidence(failed).remoteUploadEvidence;
   let currentJournal = failed;
   const linkedJournals = new Map();
+  if (externalRunner) linkedJournals.set("cloud-prior", priorCloudJournal());
   const store = {
     readJournal(releaseId) {
       return releaseId === failed.releaseId
@@ -371,7 +419,7 @@ function productionAttestorFixture(
         CLOUDFLARE_API_TOKEN: "token-fixture"
       },
       store,
-      ...(committedRunner
+      ...(committedRunner || externalRunner
         ? {
             workerSecrets: {
               geminiToken: "g".repeat(32),
@@ -386,7 +434,10 @@ function productionAttestorFixture(
       createCloudflareCommandContext() {
         return {
           readConfig: () => structuredClone(config),
-          runWrangler: () => liveStatus,
+          runWrangler: (args) => args[0] === "versions"
+            ? JSON.stringify({ id: liveWorkerVersionId, resources: { bindings: [
+              { type: "plain_text", name: "SURF_SOURCE_REVISION", text: releaseSha }
+            ] } }) : liveStatus,
           async attestPreexistingQueues() {
             events.push("queue");
             return {
@@ -395,7 +446,7 @@ function productionAttestorFixture(
                   name: "surf-ingest",
                   createdOn: "2026-08-10T04:58:17.532408Z"
                 },
-                ...(committedRunner
+                ...(committedRunner || externalRunner
                   ? [
                       {
                         name: "surf-narrative",
@@ -433,6 +484,10 @@ function productionAttestorFixture(
         return remoteUploadEvidence;
       },
       async discoverRunnerActivationFromInstalledPlist() {
+        if (externalRunner) return {
+          activationId: externalActivationId, recordPath: committedRecordPath,
+          recordSchemaVersion: 4, transitionOnly: false
+        };
         if (committedRunner) {
           return {
             activationId: failed.releaseId,
@@ -472,18 +527,36 @@ function productionAttestorFixture(
       },
       async verifyActiveRunnerCompatibility(options) {
         events.push("healthy");
-        assert.equal(options.activationId, failed.releaseId);
+        assert.equal(options.activationId, externalRunner ? externalActivationId : failed.releaseId);
         assert.equal(options.expectedQueueId, "queue-id-fixture");
         return {
           schemaVersion: 1,
-          activationId: failed.releaseId,
+          activationId: externalRunner ? externalActivationId : failed.releaseId,
           runnerArtifactSha256: committedArtifactSha256,
-          sourceRevision: failed.targetGitSha,
+          sourceRevision: invalidExternalCompatibility ? "0".repeat(40)
+            : externalRunner ? externalSourceRevision : failed.targetGitSha,
           acceptedProtocolFingerprints: [committedProtocolFingerprint],
           runtimeFingerprint: "1".repeat(64),
           resultTargetId: "target",
           bindingHmacs: {}
         };
+      },
+      async verifyExternalRunnerMigrationEvidence(options) {
+        events.push("external-migration");
+        assert.equal(options.targetRecordPath, committedRecordPath);
+        assert.equal(options.priorRecordPath, priorRecordPath);
+        const evidence = {
+          schemaVersion: 1, targetActivationId: externalActivationId,
+          targetReleaseSha: externalSourceRevision, priorActivationId: priorRunnerActivationId,
+          priorReleaseSha: releaseSha, targetRecordSha256: committedRecordSha256,
+          priorRecordSha256: priorRecordArtifact.sha256,
+          semanticReceiptSha256: transitionSha256,
+          drainIntent: { observedAt: "2026-08-15T01:00:00.000Z" },
+          drainReceipt: { observedAt: "2026-08-15T01:00:20.000Z" }
+        };
+        mutateExternalEvidence(evidence);
+        if (changeInstalledRecord) privateJson(committedRecordPath, { changed: true });
+        return evidence;
       },
       async verifyCommittedRunnerDrainEvidence(options) {
         events.push("committed");
@@ -512,6 +585,8 @@ function productionAttestorFixture(
     configArtifact,
     events,
     failed,
+    serviceRoot,
+    externalRecordPath: committedRecordPath,
     setLinkedJournal: (journal) => {
       linkedJournals.set(journal.releaseId, journal);
     },
@@ -1103,6 +1178,107 @@ test("production recovery terminally attests an exact healthy committed v4 runne
     "committed",
     "healthy"
   ]);
+  assert.equal(fixture.events.includes("restore"), false);
+});
+
+test("external migration recovery preserves separate cloud, runner and successor identities", async (t) => {
+  const fixture = productionAttestorFixture(t, { externalRunner: true });
+  const evidence = await fixture.attestor(fixture.failed);
+  assert.equal(evidence.externalRunnerActivationId, "external-desktop-r1");
+  assert.equal(evidence.externalRunnerSourceRevision, "c".repeat(40));
+  assert.equal(evidence.liveWorkerSourceRevision, "d".repeat(40));
+  assert.equal(Object.hasOwn(evidence, "committedRunnerActivationId"), false);
+  assert.equal(fixture.events.includes("restore"), false);
+  assert.equal(fixture.events.filter((event) => event === "external-migration").length, 2);
+  const replaced = replaceRunnerFailureReleaseJournal(fixture.failed, {
+    releaseId: "external-recovery-successor", targetGitSha: "f".repeat(40),
+    evidence, at: "2026-08-16T17:10:00.000Z"
+  });
+  assert.equal(replaced.supersededBy.runnerFailureAttestation.schemaVersion, 3);
+  const successor = createReleaseJournal({
+    releaseId: replaced.supersededBy.releaseId,
+    targetGitSha: replaced.supersededBy.targetGitSha,
+    targetFingerprints: { ...fixture.failed.targetFingerprints, releaseTooling: "1".repeat(64) },
+    classification: classifyReleaseImpact({
+      changedPaths: ["scripts/release-prod.mjs"],
+      targetFingerprints: { ...fixture.failed.targetFingerprints, releaseTooling: "1".repeat(64) },
+      activeReceipt: null
+    }),
+    predecessor: predecessorForReleaseReplacement(replaced),
+    createdAt: "2026-08-16T17:10:01.000Z"
+  });
+  assert.equal(successor.predecessor.runnerActivationId, "external-desktop-r1");
+  assertReleaseReplacement(replaced, successor);
+  assert.deepEqual(replacementLiveWorkerLineageEvidence(successor, {
+    readJournal: (id) => id === replaced.releaseId ? replaced : null
+  }), {
+    sourceRevision: "d".repeat(40), runnerReleaseSha: "c".repeat(40),
+    runnerRecordSha256: evidence.externalRunnerRecordSha256
+  });
+  const retried = await commitRunnerFailureReplacement(replaced, {
+    releaseId: successor.releaseId, targetGitSha: successor.targetGitSha,
+    attest() { throw new Error("Must reuse the terminal immutable adoption"); }
+  });
+  assert.equal(retried.evidence, null);
+  assert.deepEqual(retried.journal, replaced);
+  const linked = linkedExternalRunnerMigrationEvidence(successor, {
+    readJournal: (id) => id === replaced.releaseId ? replaced : null
+  });
+  guardExternalRunnerMigrationRecord({ serviceRoot: fixture.serviceRoot, evidence: linked });
+  const record = JSON.parse(readFileSync(fixture.externalRecordPath, "utf8"));
+  privateJson(fixture.externalRecordPath, {
+    ...record, source: { ...record.source, revision: "a".repeat(40) }
+  });
+  assert.throws(() => guardExternalRunnerMigrationRecord({
+    serviceRoot: fixture.serviceRoot, evidence: linked
+  }), /differs from its immutable recovery attestation/);
+  const changedLink = structuredClone(replaced);
+  changedLink.supersededBy.runnerFailureAttestation.externalRunnerRecordSha256 = "0".repeat(64);
+  assert.throws(() => linkedExternalRunnerMigrationEvidence(successor, {
+    readJournal: () => changedLink
+  }), /exact immutable replacement link/);
+  assert.throws(() => linkedExternalRunnerMigrationEvidence(successor, {
+    readJournal: () => null
+  }), /exact immutable replacement link/);
+  assert.throws(() => linkedExternalRunnerMigrationEvidence(successor, {
+    readJournal: () => priorCloudJournal()
+  }), /exact immutable replacement link/);
+});
+
+test("external migration recovery rejects mismatched or post-attempt migration evidence", async (t) => {
+  for (const [field, value] of [
+    ["targetActivationId", "arbitrary-v4"], ["targetReleaseSha", "0".repeat(40)],
+    ["targetRecordSha256", "0".repeat(64)], ["priorActivationId", "wrong-prior"],
+    ["priorReleaseSha", "0".repeat(40)], ["priorRecordSha256", "0".repeat(64)],
+    ["drainIntent", { observedAt: "2026-08-16T17:00:00.000Z" }],
+    ["drainReceipt", { observedAt: "2026-08-16T17:00:00.000Z" }]
+  ]) {
+    await t.test(field, async (t) => {
+      const fixture = productionAttestorFixture(t, {
+        externalRunner: true, mutateExternalEvidence: (evidence) => { evidence[field] = value; }
+      });
+      await assert.rejects(fixture.attestor(fixture.failed), /does not predate and bind/);
+      assert.equal(fixture.events.includes("restore"), false);
+    });
+  }
+});
+
+test("external adoption rejects current runner identity or record drift without mutation", async (t) => {
+  for (const options of [
+    { invalidExternalCompatibility: true }, { changeInstalledRecord: true }
+  ]) {
+    const fixture = productionAttestorFixture(t, { externalRunner: true, ...options });
+    await assert.rejects(fixture.attestor(fixture.failed), /identity differs|identity changed/);
+    assert.equal(fixture.events.includes("restore"), false);
+  }
+});
+
+test("read-only external recovery preflight can never restore a legacy runner", async (t) => {
+  const fixture = productionAttestorFixture(t);
+  await assert.rejects(
+    fixture.attestor(fixture.failed, { requireExternalMigration: true }),
+    /Read-only external recovery proof/
+  );
   assert.equal(fixture.events.includes("restore"), false);
 });
 

@@ -43,3 +43,22 @@ export function verifyLaunchActivation(
   }>;
   modelArtifactSha256: string;
 }>;
+
+export function verifyRetiredManagedRunnerActivation(
+  recordPath: string
+): Promise<{
+  status: "ok";
+  schemaVersion: 4;
+  transitionOnly: true;
+  retiredManagedPrior: true;
+  activationId: string;
+  releaseSha: string;
+  runnerArtifactSha256: string;
+  acceptedProtocols: Array<{
+    family: string;
+    version: number;
+    fingerprint: string;
+  }>;
+  modelId: string;
+  modelArtifactSha256: string;
+}>;
