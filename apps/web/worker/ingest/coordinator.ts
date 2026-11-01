@@ -31,6 +31,7 @@ import {
   persistRawArtifacts
 } from "./raw-artifacts";
 import { pruneRetainedData } from "./retention";
+import { shouldCaptureRawArtifacts } from "./raw-policy";
 import {
   defaultRunIdSuffix,
   finalizeSourceRuns,
@@ -283,6 +284,7 @@ export async function runNorcalIngest(
   const ingestId = options.ingestId ?? options.idSuffix ?? defaultRunIdSuffix();
   const idSuffix = options.idSuffix ?? ingestId;
   const captureHistory = shouldCaptureForecastHistory(options.kind, requestedAt);
+  const captureRaw = shouldCaptureRawArtifacts(options.kind, now);
   const caveats: SourceCaveat[] = [];
   const requestedSpotIds = options.spotIds ?? NORCAL_SPOTS.map(({ id }) => id);
   if (requestedSpotIds.length === 0 || new Set(requestedSpotIds).size !== requestedSpotIds.length) {
@@ -320,30 +322,32 @@ export async function runNorcalIngest(
     { items: [], errors: [] },
     { items: [], errors: [] }
   ];
+  const sourceFetcher = (index: number, maxBytes?: number): SourceFetch =>
+    captureRaw ? capturingFetcher(baseFetcher, captures[index]!, maxBytes) : baseFetcher;
   const [coops, nws, nwsWave, cdipMop, ndbc] = await Promise.all([
     fetchCoopsTidePredictionsForSpots(spots, {
-      fetcher: capturingFetcher(baseFetcher, captures[0]),
+      fetcher: sourceFetcher(0),
       now,
       horizonHours: providerHorizon.hours,
       horizonEndAt: providerHorizon.endAt
     }),
     fetchNwsContextForSpots(spots, {
-      fetcher: capturingFetcher(baseFetcher, captures[1])
+      fetcher: sourceFetcher(1)
     }),
     fetchNwsGridWaveForSpots(spots, {
-      fetcher: capturingFetcher(baseFetcher, captures[2]),
+      fetcher: sourceFetcher(2),
       now,
       horizonHours: DISPLAY_HORIZON_HOURS,
       horizonEndAt: providerHorizon.endAt
     }),
     fetchCdipMopForecastsForSpots(spots, {
-      fetcher: capturingFetcher(baseFetcher, captures[3], CDIP_RAW_CAPTURE_LIMIT_BYTES),
+      fetcher: sourceFetcher(3, CDIP_RAW_CAPTURE_LIMIT_BYTES),
       now,
       horizonHours: providerHorizon.hours,
       horizonEndAt: providerHorizon.endAt
     }),
     fetchNdbcRealtimeObservationsForStations(ndbcRealtimeStations, {
-      fetcher: capturingFetcher(baseFetcher, captures[4]),
+      fetcher: sourceFetcher(4),
       now
     })
   ]);
@@ -400,6 +404,16 @@ export async function runNorcalIngest(
     await persistRawArtifacts(env.RAW_ARTIFACTS, env.DB, cdipMopRun, captures[3], idSuffix, fetchedAt),
     await persistRawArtifacts(env.RAW_ARTIFACTS, env.DB, ndbcRun, captures[4], idSuffix, fetchedAt)
   ];
+  console.log(JSON.stringify({
+    event: "raw_artifact_capture",
+    ingestId,
+    generatedAt: sourceGenerationAt,
+    captureEnabled: captureRaw,
+    captureReason: options.kind === "manual-ingest" ? "manual" : captureRaw ? "scheduled_sample" : "between_samples",
+    capturedBytes: captures.reduce((sum, capture) => sum + capture.items.reduce((bytes, item) => bytes + item.body.byteLength, 0), 0),
+    artifacts: artifactPersistence.reduce((sum, result) => sum + result.rowsWritten, 0),
+    errors: artifactPersistence.reduce((sum, result) => sum + result.errors.length, 0)
+  }));
   const completedAt = new Date().toISOString();
   const finalizedRuns = await finalizeSourceRuns(env.DB, [
     {

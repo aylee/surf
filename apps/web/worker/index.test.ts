@@ -250,7 +250,7 @@ describe("worker api", () => {
     const result = await pruneRetainedData(db, now);
 
     expect(result.errors).toEqual([]);
-    expect(sqls).toHaveLength(16);
+    expect(sqls).toHaveLength(18);
     const fallbackLedgerIndex = sqls.findIndex((sql) =>
       sql.includes("delete from narrative_fallback_attempts")
     );
@@ -306,6 +306,8 @@ describe("worker api", () => {
         ).toISOString()
       );
     }
+    const captureIndex = sqls.findIndex((sql) => sql.includes("delete from raw_artifact_captures"));
+    expect(runs[captureIndex]).toEqual([now.toISOString()]);
     expect(sqls.some((sql) => sql.includes("delete from forecast_configs"))).toBe(true);
     expect(sqls.find((sql) => sql.includes("delete from source_runs"))).toContain(
       "not exists (select 1 from wave_forecasts"
@@ -990,11 +992,11 @@ describe("worker api", () => {
     expect(sourceRunRows).toHaveLength(5);
     expect(sourceRunRows.some(({ sourceId }) => sourceId === "nws:mtr-grid-wave")).toBe(true);
     const artifactSqlIndexes = sqls.flatMap((sql, index) =>
-      sql.includes("insert into source_artifacts") ? [index] : []
+      sql.includes("insert into raw_artifact_captures") ? [index] : []
     );
     expect(artifactSqlIndexes).toHaveLength(5);
     expect(artifactSqlIndexes.some((index) =>
-      JSON.parse(String(runs[index]?.[3])).some(
+      JSON.parse(String(runs[index]?.[5])).some(
         ({ r2Key }: { r2Key: string }) => r2Key.startsWith("raw/")
       )
     )).toBe(true);

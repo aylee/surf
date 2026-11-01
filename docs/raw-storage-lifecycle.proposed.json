@@ -1,0 +1,145 @@
+{
+  "rules": [
+    {
+      "id": "Default Multipart Abort Rule",
+      "enabled": true,
+      "conditions": {},
+      "abortMultipartUploadsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 604800
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day legacy cdip-mop-forecast",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/cdip-mop-forecast/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day legacy coops-tide-predictions",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/coops-tide-predictions/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day legacy ndbc-realtime2-standard-meteorological",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/ndbc-realtime2-standard-meteorological/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day legacy nws-mtr-grid-wave",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/nws-mtr-grid-wave/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day legacy nws-point-forecast-alerts",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/nws-point-forecast-alerts/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day v2 cdip-mop-forecast",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/v2/cdip-mop-forecast/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day v2 coops-tide-predictions",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/v2/coops-tide-predictions/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day v2 ndbc-realtime2-standard-meteorological",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/v2/ndbc-realtime2-standard-meteorological/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day v2 nws-mtr-grid-wave",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/v2/nws-mtr-grid-wave/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    },
+    {
+      "id": "Surf 30 day v2 nws-point-forecast-alerts",
+      "enabled": true,
+      "conditions": {
+        "prefix": "raw/v2/nws-point-forecast-alerts/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 2592000
+        }
+      }
+    }
+  ]
+}

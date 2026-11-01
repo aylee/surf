@@ -700,8 +700,15 @@ tests, and the same backup/rollback discipline as other data retention changes.
 Do not place another domain's ledger in the Surf D1 database without its own
 explicit capacity decision; separate Queues alone do not isolate D1 storage.
 
-R2 objects are not deleted by the D1 retention job. This is deliberate: D1
-metadata retention must not silently destroy raw evidence.
+R2 objects are not deleted by the D1 retention job. Raw provider bodies have
+an explicitly approved 30-day physical policy. V2 diagnostic metadata expires
+35 days after persistence; known legacy provider metadata also keeps a 35-day
+buffer from actual creation/completion. Unknown legacy prefixes retain their
+prior 400-day metadata policy, and numeric history is unchanged. Physical R2
+expiry requires the separately authorized, provider-prefix-scoped lifecycle
+policy in [raw storage operations](raw-storage.md). Deploying code alone does
+not install that policy or reclaim existing storage. The five-day metadata
+buffer covers expected processing lag, not atomic proof of object deletion.
 
 After ingest, stale operational counts should be zero:
 

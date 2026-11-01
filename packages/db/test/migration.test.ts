@@ -29,7 +29,10 @@ const narrativeFallbackMigrationSql = readFileSync(
   new URL("../migrations/0005_narrative_fallback.sql", import.meta.url),
   "utf8"
 );
-const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}\n${readModelMigrationSql}\n${narrativeMigrationSql}\n${narrativeFallbackMigrationSql}`;
+const sharedRawMigrationSql = readFileSync(
+  new URL("../migrations/0006_shared_raw_artifacts.sql", import.meta.url), "utf8"
+);
+const allMigrationSql = `${migrationSql}\n${historyMigrationSql}\n${trustWorkbenchMigrationSql}\n${readModelMigrationSql}\n${narrativeMigrationSql}\n${narrativeFallbackMigrationSql}\n${sharedRawMigrationSql}`;
 const seedSql = readFileSync(new URL("../seeds/0000_v1_norcal.sql", import.meta.url), "utf8");
 
 const appliedMigrationHashes = {
@@ -164,6 +167,14 @@ describe("D1 migration", () => {
     expect(createHash("sha256").update(trustWorkbenchMigrationSql).digest("hex")).toBe(
       appliedMigrationHashes["0002_trust_workbench.sql"]
     );
+  });
+
+  it("allows shared raw keys without rewriting evidence rows or weakening capture identity", () => {
+    expect(sharedRawMigrationSql).not.toMatch(/drop (table|index)|delete from|alter table/i);
+    expect(sharedRawMigrationSql).toContain("id text primary key");
+    expect(sharedRawMigrationSql).toContain("create table if not exists raw_artifact_captures");
+    expect(sharedRawMigrationSql).toContain("on raw_artifact_captures (r2_key)");
+    expect(sharedRawMigrationSql).toContain("on raw_artifact_captures (metadata_expires_at)");
   });
 
   it("creates the normalized v1 operational tables with required columns", () => {

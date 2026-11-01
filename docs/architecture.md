@@ -45,8 +45,10 @@ flowchart LR
 
 ## Data ownership
 
-- **R2** stores checksum-addressed raw provider responses and future large model
-  subsets. Raw artifacts are evidence, not the operational read model.
+- **R2** stores gzip-compressed diagnostic provider responses, shared by full
+  content checksum within each UTC date. Four scheduled generations per day
+  capture evidence; explicit manual ingestion also captures. Raw artifacts
+  are evidence, not the operational read model. See [storage policy](raw-storage.md).
 - **D1** stores normalized forecast/observation rows, source runs, immutable
   issued history, the spot/source reference seed, the latest validated
   1-hour/3-hour API read models, per-date fact bundles, and the narrative
@@ -165,11 +167,12 @@ fixtures, and an honest confidence posture all travel together.
    36/36/25 and are locked below the Free Worker limit by tests. CO-OPS, NWS
    grid wave, and CDIP share the exact next-midnight boundary after the fifth
    complete local date, including the 121-hour fall-back window.
-4. After every adapter attempt settles, batch-specific raw captures and hashes
-   are written to R2; source-run metadata and only that batch's normalized rows
-   are written to D1. Captures are checksum-sorted before deterministic artifact
-   IDs and keys are assigned, so concurrent completion order and Queue replay
-   cannot remap evidence. Normalized tables, source runs, finalization, and
+4. After every adapter attempt settles, source-run metadata and only that
+   batch's normalized rows are written to D1. On diagnostic capture generations,
+   bounded raw responses are compressed and written create-only to daily shared
+   R2 content keys. D1 owns per-run manifests, request URLs, raw checksums, sizes,
+   and evidence availability dates. Captures are checksum-sorted before
+   deterministic artifact IDs are assigned. Normalized tables, source runs, finalization, and
    artifact metadata use bounded JSON-backed bulk statements rather than a D1
    statement per provider row. Shared NDBC observations never fan outside the
    batch. A real-D1 production-shaped fixture locks this source pipeline at 31
