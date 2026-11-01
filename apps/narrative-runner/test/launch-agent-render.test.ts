@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rm,
   stat,
   symlink,
   writeFile
@@ -19,8 +20,14 @@ import { describe, expect, it } from "vitest";
 import { NARRATIVE_PROTOCOL_DESCRIPTOR } from "@surf/narrative-contracts";
 import {
   renderLaunchAgents,
-  verifyLaunchActivation
+  verifyLaunchActivation,
+  verifyRetiredManagedRunnerActivation
 } from "../scripts/render-launch-agents.mjs";
+
+import {
+  verifyCommittedRunnerDrainEvidence,
+  verifyExternalRunnerMigrationEvidence
+} from "../scripts/manage-launch-agents.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -131,6 +138,7 @@ async function detachedRelease(root: string, name = "release") {
     runnerArtifactManifestPath,
     render: releaseModule.renderLaunchAgents as typeof renderLaunchAgents,
     verify: releaseModule.verifyLaunchActivation as typeof verifyLaunchActivation,
+    verifyRetiredManaged: releaseModule.verifyRetiredManagedRunnerActivation as typeof verifyRetiredManagedRunnerActivation,
     install: installerModule.installLaunchAgents as (
       recordPath: string,
       options: {
@@ -256,6 +264,67 @@ describe("LaunchAgent activation records", () => {
     await expect(value.release.verify(target[1]!, { requireInstalled: true })).resolves.toMatchObject({ status: "ok" });
     await value.release.install(prior[2]!, { ...options, priorRecordPath: target[1]! });
     await expect(value.release.verify(prior[2]!, { requireInstalled: true })).resolves.toMatchObject({ status: "ok" });
+  });
+
+  it("attests a completed external migration after the retired managed executable is removed", async () => {
+    const value = await fixture(await mkdtemp(join(tmpdir(), "surf-external-evidence-")));
+    const prior = await value.release.render({ ...value.options,
+      outputDir: join(dirname(value.outputDir), "activation-r0") });
+    const target = await value.release.render({ ...value.options, omlxLifecycle: "external" });
+    const priorPath = prior[2]!;
+    const targetPath = target[1]!;
+    await value.release.install(priorPath, { environment: value.options.environment });
+    await value.release.install(targetPath, { environment: value.options.environment,
+      allowReplace: true, priorRecordPath: priorPath });
+    const priorRecord = JSON.parse(await readFile(priorPath, "utf8"));
+    const targetRecord = JSON.parse(await readFile(targetPath, "utf8"));
+    const now = Date.parse("2026-09-28T12:00:00.000Z");
+    const intent = {
+      schemaVersion: 2, targetActivationId: targetRecord.activationId,
+      targetReleaseSha: targetRecord.source.revision,
+      priorActivationId: priorRecord.activationId, priorReleaseSha: priorRecord.source.revision,
+      priorPid: 4101, heartbeatPid: 4103, runnerLabelInitiallyLoaded: true,
+      observedAt: new Date(now - 2_000).toISOString()
+    };
+    const receipt = {
+      schemaVersion: 2, priorActivationId: priorRecord.activationId,
+      priorReleaseSha: priorRecord.source.revision, priorPid: 4101, heartbeatPid: 4103,
+      outcome: "stopped", heartbeatUpdatedAt: new Date(now - 1_000).toISOString(),
+      observedAt: new Date(now).toISOString(), runnerLabelInitiallyLoaded: true,
+      runnerLabelUnloaded: true, maxWaitMs: 960_000,
+      acceptedProtocolFingerprints: priorRecord.acceptedProtocols.map(
+        ({ fingerprint }: { fingerprint: string }) => fingerprint).sort()
+    };
+    await writeFile(join(dirname(targetPath), "runner-drain-intent.json"), JSON.stringify(intent), { mode: 0o600 });
+    await writeFile(join(dirname(targetPath), "runner-drain-receipt.json"), JSON.stringify(receipt), { mode: 0o600 });
+    await rm(value.tools.omlxPath);
+
+    await expect(value.release.verify(priorPath, { requireInstalled: false }))
+      .rejects.toThrow(/omlx.*readable executable/);
+    await expect(verifyCommittedRunnerDrainEvidence({ targetRecordPath: targetPath, priorRecordPath: priorPath },
+      { now: () => now })).rejects.toThrow(/omlx.*readable executable/);
+    await expect(value.release.verifyRetiredManaged(priorPath)).resolves.toMatchObject({
+      status: "ok", schemaVersion: 4, transitionOnly: true, retiredManagedPrior: true,
+      activationId: priorRecord.activationId, releaseSha: priorRecord.source.revision
+    });
+    const evidence = await verifyExternalRunnerMigrationEvidence({ targetRecordPath: targetPath,
+      priorRecordPath: priorPath }, { now: () => now });
+    expect(evidence).toMatchObject({ targetActivationId: targetRecord.activationId,
+      priorActivationId: priorRecord.activationId,
+      priorRecordSha256: sha256(await readFile(priorPath)),
+      targetRecordSha256: sha256(await readFile(targetPath)), drainIntent: intent, drainReceipt: receipt });
+    await expect(value.release.verify(targetPath, { requireInstalled: true })).resolves.toMatchObject({ status: "ok" });
+    await expect(value.release.verifyRetiredManaged(targetPath)).rejects.toThrow(/managed v4/);
+    // A retired path that still exists must retain its original integrity.
+    await writeFile(value.tools.omlxPath, "#!/bin/sh\necho replaced\n", { mode: 0o755 });
+    await expect(value.release.verifyRetiredManaged(priorPath)).rejects.toThrow(/SHA-256 differs/);
+    await rm(value.tools.omlxPath);
+    await symlink(join(value.tools.nodeBinPath, "node"), value.tools.omlxPath);
+    await expect(value.release.verifyRetiredManaged(priorPath)).rejects.toThrow(/mutable alias/);
+    await rm(value.tools.omlxPath);
+    // Retiring one executable does not permit model or environment drift.
+    await writeFile(join(value.model.modelArtifactPath, "weights.bin"), "changed weights");
+    await expect(value.release.verifyRetiredManaged(priorPath)).rejects.toThrow(/model artifact differs/);
   });
 
   it("renders and verifies a runner-owned v4 activation", async () => {

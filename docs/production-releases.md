@@ -291,6 +291,29 @@ source. A further schema-v2
 committed-runner replacement chain is rejected until a separately audited
 lineage-carrying design exists.
 
+An independently completed managed-to-desktop oMLX migration has a separate,
+read-only recovery branch under the same `--replace-runner-failure` command.
+Ordinary release planning rejects an installed runner that differs from the
+cloud release receipt before uploading a Worker or preparing D1. If an older
+controller already reached `runner_failed` / `data-prepared`, the replacement
+can adopt an installed external-v4 runner only after proving the exact complete
+cloud predecessor, unchanged live Worker/deployment, inactive failed upload,
+D1 rollback export, preexisting Queues, and current runner health and bindings.
+The manager's exact schema-v2 managed-to-external drain intent and receipt must
+identify that predecessor and predate the failed release. No runner or desktop
+server is restarted during this attestation.
+
+This branch verifies the active external runner in full. The retired managed
+record is verified as historical evidence, permitting only its former oMLX
+executable to have been removed; it is never accepted for active execution or
+rollback. Do not reinstall that executable or edit activation records to pass
+the gate. A distinct schema-v3 terminal attestation keeps the live Worker source,
+external runner source, and successor source separate. The successor inherits
+the attested external activation and uses the normal guarded release switch.
+Only runner-artifact or release-tooling repairs may differ from the failed
+target. A linked retry reuses the immutable adoption; exact successor resumes
+retain the ordinary installed-plist and bounded drain checks.
+
 There is no automatic production rollback after Worker activation. A Queue,
 schema, or protocol boundary may already have been crossed; follow the
 quiescence procedure in [Runtime operations](runtime-operations.md) before any

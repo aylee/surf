@@ -20,7 +20,8 @@ import {
   validateD1BackupReceipt
 } from "./release-storage.mjs";
 import {
-  expectedWorkerBindingDescriptor
+  expectedWorkerBindingDescriptor,
+  resolveOptionalWorkerSourceRevision
 } from "./release-worker.mjs";
 import {
   discoverRunnerActivationFromInstalledPlist,
@@ -31,7 +32,10 @@ import { replacementLiveWorkerLineageEvidence } from "./release-runner-failure-l
 import { resolveSoleActiveWorkerVersionId } from "./worker-runtime.mjs";
 import { resolveActiveDeploymentEvidence } from "./deploy-url.mjs";
 import { activateLaunchAgents } from "../../apps/narrative-runner/scripts/manage-launch-agents.mjs";
-import { verifyCommittedRunnerDrainEvidence } from "../../apps/narrative-runner/scripts/manage-launch-agents.mjs";
+import {
+  verifyCommittedRunnerDrainEvidence,
+  verifyExternalRunnerMigrationEvidence
+} from "../../apps/narrative-runner/scripts/manage-launch-agents.mjs";
 import { verifyLaunchActivation } from "../../apps/narrative-runner/scripts/render-launch-agents.mjs";
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
@@ -45,6 +49,7 @@ const DEFAULT_DEPENDENCIES = Object.freeze({
   discoverRunnerActivationFromInstalledPlist,
   verifyActiveRunnerCompatibility,
   verifyCommittedRunnerDrainEvidence,
+  verifyExternalRunnerMigrationEvidence,
   validateImmutableRelease,
   verifyLaunchActivation
 });
@@ -107,6 +112,26 @@ function exactSnapshot(path, label) {
     ...value,
     sha256: createHash("sha256").update(value.contents).digest("hex")
   });
+}
+
+export function guardExternalRunnerMigrationRecord({ serviceRoot, evidence }) {
+  if (evidence?.schemaVersion !== 3 ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(evidence.externalRunnerActivationId ?? "")) {
+    throw new Error("External runner guard requires a validated schema-v3 adoption");
+  }
+  const snapshot = exactSnapshot(resolve(serviceRoot, "launch-agents",
+    evidence.externalRunnerActivationId, "activation-record.json"), "Adopted external runner record");
+  const record = JSON.parse(snapshot.contents.toString("utf8"));
+  if (snapshot.sha256 !== evidence.externalRunnerRecordSha256 ||
+      record.schemaVersion !== 4 || record.omlxLifecycle !== "external" ||
+      record.activationId !== evidence.externalRunnerActivationId ||
+      record.source?.revision !== evidence.externalRunnerSourceRevision ||
+      record.runnerArtifact?.sha256 !== evidence.externalRunnerArtifactSha256 ||
+      !record.acceptedProtocols?.some((p) => p.family === "surf.narrative" &&
+        p.fingerprint === evidence.externalRunnerProtocolFingerprint)) {
+    throw new Error("Adopted external runner record differs from its immutable recovery attestation");
+  }
+  return snapshot.sha256;
 }
 
 function exactRunnerManifest(releaseRoot) {
@@ -345,6 +370,119 @@ async function attestCommittedTargetRunner({
   });
 }
 
+// Adopt only a completed managed-to-external migration that existed before
+// this failed cloud attempt. It is independent of the failed target runner.
+async function attestExternalMigrationRunner({
+  deps, failed, failedContext, failedConfig, failedReleaseRoot,
+  profile, store, workerSecrets, discoveredRunner
+}) {
+  const predecessor = failed.predecessor;
+  const cloud = predecessor.releaseId === null
+    ? null : store.readJournal(predecessor.releaseId);
+  if (
+    cloud?.state !== "complete" ||
+    fingerprintReleaseJournal(cloud) !== predecessor.journalSha256 ||
+    cloud.receipts.workerVersionId !== predecessor.workerVersionId ||
+    cloud.receipts.deploymentId !== predecessor.deploymentId ||
+    cloud.receipts.runnerActivationId !== predecessor.runnerActivationId
+  ) {
+    throw new Error("External migration recovery requires its exact complete cloud predecessor");
+  }
+  const targetRecordPath = discoveredRunner.recordPath;
+  const priorRecordPath = resolve(profile.serviceRoot, "launch-agents",
+    predecessor.runnerActivationId, "activation-record.json");
+  const targetSnapshot = exactSnapshot(targetRecordPath, "External runner activation record");
+  const priorSnapshot = exactSnapshot(priorRecordPath, "Retired managed activation record");
+  const target = JSON.parse(targetSnapshot.contents.toString("utf8"));
+  const prior = JSON.parse(priorSnapshot.contents.toString("utf8"));
+  if (
+    target.schemaVersion !== 4 || target.omlxLifecycle !== "external" ||
+    target.activationId !== discoveredRunner.activationId ||
+    target.activationId === failed.releaseId ||
+    target.activationId === predecessor.runnerActivationId ||
+    prior.schemaVersion !== 4 || prior.omlxLifecycle !== undefined ||
+    prior.activationId !== predecessor.runnerActivationId ||
+    prior.source?.revision !== cloud.targetGitSha
+  ) {
+    throw new Error("External migration recovery requires the exact retired managed and installed external v4 records");
+  }
+  const detail = failedContext.runWrangler(
+    ["versions", "view", predecessor.workerVersionId, "--json"],
+    { capture: true, echo: false }
+  );
+  const liveSource = resolveOptionalWorkerSourceRevision(detail, predecessor.workerVersionId);
+  if (liveSource !== cloud.targetGitSha) {
+    throw new Error("External migration recovery live Worker source differs from its cloud predecessor");
+  }
+  const manifest = exactRunnerManifest(failedReleaseRoot);
+  const producer = (failedConfig.queues?.producers ?? []).find((p) => p.binding === "NARRATIVE_QUEUE");
+  const identities = await failedContext.inspectQueueIdentities();
+  const queueId = identities.queues?.[producer?.queue];
+  if (!producer?.queue || !queueId ||
+      typeof workerSecrets?.assertUnchanged !== "function") {
+    throw new Error("External migration recovery lacks exact Queue and unchanged Worker-secret evidence");
+  }
+  const verifyHealthy = async () => {
+    workerSecrets.assertUnchanged();
+    const compatible = await deps.verifyActiveRunnerCompatibility({
+      activationId: target.activationId,
+      serviceRoot: profile.serviceRoot,
+      expectedProtocolFingerprint: manifest.protocolFingerprint,
+      expectedCloudflareAccountId: identities.accountId,
+      expectedQueueId: queueId,
+      expectedQueueName: producer.queue,
+      expectedDeadLetterQueueName: `${failedConfig.name}-narrative-dlq`,
+      expectedCallbackOrigin: profile.customOrigin,
+      workerGeminiToken: workerSecrets.geminiToken,
+      workerResultToken: workerSecrets.resultToken
+    });
+    if (compatible.activationId !== target.activationId ||
+        compatible.sourceRevision !== target.source?.revision ||
+        compatible.runnerArtifactSha256 !== manifest.artifactSha256 ||
+        !compatible.acceptedProtocolFingerprints.includes(manifest.protocolFingerprint)) {
+      throw new Error("External runner identity differs from the exact recovery target");
+    }
+    workerSecrets.assertUnchanged();
+    return compatible;
+  };
+  const compatible = await verifyHealthy();
+  const transition = await deps.verifyExternalRunnerMigrationEvidence({
+    targetRecordPath, priorRecordPath
+  });
+  const beforeFailure = (at) => Number.isFinite(Date.parse(at)) && Date.parse(at) < Date.parse(failed.createdAt);
+  if (
+    transition.targetActivationId !== target.activationId ||
+    transition.targetReleaseSha !== target.source.revision ||
+    transition.targetRecordSha256 !== targetSnapshot.sha256 ||
+    transition.priorActivationId !== predecessor.runnerActivationId ||
+    transition.priorReleaseSha !== cloud.targetGitSha ||
+    transition.priorRecordSha256 !== priorSnapshot.sha256 ||
+    !beforeFailure(transition.drainIntent?.observedAt) ||
+    !beforeFailure(transition.drainReceipt?.observedAt) ||
+    !/^[0-9a-f]{64}$/.test(transition.semanticReceiptSha256 ?? "")
+  ) {
+    throw new Error("External runner migration does not predate and bind the failed cloud attempt");
+  }
+  if (JSON.stringify(await verifyHealthy()) !== JSON.stringify(compatible) ||
+      exactSnapshot(targetRecordPath, "External runner activation record").sha256 !== targetSnapshot.sha256 ||
+      exactSnapshot(priorRecordPath, "Retired managed activation record").sha256 !== priorSnapshot.sha256) {
+    throw new Error("External migration identity changed during attestation");
+  }
+  return Object.freeze({
+    schemaVersion: 3,
+    priorActivationId: predecessor.runnerActivationId,
+    priorRecordSha256: priorSnapshot.sha256,
+    priorReleaseSha: cloud.targetGitSha,
+    externalRunnerActivationId: target.activationId,
+    externalRunnerSourceRevision: target.source.revision,
+    externalRunnerArtifactSha256: manifest.artifactSha256,
+    externalRunnerProtocolFingerprint: manifest.protocolFingerprint,
+    externalRunnerRecordSha256: targetSnapshot.sha256,
+    liveWorkerSourceRevision: liveSource,
+    runnerTransitionSha256: transition.semanticReceiptSha256
+  });
+}
+
 export function createRunnerFailureRecoveryAttestor(
   { profile, environment, store, workerSecrets = null },
   overrides = {}
@@ -353,7 +491,7 @@ export function createRunnerFailureRecoveryAttestor(
     throw new Error("Runner-failure attestation requires production context");
   }
   const deps = dependencies(overrides);
-  return async function attestRunnerFailureReplacement(failed) {
+  return async function attestRunnerFailureReplacement(failed, { requireExternalMigration = false } = {}) {
     const failedJournalSha256 = fingerprintReleaseJournal(failed);
     const attemptsRoot = existingPrivateSubdirectory(
       profile.stateDirectory,
@@ -562,6 +700,14 @@ export function createRunnerFailureRecoveryAttestor(
         serviceRoot: profile.serviceRoot,
         allowLegacyV3: true
       });
+    if (requireExternalMigration && !(
+      discoveredRunner.recordSchemaVersion === 4 &&
+      discoveredRunner.transitionOnly === false &&
+      discoveredRunner.activationId !== failed.releaseId &&
+      discoveredRunner.activationId !== failed.predecessor.runnerActivationId
+    )) {
+      throw new Error("Read-only external recovery proof requires the independent external migration");
+    }
     const priorRecordPath = resolve(
       profile.serviceRoot,
       "launch-agents",
@@ -644,6 +790,21 @@ export function createRunnerFailureRecoveryAttestor(
             workerSecrets
           }))
         });
+    } else if (
+      discoveredRunner.recordSchemaVersion === 4 &&
+      discoveredRunner.transitionOnly === false &&
+      discoveredRunner.activationId !== failed.releaseId &&
+      discoveredRunner.activationId !== failed.predecessor.runnerActivationId
+    ) {
+      if (runnerDrainSnapshot !== null) {
+        throw new Error("External migration recovery cannot accept a failed-attempt drain receipt");
+      }
+      const attestExternal = () => attestExternalMigrationRunner({
+        deps, failed, failedContext, failedConfig, failedReleaseRoot,
+        profile, store, workerSecrets, discoveredRunner
+      });
+      runnerEvidence = await attestExternal();
+      reattestRunner = attestExternal;
     } else {
       throw new Error(
         "Runner-failure replacement requires the exact legacy predecessor or committed target v4 runner"
@@ -712,7 +873,13 @@ export function createRunnerFailureRecoveryAttestor(
             runnerTransitionSha256:
               runnerEvidence.runnerTransitionSha256
           }
-        : {}),
+        : runnerEvidence.schemaVersion === 3
+          ? Object.fromEntries([
+              "externalRunnerActivationId", "externalRunnerSourceRevision",
+              "externalRunnerArtifactSha256", "externalRunnerProtocolFingerprint",
+              "externalRunnerRecordSha256", "liveWorkerSourceRevision", "runnerTransitionSha256"
+            ].map((key) => [key, runnerEvidence[key]]))
+          : {}),
       liveWorkerVersionId: after.workerVersionId,
       liveDeploymentId: after.deploymentId,
       predecessorDeploymentCreatedOn: after.createdOn,

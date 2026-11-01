@@ -110,6 +110,25 @@ export function linkedCommittedRunnerFailureSource(
   return source;
 }
 
+export function linkedExternalRunnerMigrationEvidence(successor, { readJournal }) {
+  const current = assertReleaseJournal(successor);
+  if (current.predecessor.releaseId === null) return null;
+  const source = readJournal(current.predecessor.releaseId);
+  if (source === null || source === undefined ||
+      fingerprintReleaseJournal(source) !== current.predecessor.journalSha256) {
+    throw new Error("External runner adoption lacks its exact immutable replacement link");
+  }
+  const evidence = source?.supersededBy?.runnerFailureAttestation;
+  if (evidence?.schemaVersion !== 3) return null;
+  if (source.state !== RELEASE_JOURNAL_STATES.REPLACED ||
+      source.supersededBy.releaseId !== current.releaseId ||
+      source.supersededBy.targetGitSha !== current.targetGitSha) {
+    throw new Error("External runner adoption lacks its exact immutable replacement link");
+  }
+  assertReleaseReplacement(source, current);
+  return evidence;
+}
+
 function attestedCommittedDrainEvidence(source) {
   const attestation = source.supersededBy?.runnerFailureAttestation;
   if (attestation?.schemaVersion !== 2) {
@@ -142,6 +161,15 @@ export function replacementLiveWorkerLineageEvidence(
     return null;
   }
   const replaced = readJournal(current.predecessor.releaseId);
+  if (
+    replaced?.state === RELEASE_JOURNAL_STATES.COMPLETE &&
+    fingerprintReleaseJournal(replaced) === current.predecessor.journalSha256 &&
+    replaced.receipts.workerVersionId === current.predecessor.workerVersionId &&
+    replaced.receipts.deploymentId === current.predecessor.deploymentId &&
+    replaced.receipts.runnerActivationId === current.predecessor.runnerActivationId
+  ) {
+    return null;
+  }
   const attestation = replaced?.supersededBy?.runnerFailureAttestation;
   if (
     replaced === null ||
@@ -150,7 +178,7 @@ export function replacementLiveWorkerLineageEvidence(
     replaced.state !== RELEASE_JOURNAL_STATES.REPLACED ||
     replaced.supersededBy?.releaseId !== current.releaseId ||
     replaced.supersededBy?.targetGitSha !== current.targetGitSha ||
-    ![1, 2].includes(attestation?.schemaVersion)
+    ![1, 2, 3].includes(attestation?.schemaVersion)
   ) {
     throw new Error(
       "Runner-failure successor lacks its exact hash-linked replacement lineage"
@@ -159,15 +187,19 @@ export function replacementLiveWorkerLineageEvidence(
   assertReleaseReplacement(replaced, current);
   return Object.freeze({
     sourceRevision:
-      attestation.schemaVersion === 2
+      [2, 3].includes(attestation.schemaVersion)
         ? attestation.liveWorkerSourceRevision
         : attestation.priorRunnerReleaseSha,
     runnerReleaseSha:
-      attestation.schemaVersion === 2
+      attestation.schemaVersion === 3
+        ? attestation.externalRunnerSourceRevision
+        : attestation.schemaVersion === 2
         ? replaced.targetGitSha
         : attestation.priorRunnerReleaseSha,
     runnerRecordSha256:
-      attestation.schemaVersion === 2
+      attestation.schemaVersion === 3
+        ? attestation.externalRunnerRecordSha256
+        : attestation.schemaVersion === 2
         ? attestation.committedRunnerRecordSha256
         : attestation.priorRunnerRecordSha256
   });

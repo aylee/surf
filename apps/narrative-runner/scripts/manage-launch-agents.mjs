@@ -12,7 +12,10 @@ import {
   inspectInstalledLaunchAgents,
   installLaunchAgents
 } from "./install-launch-agents.mjs";
-import { verifyLaunchActivation } from "./render-launch-agents.mjs";
+import {
+  verifyLaunchActivation,
+  verifyRetiredManagedRunnerActivation
+} from "./render-launch-agents.mjs";
 
 const execFileAsync = promisify(execFile);
 const RUNNER_LABEL = "ai.alex.narrative-runner";
@@ -72,6 +75,8 @@ function dependencies(overrides = {}) {
     install: overrides.install ?? installLaunchAgents,
     inspectInstalled: overrides.inspectInstalled ?? inspectInstalledLaunchAgents,
     verify: overrides.verify ?? verifyLaunchActivation,
+    verifyRetiredManagedPrior:
+      overrides.verifyRetiredManagedPrior ?? verifyRetiredManagedRunnerActivation,
     readFile: overrides.readFile ?? readFile,
     portOpen: overrides.portOpen ?? defaultPortOpen,
     pidAlive: overrides.pidAlive ?? pidAlive,
@@ -609,13 +614,14 @@ async function verifiedActivationRecordSnapshot(
   });
 }
 
-export async function verifyCommittedRunnerDrainEvidence(
+async function verifyRunnerDrainEvidence(
   {
     targetRecordPath,
     priorRecordPath,
     attemptDrainReceiptPath = null
   },
-  overrides = {}
+  overrides = {},
+  externalMigration = false
 ) {
   const deps = dependencies(overrides);
   const targetSnapshot = await verifiedActivationRecordSnapshot(
@@ -627,17 +633,26 @@ export async function verifyCommittedRunnerDrainEvidence(
     },
     deps
   );
+  if (externalMigration && (
+    targetSnapshot.value.schemaVersion !== 4 ||
+    targetSnapshot.value.omlxLifecycle !== "external"
+  )) {
+    throw new Error("External runner migration requires an installed external v4 target");
+  }
   const priorSnapshot = await verifiedActivationRecordSnapshot(
     priorRecordPath,
     {
       label: "Prior activation record",
       requireInstalled: false,
-      allowLegacyV3: true
+      allowLegacyV3: !externalMigration
     },
-    deps
+    externalMigration ? { ...deps, verify: deps.verifyRetiredManagedPrior } : deps
   );
   const target = targetSnapshot.value;
   const prior = priorSnapshot.value;
+  if (externalMigration && (prior.schemaVersion !== 4 || prior.omlxLifecycle !== undefined)) {
+    throw new Error("External runner migration requires a retired managed v4 prior");
+  }
   if (
     targetRecordPath === priorRecordPath ||
     target.schemaVersion !== 4 ||
@@ -728,6 +743,19 @@ export async function verifyCommittedRunnerDrainEvidence(
     attemptDrainReceiptSha256,
     semanticReceiptSha256: semanticJsonSha256(drain.receipt)
   });
+}
+
+export async function verifyCommittedRunnerDrainEvidence(options, overrides = {}) {
+  return verifyRunnerDrainEvidence(options, overrides);
+}
+
+// This attests an already completed managed-to-external migration. It cannot
+// activate a service or turn the retired prior into current runtime authority.
+export async function verifyExternalRunnerMigrationEvidence(
+  { targetRecordPath, priorRecordPath },
+  overrides = {}
+) {
+  return verifyRunnerDrainEvidence({ targetRecordPath, priorRecordPath }, overrides, true);
 }
 
 function boundedProtocolSet(values) {

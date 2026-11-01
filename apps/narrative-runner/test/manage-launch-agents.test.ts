@@ -9,7 +9,8 @@ import {
   canRecoverHaltedRunner,
   canRecoverStoppedChildRunner,
   inspectRunnerTransitionInstallState,
-  verifyCommittedRunnerDrainEvidence
+  verifyCommittedRunnerDrainEvidence,
+  verifyExternalRunnerMigrationEvidence
 } from "../scripts/manage-launch-agents.mjs";
 
 const NOW = Date.parse("2026-08-15T12:00:00.000Z");
@@ -307,6 +308,13 @@ async function committedDrainFixture(priorSchemaVersion: 3 | 4 = 3) {
   };
 }
 
+async function externalMigrationFixture(priorSchemaVersion: 3 | 4 = 4) {
+  const value = await committedDrainFixture(priorSchemaVersion);
+  const target = { ...value.target, omlxLifecycle: "external" };
+  await writeFile(value.targetRecordPath, JSON.stringify(target), { mode: 0o600 });
+  return { ...value, target };
+}
+
 describe("bounded LaunchAgent activation", () => {
   it("attests an exact committed v4 drain against its installed target and prior record", async () => {
     const fixture = await committedDrainFixture(3);
@@ -395,6 +403,92 @@ describe("bounded LaunchAgent activation", () => {
         { verify: async () => ({ status: "ok" }), now: () => NOW }
       )
     ).rejects.toThrow(/differs from the committed manager receipt/);
+  });
+
+  it("binds external migration evidence to exact records and the immutable schema-v2 drain", async () => {
+    const fixture = await externalMigrationFixture();
+    const verify = vi.fn(async () => ({ status: "ok" }));
+    const verifyRetiredManagedPrior = vi.fn(async () => ({ status: "ok" }));
+    const evidence = await verifyExternalRunnerMigrationEvidence({ targetRecordPath: fixture.targetRecordPath,
+      priorRecordPath: fixture.priorRecordPath }, { verify, verifyRetiredManagedPrior, now: () => NOW });
+    expect(evidence).toMatchObject({
+      targetActivationId: fixture.target.activationId, targetReleaseSha: fixture.target.source.revision,
+      priorActivationId: fixture.intent.priorActivationId, priorReleaseSha: fixture.intent.priorReleaseSha,
+      targetRecordSha256: sha256(await readFile(fixture.targetRecordPath)),
+      priorRecordSha256: sha256(await readFile(fixture.priorRecordPath)),
+      drainIntent: fixture.intent, drainReceipt: fixture.receipt,
+      drainIntentSha256: sha256(await readFile(fixture.intentPath)),
+      drainReceiptSha256: sha256(await readFile(fixture.receiptPath)), attemptDrainReceiptSha256: null
+    });
+    expect(evidence.semanticReceiptSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(verify.mock.calls).toEqual(Array(2).fill([
+      fixture.targetRecordPath, { requireInstalled: true, allowLegacyV3: false }
+    ]));
+    expect(verifyRetiredManagedPrior.mock.calls).toEqual(Array(2).fill([
+      fixture.priorRecordPath, { requireInstalled: false, allowLegacyV3: false }
+    ]));
+  });
+
+  it.each(["managed target", "external prior", "legacy prior"])("rejects external migration with %s", async (kind) => {
+    const fixture = await externalMigrationFixture(kind === "legacy prior" ? 3 : 4);
+    if (kind === "managed target") {
+      await writeFile(fixture.targetRecordPath, JSON.stringify({ ...fixture.target, omlxLifecycle: undefined }));
+    } else if (kind === "external prior") {
+      await writeFile(fixture.priorRecordPath, JSON.stringify({ ...fixture.prior, omlxLifecycle: "external" }));
+    }
+    await expect(verifyExternalRunnerMigrationEvidence({ targetRecordPath: fixture.targetRecordPath,
+      priorRecordPath: fixture.priorRecordPath }, { verify: async () => ({ status: "ok" }),
+      verifyRetiredManagedPrior: async () => ({ status: "ok" }), now: () => NOW }))
+      .rejects.toThrow(/External runner migration requires/);
+  });
+
+  it.each([
+    ["target ID", { targetActivationId: "different-target" }],
+    ["prior ID", { priorActivationId: "different-prior" }],
+    ["target source", { targetReleaseSha: "e".repeat(40) }],
+    ["prior source", { priorReleaseSha: "e".repeat(40) }],
+    ["schema", { schemaVersion: 1 }]
+  ] as const)("rejects external migration intent with changed %s", async (_label, patch) => {
+    const fixture = await externalMigrationFixture();
+    await writeFile(fixture.intentPath, JSON.stringify({ ...fixture.intent, ...patch }));
+    await expect(verifyExternalRunnerMigrationEvidence({ targetRecordPath: fixture.targetRecordPath,
+      priorRecordPath: fixture.priorRecordPath }, { verify: async () => ({ status: "ok" }),
+      verifyRetiredManagedPrior: async () => ({ status: "ok" }), now: () => NOW })).rejects.toThrow();
+  });
+
+  it.each(["malformed JSON", "schema-v1 drain"])("rejects external migration with %s", async (kind) => {
+    const fixture = await externalMigrationFixture();
+    if (kind === "malformed JSON") {
+      await writeFile(fixture.intentPath, "{invalid");
+    } else {
+      const { heartbeatPid: _intentPid, ...intent } = fixture.intent;
+      const { heartbeatPid: _receiptPid, ...receipt } = fixture.receipt;
+      await writeFile(fixture.intentPath, JSON.stringify({ ...intent, schemaVersion: 1 }));
+      await writeFile(fixture.receiptPath, JSON.stringify({ ...receipt, schemaVersion: 1 }));
+    }
+    await expect(verifyExternalRunnerMigrationEvidence({ targetRecordPath: fixture.targetRecordPath,
+      priorRecordPath: fixture.priorRecordPath }, { verify: async () => ({ status: "ok" }),
+      verifyRetiredManagedPrior: async () => ({ status: "ok" }), now: () => NOW }))
+      .rejects.toThrow(/not valid JSON|exact immutable schema-v2/);
+  });
+
+  it("rejects a changed committed drain receipt and a changing retired activation snapshot", async () => {
+    const fixture = await externalMigrationFixture();
+    const options = { targetRecordPath: fixture.targetRecordPath, priorRecordPath: fixture.priorRecordPath };
+    const deps = { verify: async () => ({ status: "ok" }),
+      verifyRetiredManagedPrior: async () => ({ status: "ok" }), now: () => NOW };
+    await verifyExternalRunnerMigrationEvidence(options, deps);
+    await writeFile(fixture.receiptPath, JSON.stringify({ ...fixture.receipt, heartbeatPid: 9999 }));
+    await expect(verifyExternalRunnerMigrationEvidence(options, deps)).rejects.toThrow(/immutable intent/);
+    await writeFile(fixture.receiptPath, JSON.stringify(fixture.receipt));
+    let calls = 0;
+    await expect(verifyExternalRunnerMigrationEvidence(options, { ...deps,
+      verifyRetiredManagedPrior: async () => {
+        calls += 1;
+        if (calls === 2) await writeFile(fixture.priorRecordPath,
+          `${await readFile(fixture.priorRecordPath, "utf8")}\n`);
+        return { status: "ok" };
+      } })).rejects.toThrow(/changed while its activation was verified/);
   });
 
   it("attests fully prior, oMLX-first mixed, and fully target transition installs", async () => {
