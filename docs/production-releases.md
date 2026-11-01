@@ -327,6 +327,10 @@ D1 backup.
 - `/build.json` identifies the exact source revision and canonical client
   inputs. Static smoke compares every referenced JS/CSS asset byte-for-byte
   with the local build on both the custom domain and `workers.dev`.
+  It permits one strictly canonical Cloudflare Web Analytics insertion, with
+  either the legacy configuration or the observed automatic SPA flag `spa: 2`.
+  Every surrounding HTML byte and application asset must still match; this
+  does not change analytics, caching, or security settings.
 - `/api/health` reports source revision, Worker runtime digest, client digest,
   and narrative protocol fingerprint.
 - The narrative runner is a deterministic bundled artifact. Activation record
