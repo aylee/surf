@@ -892,11 +892,15 @@ function isCanonicalCloudflareWebAnalyticsScript(script) {
   } catch {
     return false;
   }
+  const keys = configuration && typeof configuration === "object"
+    ? Object.keys(configuration).join("\0") : "";
+  const canonicalKeys = keys === "version\0token\0r" ||
+    (keys === "version\0token\0r\0spa" && configuration.spa === 2);
   if (
     !configuration ||
     typeof configuration !== "object" ||
     Array.isArray(configuration) ||
-    Object.keys(configuration).join("\0") !== "version\0token\0r" ||
+    !canonicalKeys ||
     JSON.stringify(configuration) !== encodedConfiguration ||
     typeof configuration.version !== "string" ||
     !/^\d{4}\.\d{1,2}\.\d{1,3}$/.test(configuration.version) ||

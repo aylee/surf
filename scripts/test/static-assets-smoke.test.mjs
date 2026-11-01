@@ -254,6 +254,34 @@ test("the exact canonical Cloudflare Web Analytics insertion preserves index and
   );
 });
 
+test("the observed SPA analytics insertion preserves exact application and asset proof", async (t) => {
+  const { clientDirectory, index } = await fixture(t);
+  const configuration = JSON.stringify({ ...WEB_ANALYTICS_CONFIGURATION, spa: 2 });
+  const result = await smokeStaticAssets(ORIGIN, smokeOptions(clientDirectory,
+    fakeFetcher(index, { overrides: { "/": {
+      body: injectWebAnalytics(index, webAnalyticsScript({ configuration })),
+      contentType: "text/html; charset=utf-8"
+    } } })
+  ));
+  assert.equal(result.indexSha256, sha256(index));
+  assert.equal(result.assets.length, 4);
+  for (const spa of [false, true, 0, 1, 3, "2", null]) {
+    await assert.rejects(smokeStaticAssets(ORIGIN, smokeOptions(clientDirectory,
+      fakeFetcher(index, { overrides: { "/": {
+        body: injectWebAnalytics(index, webAnalyticsScript({
+          configuration: JSON.stringify({ ...WEB_ANALYTICS_CONFIGURATION, spa })
+        })), contentType: "text/html"
+      } } })
+    )), /remote client index does not match/);
+  }
+  await assert.rejects(smokeStaticAssets(ORIGIN, smokeOptions(clientDirectory,
+    fakeFetcher(index, { overrides: {
+      "/": { body: injectWebAnalytics(index, webAnalyticsScript({ configuration })), contentType: "text/html" },
+      [JAVASCRIPT_PATH]: { body: "unexpected application code", contentType: "text/javascript" }
+    } })
+  )), /does not match the expected build/);
+});
+
 test("noncanonical or nonexclusive Web Analytics transformations fail closed", async (t) => {
   const { clientDirectory, index } = await fixture(t);
   const canonical = webAnalyticsScript();
