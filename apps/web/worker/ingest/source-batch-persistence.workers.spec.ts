@@ -333,8 +333,8 @@ describe("source-batch persistence in real Workerd D1", () => {
     expect(normalized.flatMap(({ errors }) => errors)).toEqual([]);
     expect(artifactResults.flatMap(({ errors }) => errors)).toEqual([]);
     expect(retention.errors).toEqual([]);
-    expect(counted.count()).toBe(32);
-    expect(bucketKeys).toHaveLength(SOURCE_IDS.length * 3);
+    expect(counted.count()).toBe(34);
+    expect(bucketKeys).toHaveLength(SOURCE_IDS.length * 2);
     expect(
       await env.DB.prepare("select count(*) as count from tide_forecasts").first<{ count: number }>()
     ).toEqual({ count: tideRows.length });
@@ -342,7 +342,7 @@ describe("source-batch persistence in real Workerd D1", () => {
       await env.DB.prepare("select count(*) as count from wind_forecasts").first<{ count: number }>()
     ).toEqual({ count: nwsRows.reduce((total, row) => total + row.windForecasts.length, 0) });
     expect(
-      await env.DB.prepare("select count(*) as count from source_artifacts").first<{ count: number }>()
+      await env.DB.prepare("select count(*) as count from raw_artifact_captures").first<{ count: number }>()
     ).toEqual({ count: SOURCE_IDS.length * 2 });
     expect(
       await env.DB.prepare("select event_at from tide_events order by event_at desc limit 1").first()

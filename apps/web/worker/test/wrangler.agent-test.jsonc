@@ -26,6 +26,7 @@
       "storage": "sqlite"
     }
   },
+  "r2_buckets": [{ "binding": "RAW_ARTIFACTS", "bucket_name": "surf-raw-test" }],
   "d1_databases": [
     {
       "binding": "DB",

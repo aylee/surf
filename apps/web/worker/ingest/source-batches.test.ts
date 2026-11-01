@@ -296,10 +296,10 @@ describe("configured source batches", () => {
       new Date(NOW.getTime() + 2 * 24 * 60 * 60 * 1000).toISOString()
     );
 
-    expect(objectKeys.slice(3)).toEqual(objectKeys.slice(0, 3));
-    expect(new Set(objectKeys).size).toBe(3);
+    expect(objectKeys.slice(2)).toEqual(objectKeys.slice(0, 2));
+    expect(new Set(objectKeys).size).toBe(2);
     const artifactIdentity = (write: unknown[] | undefined) =>
-      JSON.parse(String(write?.[3])).map(
+      JSON.parse(String(write?.[5])).map(
         ({ id, r2Key, requestUrl }: { id: string; r2Key: string; requestUrl: string }) =>
           ({ id, r2Key, requestUrl })
       );

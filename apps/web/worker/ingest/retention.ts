@@ -1,5 +1,32 @@
 import { runPendingStatements } from "./database";
 import type { PersistenceResult } from "./types";
+import { RAW_ARTIFACT_METADATA_RETENTION_DAYS, RAW_ARTIFACT_PROVIDER_PREFIXES } from "./raw-policy";
+
+function knownLegacyRawPrefix(column: "r2_key" | "raw_r2_key"): string {
+  return `(${RAW_ARTIFACT_PROVIDER_PREFIXES.map((prefix) => `${column} glob 'raw/${prefix}/*'`).join(" or ")})`;
+}
+
+// Unknown or malformed archival metadata must not abort the retention pass or
+// be interpreted as approval to clear an unrelated resource's pointers.
+const SAFE_MANIFEST_JSON = "case when json_valid(artifact_manifest_json) then artifact_manifest_json else '{}' end";
+const MANIFEST_CREATED_AT = `json_extract(${SAFE_MANIFEST_JSON}, '$.createdAt')`;
+
+function validUtcJulianDate(value: string): string {
+  // julianday alone accepts numeric strings such as "100". Require the UTC
+  // timestamp shape emitted by the uploader and a valid calendar round-trip.
+  return `case when typeof(${value}) = 'text'
+    and ${value} glob '????-??-??T??:??:??*Z'
+    and julianday(${value}) is not null
+    and strftime('%Y-%m-%dT%H:%M:%S', ${value}) = substr(${value}, 1, 19)
+    then julianday(${value}) end`;
+}
+
+const LEGACY_MANIFEST_CREATED_AT = validUtcJulianDate(MANIFEST_CREATED_AT);
+const LEGACY_COMPLETED_AT = validUtcJulianDate("completed_at");
+const LEGACY_MANIFEST_ACTUAL_AT = `max(
+  coalesce(${LEGACY_COMPLETED_AT}, ${LEGACY_MANIFEST_CREATED_AT}),
+  coalesce(${LEGACY_MANIFEST_CREATED_AT}, ${LEGACY_COMPLETED_AT})
+)`;
 
 export const FORECAST_HISTORY_RETENTION_DAYS = 400;
 export const OPERATIONAL_FORECAST_RETENTION_DAYS = 2;
@@ -17,6 +44,9 @@ export async function pruneRetainedData(
   }
   const historyCutoff = new Date(
     now.getTime() - FORECAST_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000
+  ).toISOString();
+  const rawMetadataCutoff = new Date(
+    now.getTime() - RAW_ARTIFACT_METADATA_RETENTION_DAYS * 86_400_000
   ).toISOString();
   const operationalCutoff = new Date(
     now.getTime() - OPERATIONAL_FORECAST_RETENTION_DAYS * 24 * 60 * 60 * 1000
@@ -146,9 +176,28 @@ export async function pruneRetainedData(
     },
     {
       label: "prune source_artifacts",
-      statement: db
-        .prepare("delete from source_artifacts where created_at < ?")
-        .bind(historyCutoff)
+      statement: db.prepare(`delete from source_artifacts
+        where created_at < ?
+          or (created_at <= ? and ${knownLegacyRawPrefix("r2_key")})`)
+        .bind(historyCutoff, rawMetadataCutoff)
+    },
+    {
+      label: "prune raw_artifact_captures",
+      statement: db.prepare("delete from raw_artifact_captures where metadata_expires_at <= ?")
+        .bind(now.toISOString())
+    },
+    {
+      label: "expire raw manifests",
+      statement: db.prepare(`update source_runs
+        set artifact_manifest_json = null, raw_r2_key = null
+        where (
+          json_extract(${SAFE_MANIFEST_JSON}, '$.schemaVersion') = 2
+          and json_extract(${SAFE_MANIFEST_JSON}, '$.metadataExpiresAt') <= ?
+        ) or (
+          ${knownLegacyRawPrefix("raw_r2_key")}
+          and ${LEGACY_MANIFEST_ACTUAL_AT} <= julianday(?)
+        )`)
+        .bind(now.toISOString(), rawMetadataCutoff)
     },
     {
       label: "prune source_runs",
@@ -157,6 +206,7 @@ export async function pruneRetainedData(
           `delete from source_runs
            where started_at < ?
              and not exists (select 1 from source_artifacts where source_run_id = source_runs.id)
+             and not exists (select 1 from raw_artifact_captures where source_run_id = source_runs.id)
              and not exists (select 1 from wave_forecasts where source_run_id = source_runs.id)
              and not exists (select 1 from tide_forecasts where source_run_id = source_runs.id)
              and not exists (select 1 from tide_events where source_run_id = source_runs.id)
